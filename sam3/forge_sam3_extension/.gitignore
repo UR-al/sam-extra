@@ -1,0 +1,4 @@
+__pycache__/
+outputs/
+sam3ext\__pycache__/
+scripts\__pycache__/
