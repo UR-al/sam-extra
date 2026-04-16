@@ -29,8 +29,9 @@ def on_widget_change(state: dict, value: Any, *, attr: str):
     return state
 
 
-def on_generate_click(state: dict, *values: Any):
+def on_generate_click(state: dict, sam3_enable: Any, *values: Any):
     state = dict(state or {})
+    state["sam3_enable"] = sam3_enable
     for attr, value in zip(ALL_ARGS.attrs, values):
         state[attr] = value
     state["is_api"] = ()
@@ -38,7 +39,10 @@ def on_generate_click(state: dict, *values: Any):
 
 
 def state_init(w: Widgets) -> dict[str, Any]:
-    return {attr: getattr(w, attr).value for attr in ALL_ARGS.attrs}
+    return {
+        "sam3_enable": getattr(w, "sam3_enable").value,
+        **{attr: getattr(w, attr).value for attr in ALL_ARGS.attrs},
+    }
 
 
 def sam3_ui(is_img2img: bool, buttons: WebuiButtons):
@@ -101,7 +105,7 @@ def sam3_ui(is_img2img: bool, buttons: WebuiButtons):
             w.sam3_checkpoint = gr.Dropdown(
                 label="SAM3 Checkpoint",
                 choices=checkpoint_choices,
-                value=checkpoint_choices[0] if checkpoint_choices else "models/sam3.pt",
+                value=checkpoint_choices[0] if checkpoint_choices else "sam3.pt",
                 type="value",
             )
 
@@ -195,6 +199,41 @@ def sam3_ui(is_img2img: bool, buttons: WebuiButtons):
                     value=7.0,
                 )
 
+            with gr.Row():
+                w.sam3_use_sampler = gr.Checkbox(
+                    label="Use separate sampler",
+                    value=False,
+                )
+                w.sam3_sampler = gr.Dropdown(
+                    label="Sampler",
+                    choices=["Use same sampler"],
+                    value="Use same sampler",
+                    type="value",
+                )
+                w.sam3_scheduler = gr.Dropdown(
+                    label="Scheduler",
+                    choices=["Use same scheduler"],
+                    value="Use same scheduler",
+                    type="value",
+                )
+
+            with gr.Row():
+                w.sam3_use_noise_multiplier = gr.Checkbox(
+                    label="Use noise multiplier",
+                    value=False,
+                )
+                w.sam3_noise_multiplier = gr.Slider(
+                    label="Noise Multiplier",
+                    minimum=0.0,
+                    maximum=2.0,
+                    step=0.01,
+                    value=1.0,
+                )
+                w.sam3_restore_face = gr.Checkbox(
+                    label="Restore face",
+                    value=False,
+                )
+
     state = gr.State(state_init(w))
     for attr in ("sam3_enable", *ALL_ARGS.attrs):
         widget = getattr(w, attr)
@@ -203,7 +242,7 @@ def sam3_ui(is_img2img: bool, buttons: WebuiButtons):
 
     target_button = buttons.i2i_button if is_img2img else buttons.t2i_button
     if target_button is not None:
-        all_inputs = [state, *w.tolist()]
+        all_inputs = [state, w.sam3_enable, *w.tolist()]
         target_button.click(fn=on_generate_click, inputs=all_inputs, outputs=state, queue=False)
 
     infotext_fields = [(getattr(w, attr), name) for attr, name in ALL_ARGS]

@@ -28,7 +28,7 @@ class Sam3Args(BaseModel, extra=Extra.forbid):
     sam3_inpaint_prompt: str = ""
     sam3_negative_prompt: str = ""
     sam3_threshold: confloat(ge=0.0, le=1.0) = 0.4
-    sam3_checkpoint: str = "models/sam3.pt"
+    sam3_checkpoint: str = "sam3.pt"
     sam3_device: str = "auto"
     sam3_mask_blur: NonNegativeInt = 4
     sam3_denoising_strength: confloat(ge=0.0, le=1.0) = 0.4
@@ -41,6 +41,12 @@ class Sam3Args(BaseModel, extra=Extra.forbid):
     sam3_steps: PositiveInt = 28
     sam3_use_cfg_scale: bool = False
     sam3_cfg_scale: NonNegativeFloat = 7.0
+    sam3_use_sampler: bool = False
+    sam3_sampler: str = "Use same sampler"
+    sam3_scheduler: str = "Use same scheduler"
+    sam3_use_noise_multiplier: bool = False
+    sam3_noise_multiplier: confloat(ge=0.0, le=2.0) = 1.0
+    sam3_restore_face: bool = False
     sam3_preview_overlay: bool = False
     sam3_save_artifacts: bool = True
 
@@ -70,6 +76,9 @@ class Sam3Args(BaseModel, extra=Extra.forbid):
         )
         ppop("SAM3 Use Separate Steps", ["SAM3 Use Separate Steps", "SAM3 Steps"])
         ppop("SAM3 Use Separate CFG Scale", ["SAM3 Use Separate CFG Scale", "SAM3 CFG Scale"])
+        ppop("SAM3 Use Separate Sampler", ["SAM3 Use Separate Sampler", "SAM3 Sampler", "SAM3 Scheduler"])
+        ppop("SAM3 Use Noise Multiplier", ["SAM3 Use Noise Multiplier", "SAM3 Noise Multiplier"])
+        ppop("SAM3 Restore Face")
         ppop("SAM3 Preview Overlay")
         ppop("SAM3 Save Artifacts", cond=True)
         return params
@@ -96,6 +105,12 @@ ALL_ARGS = ArgsList(
         Arg("sam3_steps", "SAM3 Steps"),
         Arg("sam3_use_cfg_scale", "SAM3 Use Separate CFG Scale"),
         Arg("sam3_cfg_scale", "SAM3 CFG Scale"),
+        Arg("sam3_use_sampler", "SAM3 Use Separate Sampler"),
+        Arg("sam3_sampler", "SAM3 Sampler"),
+        Arg("sam3_scheduler", "SAM3 Scheduler"),
+        Arg("sam3_use_noise_multiplier", "SAM3 Use Noise Multiplier"),
+        Arg("sam3_noise_multiplier", "SAM3 Noise Multiplier"),
+        Arg("sam3_restore_face", "SAM3 Restore Face"),
         Arg("sam3_preview_overlay", "SAM3 Preview Overlay"),
         Arg("sam3_save_artifacts", "SAM3 Save Artifacts"),
     ]

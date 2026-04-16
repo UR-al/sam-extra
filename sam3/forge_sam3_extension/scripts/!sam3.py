@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
 from copy import copy
 from pathlib import Path
 import sys
 import traceback
 from functools import partial
 from typing import Any
+from unittest.mock import patch
 
 import gradio as gr
 import numpy as np
@@ -13,6 +15,17 @@ from PIL import Image
 
 from modules import script_callbacks, scripts, shared
 from modules.processing import StableDiffusionProcessingImg2Img, process_images
+
+
+@contextmanager
+def _pause_total_tqdm():
+    """ADetailer와 동일: 내부 i2i 실행 중 total tqdm 숨기기"""
+    try:
+        from modules.shared import opts
+        with patch.dict(opts.data, {"multiple_tqdm": False}, clear=False):
+            yield
+    except Exception:
+        yield
 
 from sam3ext import SAM3_NAME, Sam3Args, __version__, run_sam3_on_pil
 from sam3ext.core import find_checkpoint_options, write_artifacts
@@ -86,13 +99,29 @@ class Sam3MaskScript(scripts.Script):
         self.infotext_fields = [(components[0], "SAM3 Enable"), *infotext_fields]
         return components
 
-    def process(self, p, enabled, sam3_state):
+    def process(self, p, *args_):
         if getattr(p, "_sam3_inner", False):
             p._sam3_args = {"enabled": False}
             return
 
         xyz_values = getattr(p, "_sam3_xyz", {}) or {}
-        state = dict(sam3_state or {})
+        enabled = False
+        state = {}
+
+        if args_:
+            first = args_[0]
+            if isinstance(first, bool):
+                enabled = first
+                if len(args_) > 1 and isinstance(args_[1], dict):
+                    state = dict(args_[1] or {})
+            elif isinstance(first, dict):
+                state = dict(first or {})
+                enabled = bool(state.get("sam3_enable", state.get("enabled", False)))
+
+        if not state:
+            state = next((dict(arg or {}) for arg in args_ if isinstance(arg, dict)), {})
+            enabled = enabled or bool(state.get("sam3_enable", state.get("enabled", False)))
+
         if "enabled" in xyz_values:
             enabled = str(xyz_values.get("enabled")).lower() == "true"
         payload = {
@@ -102,7 +131,7 @@ class Sam3MaskScript(scripts.Script):
             "sam3_inpaint_prompt": str(state.get("sam3_inpaint_prompt", "")),
             "sam3_negative_prompt": str(state.get("sam3_negative_prompt", "")),
             "sam3_threshold": float(xyz_values.get("threshold", state.get("sam3_threshold", 0.4))),
-            "sam3_checkpoint": str(xyz_values.get("checkpoint", state.get("sam3_checkpoint", "models/sam3.pt"))),
+            "sam3_checkpoint": str(xyz_values.get("checkpoint", state.get("sam3_checkpoint", "sam3.pt"))),
             "sam3_device": str(state.get("sam3_device", "auto")),
             "sam3_mask_blur": int(state.get("sam3_mask_blur", 4)),
             "sam3_denoising_strength": float(state.get("sam3_denoising_strength", 0.4)),
@@ -115,6 +144,12 @@ class Sam3MaskScript(scripts.Script):
             "sam3_steps": int(state.get("sam3_steps", 28)),
             "sam3_use_cfg_scale": bool(state.get("sam3_use_cfg_scale", False)),
             "sam3_cfg_scale": float(state.get("sam3_cfg_scale", 7.0)),
+            "sam3_use_sampler": bool(state.get("sam3_use_sampler", False)),
+            "sam3_sampler": str(state.get("sam3_sampler", "Use same sampler")),
+            "sam3_scheduler": str(state.get("sam3_scheduler", "Use same scheduler")),
+            "sam3_use_noise_multiplier": bool(state.get("sam3_use_noise_multiplier", False)),
+            "sam3_noise_multiplier": float(state.get("sam3_noise_multiplier", 1.0)),
+            "sam3_restore_face": bool(state.get("sam3_restore_face", False)),
             "sam3_preview_overlay": bool(state.get("sam3_preview_overlay", False)),
             "sam3_save_artifacts": bool(state.get("sam3_save_artifacts", True)),
         }
@@ -174,15 +209,38 @@ class Sam3MaskScript(scripts.Script):
         return script_runner, script_args
 
     @staticmethod
+    def _get_sampler(p, args: dict[str, Any]) -> str:
+        if args.get("sam3_use_sampler"):
+            sampler = args.get("sam3_sampler", "Use same sampler")
+            if sampler != "Use same sampler":
+                return sampler
+        return getattr(p, "sampler_name", None)
+
+    @staticmethod
+    def _get_scheduler(p, args: dict[str, Any]) -> dict:
+        if not hasattr(p, "scheduler"):
+            return {}
+        if args.get("sam3_use_sampler"):
+            scheduler = args.get("sam3_scheduler", "Use same scheduler")
+            if scheduler != "Use same scheduler":
+                return {"scheduler": scheduler}
+        return {"scheduler": getattr(p, "scheduler")}
+
+    @staticmethod
+    def _get_noise_multiplier(p, args: dict[str, Any]):
+        if args.get("sam3_use_noise_multiplier"):
+            return float(args.get("sam3_noise_multiplier", 1.0))
+        return getattr(p, "initial_noise_multiplier", None) or 1.0
+
+    @staticmethod
     def _build_i2i(p, image: Image.Image, args: dict[str, Any]) -> StableDiffusionProcessingImg2Img:
         width = int(args["sam3_inpaint_width"]) if args.get("sam3_use_inpaint_width_height") else int(getattr(p, "width", image.width))
         height = int(args["sam3_inpaint_height"]) if args.get("sam3_use_inpaint_width_height") else int(getattr(p, "height", image.height))
         steps = int(args["sam3_steps"]) if args.get("sam3_use_steps") else int(getattr(p, "steps", 28))
         cfg_scale = float(args["sam3_cfg_scale"]) if args.get("sam3_use_cfg_scale") else float(getattr(p, "cfg_scale", 7.0))
-
-        version_args = {}
-        if hasattr(p, "scheduler"):
-            version_args["scheduler"] = getattr(p, "scheduler")
+        sampler_name = Sam3MaskScript._get_sampler(p, args)
+        noise_multiplier = Sam3MaskScript._get_noise_multiplier(p, args)
+        version_args = Sam3MaskScript._get_scheduler(p, args)
 
         p2 = StableDiffusionProcessingImg2Img(
             init_images=[image],
@@ -194,6 +252,7 @@ class Sam3MaskScript(scripts.Script):
             inpaint_full_res=bool(args["sam3_inpaint_only_masked"]),
             inpaint_full_res_padding=int(args["sam3_inpaint_only_masked_padding"]),
             inpainting_mask_invert=0,
+            initial_noise_multiplier=noise_multiplier,
             sd_model=p.sd_model,
             outpath_samples=p.outpath_samples,
             outpath_grids=p.outpath_grids,
@@ -205,14 +264,14 @@ class Sam3MaskScript(scripts.Script):
             subseed_strength=getattr(p, "subseed_strength", 0),
             seed_resize_from_h=getattr(p, "seed_resize_from_h", 0),
             seed_resize_from_w=getattr(p, "seed_resize_from_w", 0),
-            sampler_name=getattr(p, "sampler_name", None),
+            sampler_name=sampler_name,
             batch_size=1,
             n_iter=1,
             steps=steps,
             cfg_scale=cfg_scale,
             width=width,
             height=height,
-            restore_faces=getattr(p, "restore_faces", False),
+            restore_faces=bool(args.get("sam3_restore_face", False)),
             tiling=getattr(p, "tiling", False),
             extra_generation_params=dict(getattr(p, "extra_generation_params", {})),
             do_not_save_samples=True,
@@ -223,14 +282,11 @@ class Sam3MaskScript(scripts.Script):
         p2.cached_uc = [None, None]
         p2.scripts, p2.script_args = Sam3MaskScript._script_filter(p)
         p2._sam3_inner = True
-        p2.enable_hr = getattr(p, "enable_hr", False)
-        p2.hr_prompt = getattr(p, "hr_prompt", "")
-        p2.hr_negative_prompt = getattr(p, "hr_negative_prompt", "")
-        p2.all_hr_prompts = list(getattr(p, "all_hr_prompts", []) or [])
-        p2.all_hr_negative_prompts = list(getattr(p, "all_hr_negative_prompts", []) or [])
+        p2.all_hr_prompts = [""]
+        p2.all_hr_negative_prompts = [""]
         return p2
 
-    def postprocess_image(self, p, pp, enabled, sam3_state):
+    def postprocess_image(self, p, pp, *args_):
         args = getattr(p, "_sam3_args", None) or {}
         if not args.get("enabled"):
             return
@@ -268,32 +324,31 @@ class Sam3MaskScript(scripts.Script):
                 file=sys.stderr,
             )
 
-            for index, mask in enumerate(masks, start=1):
-                if shared.state.interrupted or shared.state.skipped:
-                    break
-                p2 = self._build_i2i(p, current_image, args)
-                p2.image_mask = mask
-                p2.init_images[0] = current_image
-                p2.prompt = prompt
-                p2.negative_prompt = negative_prompt
-                if not p2.all_hr_prompts:
-                    p2.all_hr_prompts = [p2.prompt]
-                if not p2.all_hr_negative_prompts:
-                    p2.all_hr_negative_prompts = [p2.negative_prompt]
-                try:
-                    processed = process_images(p2)
-                except Exception:
-                    error = traceback.format_exc()
-                    print(f"[-] SAM3: inpaint pass {index} failed:\n{error}", file=sys.stderr)
-                    raise
-                finally:
-                    p2.close()
+            shared.state.job_count += len(masks)
 
-                if not processed.images:
-                    print(f"[-] SAM3: inpaint pass {index} returned no images.", file=sys.stderr)
-                    break
-                print(f"[-] SAM3: inpaint pass {index} completed.", file=sys.stderr)
-                current_image = processed.images[0].convert("RGB")
+            with _pause_total_tqdm():
+                for index, mask in enumerate(masks, start=1):
+                    if shared.state.interrupted or shared.state.skipped:
+                        break
+                    p2 = self._build_i2i(p, current_image, args)
+                    p2.image_mask = mask
+                    p2.init_images[0] = current_image
+                    p2.prompt = prompt
+                    p2.negative_prompt = negative_prompt
+                    try:
+                        processed = process_images(p2)
+                    except Exception:
+                        error = traceback.format_exc()
+                        print(f"[-] SAM3: inpaint pass {index} failed:\n{error}", file=sys.stderr)
+                        raise
+                    finally:
+                        p2.close()
+
+                    if not processed.images:
+                        print(f"[-] SAM3: inpaint pass {index} returned no images.", file=sys.stderr)
+                        break
+                    print(f"[-] SAM3: inpaint pass {index} completed.", file=sys.stderr)
+                    current_image = processed.images[0].convert("RGB")
 
             pp.image = current_image
             return
