@@ -6,7 +6,7 @@ SAM3 / SAM3.1 마스크 + 인페인트 확장. ADetailer 스타일의 자동 검
 
 ```
 cd <sd-webui-forge-neo>/extensions
-git clone https://github.com/UR-MJ/sam-extra.git
+git clone https://github.com/UR-al/sam-extra.git
 ```
 
 webui 재시작 후 txt2img / img2img 패널의 "SAM3 Mask" 아코디언이 표시되면 정상입니다.
