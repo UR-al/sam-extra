@@ -1,0 +1,15 @@
+sam3
+torch
+safetensors
+opencv-python
+timm
+einops
+huggingface_hub
+iopath
+pydantic
+py-cpuinfo
+protobuf
+packaging
+numpy
+Pillow>=11.1.0
+gradio<6.0,>=4.0

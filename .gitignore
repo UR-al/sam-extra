@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+.venv/
+outputs/
+models/
+*.pt
+*.pth
+*.safetensors
