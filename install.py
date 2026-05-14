@@ -47,6 +47,7 @@ def check_environment():
         ("einops", None, None),
         ("huggingface_hub", None, None),
         ("iopath", None, None),
+        ("safetensors", None, None),
     ]
     missing = [pkg for pkg, low, high in required if not is_installed(pkg, low, high)]
     if missing:

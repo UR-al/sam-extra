@@ -11,6 +11,16 @@ from .__version__ import __version__
 from .args import ALL_ARGS
 from .core import SAM3_NAME, find_checkpoint_options
 
+try:
+    from modules.sd_samplers import all_samplers as _all_samplers
+except Exception:
+    _all_samplers = []
+
+try:
+    from modules.sd_schedulers import schedulers as _all_schedulers
+except Exception:
+    _all_schedulers = []
+
 
 class Widgets(SimpleNamespace):
     def tolist(self):
@@ -62,7 +72,7 @@ def sam3_ui(is_img2img: bool, buttons: WebuiButtons):
                 value="face",
                 label="SAM3 Detect Prompt",
                 lines=2,
-                placeholder="What SAM3 should segment, e.g. face / hand / hair / person",
+                placeholder="e.g. face, eyes, hair / hand   ( ',' = OR-merge into one mask, '/' = separate detailer pass )",
             )
 
         with gr.Row():
@@ -100,6 +110,13 @@ def sam3_ui(is_img2img: bool, buttons: WebuiButtons):
                 maximum=1.0,
                 step=0.01,
                 value=0.40,
+            )
+            w.sam3_mask_dilation = gr.Slider(
+                label="Mask Dilation (px)",
+                minimum=0,
+                maximum=128,
+                step=1,
+                value=0,
             )
             checkpoint_choices = find_checkpoint_options()
             w.sam3_checkpoint = gr.Dropdown(
@@ -206,13 +223,13 @@ def sam3_ui(is_img2img: bool, buttons: WebuiButtons):
                 )
                 w.sam3_sampler = gr.Dropdown(
                     label="Sampler",
-                    choices=["Use same sampler"],
+                    choices=["Use same sampler", *[s.name for s in _all_samplers]],
                     value="Use same sampler",
                     type="value",
                 )
                 w.sam3_scheduler = gr.Dropdown(
                     label="Scheduler",
-                    choices=["Use same scheduler"],
+                    choices=["Use same scheduler", *[s.label for s in _all_schedulers]],
                     value="Use same scheduler",
                     type="value",
                 )

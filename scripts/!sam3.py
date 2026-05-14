@@ -6,7 +6,7 @@ from pathlib import Path
 import sys
 import traceback
 from functools import partial
-from typing import Any
+from typing import Any, NamedTuple
 from unittest.mock import patch
 
 import gradio as gr
@@ -15,6 +15,16 @@ from PIL import Image
 
 from modules import script_callbacks, scripts, shared
 from modules.processing import StableDiffusionProcessingImg2Img, process_images
+
+try:
+    from modules.sd_samplers import all_samplers as _all_samplers
+except Exception:
+    _all_samplers = []
+
+try:
+    from modules.sd_schedulers import schedulers as _all_schedulers
+except Exception:
+    _all_schedulers = []
 
 
 @contextmanager
@@ -35,10 +45,25 @@ from sam3ext.ui import WebuiButtons, sam3_ui
 txt2img_submit_button = img2img_submit_button = None
 
 
+class PromptSR(NamedTuple):
+    s: str
+    r: str
+
+
 def set_value(p, x: Any, xs: Any, *, field: str):
     if not hasattr(p, "_sam3_xyz"):
         p._sam3_xyz = {}
     p._sam3_xyz[field] = x
+
+
+def search_and_replace_prompt(p, x: Any, xs: Any, replace_in_main_prompt: bool):
+    if replace_in_main_prompt:
+        p.prompt = p.prompt.replace(xs[0], x)
+        p.negative_prompt = p.negative_prompt.replace(xs[0], x)
+
+    if not hasattr(p, "_sam3_xyz_prompt_sr"):
+        p._sam3_xyz_prompt_sr = []
+    p._sam3_xyz_prompt_sr.append(PromptSR(s=xs[0], r=x))
 
 
 def make_axis_on_xyz_grid():
@@ -51,16 +76,66 @@ def make_axis_on_xyz_grid():
     if xyz_grid is None:
         return
 
+    bool_choices = lambda: ["True", "False"]
+    sampler_choices = lambda: [s.name for s in _all_samplers]
+    scheduler_choices = lambda: [s.label for s in _all_schedulers]
+    mode_choices = lambda: ["Mask only", "Inpaint"]
+    mask_mode_choices = lambda: ["Combined", "Individual"]
+    device_choices = lambda: ["auto", "cuda", "cpu"]
+    format_path = (
+        xyz_grid.format_remove_path
+        if hasattr(xyz_grid, "format_remove_path")
+        else xyz_grid.format_value
+    )
+
     axis = [
-        xyz_grid.AxisOption("[SAM3] Enable", str, partial(set_value, field="enabled"), choices=lambda: ["True", "False"]),
-        xyz_grid.AxisOption("[SAM3] Prompt", str, partial(set_value, field="prompt")),
-        xyz_grid.AxisOption("[SAM3] Threshold", float, partial(set_value, field="threshold")),
+        xyz_grid.AxisOption("[SAM3] Enable", str, partial(set_value, field="enabled"), choices=bool_choices),
         xyz_grid.AxisOption(
             "[SAM3] Checkpoint",
             str,
-            partial(set_value, field="checkpoint"),
-            format_value=xyz_grid.format_remove_path if hasattr(xyz_grid, "format_remove_path") else xyz_grid.format_value,
+            partial(set_value, field="sam3_checkpoint"),
+            format_value=format_path,
             choices=find_checkpoint_options,
+        ),
+        xyz_grid.AxisOption("[SAM3] Mode", str, partial(set_value, field="sam3_mode"), choices=mode_choices),
+        xyz_grid.AxisOption("[SAM3] Mask Mode", str, partial(set_value, field="sam3_mask_mode"), choices=mask_mode_choices),
+        xyz_grid.AxisOption("[SAM3] Device", str, partial(set_value, field="sam3_device"), choices=device_choices),
+        xyz_grid.AxisOption("[SAM3] Detect Prompt", str, partial(set_value, field="sam3_prompt")),
+        xyz_grid.AxisOption("[SAM3] Inpaint Prompt", str, partial(set_value, field="sam3_inpaint_prompt")),
+        xyz_grid.AxisOption("[SAM3] Negative Prompt", str, partial(set_value, field="sam3_negative_prompt")),
+        xyz_grid.AxisOption(
+            "[SAM3] Prompt S/R (SAM3 inpaint)",
+            str,
+            partial(search_and_replace_prompt, replace_in_main_prompt=False),
+        ),
+        xyz_grid.AxisOption(
+            "[SAM3] Prompt S/R (SAM3 inpaint and main prompt)",
+            str,
+            partial(search_and_replace_prompt, replace_in_main_prompt=True),
+        ),
+        xyz_grid.AxisOption("[SAM3] Threshold", float, partial(set_value, field="sam3_threshold")),
+        xyz_grid.AxisOption("[SAM3] Mask Dilation", int, partial(set_value, field="sam3_mask_dilation")),
+        xyz_grid.AxisOption("[SAM3] Mask Blur", int, partial(set_value, field="sam3_mask_blur")),
+        xyz_grid.AxisOption("[SAM3] Denoising Strength", float, partial(set_value, field="sam3_denoising_strength")),
+        xyz_grid.AxisOption("[SAM3] CFG Scale", float, partial(set_value, field="sam3_cfg_scale")),
+        xyz_grid.AxisOption("[SAM3] Steps", int, partial(set_value, field="sam3_steps")),
+        xyz_grid.AxisOption(
+            "[SAM3] Inpaint Only Masked",
+            str,
+            partial(set_value, field="sam3_inpaint_only_masked"),
+            choices=bool_choices,
+        ),
+        xyz_grid.AxisOption("[SAM3] Inpaint Padding", int, partial(set_value, field="sam3_inpaint_only_masked_padding")),
+        xyz_grid.AxisOption("[SAM3] Inpaint Width", int, partial(set_value, field="sam3_inpaint_width")),
+        xyz_grid.AxisOption("[SAM3] Inpaint Height", int, partial(set_value, field="sam3_inpaint_height")),
+        xyz_grid.AxisOption("[SAM3] Sampler", str, partial(set_value, field="sam3_sampler"), choices=sampler_choices),
+        xyz_grid.AxisOption("[SAM3] Scheduler", str, partial(set_value, field="sam3_scheduler"), choices=scheduler_choices),
+        xyz_grid.AxisOption("[SAM3] Noise Multiplier", float, partial(set_value, field="sam3_noise_multiplier")),
+        xyz_grid.AxisOption(
+            "[SAM3] Restore Face",
+            str,
+            partial(set_value, field="sam3_restore_face"),
+            choices=bool_choices,
         ),
     ]
 
@@ -124,32 +199,58 @@ class Sam3MaskScript(scripts.Script):
 
         if "enabled" in xyz_values:
             enabled = str(xyz_values.get("enabled")).lower() == "true"
+
+        def _xyz_or(state_key: str, default: Any, *, legacy: str | None = None) -> Any:
+            if state_key in xyz_values:
+                return xyz_values[state_key]
+            if legacy is not None and legacy in xyz_values:
+                return xyz_values[legacy]
+            return state.get(state_key, default)
+
+        def _as_bool(value: Any, default: bool) -> bool:
+            if isinstance(value, bool):
+                return value
+            if value is None:
+                return default
+            return str(value).strip().lower() in {"true", "1", "yes", "on"}
+
+        sam3_sampler = str(_xyz_or("sam3_sampler", "Use same sampler"))
+        sam3_scheduler = str(_xyz_or("sam3_scheduler", "Use same scheduler"))
+        use_sampler = bool(state.get("sam3_use_sampler", False)) or (
+            "sam3_sampler" in xyz_values or "sam3_scheduler" in xyz_values
+        )
+
         payload = {
-            "sam3_mode": str(state.get("sam3_mode", "Inpaint")),
-            "sam3_mask_mode": str(state.get("sam3_mask_mode", "Individual")),
-            "sam3_prompt": str(xyz_values.get("prompt", state.get("sam3_prompt", "face"))).strip() or "face",
-            "sam3_inpaint_prompt": str(state.get("sam3_inpaint_prompt", "")),
-            "sam3_negative_prompt": str(state.get("sam3_negative_prompt", "")),
-            "sam3_threshold": float(xyz_values.get("threshold", state.get("sam3_threshold", 0.4))),
-            "sam3_checkpoint": str(xyz_values.get("checkpoint", state.get("sam3_checkpoint", "sam3.pt"))),
-            "sam3_device": str(state.get("sam3_device", "auto")),
-            "sam3_mask_blur": int(state.get("sam3_mask_blur", 4)),
-            "sam3_denoising_strength": float(state.get("sam3_denoising_strength", 0.4)),
-            "sam3_inpaint_only_masked": bool(state.get("sam3_inpaint_only_masked", True)),
-            "sam3_inpaint_only_masked_padding": int(state.get("sam3_inpaint_only_masked_padding", 32)),
-            "sam3_use_inpaint_width_height": bool(state.get("sam3_use_inpaint_width_height", False)),
-            "sam3_inpaint_width": int(state.get("sam3_inpaint_width", 512)),
-            "sam3_inpaint_height": int(state.get("sam3_inpaint_height", 512)),
-            "sam3_use_steps": bool(state.get("sam3_use_steps", False)),
-            "sam3_steps": int(state.get("sam3_steps", 28)),
-            "sam3_use_cfg_scale": bool(state.get("sam3_use_cfg_scale", False)),
-            "sam3_cfg_scale": float(state.get("sam3_cfg_scale", 7.0)),
-            "sam3_use_sampler": bool(state.get("sam3_use_sampler", False)),
-            "sam3_sampler": str(state.get("sam3_sampler", "Use same sampler")),
-            "sam3_scheduler": str(state.get("sam3_scheduler", "Use same scheduler")),
-            "sam3_use_noise_multiplier": bool(state.get("sam3_use_noise_multiplier", False)),
-            "sam3_noise_multiplier": float(state.get("sam3_noise_multiplier", 1.0)),
-            "sam3_restore_face": bool(state.get("sam3_restore_face", False)),
+            "sam3_mode": str(_xyz_or("sam3_mode", "Inpaint")),
+            "sam3_mask_mode": str(_xyz_or("sam3_mask_mode", "Individual")),
+            "sam3_prompt": str(_xyz_or("sam3_prompt", "face", legacy="prompt")).strip() or "face",
+            "sam3_inpaint_prompt": str(_xyz_or("sam3_inpaint_prompt", "")),
+            "sam3_negative_prompt": str(_xyz_or("sam3_negative_prompt", "")),
+            "sam3_threshold": float(_xyz_or("sam3_threshold", 0.4, legacy="threshold")),
+            "sam3_mask_dilation": int(_xyz_or("sam3_mask_dilation", 0)),
+            "sam3_checkpoint": str(_xyz_or("sam3_checkpoint", "sam3.pt", legacy="checkpoint")),
+            "sam3_device": str(_xyz_or("sam3_device", "auto")),
+            "sam3_mask_blur": int(_xyz_or("sam3_mask_blur", 4)),
+            "sam3_denoising_strength": float(_xyz_or("sam3_denoising_strength", 0.4)),
+            "sam3_inpaint_only_masked": _as_bool(
+                _xyz_or("sam3_inpaint_only_masked", True), True
+            ),
+            "sam3_inpaint_only_masked_padding": int(_xyz_or("sam3_inpaint_only_masked_padding", 32)),
+            "sam3_use_inpaint_width_height": bool(state.get("sam3_use_inpaint_width_height", False))
+            or ("sam3_inpaint_width" in xyz_values or "sam3_inpaint_height" in xyz_values),
+            "sam3_inpaint_width": int(_xyz_or("sam3_inpaint_width", 512)),
+            "sam3_inpaint_height": int(_xyz_or("sam3_inpaint_height", 512)),
+            "sam3_use_steps": bool(state.get("sam3_use_steps", False)) or ("sam3_steps" in xyz_values),
+            "sam3_steps": int(_xyz_or("sam3_steps", 28)),
+            "sam3_use_cfg_scale": bool(state.get("sam3_use_cfg_scale", False)) or ("sam3_cfg_scale" in xyz_values),
+            "sam3_cfg_scale": float(_xyz_or("sam3_cfg_scale", 7.0)),
+            "sam3_use_sampler": use_sampler,
+            "sam3_sampler": sam3_sampler,
+            "sam3_scheduler": sam3_scheduler,
+            "sam3_use_noise_multiplier": bool(state.get("sam3_use_noise_multiplier", False))
+            or ("sam3_noise_multiplier" in xyz_values),
+            "sam3_noise_multiplier": float(_xyz_or("sam3_noise_multiplier", 1.0)),
+            "sam3_restore_face": _as_bool(_xyz_or("sam3_restore_face", False), False),
             "sam3_preview_overlay": bool(state.get("sam3_preview_overlay", False)),
             "sam3_save_artifacts": bool(state.get("sam3_save_artifacts", True)),
         }
@@ -177,6 +278,13 @@ class Sam3MaskScript(scripts.Script):
     def _copy_prompt(prompt_value, fallback: str) -> str:
         text = str(prompt_value or "").strip()
         return text or str(fallback or "")
+
+    @staticmethod
+    def _apply_prompt_sr(p, text: str) -> str:
+        pairs = getattr(p, "_sam3_xyz_prompt_sr", None) or []
+        for pair in pairs:
+            text = text.replace(pair.s, pair.r)
+        return text
 
     @staticmethod
     def _script_args_copy(script_args):
@@ -300,6 +408,7 @@ class Sam3MaskScript(scripts.Script):
             checkpoint_value=args["sam3_checkpoint"],
             device=args["sam3_device"],
             allow_huggingface=allow_huggingface,
+            mask_dilation=int(args.get("sam3_mask_dilation", 0)),
         )
 
         if args.get("sam3_save_artifacts"):
@@ -318,6 +427,8 @@ class Sam3MaskScript(scripts.Script):
             current_image = image.convert("RGB")
             prompt = self._copy_prompt(args.get("sam3_inpaint_prompt"), getattr(p, "prompt", ""))
             negative_prompt = self._copy_prompt(args.get("sam3_negative_prompt"), getattr(p, "negative_prompt", ""))
+            prompt = self._apply_prompt_sr(p, prompt)
+            negative_prompt = self._apply_prompt_sr(p, negative_prompt)
             print(
                 f"[-] SAM3: starting inpaint mode with {len(masks)} mask(s), "
                 f"processing={args.get('sam3_mask_mode')}, detect_prompt={args.get('sam3_prompt')!r}",
