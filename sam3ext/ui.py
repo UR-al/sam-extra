@@ -22,13 +22,65 @@ except Exception:
     _all_schedulers = []
 
 
+_CN_MODEL_EXTS = (".pt", ".pth", ".ckpt", ".safetensors", ".bin")
+
+
+def _scan_sam3_dir_for_cn_models() -> dict[str, str]:
+    """Scan ``models/sam3/`` for ControlNet-compatible weight files (LLLite
+    inpaint, custom CN checkpoints kept next to the SAM3 weights, etc.) and
+    return a ``{name: path}`` map.
+
+    SAM3 detection checkpoints themselves are excluded by name pattern — they
+    live in the SAM3 Checkpoint dropdown, not the CN model dropdown.
+    """
+    import os as _os
+    from pathlib import Path as _Path
+
+    try:
+        from modules import paths as _paths
+    except Exception:
+        return {}
+
+    models_root = _Path(_paths.models_path)
+    candidates: list[_Path] = []
+    # Match both `models/sam3` (existing convention) and `models/SAM3` (user
+    # may rename); the actual folder on disk wins.
+    for variant in ("sam3", "SAM3"):
+        target = models_root / variant
+        if not target.is_dir():
+            continue
+        for ext in _CN_MODEL_EXTS:
+            candidates.extend(sorted(target.glob(f"*{ext}")))
+
+    found: dict[str, str] = {}
+    for path in candidates:
+        stem = path.stem
+        # Skip SAM3 detection checkpoints — those are handled by
+        # find_checkpoint_options() and would only confuse the CN dropdown.
+        if stem.lower().startswith("sam3"):
+            continue
+        # First-wins (sam3 vs SAM3 dedupe by stem)
+        found.setdefault(stem, str(path))
+    return found
+
+
 def _controlnet_model_choices() -> list[str]:
     """Return ControlNet model filenames, with ``None`` when the
-    sd_forge_controlnet extension isn't loaded so the UI still renders."""
+    sd_forge_controlnet extension isn't loaded so the UI still renders.
+
+    Also surfaces non-SAM3 weights stored in ``models/sam3/`` (e.g.
+    ``anima-lllite-inpainting-v2.safetensors``) by registering them into
+    ``global_state.controlnet_filename_dict`` so the CN script can resolve
+    the name → path mapping at load time.
+    """
     try:
         from lib_controlnet import global_state
 
         global_state.update_controlnet_filenames()
+        extras = _scan_sam3_dir_for_cn_models()
+        if extras:
+            global_state.controlnet_filename_dict.update(extras)
+            global_state.controlnet_names = sorted(global_state.controlnet_filename_dict.keys())
         names = list(global_state.get_all_controlnet_names())
         return names or ["None"]
     except Exception:

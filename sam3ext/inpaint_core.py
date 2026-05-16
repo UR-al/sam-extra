@@ -195,9 +195,22 @@ def inject_controlnet_unit(p2: StableDiffusionProcessingImg2Img, cn_args: dict[s
 
     try:
         from lib_controlnet.external_code import ControlNetUnit
+        from lib_controlnet import global_state as _cn_state
     except Exception as exc:
         print(f"[-] SAM3: ControlNet extension not loaded, skipping CN injection ({exc})", file=sys.stderr)
         return
+
+    # Re-register models/sam3/ entries on the CN filename dict in case it was
+    # reset between UI build time and now (refresh button in the standard
+    # ControlNet UI calls update_controlnet_filenames() which wipes the dict).
+    try:
+        from .ui import _scan_sam3_dir_for_cn_models
+
+        extras = _scan_sam3_dir_for_cn_models()
+        if extras:
+            _cn_state.controlnet_filename_dict.update(extras)
+    except Exception:
+        pass
 
     cn_script = _find_controlnet_script(p2)
     if cn_script is None:
