@@ -102,6 +102,12 @@ def make_axis_on_xyz_grid():
         ),
         xyz_grid.AxisOption("[SAM3] Threshold", float, partial(set_value, field="sam3_threshold")),
         xyz_grid.AxisOption("[SAM3] Mask Dilation", int, partial(set_value, field="sam3_mask_dilation")),
+        xyz_grid.AxisOption(
+            "[SAM3] Mask Hull",
+            str,
+            partial(set_value, field="sam3_mask_hull"),
+            choices=bool_choices,
+        ),
         xyz_grid.AxisOption("[SAM3] Mask Blur", int, partial(set_value, field="sam3_mask_blur")),
         xyz_grid.AxisOption("[SAM3] Denoising Strength", float, partial(set_value, field="sam3_denoising_strength")),
         xyz_grid.AxisOption("[SAM3] CFG Scale", float, partial(set_value, field="sam3_cfg_scale")),
@@ -232,6 +238,7 @@ class Sam3MaskScript(scripts.Script):
             "sam3_negative_prompt": str(_xyz_or("sam3_negative_prompt", "")),
             "sam3_threshold": float(_xyz_or("sam3_threshold", 0.4, legacy="threshold")),
             "sam3_mask_dilation": int(_xyz_or("sam3_mask_dilation", 0)),
+            "sam3_mask_hull": _as_bool(_xyz_or("sam3_mask_hull", False), False),
             "sam3_checkpoint": str(_xyz_or("sam3_checkpoint", "sam3.pt", legacy="checkpoint")),
             "sam3_device": str(_xyz_or("sam3_device", "auto")),
             "sam3_mask_blur": int(_xyz_or("sam3_mask_blur", 4)),
@@ -306,6 +313,7 @@ class Sam3MaskScript(scripts.Script):
             device=args["sam3_device"],
             allow_huggingface=allow_huggingface,
             mask_dilation=int(args.get("sam3_mask_dilation", 0)),
+            mask_hull=bool(args.get("sam3_mask_hull", False)),
         )
 
         if args.get("sam3_save_artifacts"):

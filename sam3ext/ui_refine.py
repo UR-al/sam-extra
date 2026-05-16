@@ -35,6 +35,7 @@ class RefinePanel:
     negative_prompt: gr.Textbox
     threshold: gr.Slider
     mask_dilation: gr.Slider
+    mask_hull: gr.Checkbox
     mask_blur: gr.Slider
     denoising_strength: gr.Slider
     inpaint_only_masked: gr.Checkbox
@@ -70,6 +71,7 @@ class RefinePanel:
             self.negative_prompt,
             self.threshold,
             self.mask_dilation,
+            self.mask_hull,
             self.mask_blur,
             self.denoising_strength,
             self.inpaint_only_masked,
@@ -103,6 +105,7 @@ REFINE_ARG_KEYS = (
     "negative_prompt",
     "threshold",
     "mask_dilation",
+    "mask_hull",
     "mask_blur",
     "denoising_strength",
     "inpaint_only_masked",
@@ -173,12 +176,18 @@ def build_refine_panel(
 
         with gr.Row():
             threshold = gr.Slider(label="SAM3 Threshold", minimum=0.0, maximum=1.0, step=0.01, value=0.4)
-            mask_dilation = gr.Slider(label="Mask Dilation (px)", minimum=0, maximum=128, step=1, value=4)
+            mask_dilation = gr.Slider(label="Mask Dilation (px)", minimum=0, maximum=256, step=1, value=4)
             mask_blur = gr.Slider(label="Mask Blur", minimum=0, maximum=64, step=1, value=4)
             mask_mode = gr.Radio(
                 label="Mask Processing",
                 choices=["Individual", "Combined"],
                 value="Combined",
+            )
+
+        with gr.Row():
+            mask_hull = gr.Checkbox(
+                label="Convex Hull (wrap strands — recommended for hair/fur)",
+                value=False,
             )
 
         with gr.Row():
@@ -290,6 +299,7 @@ def build_refine_panel(
         negative_prompt=negative_prompt,
         threshold=threshold,
         mask_dilation=mask_dilation,
+        mask_hull=mask_hull,
         mask_blur=mask_blur,
         denoising_strength=denoising_strength,
         inpaint_only_masked=inpaint_only_masked,
@@ -367,6 +377,7 @@ def map_widget_values_to_sam3_args(values: tuple) -> dict[str, Any]:
         "sam3_negative_prompt": str(keyed["negative_prompt"] or ""),
         "sam3_threshold": float(keyed["threshold"]),
         "sam3_mask_dilation": int(keyed["mask_dilation"]),
+        "sam3_mask_hull": bool(keyed["mask_hull"]),
         "sam3_checkpoint": str(keyed["checkpoint"]),
         "sam3_device": "auto",
         "sam3_mask_mode": str(keyed["mask_mode"]),

@@ -414,6 +414,7 @@ def run_sam3_refine(
         device=args["sam3_device"],
         allow_huggingface=allow_huggingface,
         mask_dilation=int(args.get("sam3_mask_dilation", 0)),
+        mask_hull=bool(args.get("sam3_mask_hull", False)),
     )
 
     masks_source = sam3_result.masks if args.get("sam3_mask_mode") == "Individual" else None

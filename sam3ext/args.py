@@ -29,6 +29,7 @@ class Sam3Args(BaseModel, extra=Extra.forbid):
     sam3_negative_prompt: str = ""
     sam3_threshold: confloat(ge=0.0, le=1.0) = 0.4
     sam3_mask_dilation: NonNegativeInt = 0
+    sam3_mask_hull: bool = False
     sam3_checkpoint: str = "sam3.pt"
     sam3_device: str = "auto"
     sam3_mask_blur: NonNegativeInt = 4
@@ -92,6 +93,7 @@ class Sam3Args(BaseModel, extra=Extra.forbid):
         ppop("SAM3 Inpaint Prompt")
         ppop("SAM3 Negative Prompt")
         ppop("SAM3 Mask Dilation", cond=0)
+        ppop("SAM3 Mask Hull")
         ppop("SAM3 Mask Blur", cond=4)
         ppop("SAM3 Denoising Strength", cond=0.4)
         ppop("SAM3 Inpaint Only Masked", ["SAM3 Inpaint Only Masked", "SAM3 Inpaint Padding"], cond=True)
@@ -137,6 +139,7 @@ ALL_ARGS = ArgsList(
         Arg("sam3_negative_prompt", "SAM3 Negative Prompt"),
         Arg("sam3_threshold", "SAM3 Threshold"),
         Arg("sam3_mask_dilation", "SAM3 Mask Dilation"),
+        Arg("sam3_mask_hull", "SAM3 Mask Hull"),
         Arg("sam3_checkpoint", "SAM3 Checkpoint"),
         Arg("sam3_device", "SAM3 Device"),
         Arg("sam3_mask_blur", "SAM3 Mask Blur"),

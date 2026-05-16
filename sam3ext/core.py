@@ -295,6 +295,33 @@ def _dilate_mask(mask: np.ndarray, px: int) -> np.ndarray:
     return dilated.astype(bool)
 
 
+def _convex_hull_mask(mask: np.ndarray) -> np.ndarray:
+    """Wrap each connected region of ``mask`` in its convex hull.
+
+    Useful for hair / fur / antennae where SAM3 catches the main silhouette
+    but misses thin strands that stick out — the hull naturally includes the
+    air between strands so a follow-up inpaint can redraw the whole shape.
+
+    Per-component (not one global hull over all components) so distinct
+    detected regions stay separate.
+    """
+    if not np.any(mask):
+        return mask.astype(bool)
+    import cv2
+
+    mask_u8 = mask.astype(np.uint8) * 255
+    num_labels, labels = cv2.connectedComponents(mask_u8)
+    out = np.zeros_like(mask_u8)
+    for label in range(1, num_labels):
+        component = (labels == label).astype(np.uint8) * 255
+        contours, _ = cv2.findContours(component, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if not contours:
+            continue
+        hull = cv2.convexHull(np.vstack(contours))
+        cv2.fillPoly(out, [hull], 255)
+    return (out > 0).astype(bool)
+
+
 def _clean_split_masks(masks: np.ndarray, boxes: np.ndarray, height: int, width: int) -> list[np.ndarray]:
     split_masks = _split_masks(masks, height, width)
     if not split_masks:
@@ -327,6 +354,7 @@ def run_sam3_on_pil(
     device: str,
     allow_huggingface: bool = True,
     mask_dilation: int = 0,
+    mask_hull: bool = False,
 ) -> Sam3Result:
     import torch
 
@@ -387,6 +415,8 @@ def run_sam3_on_pil(
         if not group_split:
             continue
         group_mask = np.any(np.stack(group_split, axis=0), axis=0)
+        if mask_hull:
+            group_mask = _convex_hull_mask(group_mask)
         group_mask = _dilate_mask(group_mask, mask_dilation)
         if np.any(group_mask):
             group_masks.append(group_mask)

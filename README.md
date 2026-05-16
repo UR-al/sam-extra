@@ -100,11 +100,21 @@ Mask Dilation:    8      (SAM3가 너무 타이트하게 잡을 때)
 
 전체-프레임 변경 시(전신 옷 교체 등)는 "Inpaint only masked"를 끄는 게 보통 더 잘 됩니다 — 크롭된 영역만 보면 CN의 포즈/깊이 정보가 약해지기 때문.
 
+## 마스크 후처리 (v0.4.3)
+
+머리카락이나 모피처럼 가는 strand가 SAM3에 의해 부분적으로 누락되는 경우를 위한 두 가지 마스크 확장 옵션:
+
+- **Mask Dilation (px)** — 마스크를 N 픽셀 바깥쪽으로 늘림. 작은 누락에 효과적. (최대 256까지 슬라이드 가능, v0.4.3에서 128→256으로 확장)
+- **Convex Hull (wrap strands)** — 검출된 영역을 *최소 볼록다각형*으로 감쌈. SAM3가 잡지 못한 strand 사이 공간까지 자동으로 포함됨. 머리·털·안테나 등에 특히 효과적. 컴포넌트별로 적용되어 분리된 영역끼리 합쳐지지 않음.
+
+적용 순서: hull → dilation → blur. 둘 다 SAM3 패널과 Refine 패널 모두에 노출되며, infotext / XYZ 축으로도 사용 가능.
+
 ## 주요 기능
 
 - SAM3 / SAM3.1 (`.pt`, `.safetensors`) 체크포인트 지원
 - 텍스트 프롬프트로 검출 (`face, eyes / hand` 처럼 `,` = OR-merge, `/` = 별도 인페인트 패스)
 - Combined / Individual 마스크 모드
+- **Mask Hull (convex hull) + dilation up to 256 px** — 머리·털 strand가 새는 경우용 (v0.4.3)
 - 인페인트 옵션 (denoising, mask blur, only-masked padding, separate width/height, steps, CFG, sampler/scheduler, noise multiplier, restore face)
 - **ControlNet 통합** (preprocessor / model / weight / guidance start·end / pixel-perfect / control mode / resize mode / processor res / threshold a·b / override external)
 - **Post-generation Refine 패널** — 갤러리에서 이미지 선택 후 즉시 SAM3+인페인트(+CN) 적용, 결과를 갤러리에 누적 삽입, 체이닝 가능

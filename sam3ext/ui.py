@@ -196,9 +196,13 @@ def sam3_ui(is_img2img: bool, buttons: WebuiButtons):
             w.sam3_mask_dilation = gr.Slider(
                 label="Mask Dilation (px)",
                 minimum=0,
-                maximum=128,
+                maximum=256,
                 step=1,
                 value=0,
+            )
+            w.sam3_mask_hull = gr.Checkbox(
+                label="Convex Hull (wrap strands)",
+                value=False,
             )
             checkpoint_choices = find_checkpoint_options()
             w.sam3_checkpoint = gr.Dropdown(
