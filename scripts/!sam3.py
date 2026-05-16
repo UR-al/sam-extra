@@ -347,42 +347,57 @@ class Sam3MaskScript(scripts.Script):
 
 
 txt2img_gallery_component = None
+txt2img_prompt_component = None
+txt2img_neg_prompt_component = None
 refine_panel: RefinePanel | None = None
 
 
-def _wire_refine_panel(panel: RefinePanel, gallery):
-    """Hook the gallery's select event + the Refine button's click handler.
+# JS shim: replace the placeholder selected_index slot (index 1 in the inputs
+# array) with the current gallery selection from the DOM. This sidesteps
+# Gradio 5.x's check_all_files_in_cache validation of SelectData event_data
+# that we'd otherwise hit by subscribing to gallery.select.
+_REFINE_JS = (
+    "(...args) => {"
+    "  try { args[1] = selected_gallery_index(); } catch (e) { args[1] = -1; }"
+    "  return args;"
+    "}"
+)
 
-    Lives here (not in ui_refine.py) because it needs the gallery component
-    reference, which we only resolve at on_after_component time.
-    """
 
-    def _on_select(evt: gr.SelectData):
-        return evt.index if evt is not None else None
+def _wire_refine_panel(panel: RefinePanel, gallery, main_prompt, main_neg_prompt):
+    """Wire the Refine button. Index is injected client-side via ``_REFINE_JS``
+    so we don't need a ``gallery.select`` handler (which would otherwise
+    trigger Gradio's file-cache validation on the selected image's path)."""
 
-    gallery.select(
-        fn=_on_select,
-        inputs=[],
-        outputs=[panel.selected_index_state],
-        queue=False,
-    )
-
+    # ``selected_index_state`` is the placeholder slot the JS overwrites.
     panel.refine_button.click(
         fn=handle_refine_click,
-        inputs=[gallery, panel.selected_index_state, *panel.all_widgets()],
+        _js=_REFINE_JS,
+        inputs=[
+            gallery,
+            panel.selected_index_state,
+            *panel.all_widgets(),
+            main_prompt,
+            main_neg_prompt,
+        ],
         outputs=[gallery, panel.status],
     )
 
 
 def on_after_component(component, **kwargs):
     global txt2img_submit_button, img2img_submit_button
-    global txt2img_gallery_component, refine_panel
+    global txt2img_gallery_component, txt2img_prompt_component, txt2img_neg_prompt_component
+    global refine_panel
 
     elem_id = kwargs.get("elem_id")
     if elem_id == "txt2img_generate":
         txt2img_submit_button = component
     elif elem_id == "img2img_generate":
         img2img_submit_button = component
+    elif elem_id == "txt2img_prompt":
+        txt2img_prompt_component = component
+    elif elem_id == "txt2img_neg_prompt":
+        txt2img_neg_prompt_component = component
     elif elem_id == "txt2img_gallery":
         txt2img_gallery_component = component
     elif elem_id == "html_log_txt2img" and refine_panel is None and txt2img_gallery_component is not None:
@@ -394,7 +409,12 @@ def on_after_component(component, **kwargs):
             schedulers = [s.label for s in _all_schedulers]
             checkpoints = find_checkpoint_options()
             refine_panel = build_refine_panel(samplers, schedulers, checkpoints)
-            _wire_refine_panel(refine_panel, txt2img_gallery_component)
+            _wire_refine_panel(
+                refine_panel,
+                txt2img_gallery_component,
+                txt2img_prompt_component,
+                txt2img_neg_prompt_component,
+            )
         except Exception:
             error = traceback.format_exc()
             print(f"[-] SAM3: failed to render Refine panel:\n{error}", file=sys.stderr)

@@ -402,17 +402,36 @@ def map_widget_values_to_sam3_args(values: tuple) -> dict[str, Any]:
     }
 
 
-def handle_refine_click(gallery_value, selected_index, *widget_values):
+def handle_refine_click(gallery_value, selected_index, *all_values):
     """Refine-button handler. Returns ``(updated_gallery, status_html)``.
+
+    ``all_values`` = ``(*widget_values, main_prompt, main_neg_prompt)``. The
+    two main-prompt slots come last because they are appended by the wiring
+    in ``scripts/!sam3.py``; we use them as a fallback when the Refine
+    panel's own inpaint/negative prompts are blank.
 
     Out-of-scope behaviors are returned as HTML status messages rather than
     raised exceptions so the panel stays responsive.
     """
-    if not widget_values:
-        return gallery_value, "<span style='color:#c33'>SAM3 Refine: no widget values received.</span>"
+    expected_widget_count = len(REFINE_ARG_KEYS)
+    if len(all_values) < expected_widget_count:
+        return gallery_value, "<span style='color:#c33'>SAM3 Refine: missing widget values.</span>"
+
+    widget_values = all_values[:expected_widget_count]
+    extras = all_values[expected_widget_count:]
+    main_prompt = str(extras[0]) if len(extras) > 0 else ""
+    main_neg_prompt = str(extras[1]) if len(extras) > 1 else ""
 
     args = map_widget_values_to_sam3_args(widget_values)
     insert_mode = args.pop("_insert_mode", "After selected")
+
+    # Fall back to the main t2i prompts when the Refine panel's own prompts
+    # are left empty (matches the in-flight Sam3MaskScript.postprocess_image
+    # behavior, which uses p.prompt / p.negative_prompt as defaults).
+    if not args.get("sam3_inpaint_prompt"):
+        args["sam3_inpaint_prompt"] = main_prompt
+    if not args.get("sam3_negative_prompt"):
+        args["sam3_negative_prompt"] = main_neg_prompt
 
     if not args["sam3_prompt"]:
         return gallery_value, "<span style='color:#c33'>SAM3 Refine: enter a detect prompt first.</span>"

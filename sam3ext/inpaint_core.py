@@ -227,10 +227,28 @@ def inject_controlnet_unit(p2: StableDiffusionProcessingImg2Img, cn_args: dict[s
         )
         return
 
+    module_name = str(cn_args.get("sam3_cn_module", "inpaint_only"))
+    model_name = str(cn_args.get("sam3_cn_model", "None"))
+
+    # LLLite anima inpaint variants take a 4-channel (RGB + mask) cond and
+    # need the mask tensor to survive preprocessing. ``inpaint_*`` preprocessors
+    # discard the mask (return None) and rewrite cond, which breaks the
+    # ``assert isinstance(mask, torch.Tensor)`` in the LLLite forward. Force a
+    # pass-through preprocessor in that case.
+    lower_model = model_name.lower()
+    if "lllite" in lower_model and "inpaint" in lower_model and module_name.startswith("inpaint"):
+        print(
+            f"[-] SAM3: LLLite inpaint model '{model_name}' is incompatible with "
+            f"preprocessor '{module_name}' (preprocessor strips the mask); "
+            f"overriding to 'None' so the mask reaches the LLLite forward.",
+            file=sys.stderr,
+        )
+        module_name = "None"
+
     sam3_unit = ControlNetUnit(
         enabled=True,
-        module=str(cn_args.get("sam3_cn_module", "inpaint_only")),
-        model=str(cn_args.get("sam3_cn_model", "None")),
+        module=module_name,
+        model=model_name,
         weight=float(cn_args.get("sam3_cn_weight", 1.0)),
         guidance_start=float(cn_args.get("sam3_cn_guidance_start", 0.0)),
         guidance_end=float(cn_args.get("sam3_cn_guidance_end", 1.0)),
