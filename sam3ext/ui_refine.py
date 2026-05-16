@@ -29,7 +29,7 @@ class RefinePanel:
     runtime callable depends on Forge's shared state)."""
 
     accordion: gr.Accordion
-    selected_index_state: gr.State
+    selected_index_state: gr.Number  # hidden frontend slot — JS shim fills it
     detect_prompt: gr.Textbox
     inpaint_prompt: gr.Textbox
     negative_prompt: gr.Textbox
@@ -146,7 +146,11 @@ def build_refine_panel(
     cn_module_default = _default_cn_module(cn_modules)
 
     with gr.Accordion("SAM3 Refine (post-generation)", open=False, elem_id="sam3_refine_panel") as acc:
-        selected_index_state = gr.State(value=None)
+        # Hidden Number (not gr.State) so the `_js` shim on the Refine button
+        # can address this slot reliably: Gradio's _js handler only receives
+        # frontend components in its args array — gr.State is server-side and
+        # would shift every subsequent arg by one if we tried to overwrite it.
+        selected_index_state = gr.Number(value=-1, precision=0, visible=False, elem_id="sam3_refine_selected_index")
         gr.Markdown(
             "Pick an image in the gallery above, then enter prompts and click **Refine**. "
             "The result is inserted next to the selected image — chain refines by reselecting."
@@ -370,6 +374,17 @@ def map_widget_values_to_sam3_args(values: tuple) -> dict[str, Any]:
     """Translate the Refine panel's widget values into the dict shape that
     ``inpaint_core.run_sam3_refine`` expects (same keys as ``Sam3Args``)."""
     keyed = dict(zip(REFINE_ARG_KEYS, values))
+    # Sanity guard: a widget-order shift bug would put a string where a float
+    # is expected (e.g. threshold). Fail loud with the field name so the
+    # mismatch is obvious instead of a cryptic ValueError from float().
+    for k in ("threshold", "denoising_strength", "cfg_scale", "cn_weight", "cn_guidance_start", "cn_guidance_end"):
+        v = keyed.get(k)
+        if isinstance(v, str):
+            raise RuntimeError(
+                f"SAM3 Refine: widget-order mismatch — '{k}' received a string "
+                f"({v[:60]!r}...) instead of a number. The inputs list passed "
+                f"to handle_refine_click is out of sync with REFINE_ARG_KEYS."
+            )
     return {
         # SAM3 detection
         "sam3_prompt": str(keyed["detect_prompt"] or "").strip(),
@@ -451,8 +466,13 @@ def handle_refine_click(gallery_value, selected_index, *all_values):
     if not gallery_list:
         return gallery_value, "<span style='color:#c33'>SAM3 Refine: gallery is empty.</span>"
 
-    idx = selected_index
-    if idx is None or not isinstance(idx, int) or idx < 0 or idx >= len(gallery_list):
+    # Hidden Number arrives as float; JS shim defaults to -1 when nothing is
+    # selected. Coerce + clamp to a valid index.
+    try:
+        idx = int(selected_index) if selected_index is not None else -1
+    except (TypeError, ValueError):
+        idx = -1
+    if idx < 0 or idx >= len(gallery_list):
         idx = len(gallery_list) - 1  # default to last item
 
     image = _coerce_gallery_item_to_pil(gallery_list[idx])
