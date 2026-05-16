@@ -50,6 +50,29 @@ class Sam3Args(BaseModel, extra=Extra.forbid):
     sam3_restore_face: bool = False
     sam3_preview_overlay: bool = False
     sam3_save_artifacts: bool = True
+    # ControlNet (Step 2): only meaningful when sam3_mode == "Inpaint" and the
+    # sd_forge_controlnet extension is loaded. Plumbed end-to-end in Step 3.
+    sam3_cn_enable: bool = False
+    sam3_cn_override_external: bool = False
+    sam3_cn_model: str = "None"
+    sam3_cn_module: str = "inpaint_only"
+    sam3_cn_weight: confloat(ge=0.0, le=2.0) = 1.0
+    sam3_cn_guidance_start: confloat(ge=0.0, le=1.0) = 0.0
+    sam3_cn_guidance_end: confloat(ge=0.0, le=1.0) = 1.0
+    sam3_cn_pixel_perfect: bool = True
+    sam3_cn_control_mode: Literal[
+        "Balanced",
+        "My prompt is more important",
+        "ControlNet is more important",
+    ] = "Balanced"
+    sam3_cn_resize_mode: Literal[
+        "Just Resize",
+        "Crop and Resize",
+        "Resize and Fill",
+    ] = "Crop and Resize"
+    sam3_cn_processor_res: NonNegativeInt = 512
+    sam3_cn_threshold_a: float = -1.0
+    sam3_cn_threshold_b: float = -1.0
 
     @staticmethod
     def ppop(p: dict[str, Any], key: str, pops: list[str] | None = None, cond: Any = None) -> None:
@@ -83,6 +106,25 @@ class Sam3Args(BaseModel, extra=Extra.forbid):
         ppop("SAM3 Restore Face")
         ppop("SAM3 Preview Overlay")
         ppop("SAM3 Save Artifacts", cond=True)
+        # ControlNet block: if disabled, drop the whole subgroup from infotext.
+        ppop(
+            "SAM3 CN Enable",
+            [
+                "SAM3 CN Enable",
+                "SAM3 CN Override External",
+                "SAM3 CN Model",
+                "SAM3 CN Module",
+                "SAM3 CN Weight",
+                "SAM3 CN Guidance Start",
+                "SAM3 CN Guidance End",
+                "SAM3 CN Pixel Perfect",
+                "SAM3 CN Control Mode",
+                "SAM3 CN Resize Mode",
+                "SAM3 CN Processor Res",
+                "SAM3 CN Threshold A",
+                "SAM3 CN Threshold B",
+            ],
+        )
         return params
 
 
@@ -116,5 +158,18 @@ ALL_ARGS = ArgsList(
         Arg("sam3_restore_face", "SAM3 Restore Face"),
         Arg("sam3_preview_overlay", "SAM3 Preview Overlay"),
         Arg("sam3_save_artifacts", "SAM3 Save Artifacts"),
+        Arg("sam3_cn_enable", "SAM3 CN Enable"),
+        Arg("sam3_cn_override_external", "SAM3 CN Override External"),
+        Arg("sam3_cn_model", "SAM3 CN Model"),
+        Arg("sam3_cn_module", "SAM3 CN Module"),
+        Arg("sam3_cn_weight", "SAM3 CN Weight"),
+        Arg("sam3_cn_guidance_start", "SAM3 CN Guidance Start"),
+        Arg("sam3_cn_guidance_end", "SAM3 CN Guidance End"),
+        Arg("sam3_cn_pixel_perfect", "SAM3 CN Pixel Perfect"),
+        Arg("sam3_cn_control_mode", "SAM3 CN Control Mode"),
+        Arg("sam3_cn_resize_mode", "SAM3 CN Resize Mode"),
+        Arg("sam3_cn_processor_res", "SAM3 CN Processor Res"),
+        Arg("sam3_cn_threshold_a", "SAM3 CN Threshold A"),
+        Arg("sam3_cn_threshold_b", "SAM3 CN Threshold B"),
     ]
 )

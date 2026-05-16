@@ -1,20 +1,15 @@
 from __future__ import annotations
 
-from contextlib import contextmanager
-from copy import copy
-from pathlib import Path
 import sys
 import traceback
 from functools import partial
 from typing import Any, NamedTuple
-from unittest.mock import patch
 
 import gradio as gr
 import numpy as np
 from PIL import Image
 
 from modules import script_callbacks, scripts, shared
-from modules.processing import StableDiffusionProcessingImg2Img, process_images
 
 try:
     from modules.sd_samplers import all_samplers as _all_samplers
@@ -27,19 +22,11 @@ except Exception:
     _all_schedulers = []
 
 
-@contextmanager
-def _pause_total_tqdm():
-    """ADetailer와 동일: 내부 i2i 실행 중 total tqdm 숨기기"""
-    try:
-        from modules.shared import opts
-        with patch.dict(opts.data, {"multiple_tqdm": False}, clear=False):
-            yield
-    except Exception:
-        yield
-
 from sam3ext import SAM3_NAME, Sam3Args, __version__, run_sam3_on_pil
 from sam3ext.core import find_checkpoint_options, write_artifacts
+from sam3ext.inpaint_core import apply_prompt_sr, copy_prompt, run_inpaint_passes
 from sam3ext.ui import WebuiButtons, sam3_ui
+from sam3ext.ui_refine import RefinePanel, build_refine_panel, handle_refine_click
 
 
 txt2img_submit_button = img2img_submit_button = None
@@ -137,6 +124,23 @@ def make_axis_on_xyz_grid():
             partial(set_value, field="sam3_restore_face"),
             choices=bool_choices,
         ),
+        xyz_grid.AxisOption(
+            "[SAM3] CN Enable",
+            str,
+            partial(set_value, field="sam3_cn_enable"),
+            choices=bool_choices,
+        ),
+        xyz_grid.AxisOption(
+            "[SAM3] CN Override External",
+            str,
+            partial(set_value, field="sam3_cn_override_external"),
+            choices=bool_choices,
+        ),
+        xyz_grid.AxisOption("[SAM3] CN Model", str, partial(set_value, field="sam3_cn_model")),
+        xyz_grid.AxisOption("[SAM3] CN Module", str, partial(set_value, field="sam3_cn_module")),
+        xyz_grid.AxisOption("[SAM3] CN Weight", float, partial(set_value, field="sam3_cn_weight")),
+        xyz_grid.AxisOption("[SAM3] CN Guidance Start", float, partial(set_value, field="sam3_cn_guidance_start")),
+        xyz_grid.AxisOption("[SAM3] CN Guidance End", float, partial(set_value, field="sam3_cn_guidance_end")),
     ]
 
     if not any(x.label.startswith("[SAM3]") for x in xyz_grid.axis_options):
@@ -253,6 +257,19 @@ class Sam3MaskScript(scripts.Script):
             "sam3_restore_face": _as_bool(_xyz_or("sam3_restore_face", False), False),
             "sam3_preview_overlay": bool(state.get("sam3_preview_overlay", False)),
             "sam3_save_artifacts": bool(state.get("sam3_save_artifacts", True)),
+            "sam3_cn_enable": _as_bool(_xyz_or("sam3_cn_enable", False), False),
+            "sam3_cn_override_external": _as_bool(_xyz_or("sam3_cn_override_external", False), False),
+            "sam3_cn_model": str(_xyz_or("sam3_cn_model", "None")),
+            "sam3_cn_module": str(_xyz_or("sam3_cn_module", "inpaint_only")),
+            "sam3_cn_weight": float(_xyz_or("sam3_cn_weight", 1.0)),
+            "sam3_cn_guidance_start": float(_xyz_or("sam3_cn_guidance_start", 0.0)),
+            "sam3_cn_guidance_end": float(_xyz_or("sam3_cn_guidance_end", 1.0)),
+            "sam3_cn_pixel_perfect": _as_bool(_xyz_or("sam3_cn_pixel_perfect", True), True),
+            "sam3_cn_control_mode": str(_xyz_or("sam3_cn_control_mode", "Balanced")),
+            "sam3_cn_resize_mode": str(_xyz_or("sam3_cn_resize_mode", "Crop and Resize")),
+            "sam3_cn_processor_res": int(_xyz_or("sam3_cn_processor_res", 512)),
+            "sam3_cn_threshold_a": float(_xyz_or("sam3_cn_threshold_a", -1.0)),
+            "sam3_cn_threshold_b": float(_xyz_or("sam3_cn_threshold_b", -1.0)),
         }
 
         try:
@@ -273,126 +290,6 @@ class Sam3MaskScript(scripts.Script):
                 f"prompt={validated.sam3_prompt!r}",
                 file=sys.stderr,
             )
-
-    @staticmethod
-    def _copy_prompt(prompt_value, fallback: str) -> str:
-        text = str(prompt_value or "").strip()
-        return text or str(fallback or "")
-
-    @staticmethod
-    def _apply_prompt_sr(p, text: str) -> str:
-        pairs = getattr(p, "_sam3_xyz_prompt_sr", None) or []
-        for pair in pairs:
-            text = text.replace(pair.s, pair.r)
-        return text
-
-    @staticmethod
-    def _script_args_copy(script_args):
-        script_args = script_args or []
-        type_ = type(script_args)
-        result = []
-        for arg in script_args:
-            try:
-                copied = copy(arg)
-            except TypeError:
-                copied = arg
-            result.append(copied)
-        return type_(result)
-
-    @staticmethod
-    def _script_filter(p):
-        script_runner = copy(getattr(p, "scripts", None))
-        script_args = Sam3MaskScript._script_args_copy(getattr(p, "script_args", []))
-        if script_runner is None:
-            return None, script_args
-
-        filtered = []
-        for script_object in getattr(script_runner, "alwayson_scripts", []):
-            filename = Path(getattr(script_object, "filename", "")).stem.lower()
-            if filename in {"!sam3", "sam3_mask"}:
-                continue
-            filtered.append(script_object)
-
-        script_runner.alwayson_scripts = filtered
-        return script_runner, script_args
-
-    @staticmethod
-    def _get_sampler(p, args: dict[str, Any]) -> str:
-        if args.get("sam3_use_sampler"):
-            sampler = args.get("sam3_sampler", "Use same sampler")
-            if sampler != "Use same sampler":
-                return sampler
-        return getattr(p, "sampler_name", None)
-
-    @staticmethod
-    def _get_scheduler(p, args: dict[str, Any]) -> dict:
-        if not hasattr(p, "scheduler"):
-            return {}
-        if args.get("sam3_use_sampler"):
-            scheduler = args.get("sam3_scheduler", "Use same scheduler")
-            if scheduler != "Use same scheduler":
-                return {"scheduler": scheduler}
-        return {"scheduler": getattr(p, "scheduler")}
-
-    @staticmethod
-    def _get_noise_multiplier(p, args: dict[str, Any]):
-        if args.get("sam3_use_noise_multiplier"):
-            return float(args.get("sam3_noise_multiplier", 1.0))
-        return getattr(p, "initial_noise_multiplier", None) or 1.0
-
-    @staticmethod
-    def _build_i2i(p, image: Image.Image, args: dict[str, Any]) -> StableDiffusionProcessingImg2Img:
-        width = int(args["sam3_inpaint_width"]) if args.get("sam3_use_inpaint_width_height") else int(getattr(p, "width", image.width))
-        height = int(args["sam3_inpaint_height"]) if args.get("sam3_use_inpaint_width_height") else int(getattr(p, "height", image.height))
-        steps = int(args["sam3_steps"]) if args.get("sam3_use_steps") else int(getattr(p, "steps", 28))
-        cfg_scale = float(args["sam3_cfg_scale"]) if args.get("sam3_use_cfg_scale") else float(getattr(p, "cfg_scale", 7.0))
-        sampler_name = Sam3MaskScript._get_sampler(p, args)
-        noise_multiplier = Sam3MaskScript._get_noise_multiplier(p, args)
-        version_args = Sam3MaskScript._get_scheduler(p, args)
-
-        p2 = StableDiffusionProcessingImg2Img(
-            init_images=[image],
-            resize_mode=0,
-            denoising_strength=float(args["sam3_denoising_strength"]),
-            mask=None,
-            mask_blur=int(args["sam3_mask_blur"]),
-            inpainting_fill=1,
-            inpaint_full_res=bool(args["sam3_inpaint_only_masked"]),
-            inpaint_full_res_padding=int(args["sam3_inpaint_only_masked_padding"]),
-            inpainting_mask_invert=0,
-            initial_noise_multiplier=noise_multiplier,
-            sd_model=p.sd_model,
-            outpath_samples=p.outpath_samples,
-            outpath_grids=p.outpath_grids,
-            prompt="",
-            negative_prompt="",
-            styles=getattr(p, "styles", []),
-            seed=getattr(p, "seed", -1),
-            subseed=getattr(p, "subseed", -1),
-            subseed_strength=getattr(p, "subseed_strength", 0),
-            seed_resize_from_h=getattr(p, "seed_resize_from_h", 0),
-            seed_resize_from_w=getattr(p, "seed_resize_from_w", 0),
-            sampler_name=sampler_name,
-            batch_size=1,
-            n_iter=1,
-            steps=steps,
-            cfg_scale=cfg_scale,
-            width=width,
-            height=height,
-            restore_faces=bool(args.get("sam3_restore_face", False)),
-            tiling=getattr(p, "tiling", False),
-            extra_generation_params=dict(getattr(p, "extra_generation_params", {})),
-            do_not_save_samples=True,
-            do_not_save_grid=True,
-            **version_args,
-        )
-        p2.cached_c = [None, None]
-        p2.cached_uc = [None, None]
-        p2.scripts, p2.script_args = Sam3MaskScript._script_filter(p)
-        p2._sam3_inner = True
-        p2.all_hr_prompts = [""]
-        p2.all_hr_negative_prompts = [""]
-        return p2
 
     def postprocess_image(self, p, pp, *args_):
         args = getattr(p, "_sam3_args", None) or {}
@@ -424,58 +321,83 @@ class Sam3MaskScript(scripts.Script):
 
         if args.get("sam3_mode") == "Inpaint":
             masks = [result.mask] if args.get("sam3_mask_mode") == "Combined" else (result.masks or [result.mask])
-            current_image = image.convert("RGB")
-            prompt = self._copy_prompt(args.get("sam3_inpaint_prompt"), getattr(p, "prompt", ""))
-            negative_prompt = self._copy_prompt(args.get("sam3_negative_prompt"), getattr(p, "negative_prompt", ""))
-            prompt = self._apply_prompt_sr(p, prompt)
-            negative_prompt = self._apply_prompt_sr(p, negative_prompt)
+            prompt = copy_prompt(args.get("sam3_inpaint_prompt"), getattr(p, "prompt", ""))
+            negative_prompt = copy_prompt(args.get("sam3_negative_prompt"), getattr(p, "negative_prompt", ""))
+            prompt = apply_prompt_sr(p, prompt)
+            negative_prompt = apply_prompt_sr(p, negative_prompt)
             print(
                 f"[-] SAM3: starting inpaint mode with {len(masks)} mask(s), "
                 f"processing={args.get('sam3_mask_mode')}, detect_prompt={args.get('sam3_prompt')!r}",
                 file=sys.stderr,
             )
 
-            shared.state.job_count += len(masks)
-
-            with _pause_total_tqdm():
-                for index, mask in enumerate(masks, start=1):
-                    if shared.state.interrupted or shared.state.skipped:
-                        break
-                    p2 = self._build_i2i(p, current_image, args)
-                    p2.image_mask = mask
-                    p2.init_images[0] = current_image
-                    p2.prompt = prompt
-                    p2.negative_prompt = negative_prompt
-                    try:
-                        processed = process_images(p2)
-                    except Exception:
-                        error = traceback.format_exc()
-                        print(f"[-] SAM3: inpaint pass {index} failed:\n{error}", file=sys.stderr)
-                        raise
-                    finally:
-                        p2.close()
-
-                    if not processed.images:
-                        print(f"[-] SAM3: inpaint pass {index} returned no images.", file=sys.stderr)
-                        break
-                    print(f"[-] SAM3: inpaint pass {index} completed.", file=sys.stderr)
-                    current_image = processed.images[0].convert("RGB")
-
-            pp.image = current_image
+            pp.image = run_inpaint_passes(
+                p,
+                image,
+                masks,
+                prompt,
+                negative_prompt,
+                args,
+                cn_args=args,
+            )
             return
 
         if args.get("sam3_preview_overlay"):
             pp.image = result.overlay
 
 
+txt2img_gallery_component = None
+refine_panel: RefinePanel | None = None
+
+
+def _wire_refine_panel(panel: RefinePanel, gallery):
+    """Hook the gallery's select event + the Refine button's click handler.
+
+    Lives here (not in ui_refine.py) because it needs the gallery component
+    reference, which we only resolve at on_after_component time.
+    """
+
+    def _on_select(evt: gr.SelectData):
+        return evt.index if evt is not None else None
+
+    gallery.select(
+        fn=_on_select,
+        inputs=[],
+        outputs=[panel.selected_index_state],
+        queue=False,
+    )
+
+    panel.refine_button.click(
+        fn=handle_refine_click,
+        inputs=[gallery, panel.selected_index_state, *panel.all_widgets()],
+        outputs=[gallery, panel.status],
+    )
+
+
 def on_after_component(component, **kwargs):
     global txt2img_submit_button, img2img_submit_button
+    global txt2img_gallery_component, refine_panel
 
     elem_id = kwargs.get("elem_id")
     if elem_id == "txt2img_generate":
         txt2img_submit_button = component
     elif elem_id == "img2img_generate":
         img2img_submit_button = component
+    elif elem_id == "txt2img_gallery":
+        txt2img_gallery_component = component
+    elif elem_id == "html_log_txt2img" and refine_panel is None and txt2img_gallery_component is not None:
+        # We are still inside the t2i output panel's inner Group context; any
+        # Gradio components built here become siblings of the html_log under
+        # txt2img_results_panel.
+        try:
+            samplers = [s.name for s in _all_samplers]
+            schedulers = [s.label for s in _all_schedulers]
+            checkpoints = find_checkpoint_options()
+            refine_panel = build_refine_panel(samplers, schedulers, checkpoints)
+            _wire_refine_panel(refine_panel, txt2img_gallery_component)
+        except Exception:
+            error = traceback.format_exc()
+            print(f"[-] SAM3: failed to render Refine panel:\n{error}", file=sys.stderr)
 
 
 script_callbacks.on_after_component(on_after_component)

@@ -6,3 +6,5 @@ models/
 *.pt
 *.pth
 *.safetensors
+.claude/
+pip

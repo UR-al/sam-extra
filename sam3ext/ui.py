@@ -22,6 +22,36 @@ except Exception:
     _all_schedulers = []
 
 
+def _controlnet_model_choices() -> list[str]:
+    """Return ControlNet model filenames, with ``None`` when the
+    sd_forge_controlnet extension isn't loaded so the UI still renders."""
+    try:
+        from lib_controlnet import global_state
+
+        global_state.update_controlnet_filenames()
+        names = list(global_state.get_all_controlnet_names())
+        return names or ["None"]
+    except Exception:
+        return ["None"]
+
+
+def _controlnet_module_choices() -> list[str]:
+    try:
+        from lib_controlnet import global_state
+
+        names = list(global_state.get_all_preprocessor_names())
+        return names or ["None"]
+    except Exception:
+        return ["None"]
+
+
+def _default_cn_module(choices: list[str]) -> str:
+    for preferred in ("inpaint_only", "inpaint_global_harmonious", "None"):
+        if preferred in choices:
+            return preferred
+    return choices[0] if choices else "None"
+
+
 class Widgets(SimpleNamespace):
     def tolist(self):
         return [getattr(self, attr) for attr in ALL_ARGS.attrs]
@@ -249,6 +279,101 @@ def sam3_ui(is_img2img: bool, buttons: WebuiButtons):
                 w.sam3_restore_face = gr.Checkbox(
                     label="Restore face",
                     value=False,
+                )
+
+        with gr.Accordion("ControlNet", open=False):
+            cn_models = _controlnet_model_choices()
+            cn_modules = _controlnet_module_choices()
+            cn_module_default = _default_cn_module(cn_modules)
+
+            with gr.Row():
+                w.sam3_cn_enable = gr.Checkbox(
+                    label="Enable ControlNet for SAM3 inpaint",
+                    value=False,
+                )
+                w.sam3_cn_override_external = gr.Checkbox(
+                    label="Override external CN units (disable other slots during SAM3 pass)",
+                    value=False,
+                )
+                w.sam3_cn_pixel_perfect = gr.Checkbox(
+                    label="Pixel Perfect",
+                    value=True,
+                )
+
+            with gr.Row():
+                w.sam3_cn_module = gr.Dropdown(
+                    label="Preprocessor",
+                    choices=cn_modules,
+                    value=cn_module_default,
+                    type="value",
+                )
+                w.sam3_cn_model = gr.Dropdown(
+                    label="Model",
+                    choices=cn_models,
+                    value=cn_models[0] if cn_models else "None",
+                    type="value",
+                )
+
+            with gr.Row():
+                w.sam3_cn_weight = gr.Slider(
+                    label="Weight",
+                    minimum=0.0,
+                    maximum=2.0,
+                    step=0.05,
+                    value=1.0,
+                )
+                w.sam3_cn_guidance_start = gr.Slider(
+                    label="Guidance Start",
+                    minimum=0.0,
+                    maximum=1.0,
+                    step=0.01,
+                    value=0.0,
+                )
+                w.sam3_cn_guidance_end = gr.Slider(
+                    label="Guidance End",
+                    minimum=0.0,
+                    maximum=1.0,
+                    step=0.01,
+                    value=1.0,
+                )
+
+            with gr.Row():
+                w.sam3_cn_control_mode = gr.Radio(
+                    label="Control Mode",
+                    choices=[
+                        "Balanced",
+                        "My prompt is more important",
+                        "ControlNet is more important",
+                    ],
+                    value="Balanced",
+                )
+                w.sam3_cn_resize_mode = gr.Radio(
+                    label="Resize Mode",
+                    choices=["Just Resize", "Crop and Resize", "Resize and Fill"],
+                    value="Crop and Resize",
+                )
+
+            with gr.Row():
+                w.sam3_cn_processor_res = gr.Slider(
+                    label="Preprocessor Resolution",
+                    minimum=64,
+                    maximum=2048,
+                    step=8,
+                    value=512,
+                )
+                w.sam3_cn_threshold_a = gr.Slider(
+                    label="Threshold A (-1 = unused)",
+                    minimum=-1,
+                    maximum=256,
+                    step=1,
+                    value=-1,
+                )
+                w.sam3_cn_threshold_b = gr.Slider(
+                    label="Threshold B (-1 = unused)",
+                    minimum=-1,
+                    maximum=256,
+                    step=1,
+                    value=-1,
                 )
 
     state = gr.State(state_init(w))
