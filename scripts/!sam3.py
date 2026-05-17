@@ -451,6 +451,26 @@ def _wire_refine_panel(
         queue=False,
     )
 
+    # Auto seed pull on gallery change: when t2i Generate finishes (or our
+    # Refine appends a new image), the gallery's value updates and Gradio
+    # fires .change. Pull the seed from the LAST item — that's the freshly
+    # generated/refined one and the most useful default for the next
+    # Refine click. The user can still manually click 🎯 after selecting
+    # a different older image.
+    def _auto_pull_seed_from_latest(gallery_value):
+        items = list(gallery_value or [])
+        if not items:
+            return -1
+        return _pull_seed_from_gallery_item(gallery_value, len(items) - 1)
+
+    gallery.change(
+        fn=_auto_pull_seed_from_latest,
+        inputs=[gallery],
+        outputs=[panel.seed],
+        queue=False,
+        show_progress=False,
+    )
+
 
 def on_after_component(component, **kwargs):
     global txt2img_submit_button, img2img_submit_button

@@ -226,7 +226,7 @@ def build_refine_panel(
         with gr.Row():
             negative_prompt = gr.Textbox(
                 value="",
-                label="Negative Prompt",
+                label="SAM3 Refine Negative",
                 lines=1,
                 placeholder="Optional — appended after the (possibly cleaned) inherited main negative.",
                 elem_id="sam3_refine_negative",
@@ -239,17 +239,22 @@ def build_refine_panel(
                 elem_id="sam3_refine_inherit_main",
             )
             inherit_main_neg_prompt = gr.Checkbox(
+                # Default OFF: most users don't want the t2i negative bleeding
+                # into the Refine pass — e.g. a t2i negative containing
+                # "nude" would actively fight a Refine asking for nude. Tick
+                # this only when the t2i negative's style anchors (anti-
+                # quality terms etc.) are worth keeping for the refine.
                 label="Inherit main t2i negative (Target also stripped here)",
-                value=True,
+                value=False,
                 elem_id="sam3_refine_inherit_neg",
             )
 
         with gr.Row():
-            threshold = gr.Slider(label="SAM3 Threshold", minimum=0.0, maximum=1.0, step=0.01, value=0.4, elem_id="sam3_refine_threshold")
-            mask_dilation = gr.Slider(label="Mask Dilation (px)", minimum=0, maximum=256, step=1, value=4, elem_id="sam3_refine_mask_dilation")
-            mask_blur = gr.Slider(label="Mask Blur", minimum=0, maximum=64, step=1, value=4, elem_id="sam3_refine_mask_blur")
+            threshold = gr.Slider(label="SAM3 Refine Threshold", minimum=0.0, maximum=1.0, step=0.01, value=0.4, elem_id="sam3_refine_threshold")
+            mask_dilation = gr.Slider(label="SAM3 Refine Mask Dilation (px)", minimum=0, maximum=256, step=1, value=4, elem_id="sam3_refine_mask_dilation")
+            mask_blur = gr.Slider(label="SAM3 Refine Mask Blur", minimum=0, maximum=64, step=1, value=4, elem_id="sam3_refine_mask_blur")
             mask_mode = gr.Radio(
-                label="Mask Processing",
+                label="SAM3 Refine Mask Processing",
                 choices=["Individual", "Combined"],
                 value="Combined",
                 elem_id="sam3_refine_mask_mode",
@@ -306,19 +311,19 @@ def build_refine_panel(
 
         with gr.Row():
             denoising_strength = gr.Slider(
-                label="Denoising Strength", minimum=0.0, maximum=1.0, step=0.01, value=0.75,
+                label="SAM3 Refine Denoising Strength", minimum=0.0, maximum=1.0, step=0.01, value=0.75,
                 elem_id="sam3_refine_denoising",
             )
             inpainting_fill = gr.Dropdown(
-                label="Masked content",
+                label="SAM3 Refine Masked Content",
                 choices=["fill", "original", "latent noise", "latent nothing"],
                 value="latent noise",
                 type="value",
                 elem_id="sam3_refine_inpainting_fill",
             )
-            inpaint_only_masked = gr.Checkbox(label="Inpaint only masked", value=False, elem_id="sam3_refine_inpaint_only_masked")
+            inpaint_only_masked = gr.Checkbox(label="SAM3 Refine Inpaint Only Masked", value=False, elem_id="sam3_refine_inpaint_only_masked")
             inpaint_only_masked_padding = gr.Slider(
-                label="Inpaint padding", minimum=0, maximum=256, step=1, value=32,
+                label="SAM3 Refine Inpaint Padding", minimum=0, maximum=256, step=1, value=32,
                 elem_id="sam3_refine_inpaint_padding",
             )
 
@@ -347,7 +352,7 @@ def build_refine_panel(
 
         with gr.Row():
             checkpoint = gr.Dropdown(
-                label="SAM3 Checkpoint",
+                label="SAM3 Refine Checkpoint",
                 choices=checkpoint_choices,
                 value=checkpoint_choices[0] if checkpoint_choices else "sam3.pt",
                 type="value",
@@ -355,7 +360,7 @@ def build_refine_panel(
             )
             sd_choices = _sd_checkpoint_choices()
             sd_model_override = gr.Dropdown(
-                label="SD Model override (Refine pass only)",
+                label="SAM3 Refine SD Model Override",
                 choices=sd_choices,
                 value="Use current",
                 type="value",
@@ -364,39 +369,39 @@ def build_refine_panel(
 
         with gr.Accordion("ControlNet", open=False):
             with gr.Row():
-                cn_enable = gr.Checkbox(label="Enable ControlNet", value=False, elem_id="sam3_refine_cn_enable")
+                cn_enable = gr.Checkbox(label="SAM3 Refine CN Enable", value=False, elem_id="sam3_refine_cn_enable")
                 cn_override_external = gr.Checkbox(
-                    label="Override external CN units", value=False, elem_id="sam3_refine_cn_override"
+                    label="SAM3 Refine CN Override External", value=False, elem_id="sam3_refine_cn_override"
                 )
-                cn_pixel_perfect = gr.Checkbox(label="Pixel Perfect", value=True, elem_id="sam3_refine_cn_pp")
+                cn_pixel_perfect = gr.Checkbox(label="SAM3 Refine CN Pixel Perfect", value=True, elem_id="sam3_refine_cn_pp")
             with gr.Row():
                 cn_module = gr.Dropdown(
-                    label="Preprocessor",
+                    label="SAM3 Refine CN Preprocessor",
                     choices=cn_modules,
                     value=cn_module_default,
                     type="value",
                     elem_id="sam3_refine_cn_module",
                 )
                 cn_model = gr.Dropdown(
-                    label="Model",
+                    label="SAM3 Refine CN Model",
                     choices=cn_models,
                     value=cn_models[0] if cn_models else "None",
                     type="value",
                     elem_id="sam3_refine_cn_model",
                 )
             with gr.Row():
-                cn_weight = gr.Slider(label="Weight", minimum=0.0, maximum=2.0, step=0.05, value=1.0, elem_id="sam3_refine_cn_weight")
+                cn_weight = gr.Slider(label="SAM3 Refine CN Weight", minimum=0.0, maximum=2.0, step=0.05, value=1.0, elem_id="sam3_refine_cn_weight")
                 cn_guidance_start = gr.Slider(
-                    label="Guidance Start", minimum=0.0, maximum=1.0, step=0.01, value=0.0,
+                    label="SAM3 Refine CN Guidance Start", minimum=0.0, maximum=1.0, step=0.01, value=0.0,
                     elem_id="sam3_refine_cn_gstart",
                 )
                 cn_guidance_end = gr.Slider(
-                    label="Guidance End", minimum=0.0, maximum=1.0, step=0.01, value=1.0,
+                    label="SAM3 Refine CN Guidance End", minimum=0.0, maximum=1.0, step=0.01, value=1.0,
                     elem_id="sam3_refine_cn_gend",
                 )
             with gr.Row():
                 cn_control_mode = gr.Radio(
-                    label="Control Mode",
+                    label="SAM3 Refine CN Control Mode",
                     choices=[
                         "Balanced",
                         "My prompt is more important",
@@ -406,14 +411,14 @@ def build_refine_panel(
                     elem_id="sam3_refine_cn_control_mode",
                 )
                 cn_resize_mode = gr.Radio(
-                    label="Resize Mode",
+                    label="SAM3 Refine CN Resize Mode",
                     choices=["Just Resize", "Crop and Resize", "Resize and Fill"],
                     value="Crop and Resize",
                     elem_id="sam3_refine_cn_resize_mode",
                 )
             with gr.Row():
                 cn_processor_res = gr.Slider(
-                    label="Preprocessor Resolution",
+                    label="SAM3 Refine CN Preprocessor Resolution",
                     minimum=64,
                     maximum=2048,
                     step=8,
@@ -421,17 +426,17 @@ def build_refine_panel(
                     elem_id="sam3_refine_cn_procres",
                 )
                 cn_threshold_a = gr.Slider(
-                    label="Threshold A", minimum=-1, maximum=256, step=1, value=-1,
+                    label="SAM3 Refine CN Threshold A", minimum=-1, maximum=256, step=1, value=-1,
                     elem_id="sam3_refine_cn_ta",
                 )
                 cn_threshold_b = gr.Slider(
-                    label="Threshold B", minimum=-1, maximum=256, step=1, value=-1,
+                    label="SAM3 Refine CN Threshold B", minimum=-1, maximum=256, step=1, value=-1,
                     elem_id="sam3_refine_cn_tb",
                 )
 
         with gr.Row():
             insert_mode = gr.Radio(
-                label="Insert result",
+                label="SAM3 Refine Insert Result",
                 choices=["After selected", "At end"],
                 value="After selected",
                 elem_id="sam3_refine_insert_mode",
