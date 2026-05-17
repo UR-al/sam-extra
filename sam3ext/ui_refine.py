@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import io
 import os
+import re
 import sys
 import traceback
 from dataclasses import dataclass
@@ -35,6 +36,7 @@ class RefinePanel:
     negative_prompt: gr.Textbox
     inherit_main_prompt: gr.Checkbox
     inherit_main_neg_prompt: gr.Checkbox
+    prompt_sr: gr.Textbox
     threshold: gr.Slider
     mask_dilation: gr.Slider
     mask_hull: gr.Checkbox
@@ -73,6 +75,7 @@ class RefinePanel:
             self.negative_prompt,
             self.inherit_main_prompt,
             self.inherit_main_neg_prompt,
+            self.prompt_sr,
             self.threshold,
             self.mask_dilation,
             self.mask_hull,
@@ -109,6 +112,7 @@ REFINE_ARG_KEYS = (
     "negative_prompt",
     "inherit_main_prompt",
     "inherit_main_neg_prompt",
+    "prompt_sr",
     "threshold",
     "mask_dilation",
     "mask_hull",
@@ -192,6 +196,17 @@ def build_refine_panel(
             inherit_main_neg_prompt = gr.Checkbox(
                 label="Inherit main t2i negative prompt",
                 value=True,
+            )
+
+        with gr.Row():
+            prompt_sr = gr.Textbox(
+                value="",
+                label="Prompt S/R (applied to inherited main prompt + negative before merge)",
+                lines=2,
+                placeholder=(
+                    "one rule per line, pattern=replacement; empty replacement = delete.\n"
+                    "example:  shirt=    (removes 'shirt' from inherited main so 'nude' in refine prompt isn't shouted down)"
+                ),
             )
 
         with gr.Row():
@@ -319,6 +334,7 @@ def build_refine_panel(
         negative_prompt=negative_prompt,
         inherit_main_prompt=inherit_main_prompt,
         inherit_main_neg_prompt=inherit_main_neg_prompt,
+        prompt_sr=prompt_sr,
         threshold=threshold,
         mask_dilation=mask_dilation,
         mask_hull=mask_hull,
@@ -386,6 +402,41 @@ def _coerce_gallery_item_to_pil(item: Any) -> Image.Image | None:
         except Exception:
             return None
     return None
+
+
+def _apply_prompt_sr(text: str, rules_field: str) -> str:
+    """Apply ``pattern=replacement`` rules (one per line) to ``text`` and
+    normalize the result.
+
+    Empty replacement deletes the pattern. After all substitutions, runs of
+    commas / leading-or-trailing commas / collapsed whitespace get cleaned
+    up so the merged prompt reads naturally.
+
+    Returns ``text`` unchanged when ``rules_field`` is empty / has no
+    parseable ``=`` lines.
+    """
+    if not text or not rules_field:
+        return text
+    out = text
+    matched_any = False
+    for raw_line in rules_field.splitlines():
+        line = raw_line.strip()
+        if not line or "=" not in line:
+            continue
+        pattern, _, replacement = line.partition("=")
+        pattern = pattern.strip()
+        if not pattern:
+            continue
+        if pattern in out:
+            out = out.replace(pattern, replacement)
+            matched_any = True
+    if not matched_any:
+        return text
+    # Normalize: collapse whitespace, then comma-spacing, then repeated commas
+    out = re.sub(r"\s+", " ", out)
+    out = re.sub(r"\s*,\s*", ", ", out)
+    out = re.sub(r"(,\s*){2,}", ", ", out)
+    return out.strip(" ,")
 
 
 def _as_float(value: Any, default: float) -> float:
@@ -476,6 +527,7 @@ def map_widget_values_to_sam3_args(values: tuple) -> dict[str, Any]:
         "_insert_mode": str(keyed.get("insert_mode") or "After selected"),
         "_inherit_main_prompt": bool(keyed.get("inherit_main_prompt", True)),
         "_inherit_main_neg_prompt": bool(keyed.get("inherit_main_neg_prompt", True)),
+        "_prompt_sr": str(keyed.get("prompt_sr") or ""),
     }
 
 
@@ -503,6 +555,16 @@ def handle_refine_click(gallery_value, selected_index, *all_values):
     insert_mode = args.pop("_insert_mode", "After selected")
     inherit_main = args.pop("_inherit_main_prompt", True)
     inherit_main_neg = args.pop("_inherit_main_neg_prompt", True)
+    sr_rules = args.pop("_prompt_sr", "")
+
+    # Strip user-specified tokens from the inherited main prompt(s) BEFORE
+    # merging — lets the user drop e.g. "shirt" so a refine prompt of "nude"
+    # isn't shouted down by the original main prompt's "shirt" token while
+    # still keeping LoRAs, style triggers, and important anatomy context
+    # ("2girls", "grabbing pectorals", etc.) intact. Same rules apply to
+    # negative — useful when main negative has "nude" anti-trigger.
+    cleaned_main = _apply_prompt_sr(main_prompt, sr_rules) if main_prompt else main_prompt
+    cleaned_neg = _apply_prompt_sr(main_neg_prompt, sr_rules) if main_neg_prompt else main_neg_prompt
 
     # Prompt resolution:
     # - Inherit ON  + refine empty  -> main only (preserves fallback semantics)
@@ -513,11 +575,11 @@ def handle_refine_click(gallery_value, selected_index, *all_values):
     # - Inherit OFF + refine empty  -> "" (use the model's unconditional default)
     # - Inherit OFF + refine filled -> refine only (clean override)
     refine_p = args.get("sam3_inpaint_prompt") or ""
-    if inherit_main and main_prompt:
-        args["sam3_inpaint_prompt"] = f"{main_prompt}, {refine_p}".rstrip(", ") if refine_p else main_prompt
+    if inherit_main and cleaned_main:
+        args["sam3_inpaint_prompt"] = f"{cleaned_main}, {refine_p}".rstrip(", ") if refine_p else cleaned_main
     refine_n = args.get("sam3_negative_prompt") or ""
-    if inherit_main_neg and main_neg_prompt:
-        args["sam3_negative_prompt"] = f"{main_neg_prompt}, {refine_n}".rstrip(", ") if refine_n else main_neg_prompt
+    if inherit_main_neg and cleaned_neg:
+        args["sam3_negative_prompt"] = f"{cleaned_neg}, {refine_n}".rstrip(", ") if refine_n else cleaned_neg
 
     if not args["sam3_prompt"]:
         return gallery_value, "<span style='color:#c33'>SAM3 Refine: enter a detect prompt first.</span>"
