@@ -39,7 +39,7 @@ class Sam3Args(BaseModel, extra=Extra.forbid):
         "original",
         "latent noise",
         "latent nothing",
-    ] = "latent noise"
+    ] = "original"
     sam3_inpaint_only_masked: bool = True
     sam3_inpaint_only_masked_padding: NonNegativeInt = 32
     sam3_use_inpaint_width_height: bool = False
@@ -109,7 +109,7 @@ class Sam3Args(BaseModel, extra=Extra.forbid):
         ppop("SAM3 Mask Hull")
         ppop("SAM3 Mask Blur", cond=4)
         ppop("SAM3 Denoising Strength", cond=0.4)
-        ppop("SAM3 Inpainting Fill", cond="latent noise")
+        ppop("SAM3 Inpainting Fill", cond="original")
         ppop("SAM3 Inpaint Only Masked", ["SAM3 Inpaint Only Masked", "SAM3 Inpaint Padding"], cond=True)
         ppop(
             "SAM3 Use Inpaint Width Height",

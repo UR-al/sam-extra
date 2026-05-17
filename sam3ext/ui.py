@@ -270,7 +270,7 @@ def sam3_ui(is_img2img: bool, buttons: WebuiButtons):
                 w.sam3_inpainting_fill = gr.Dropdown(
                     label="Masked content (init for masked area)",
                     choices=["fill", "original", "latent noise", "latent nothing"],
-                    value="latent noise",
+                    value="original",
                     type="value",
                     elem_id=eid("inpainting_fill"),
                 )

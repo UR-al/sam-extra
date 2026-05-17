@@ -167,10 +167,12 @@ def build_i2i(p, image: Image.Image, args: dict[str, Any]) -> StableDiffusionPro
     noise_multiplier = get_noise_multiplier(p, args)
     version_args = get_scheduler(p, args)
     seed = get_seed(p, args)
-    # inpainting_fill: 2 = latent noise. Same rationale as build_standalone_i2i
-    # (drastic prompt-driven changes need a clean noise start; "1 = original"
-    # leaves color bias that fights the new prompt even at denoise=1).
-    inpainting_fill = _resolve_inpainting_fill(args.get("sam3_inpainting_fill"))
+    # In-flight inpaint is usually a face/detailer style refinement of a
+    # small region — keep the masked area's original pixels by default so
+    # the model has color context to work from. Refine path (drastic
+    # changes like clothes swap) defaults to ``latent noise`` instead.
+    # Both paths honor an explicit ``sam3_inpainting_fill`` from args.
+    inpainting_fill = _resolve_inpainting_fill(args.get("sam3_inpainting_fill"), default=1)
 
     p2 = StableDiffusionProcessingImg2Img(
         init_images=[image],
@@ -496,6 +498,13 @@ def override_sampler_script_slot(p2, args: dict[str, Any]) -> None:
     if before == after:
         return
     p2.script_args = args_type(patched) if not isinstance(script_args, list) else patched
+    # NOTE for users wondering why the inpaint pass is slower than they
+    # remember: pre-v0.6.0 the SAM3 panel's "Use separate ..." toggles
+    # were silently ignored (ScriptSampler.setup re-applied the t2i
+    # values). v0.6.0 fixed that, so a heavier sampler/scheduler chosen
+    # here (e.g. ER SDE + Bong Tangent) actually runs in-flight now and
+    # is heavier than the default DPM++ 2M that used to silently win.
+    # Uncheck the toggles in the SAM3 panel to revert to t2i defaults.
     print(
         f"[-] SAM3: patched ScriptSampler slot (args[{af}:{at}]) — "
         f"before {before} → after {after} "
