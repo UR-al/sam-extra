@@ -444,19 +444,37 @@ def _find_sampler_script(runner):
 
 
 def override_sampler_script_slot(p2, args: dict[str, Any]) -> None:
-    """ScriptSampler.setup runs early in process_images and does
-    ``p.steps = steps; p.sampler_name = sampler_name; p.scheduler = scheduler``
-    using whatever values sit in its 3-slot script_args window. Without an
-    override, those values come from inherited t2i state (in-flight) or
-    component defaults (standalone refine), which silently clobber what we
-    set via the constructor.
+    """Override the sampler/steps/scheduler that ``process_images`` will
+    actually use for this pass.
 
-    For EACH of (steps, sampler, scheduler), we patch only when the
-    corresponding ``sam3_use_*`` flag in ``args`` is True. This way:
+    ScriptSampler.setup writes ``p.steps``, ``p.sampler_name``, ``p.scheduler``
+    using its 3 ``script_args`` slots. We initially assumed setup runs DURING
+    ``process_images`` and patched the script_args slot ahead of it. But the
+    setup actually runs *once* — synchronously when ``p2.script_args`` is
+    first assigned, via the ``script_args`` property setter:
 
-    - In-flight: the user's per-slot override toggles
-      (``sam3_use_steps`` / ``sam3_use_sampler`` / ``sam3_use_scheduler``)
-      decide what overrides the t2i defaults.
+        @script_args.setter
+        def script_args(self, value):
+            self.script_args_value = value
+            if self.scripts_value and self.script_args_value and not self.scripts_setup_complete:
+                self.setup_scripts()           # ← fires ScriptSampler.setup
+                                               #     using the *current* script_args
+
+    Both ``build_i2i`` and ``build_standalone_i2i`` set ``p2.script_args``
+    inside their bodies, so by the time we call this function the setup
+    has already fired with the un-patched slot — overwriting our
+    constructor's sampler_name/steps/scheduler with the inherited defaults.
+    Any later mutation of script_args is silently ignored: setter sees
+    ``scripts_setup_complete=True`` and skips the re-trigger.
+
+    Real fix: in addition to patching the slot (kept for any downstream
+    code that reads script_args), write the values onto ``p2`` directly.
+    Those attributes are what ``sd_samplers.create_sampler`` /
+    ``p.scheduler`` reads at sampling time. Honors per-flag opt-in:
+
+    - In-flight: the user's ``sam3_use_steps`` / ``sam3_use_sampler`` /
+      ``sam3_use_scheduler`` toggles decide which slots win over the
+      inherited t2i defaults.
     - Standalone refine: ``run_sam3_refine`` sets all three flags True so
       the Refine panel's chosen values always win.
     """
@@ -479,35 +497,35 @@ def override_sampler_script_slot(p2, args: dict[str, Any]) -> None:
     script_args = p2.script_args
     args_type = type(script_args)
     patched = list(script_args)
-    before = (patched[af + 0], patched[af + 1], patched[af + 2])
+    slot_before = (patched[af + 0], patched[af + 1], patched[af + 2])
+    p2_before = (p2.steps, p2.sampler_name, p2.scheduler)
 
     if use_steps:
-        patched[af + 0] = int(args.get("sam3_steps", before[0]))
+        steps_val = int(args.get("sam3_steps", slot_before[0]))
+        patched[af + 0] = steps_val
+        p2.steps = steps_val
     if use_sampler:
         sampler_name = str(args.get("sam3_sampler") or "Euler a")
         if sampler_name in ("", "Use same sampler"):
             sampler_name = "Euler a"
         patched[af + 1] = sampler_name
+        p2.sampler_name = sampler_name
     if use_scheduler:
         scheduler = str(args.get("sam3_scheduler") or "Automatic")
         if scheduler in ("", "Use same scheduler"):
             scheduler = "Automatic"
         patched[af + 2] = scheduler
+        p2.scheduler = scheduler
 
-    after = (patched[af + 0], patched[af + 1], patched[af + 2])
-    if before == after:
+    slot_after = (patched[af + 0], patched[af + 1], patched[af + 2])
+    p2_after = (p2.steps, p2.sampler_name, p2.scheduler)
+    if slot_before == slot_after and p2_before == p2_after:
         return
     p2.script_args = args_type(patched) if not isinstance(script_args, list) else patched
-    # NOTE for users wondering why the inpaint pass is slower than they
-    # remember: pre-v0.6.0 the SAM3 panel's "Use separate ..." toggles
-    # were silently ignored (ScriptSampler.setup re-applied the t2i
-    # values). v0.6.0 fixed that, so a heavier sampler/scheduler chosen
-    # here (e.g. ER SDE + Bong Tangent) actually runs in-flight now and
-    # is heavier than the default DPM++ 2M that used to silently win.
-    # Uncheck the toggles in the SAM3 panel to revert to t2i defaults.
     print(
-        f"[-] SAM3: patched ScriptSampler slot (args[{af}:{at}]) — "
-        f"before {before} → after {after} "
+        f"[-] SAM3: ScriptSampler override applied — "
+        f"slot {slot_before} → {slot_after}, "
+        f"p2 attrs {p2_before} → {p2_after} "
         f"(use_steps={use_steps}, use_sampler={use_sampler}, use_scheduler={use_scheduler})",
         file=sys.stderr,
     )
