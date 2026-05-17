@@ -358,6 +358,66 @@ def build_standalone_i2i(
     return p2
 
 
+def _find_sampler_script(runner):
+    """Locate Forge's built-in ScriptSampler — the script whose ``setup(p)``
+    method silently overwrites ``p.steps`` / ``p.sampler_name`` /
+    ``p.scheduler`` with the values from its own UI widgets. We need to
+    override its slot in script_args so our intended sampler/steps survive.
+    """
+    for s in getattr(runner, "alwayson_scripts", []) or []:
+        if Path(getattr(s, "filename", "")).stem.lower() != "sampler":
+            continue
+        try:
+            if (s.title() or "").lower() == "sampler":
+                return s
+        except Exception:
+            pass
+    return None
+
+
+def override_sampler_script_slot(p2, args: dict[str, Any]) -> None:
+    """ScriptSampler.setup runs early in process_images and does
+    ``p.steps = steps; p.sampler_name = sampler_name; p.scheduler = scheduler``
+    using whatever values sit in its 3-slot script_args window. In a real
+    Generate click those come from the user's t2i UI; in our standalone
+    refine they come from the component defaults (typically 20 / first
+    sampler / "Automatic"), which then clobber the Refine panel's chosen
+    values.
+
+    Find the script, identify its slot, and patch the 3 entries to match
+    what the Refine user actually picked.
+    """
+    sampler_script = _find_sampler_script(getattr(p2, "scripts", None))
+    if sampler_script is None:
+        return
+    af = getattr(sampler_script, "args_from", None)
+    at = getattr(sampler_script, "args_to", None)
+    if af is None or at is None or at - af < 3:
+        return
+
+    steps = int(args.get("sam3_steps", 28))
+    sampler_name = str(args.get("sam3_sampler") or "Euler a")
+    if sampler_name == "Use same sampler":
+        sampler_name = "Euler a"
+    scheduler = str(args.get("sam3_scheduler") or "Automatic")
+    if scheduler == "Use same scheduler":
+        scheduler = "Automatic"
+
+    script_args = p2.script_args
+    args_type = type(script_args)
+    patched = list(script_args)
+    before = (patched[af + 0], patched[af + 1], patched[af + 2])
+    patched[af + 0] = steps
+    patched[af + 1] = sampler_name
+    patched[af + 2] = scheduler
+    p2.script_args = args_type(patched) if not isinstance(script_args, list) else patched
+    print(
+        f"[-] SAM3 Refine: patched ScriptSampler slot (args[{af}:{at}]) — "
+        f"before {before} → after {(steps, sampler_name, scheduler)}",
+        file=sys.stderr,
+    )
+
+
 def build_standalone_scripts_runner():
     """Clone the t2i script runner with SAM3 itself stripped (avoids
     recursion). Returns ``(runner, script_args)`` ready to drop onto a
@@ -506,6 +566,7 @@ def run_sam3_refine(
             p2.prompt = prompt
             p2.negative_prompt = negative_prompt
             inject_controlnet_unit(p2, args)
+            override_sampler_script_slot(p2, args)
             print(
                 f"[-] SAM3 Refine pass {index}: p2 BEFORE process_images — "
                 f"sampler_name={p2.sampler_name!r}, scheduler={p2.scheduler!r}, "
