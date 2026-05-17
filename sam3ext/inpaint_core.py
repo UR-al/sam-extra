@@ -572,23 +572,35 @@ def _disable_inherited_cn_units(script_args, runner) -> None:
 
 
 def build_standalone_scripts_runner():
-    """Clone the t2i script runner with SAM3 itself stripped (avoids
-    recursion). Returns ``(runner, script_args)`` ready to drop onto a
-    standalone ``p2``, or ``(None, None)`` if the t2i runner has not been
-    built yet (e.g., refine is invoked before any UI has rendered).
+    """Clone the **img2img** script runner with SAM3 stripped. Returns
+    ``(runner, script_args)`` ready to drop onto a standalone ``p2``, or
+    ``(None, None)`` if no runner has been built yet.
 
-    ``scripts_txt2img.inputs`` is a list of *Gradio components*, not values —
-    a real Generate click lets Gradio resolve those to current UI values. For
-    our standalone path there is no such click, so we collapse each component
-    to its default ``.value``. For most alwayson scripts that means "do
-    nothing"; for ControlNet, the .value is the user's currently-configured
-    t2i CN unit which we then forcibly disable via
-    ``_disable_inherited_cn_units`` so the Refine panel's CN settings are
-    authoritative.
+    Why img2img and not txt2img? Refine is an img2img-shaped operation
+    (initial image + mask + denoise), and the standard inpaint tab runs
+    the same operation through ``scripts_img2img``. Earlier versions of
+    this code cloned ``scripts_txt2img`` instead, which dragged in the
+    t2i-side configuration of every alwayson script (NegPiP, image_stitch,
+    couple, neveroom, ...). The t2i-side defaults often imply more work
+    per sampling step than the matching img2img-side defaults, which we
+    observed as a >15× per-step slowdown vs the standard inpaint tab on
+    the same model/sampler. Falling back to ``scripts_txt2img`` only when
+    img2img isn't initialized (rare edge case in API-only setups).
+
+    ``runner.inputs`` is a list of *Gradio components*, not values — a
+    real Generate click lets Gradio resolve those to current UI values.
+    Our standalone path has no such click, so we collapse each component
+    to its default ``.value``. For ControlNet, the inherited ``.value``
+    is the user's currently-configured CN unit; we forcibly disable it
+    via ``_disable_inherited_cn_units`` so the Refine panel's CN
+    settings (or lack thereof) are authoritative.
     """
     from modules import scripts as _scripts
 
-    source = getattr(_scripts, "scripts_txt2img", None)
+    source = (
+        getattr(_scripts, "scripts_img2img", None)
+        or getattr(_scripts, "scripts_txt2img", None)
+    )
     if source is None:
         return None, None
 
@@ -718,13 +730,22 @@ def run_sam3_refine(
     negative_prompt = copy_prompt(args.get("sam3_negative_prompt"), "")
 
     results: list[tuple[Image.Image, str]] = []
-    shared.state.job_count += len(masks)
+    # Initialize Forge's progress state so the gallery's spinner/progress
+    # bar advances during the refine pass. job_count being -1 (no active
+    # job) means the standard UI won't render a percentage; setting it
+    # explicitly to the number of refine passes makes the count visible.
+    if shared.state.job_count < 0:
+        shared.state.job_count = len(masks)
+    else:
+        shared.state.job_count += len(masks)
+    shared.state.job = "sam3_refine"
 
     with pause_total_tqdm():
         for index, mask in enumerate(masks, start=1):
             if shared.state.interrupted or shared.state.skipped:
                 break
             shared.state.textinfo = f"SAM3 Refine: pass {index}/{len(masks)} — preparing"
+            shared.state.job = f"SAM3 Refine pass {index}/{len(masks)}"
             p2 = build_standalone_i2i(
                 image,
                 args,
@@ -753,6 +774,9 @@ def run_sam3_refine(
                 file=sys.stderr,
             )
             processed = None
+            import time as _time
+
+            t0 = _time.perf_counter()
             try:
                 processed = process_images(p2)
             except Exception:
@@ -766,6 +790,11 @@ def run_sam3_refine(
                 )
             finally:
                 p2.close()
+                t1 = _time.perf_counter()
+                print(
+                    f"[-] SAM3 Refine: pass {index} process_images took {t1 - t0:.2f}s",
+                    file=sys.stderr,
+                )
 
             if processed is None:
                 continue
@@ -802,7 +831,9 @@ def run_sam3_refine(
             )
             results.append((processed.images[0].convert("RGB"), info_text))
             print(f"[-] SAM3 Refine: pass {index} completed.", file=sys.stderr)
+            shared.state.textinfo = f"SAM3 Refine: pass {index}/{len(masks)} — done"
 
+    shared.state.textinfo = ""
     return results
 
 
