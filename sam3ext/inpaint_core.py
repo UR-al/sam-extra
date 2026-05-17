@@ -379,6 +379,14 @@ def build_standalone_scripts_runner():
     components = getattr(source, "inputs", None) or []
     script_args = [getattr(component, "value", None) for component in components]
 
+    # Slot 0 is the "Script" selectable-script-index dropdown (type="index").
+    # In a real Generate click Gradio converts the selected choice ("None") to
+    # int 0 *before* fn invocation. We bypass that, so use the int directly.
+    # Third-party extensions read p.script_args[0] and assume int — leaving the
+    # raw "None" string in place crashes them (api-payload-display, etc.).
+    if script_args:
+        script_args[0] = 0
+
     return runner, script_args
 
 
