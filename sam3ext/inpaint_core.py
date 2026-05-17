@@ -397,10 +397,17 @@ def run_sam3_refine(
     sd_model,
     outpath_samples: str,
     outpath_grids: str,
-) -> list[Image.Image]:
+) -> list[tuple[Image.Image, str]]:
     """Standalone equivalent of ``run_inpaint_passes`` for the post-generation
     Refine panel: no ``p`` to inherit from, runs once per detected mask, and
-    returns the resulting images (one per mask) instead of chaining them.
+    returns ``(image, infotext)`` pairs (one per mask) instead of chaining
+    them.
+
+    The ``infotext`` is ``processed.infotexts[0]`` (or ``processed.info`` as
+    fallback) — the exact "Parameters: ..." string that gets embedded in the
+    saved PNG. The handler stitches these into the gallery's
+    ``generation_info`` JSON so clicking the new image in the gallery shows
+    the real transformed prompt, not the original t2i prompt.
 
     Returns ``[]`` when SAM3 finds nothing or every pass is interrupted.
     """
@@ -440,7 +447,7 @@ def run_sam3_refine(
     prompt = copy_prompt(args.get("sam3_inpaint_prompt"), "")
     negative_prompt = copy_prompt(args.get("sam3_negative_prompt"), "")
 
-    results: list[Image.Image] = []
+    results: list[tuple[Image.Image, str]] = []
     _shared.state.job_count += len(masks)
 
     with pause_total_tqdm():
@@ -474,7 +481,18 @@ def run_sam3_refine(
             if not processed.images:
                 print(f"[-] SAM3 Refine: pass {index} returned no images.", file=sys.stderr)
                 continue
-            results.append(processed.images[0].convert("RGB"))
+            # Use the per-image infotext when available (Forge populates this
+            # in processed.infotexts) — falls back to processed.info for older
+            # paths / single-image batches.
+            info_text = ""
+            try:
+                if getattr(processed, "infotexts", None):
+                    info_text = processed.infotexts[0] or ""
+                if not info_text:
+                    info_text = getattr(processed, "info", "") or ""
+            except Exception:
+                info_text = ""
+            results.append((processed.images[0].convert("RGB"), info_text))
             print(f"[-] SAM3 Refine: pass {index} completed.", file=sys.stderr)
 
     return results

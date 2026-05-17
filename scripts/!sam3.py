@@ -368,6 +368,8 @@ class Sam3MaskScript(scripts.Script):
 txt2img_gallery_component = None
 txt2img_prompt_component = None
 txt2img_neg_prompt_component = None
+txt2img_html_info_component = None
+txt2img_generation_info_component = None
 refine_panel: RefinePanel | None = None
 
 
@@ -383,12 +385,24 @@ _REFINE_JS = (
 )
 
 
-def _wire_refine_panel(panel: RefinePanel, gallery, main_prompt, main_neg_prompt):
+def _wire_refine_panel(
+    panel: RefinePanel,
+    gallery,
+    main_prompt,
+    main_neg_prompt,
+    html_info,
+    generation_info,
+):
     """Wire the Refine button. Index is injected client-side via ``_REFINE_JS``
     so we don't need a ``gallery.select`` handler (which would otherwise
-    trigger Gradio's file-cache validation on the selected image's path)."""
+    trigger Gradio's file-cache validation on the selected image's path).
 
-    # ``selected_index_state`` is the placeholder slot the JS overwrites.
+    ``html_info`` and ``generation_info`` are the standard txt2img output-panel
+    components — wiring them as outputs lets us push the per-refine prompt
+    into the gallery sidebar so the user actually sees the transformed text,
+    instead of the original t2i prompt leaking through.
+    """
+
     panel.refine_button.click(
         fn=handle_refine_click,
         _js=_REFINE_JS,
@@ -398,14 +412,16 @@ def _wire_refine_panel(panel: RefinePanel, gallery, main_prompt, main_neg_prompt
             *panel.all_widgets(),
             main_prompt,
             main_neg_prompt,
+            generation_info,
         ],
-        outputs=[gallery, panel.status],
+        outputs=[gallery, panel.status, html_info, generation_info],
     )
 
 
 def on_after_component(component, **kwargs):
     global txt2img_submit_button, img2img_submit_button
     global txt2img_gallery_component, txt2img_prompt_component, txt2img_neg_prompt_component
+    global txt2img_html_info_component, txt2img_generation_info_component
     global refine_panel
 
     elem_id = kwargs.get("elem_id")
@@ -419,10 +435,23 @@ def on_after_component(component, **kwargs):
         txt2img_neg_prompt_component = component
     elif elem_id == "txt2img_gallery":
         txt2img_gallery_component = component
-    elif elem_id == "html_log_txt2img" and refine_panel is None and txt2img_gallery_component is not None:
-        # We are still inside the t2i output panel's inner Group context; any
-        # Gradio components built here become siblings of the html_log under
-        # txt2img_results_panel.
+    elif elem_id == "html_info_txt2img":
+        txt2img_html_info_component = component
+    elif elem_id == "generation_info_txt2img":
+        # Render the Refine panel right after generation_info Textbox so all
+        # the components we need to wire as outputs (gallery, html_info,
+        # generation_info) are already captured. The panel lands inside the
+        # same hidden gr.Group as the infotext bits, but its accordion is
+        # visible itself.
+        txt2img_generation_info_component = component
+        if refine_panel is not None or txt2img_gallery_component is None:
+            return
+        if txt2img_html_info_component is None:
+            print(
+                "[-] SAM3: html_info_txt2img not captured yet — skipping Refine panel render.",
+                file=sys.stderr,
+            )
+            return
         try:
             samplers = [s.name for s in _all_samplers]
             schedulers = [s.label for s in _all_schedulers]
@@ -433,6 +462,8 @@ def on_after_component(component, **kwargs):
                 txt2img_gallery_component,
                 txt2img_prompt_component,
                 txt2img_neg_prompt_component,
+                txt2img_html_info_component,
+                txt2img_generation_info_component,  # local reference; not None at this point
             )
         except Exception:
             error = traceback.format_exc()

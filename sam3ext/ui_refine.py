@@ -4,6 +4,7 @@ gallery image, appending the result back into the same gallery."""
 from __future__ import annotations
 
 import io
+import json
 import os
 import re
 import sys
@@ -36,7 +37,6 @@ class RefinePanel:
     negative_prompt: gr.Textbox
     inherit_main_prompt: gr.Checkbox
     inherit_main_neg_prompt: gr.Checkbox
-    prompt_sr: gr.Textbox
     threshold: gr.Slider
     mask_dilation: gr.Slider
     mask_hull: gr.Checkbox
@@ -76,7 +76,6 @@ class RefinePanel:
             self.negative_prompt,
             self.inherit_main_prompt,
             self.inherit_main_neg_prompt,
-            self.prompt_sr,
             self.threshold,
             self.mask_dilation,
             self.mask_hull,
@@ -114,7 +113,6 @@ REFINE_ARG_KEYS = (
     "negative_prompt",
     "inherit_main_prompt",
     "inherit_main_neg_prompt",
-    "prompt_sr",
     "threshold",
     "mask_dilation",
     "mask_hull",
@@ -210,20 +208,6 @@ def build_refine_panel(
                 label="Inherit main t2i negative (Target also stripped here)",
                 value=True,
                 elem_id="sam3_refine_inherit_neg",
-            )
-
-        with gr.Accordion("Advanced — extra S/R rules", open=False):
-            prompt_sr = gr.Textbox(
-                value="",
-                label="Extra Prompt S/R rules (applied BEFORE the Target auto-strip)",
-                lines=2,
-                placeholder=(
-                    "one rule per line, pat1, pat2, ... = replacement\n"
-                    "examples:\n"
-                    "  shirt=                   (drop every segment containing 'shirt')\n"
-                    "  shirt, necktie = nude    (drop both segments, insert 'nude' once at first match)"
-                ),
-                elem_id="sam3_refine_extra_sr",
             )
 
         with gr.Row():
@@ -373,7 +357,6 @@ def build_refine_panel(
         negative_prompt=negative_prompt,
         inherit_main_prompt=inherit_main_prompt,
         inherit_main_neg_prompt=inherit_main_neg_prompt,
-        prompt_sr=prompt_sr,
         threshold=threshold,
         mask_dilation=mask_dilation,
         mask_hull=mask_hull,
@@ -625,53 +608,70 @@ def map_widget_values_to_sam3_args(values: tuple) -> dict[str, Any]:
         "_insert_mode": str(keyed.get("insert_mode") or "After selected"),
         "_inherit_main_prompt": bool(keyed.get("inherit_main_prompt", True)),
         "_inherit_main_neg_prompt": bool(keyed.get("inherit_main_neg_prompt", True)),
-        "_prompt_sr": str(keyed.get("prompt_sr") or ""),
     }
 
 
-def handle_refine_click(gallery_value, selected_index, *all_values):
-    """Refine-button handler. Returns ``(updated_gallery, status_html)``.
+def _plaintext_to_html(text: str) -> str:
+    """Light-weight stand-in for modules.ui.plaintext_to_html (avoids importing
+    Forge modules at module load) — escape + preserve newlines for display in
+    the txt2img sidebar's infotext HTML element."""
+    if not text:
+        return ""
+    import html as _html
 
-    ``all_values`` = ``(*widget_values, main_prompt, main_neg_prompt)``. The
-    two main-prompt slots come last because they are appended by the wiring
-    in ``scripts/!sam3.py``; we use them as a fallback when the Refine
-    panel's own inpaint/negative prompts are blank.
+    escaped = _html.escape(text)
+    return f"<p>{escaped.replace(chr(10), '<br>')}</p>"
+
+
+_NO_INFO_UPDATE = object()
+
+
+def handle_refine_click(gallery_value, selected_index, *all_values):
+    """Refine-button handler. Returns
+    ``(updated_gallery, status_html, html_info, generation_info_json)``.
+
+    ``all_values`` =
+    ``(*widget_values, main_prompt, main_neg_prompt, current_generation_info)``
+    — the three extras are appended by the wiring in ``scripts/!sam3.py``.
+
+    The last two outputs update the gallery sidebar's prompt display:
+    ``html_info`` is the immediately-visible HTML for the latest refine,
+    ``generation_info_json`` is the per-image infotext array that
+    ``update_generation_info`` (the standard click-handler) reads when the
+    user clicks a different gallery thumbnail.
 
     Out-of-scope behaviors are returned as HTML status messages rather than
     raised exceptions so the panel stays responsive.
     """
     expected_widget_count = len(REFINE_ARG_KEYS)
     if len(all_values) < expected_widget_count:
-        return gallery_value, "<span style='color:#c33'>SAM3 Refine: missing widget values.</span>"
+        return (
+            gallery_value,
+            "<span style='color:#c33'>SAM3 Refine: missing widget values.</span>",
+            gr.update(),
+            gr.update(),
+        )
 
     widget_values = all_values[:expected_widget_count]
     extras = all_values[expected_widget_count:]
     main_prompt = str(extras[0]) if len(extras) > 0 else ""
     main_neg_prompt = str(extras[1]) if len(extras) > 1 else ""
+    current_info_json = str(extras[2]) if len(extras) > 2 else ""
 
     args = map_widget_values_to_sam3_args(widget_values)
     insert_mode = args.pop("_insert_mode", "After selected")
     inherit_main = args.pop("_inherit_main_prompt", True)
     inherit_main_neg = args.pop("_inherit_main_neg_prompt", True)
-    sr_rules_explicit = args.pop("_prompt_sr", "")
 
     refine_p = args.get("sam3_inpaint_prompt") or ""
     detect_p = args.get("sam3_prompt") or ""
     detect_tokens = _parse_detect_tokens(detect_p)
 
-    # Always derive an implicit S/R rule from the Target field. Positive gets
-    # the Replacement value injected once at the first match site; negative
-    # just deletes (don't leak the new subject into the anti-prompt).
-    implicit_positive = (
-        f"{', '.join(detect_tokens)} = {refine_p}".strip()
-        if detect_tokens else ""
-    )
-    implicit_negative = (
-        f"{', '.join(detect_tokens)} = ".strip()
-        if detect_tokens else ""
-    )
-    sr_positive = "\n".join(r for r in (sr_rules_explicit, implicit_positive) if r)
-    sr_negative = "\n".join(r for r in (sr_rules_explicit, implicit_negative) if r)
+    # Target → S/R: positive gets the Replacement injected once at the first
+    # match site; negative just deletes (don't leak the new subject into the
+    # anti-prompt).
+    sr_positive = f"{', '.join(detect_tokens)} = {refine_p}" if detect_tokens else ""
+    sr_negative = f"{', '.join(detect_tokens)} = " if detect_tokens else ""
 
     cleaned_main = _apply_prompt_sr(main_prompt, sr_positive) if main_prompt else main_prompt
     cleaned_neg = _apply_prompt_sr(main_neg_prompt, sr_negative) if main_neg_prompt else main_neg_prompt
@@ -710,11 +710,21 @@ def handle_refine_click(gallery_value, selected_index, *all_values):
         )
 
     if not args["sam3_prompt"]:
-        return gallery_value, "<span style='color:#c33'>SAM3 Refine: enter a detect prompt first.</span>"
+        return (
+            gallery_value,
+            "<span style='color:#c33'>SAM3 Refine: enter a Target (detect prompt) first.</span>",
+            gr.update(),
+            gr.update(),
+        )
 
     gallery_list = list(gallery_value or [])
     if not gallery_list:
-        return gallery_value, "<span style='color:#c33'>SAM3 Refine: gallery is empty.</span>"
+        return (
+            gallery_value,
+            "<span style='color:#c33'>SAM3 Refine: gallery is empty.</span>",
+            gr.update(),
+            gr.update(),
+        )
 
     # Hidden Number arrives as float; JS shim defaults to -1 when nothing is
     # selected. Coerce + clamp to a valid index.
@@ -727,13 +737,23 @@ def handle_refine_click(gallery_value, selected_index, *all_values):
 
     image = _coerce_gallery_item_to_pil(gallery_list[idx])
     if image is None:
-        return gallery_value, f"<span style='color:#c33'>SAM3 Refine: could not load selected image (index {idx}).</span>"
+        return (
+            gallery_value,
+            f"<span style='color:#c33'>SAM3 Refine: could not load selected image (index {idx}).</span>",
+            gr.update(),
+            gr.update(),
+        )
 
     from modules import shared as _shared
 
     sd_model = getattr(_shared, "sd_model", None)
     if sd_model is None:
-        return gallery_value, "<span style='color:#c33'>SAM3 Refine: no SD model loaded.</span>"
+        return (
+            gallery_value,
+            "<span style='color:#c33'>SAM3 Refine: no SD model loaded.</span>",
+            gr.update(),
+            gr.update(),
+        )
 
     outpath_samples = getattr(_shared.opts, "outdir_txt2img_samples", "outputs/txt2img-images")
     outpath_grids = getattr(_shared.opts, "outdir_txt2img_grids", "outputs/txt2img-grids")
@@ -741,7 +761,7 @@ def handle_refine_click(gallery_value, selected_index, *all_values):
     from .inpaint_core import run_sam3_refine
 
     try:
-        new_images = run_sam3_refine(
+        new_pairs = run_sam3_refine(
             image,
             args,
             sd_model=sd_model,
@@ -751,14 +771,56 @@ def handle_refine_click(gallery_value, selected_index, *all_values):
     except Exception:
         error = traceback.format_exc()
         print(f"[-] SAM3 Refine: handler failed:\n{error}", file=sys.stderr)
-        return gallery_value, f"<pre style='color:#c33'>SAM3 Refine failed — see console.</pre>"
+        return (
+            gallery_value,
+            f"<pre style='color:#c33'>SAM3 Refine failed — see console.</pre>",
+            gr.update(),
+            gr.update(),
+        )
 
-    if not new_images:
-        return gallery_value, "<span style='color:#c80'>SAM3 Refine: no result (empty mask or interrupted).</span>"
+    if not new_pairs:
+        return (
+            gallery_value,
+            "<span style='color:#c80'>SAM3 Refine: no result (empty mask or interrupted).</span>",
+            gr.update(),
+            gr.update(),
+        )
+
+    new_images = [img for img, _ in new_pairs]
+    new_infotexts = [info for _, info in new_pairs]
 
     if insert_mode == "At end":
         updated = gallery_list + new_images
     else:
         updated = gallery_list[: idx + 1] + new_images + gallery_list[idx + 1 :]
 
-    return updated, f"<span style='color:#383'>SAM3 Refine: added {len(new_images)} image(s).</span>"
+    # Splice the new infotexts into the existing generation_info JSON so the
+    # standard "click a gallery item" handler shows the per-image transformed
+    # prompt instead of falling back to the original t2i prompt.
+    info_payload: dict[str, Any]
+    try:
+        info_payload = json.loads(current_info_json) if current_info_json else {}
+    except Exception:
+        info_payload = {}
+    existing_infotexts = list(info_payload.get("infotexts") or [""] * len(gallery_list))
+    while len(existing_infotexts) < len(gallery_list):
+        existing_infotexts.append("")
+    if insert_mode == "At end":
+        merged_infotexts = existing_infotexts + new_infotexts
+    else:
+        merged_infotexts = (
+            existing_infotexts[: idx + 1] + new_infotexts + existing_infotexts[idx + 1 :]
+        )
+    info_payload["infotexts"] = merged_infotexts
+    new_info_json = json.dumps(info_payload, ensure_ascii=False)
+
+    # Right side of the gallery — immediately show the latest refine's prompt
+    # so the user can verify the transformation visually without clicking.
+    latest_html = _plaintext_to_html(new_infotexts[-1] if new_infotexts else "")
+
+    return (
+        updated,
+        f"<span style='color:#383'>SAM3 Refine: added {len(new_images)} image(s). Click the new thumbnail to recheck infotext.</span>",
+        latest_html,
+        new_info_json,
+    )
