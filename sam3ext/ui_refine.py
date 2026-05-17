@@ -36,7 +36,6 @@ class RefinePanel:
     negative_prompt: gr.Textbox
     inherit_main_prompt: gr.Checkbox
     inherit_main_neg_prompt: gr.Checkbox
-    auto_sr_from_detect: gr.Checkbox
     prompt_sr: gr.Textbox
     threshold: gr.Slider
     mask_dilation: gr.Slider
@@ -77,7 +76,6 @@ class RefinePanel:
             self.negative_prompt,
             self.inherit_main_prompt,
             self.inherit_main_neg_prompt,
-            self.auto_sr_from_detect,
             self.prompt_sr,
             self.threshold,
             self.mask_dilation,
@@ -116,7 +114,6 @@ REFINE_ARG_KEYS = (
     "negative_prompt",
     "inherit_main_prompt",
     "inherit_main_neg_prompt",
-    "auto_sr_from_detect",
     "prompt_sr",
     "threshold",
     "mask_dilation",
@@ -175,97 +172,110 @@ def build_refine_panel(
         with gr.Row():
             detect_prompt = gr.Textbox(
                 value="",
-                label="Mask Prompt (SAM3 detects these tokens; auto-stripped from main)",
+                label="Target (마스크/치환할 대상)",
                 lines=1,
-                placeholder="e.g. white shirt, black necktie — separate with ',' for OR-merge, '/' for separate passes",
+                placeholder=(
+                    "what SAM3 masks AND what gets stripped from the inherited main prompt.\n"
+                    "comma-separated: e.g. 'shirt, necktie' → 'white shirt' / 'black necktie' segments both go."
+                ),
+                elem_id="sam3_refine_target",
             )
         with gr.Row():
             inpaint_prompt = gr.Textbox(
                 value="",
-                label="Replacement Prompt (what to draw + the S/R replacement value)",
+                label="Replacement (대체할 단어)",
                 lines=2,
-                placeholder="e.g. nude — replaces detected tokens in the inherited main prompt (inserted once)",
+                placeholder=(
+                    "what to draw inside the mask AND what to insert in place of the Target tokens.\n"
+                    "single occurrence even when multiple Target tokens matched. e.g. 'nude'"
+                ),
+                elem_id="sam3_refine_replacement",
             )
         with gr.Row():
             negative_prompt = gr.Textbox(
                 value="",
                 label="Negative Prompt",
                 lines=1,
-                placeholder="Optional",
+                placeholder="Optional — appended after the (possibly cleaned) inherited main negative.",
+                elem_id="sam3_refine_negative",
             )
 
         with gr.Row():
             inherit_main_prompt = gr.Checkbox(
-                label="Inherit main t2i prompt (carries LoRAs / style triggers — recommended)",
+                label="Inherit main t2i prompt (LoRAs / style triggers) — Target auto-stripped",
                 value=True,
+                elem_id="sam3_refine_inherit_main",
             )
             inherit_main_neg_prompt = gr.Checkbox(
-                label="Inherit main t2i negative prompt",
+                label="Inherit main t2i negative (Target also stripped here)",
                 value=True,
+                elem_id="sam3_refine_inherit_neg",
             )
 
-        with gr.Row():
-            auto_sr_from_detect = gr.Checkbox(
-                label="Auto-strip Mask Prompt tokens from inherited main (and inject Replacement once)",
-                value=True,
-            )
-
-        with gr.Row():
+        with gr.Accordion("Advanced — extra S/R rules", open=False):
             prompt_sr = gr.Textbox(
                 value="",
-                label="Extra Prompt S/R rules (optional — applied before auto-strip)",
+                label="Extra Prompt S/R rules (applied BEFORE the Target auto-strip)",
                 lines=2,
                 placeholder=(
                     "one rule per line, pat1, pat2, ... = replacement\n"
                     "examples:\n"
-                    "  shirt=         (drop every segment containing 'shirt' — 'white shirt' goes too)\n"
-                    "  shirt, necktie = nude   (drop both segments; insert 'nude' once at first match)"
+                    "  shirt=                   (drop every segment containing 'shirt')\n"
+                    "  shirt, necktie = nude    (drop both segments, insert 'nude' once at first match)"
                 ),
+                elem_id="sam3_refine_extra_sr",
             )
 
         with gr.Row():
-            threshold = gr.Slider(label="SAM3 Threshold", minimum=0.0, maximum=1.0, step=0.01, value=0.4)
-            mask_dilation = gr.Slider(label="Mask Dilation (px)", minimum=0, maximum=256, step=1, value=4)
-            mask_blur = gr.Slider(label="Mask Blur", minimum=0, maximum=64, step=1, value=4)
+            threshold = gr.Slider(label="SAM3 Threshold", minimum=0.0, maximum=1.0, step=0.01, value=0.4, elem_id="sam3_refine_threshold")
+            mask_dilation = gr.Slider(label="Mask Dilation (px)", minimum=0, maximum=256, step=1, value=4, elem_id="sam3_refine_mask_dilation")
+            mask_blur = gr.Slider(label="Mask Blur", minimum=0, maximum=64, step=1, value=4, elem_id="sam3_refine_mask_blur")
             mask_mode = gr.Radio(
                 label="Mask Processing",
                 choices=["Individual", "Combined"],
                 value="Combined",
+                elem_id="sam3_refine_mask_mode",
             )
 
         with gr.Row():
             mask_hull = gr.Checkbox(
                 label="Convex Hull (wrap strands — recommended for hair/fur)",
                 value=False,
+                elem_id="sam3_refine_mask_hull",
             )
             unload_after = gr.Checkbox(
                 label="Unload SAM3 from VRAM after detection (~3.5 GB — recommended for ≤12 GB GPUs)",
                 value=False,
+                elem_id="sam3_refine_unload_after",
             )
 
         with gr.Row():
             denoising_strength = gr.Slider(
-                label="Denoising Strength", minimum=0.0, maximum=1.0, step=0.01, value=0.75
+                label="Denoising Strength", minimum=0.0, maximum=1.0, step=0.01, value=0.75,
+                elem_id="sam3_refine_denoising",
             )
-            inpaint_only_masked = gr.Checkbox(label="Inpaint only masked", value=False)
+            inpaint_only_masked = gr.Checkbox(label="Inpaint only masked", value=False, elem_id="sam3_refine_inpaint_only_masked")
             inpaint_only_masked_padding = gr.Slider(
-                label="Inpaint padding", minimum=0, maximum=256, step=1, value=32
+                label="Inpaint padding", minimum=0, maximum=256, step=1, value=32,
+                elem_id="sam3_refine_inpaint_padding",
             )
 
         with gr.Row():
-            steps = gr.Slider(label="Steps", minimum=1, maximum=150, step=1, value=28)
-            cfg_scale = gr.Slider(label="CFG Scale", minimum=0.0, maximum=30.0, step=0.1, value=7.0)
+            steps = gr.Slider(label="Steps", minimum=1, maximum=150, step=1, value=28, elem_id="sam3_refine_steps")
+            cfg_scale = gr.Slider(label="CFG Scale", minimum=0.0, maximum=30.0, step=0.1, value=7.0, elem_id="sam3_refine_cfg")
             sampler = gr.Dropdown(
                 label="Sampler",
                 choices=samplers or ["Euler a"],
                 value=samplers[0] if samplers else "Euler a",
                 type="value",
+                elem_id="sam3_refine_sampler",
             )
             scheduler = gr.Dropdown(
                 label="Scheduler",
                 choices=schedulers or ["Automatic"],
                 value=schedulers[0] if schedulers else "Automatic",
                 type="value",
+                elem_id="sam3_refine_scheduler",
             )
 
         with gr.Row():
@@ -274,35 +284,40 @@ def build_refine_panel(
                 choices=checkpoint_choices,
                 value=checkpoint_choices[0] if checkpoint_choices else "sam3.pt",
                 type="value",
+                elem_id="sam3_refine_checkpoint",
             )
 
         with gr.Accordion("ControlNet", open=False):
             with gr.Row():
-                cn_enable = gr.Checkbox(label="Enable ControlNet", value=False)
+                cn_enable = gr.Checkbox(label="Enable ControlNet", value=False, elem_id="sam3_refine_cn_enable")
                 cn_override_external = gr.Checkbox(
-                    label="Override external CN units", value=False
+                    label="Override external CN units", value=False, elem_id="sam3_refine_cn_override"
                 )
-                cn_pixel_perfect = gr.Checkbox(label="Pixel Perfect", value=True)
+                cn_pixel_perfect = gr.Checkbox(label="Pixel Perfect", value=True, elem_id="sam3_refine_cn_pp")
             with gr.Row():
                 cn_module = gr.Dropdown(
                     label="Preprocessor",
                     choices=cn_modules,
                     value=cn_module_default,
                     type="value",
+                    elem_id="sam3_refine_cn_module",
                 )
                 cn_model = gr.Dropdown(
                     label="Model",
                     choices=cn_models,
                     value=cn_models[0] if cn_models else "None",
                     type="value",
+                    elem_id="sam3_refine_cn_model",
                 )
             with gr.Row():
-                cn_weight = gr.Slider(label="Weight", minimum=0.0, maximum=2.0, step=0.05, value=1.0)
+                cn_weight = gr.Slider(label="Weight", minimum=0.0, maximum=2.0, step=0.05, value=1.0, elem_id="sam3_refine_cn_weight")
                 cn_guidance_start = gr.Slider(
-                    label="Guidance Start", minimum=0.0, maximum=1.0, step=0.01, value=0.0
+                    label="Guidance Start", minimum=0.0, maximum=1.0, step=0.01, value=0.0,
+                    elem_id="sam3_refine_cn_gstart",
                 )
                 cn_guidance_end = gr.Slider(
-                    label="Guidance End", minimum=0.0, maximum=1.0, step=0.01, value=1.0
+                    label="Guidance End", minimum=0.0, maximum=1.0, step=0.01, value=1.0,
+                    elem_id="sam3_refine_cn_gend",
                 )
             with gr.Row():
                 cn_control_mode = gr.Radio(
@@ -313,11 +328,13 @@ def build_refine_panel(
                         "ControlNet is more important",
                     ],
                     value="Balanced",
+                    elem_id="sam3_refine_cn_control_mode",
                 )
                 cn_resize_mode = gr.Radio(
                     label="Resize Mode",
                     choices=["Just Resize", "Crop and Resize", "Resize and Fill"],
                     value="Crop and Resize",
+                    elem_id="sam3_refine_cn_resize_mode",
                 )
             with gr.Row():
                 cn_processor_res = gr.Slider(
@@ -326,12 +343,15 @@ def build_refine_panel(
                     maximum=2048,
                     step=8,
                     value=512,
+                    elem_id="sam3_refine_cn_procres",
                 )
                 cn_threshold_a = gr.Slider(
-                    label="Threshold A", minimum=-1, maximum=256, step=1, value=-1
+                    label="Threshold A", minimum=-1, maximum=256, step=1, value=-1,
+                    elem_id="sam3_refine_cn_ta",
                 )
                 cn_threshold_b = gr.Slider(
-                    label="Threshold B", minimum=-1, maximum=256, step=1, value=-1
+                    label="Threshold B", minimum=-1, maximum=256, step=1, value=-1,
+                    elem_id="sam3_refine_cn_tb",
                 )
 
         with gr.Row():
@@ -339,8 +359,9 @@ def build_refine_panel(
                 label="Insert result",
                 choices=["After selected", "At end"],
                 value="After selected",
+                elem_id="sam3_refine_insert_mode",
             )
-            refine_button = gr.Button("▶ Refine", variant="primary")
+            refine_button = gr.Button("▶ Refine", variant="primary", elem_id="sam3_refine_button")
 
         status = gr.HTML(value="", elem_id="sam3_refine_status")
 
@@ -352,7 +373,6 @@ def build_refine_panel(
         negative_prompt=negative_prompt,
         inherit_main_prompt=inherit_main_prompt,
         inherit_main_neg_prompt=inherit_main_neg_prompt,
-        auto_sr_from_detect=auto_sr_from_detect,
         prompt_sr=prompt_sr,
         threshold=threshold,
         mask_dilation=mask_dilation,
@@ -605,7 +625,6 @@ def map_widget_values_to_sam3_args(values: tuple) -> dict[str, Any]:
         "_insert_mode": str(keyed.get("insert_mode") or "After selected"),
         "_inherit_main_prompt": bool(keyed.get("inherit_main_prompt", True)),
         "_inherit_main_neg_prompt": bool(keyed.get("inherit_main_neg_prompt", True)),
-        "_auto_sr_from_detect": bool(keyed.get("auto_sr_from_detect", True)),
         "_prompt_sr": str(keyed.get("prompt_sr") or ""),
     }
 
@@ -634,17 +653,15 @@ def handle_refine_click(gallery_value, selected_index, *all_values):
     insert_mode = args.pop("_insert_mode", "After selected")
     inherit_main = args.pop("_inherit_main_prompt", True)
     inherit_main_neg = args.pop("_inherit_main_neg_prompt", True)
-    auto_sr = args.pop("_auto_sr_from_detect", True)
     sr_rules_explicit = args.pop("_prompt_sr", "")
 
     refine_p = args.get("sam3_inpaint_prompt") or ""
     detect_p = args.get("sam3_prompt") or ""
-    detect_tokens = _parse_detect_tokens(detect_p) if auto_sr else []
+    detect_tokens = _parse_detect_tokens(detect_p)
 
-    # Build the implicit S/R rules from the Mask Prompt. Positive gets the
-    # Replacement Prompt as the substitution value (so it's inserted once
-    # right where the detected tokens lived). Negative just deletes — we
-    # don't want the inpaint description leaking into the negative.
+    # Always derive an implicit S/R rule from the Target field. Positive gets
+    # the Replacement value injected once at the first match site; negative
+    # just deletes (don't leak the new subject into the anti-prompt).
     implicit_positive = (
         f"{', '.join(detect_tokens)} = {refine_p}".strip()
         if detect_tokens else ""
@@ -659,13 +676,27 @@ def handle_refine_click(gallery_value, selected_index, *all_values):
     cleaned_main = _apply_prompt_sr(main_prompt, sr_positive) if main_prompt else main_prompt
     cleaned_neg = _apply_prompt_sr(main_neg_prompt, sr_negative) if main_neg_prompt else main_neg_prompt
 
-    # Positive prompt resolution:
-    # - auto-SR ON  : Replacement Prompt was already injected via the implicit
-    #                 rule; don't append a second copy.
-    # - auto-SR OFF : Standard "main + refine" concat (LoRAs in main carry,
-    #                 refine adds new description at the end).
+    # Trace exactly what S/R produced — so a user can verify in the console
+    # that 'shirt' really did strip 'white shirt' etc. instead of guessing.
+    if cleaned_main != main_prompt or cleaned_neg != main_neg_prompt:
+        print(
+            f"[-] SAM3 Refine prompt transform:\n"
+            f"      target  : {detect_p!r}\n"
+            f"      replace : {refine_p!r}\n"
+            f"      main +  : {main_prompt!r}\n"
+            f"           -> : {cleaned_main!r}\n"
+            f"      main -  : {main_neg_prompt!r}\n"
+            f"           -> : {cleaned_neg!r}",
+            file=sys.stderr,
+        )
+
+    # Positive resolution:
+    # - Target set + inherit ON : cleaned_main already has the replacement
+    #                             injected; that IS the final prompt.
+    # - Target empty + inherit ON: append refine prompt to main (back-compat).
+    # - inherit OFF             : refine prompt only.
     if inherit_main and cleaned_main:
-        if auto_sr and detect_tokens:
+        if detect_tokens:
             args["sam3_inpaint_prompt"] = cleaned_main
         else:
             args["sam3_inpaint_prompt"] = (
