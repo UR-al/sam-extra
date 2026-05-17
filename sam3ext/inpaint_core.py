@@ -301,13 +301,24 @@ def build_standalone_i2i(
     scheduler = args.get("sam3_scheduler", "Use same scheduler")
     version_args = {} if scheduler == "Use same scheduler" else {"scheduler": scheduler}
 
+    # ``inpainting_fill`` semantics (matches webui's img2img inpaint dropdown):
+    #   0 = fill          (gray fill in masked area)
+    #   1 = original      (keep original pixels in masked area as init)
+    #   2 = latent noise  (random latent in masked area)  ← Refine default
+    #   3 = latent nothing (zeros in masked area)
+    # For "shirt → nude" style drastic transforms, ``2`` gives the cleanest
+    # separation from the original at sampling start. ``1`` (the previous
+    # default) was leaving original-color bias even at denoise=1 — visible
+    # as a flat-color paint over the unchanged garment.
+    inpainting_fill = int(args.get("sam3_inpainting_fill", 2))
+
     p2 = StableDiffusionProcessingImg2Img(
         init_images=[image],
         resize_mode=0,
         denoising_strength=float(args["sam3_denoising_strength"]),
         mask=None,
         mask_blur=int(args["sam3_mask_blur"]),
-        inpainting_fill=1,
+        inpainting_fill=inpainting_fill,
         inpaint_full_res=bool(args["sam3_inpaint_only_masked"]),
         inpaint_full_res_padding=int(args["sam3_inpaint_only_masked_padding"]),
         inpainting_mask_invert=0,
@@ -443,6 +454,34 @@ def run_sam3_refine(
     if not masks or not any(np_any(m) for m in masks):
         print("[-] SAM3 Refine: detection returned an empty mask; nothing to do.", file=sys.stderr)
         return []
+
+    # Diagnostic: per-mask coverage so the user can see if SAM3 caught a tiny
+    # sliver vs the whole garment, plus the key inpaint knobs in effect.
+    try:
+        import numpy as _np
+
+        for i, m in enumerate(masks, start=1):
+            arr = _np.asarray(m)
+            nonzero = int((arr > 127).sum()) if arr.size else 0
+            total = int(arr.size) if arr.size else 1
+            pct = 100.0 * nonzero / max(total, 1)
+            print(
+                f"[-] SAM3 Refine: mask {i}/{len(masks)} coverage {pct:.1f}% "
+                f"({nonzero}/{total} pixels)",
+                file=sys.stderr,
+            )
+    except Exception:
+        pass
+    print(
+        f"[-] SAM3 Refine: inpaint settings — denoise={args.get('sam3_denoising_strength')}, "
+        f"mask_blur={args.get('sam3_mask_blur')}, only_masked={args.get('sam3_inpaint_only_masked')}, "
+        f"fill={args.get('sam3_inpainting_fill', 2)} (0=fill,1=original,2=latent_noise,3=zeros), "
+        f"steps={args.get('sam3_steps')}, cfg={args.get('sam3_cfg_scale')}, "
+        f"sampler={args.get('sam3_sampler')!r}, scheduler={args.get('sam3_scheduler')!r}, "
+        f"cn_enable={args.get('sam3_cn_enable')}, cn_model={args.get('sam3_cn_model')!r}, "
+        f"cn_weight={args.get('sam3_cn_weight')}",
+        file=sys.stderr,
+    )
 
     prompt = copy_prompt(args.get("sam3_inpaint_prompt"), "")
     negative_prompt = copy_prompt(args.get("sam3_negative_prompt"), "")
