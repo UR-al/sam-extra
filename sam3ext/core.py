@@ -84,24 +84,39 @@ def _ensure_bpe_vocab() -> str | None:
 
 
 def find_checkpoint_options() -> list[str]:
+    """Return SAM3 detection checkpoint *filenames* (basenames, not full
+    paths) for the UI dropdown.
+
+    Filters to files whose name starts with ``sam3`` so non-SAM3 weights
+    stored next to them (e.g. ``anima-lllite-inpainting-v2.safetensors``,
+    which lives in the same ``models/sam3/`` folder for the CN dropdown)
+    don't pollute the SAM3 Checkpoint selector. ``resolve_checkpoint_path``
+    handles basename → absolute path resolution at load time.
+    """
     paths = _safe_import_webui_modules()
-    candidates: list[Path] = []
+    seen_names: set[str] = set()
+    result: list[str] = []
+
+    def _consider(path: Path) -> None:
+        name = path.name
+        if not name.lower().startswith("sam3"):
+            return
+        if name in seen_names:
+            return
+        seen_names.add(name)
+        result.append(name)
+
     if paths is not None:
         models_root = Path(paths.models_path)
         for suffix in SUPPORTED_CHECKPOINT_SUFFIXES:
-            candidates.extend(sorted((models_root / "sam3").glob(f"*{suffix}")))
-            candidates.extend(sorted(models_root.glob(f"sam3*{suffix}")))
+            for p in sorted((models_root / "sam3").glob(f"*{suffix}")):
+                _consider(p)
+            for p in sorted(models_root.glob(f"sam3*{suffix}")):
+                _consider(p)
     for suffix in SUPPORTED_CHECKPOINT_SUFFIXES:
-        candidates.extend(sorted((EXTENSION_ROOT / "models").glob(f"*{suffix}")))
+        for p in sorted((EXTENSION_ROOT / "models").glob(f"*{suffix}")):
+            _consider(p)
 
-    seen: set[str] = set()
-    result: list[str] = []
-    for path in candidates:
-        resolved = str(path.resolve())
-        if resolved in seen:
-            continue
-        seen.add(resolved)
-        result.append(str(path))
     if not result:
         result.append("sam3.pt")
     return result

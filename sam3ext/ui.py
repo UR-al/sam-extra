@@ -207,6 +207,7 @@ def sam3_ui(is_img2img: bool, buttons: WebuiButtons):
             checkpoint_choices = find_checkpoint_options()
             w.sam3_checkpoint = gr.Dropdown(
                 label="SAM3 Checkpoint",
+                elem_id="sam3_checkpoint",
                 choices=checkpoint_choices,
                 value=checkpoint_choices[0] if checkpoint_choices else "sam3.pt",
                 type="value",

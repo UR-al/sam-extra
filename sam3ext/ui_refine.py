@@ -36,6 +36,7 @@ class RefinePanel:
     negative_prompt: gr.Textbox
     inherit_main_prompt: gr.Checkbox
     inherit_main_neg_prompt: gr.Checkbox
+    auto_sr_from_detect: gr.Checkbox
     prompt_sr: gr.Textbox
     threshold: gr.Slider
     mask_dilation: gr.Slider
@@ -76,6 +77,7 @@ class RefinePanel:
             self.negative_prompt,
             self.inherit_main_prompt,
             self.inherit_main_neg_prompt,
+            self.auto_sr_from_detect,
             self.prompt_sr,
             self.threshold,
             self.mask_dilation,
@@ -114,6 +116,7 @@ REFINE_ARG_KEYS = (
     "negative_prompt",
     "inherit_main_prompt",
     "inherit_main_neg_prompt",
+    "auto_sr_from_detect",
     "prompt_sr",
     "threshold",
     "mask_dilation",
@@ -172,16 +175,16 @@ def build_refine_panel(
         with gr.Row():
             detect_prompt = gr.Textbox(
                 value="",
-                label="Detect Prompt",
+                label="Mask Prompt (SAM3 detects these tokens; auto-stripped from main)",
                 lines=1,
-                placeholder="e.g. shirt, hair, face — what SAM3 should mask in the selected image",
+                placeholder="e.g. white shirt, black necktie — separate with ',' for OR-merge, '/' for separate passes",
             )
         with gr.Row():
             inpaint_prompt = gr.Textbox(
                 value="",
-                label="Inpaint Prompt",
+                label="Replacement Prompt (what to draw + the S/R replacement value)",
                 lines=2,
-                placeholder="What to draw inside the mask (e.g. 'red leather jacket')",
+                placeholder="e.g. nude — replaces detected tokens in the inherited main prompt (inserted once)",
             )
         with gr.Row():
             negative_prompt = gr.Textbox(
@@ -202,13 +205,21 @@ def build_refine_panel(
             )
 
         with gr.Row():
+            auto_sr_from_detect = gr.Checkbox(
+                label="Auto-strip Mask Prompt tokens from inherited main (and inject Replacement once)",
+                value=True,
+            )
+
+        with gr.Row():
             prompt_sr = gr.Textbox(
                 value="",
-                label="Prompt S/R (applied to inherited main prompt + negative before merge)",
+                label="Extra Prompt S/R rules (optional — applied before auto-strip)",
                 lines=2,
                 placeholder=(
-                    "one rule per line, pattern=replacement; empty replacement = delete.\n"
-                    "example:  shirt=    (removes 'shirt' from inherited main so 'nude' in refine prompt isn't shouted down)"
+                    "one rule per line, pat1, pat2, ... = replacement\n"
+                    "examples:\n"
+                    "  shirt=         (drop every segment containing 'shirt' — 'white shirt' goes too)\n"
+                    "  shirt, necktie = nude   (drop both segments; insert 'nude' once at first match)"
                 ),
             )
 
@@ -341,6 +352,7 @@ def build_refine_panel(
         negative_prompt=negative_prompt,
         inherit_main_prompt=inherit_main_prompt,
         inherit_main_neg_prompt=inherit_main_neg_prompt,
+        auto_sr_from_detect=auto_sr_from_detect,
         prompt_sr=prompt_sr,
         threshold=threshold,
         mask_dilation=mask_dilation,
@@ -412,16 +424,63 @@ def _coerce_gallery_item_to_pil(item: Any) -> Image.Image | None:
     return None
 
 
+def _normalize_prompt(text: str) -> str:
+    """Collapse whitespace + comma spacing + drop empty / repeated commas."""
+    text = re.sub(r"\s+", " ", text)
+    text = re.sub(r"\s*,\s*", ", ", text)
+    text = re.sub(r"(,\s*){2,}", ", ", text)
+    return text.strip(" ,")
+
+
+def _strip_patterns_with_replacement(text: str, patterns: list[str], replacement: str) -> str:
+    """Walk comma-separated segments of ``text``; drop any segment that
+    contains any of ``patterns``; insert ``replacement`` once at the first
+    drop position.
+
+    Comma-segment removal (vs naive substring replace) avoids orphan
+    fragments like "white" left behind when stripping "shirt" from
+    "white shirt".
+    """
+    if not patterns:
+        return text
+    segments = [s.strip() for s in text.split(",")]
+    out: list[str] = []
+    inserted = False
+    matched_any = False
+    for seg in segments:
+        if not seg:
+            continue
+        seg_matches = any(pat and pat in seg for pat in patterns)
+        if seg_matches:
+            matched_any = True
+            if not inserted and replacement:
+                out.append(replacement)
+                inserted = True
+            continue
+        out.append(seg)
+    if not matched_any:
+        return text
+    return ", ".join(out)
+
+
 def _apply_prompt_sr(text: str, rules_field: str) -> str:
-    """Apply ``pattern=replacement`` rules (one per line) to ``text`` and
-    normalize the result.
+    """Apply S/R rules (one per line) to ``text``.
 
-    Empty replacement deletes the pattern. After all substitutions, runs of
-    commas / leading-or-trailing commas / collapsed whitespace get cleaned
-    up so the merged prompt reads naturally.
+    Rule grammar::
 
-    Returns ``text`` unchanged when ``rules_field`` is empty / has no
-    parseable ``=`` lines.
+        pat                       = replacement
+        pat1, pat2, ..., patN     = replacement
+
+    Multi-pattern: every comma-segment containing any of the patterns is
+    removed; ``replacement`` is inserted once at the first match position
+    (so ``white shirt, black necktie = nude`` collapses both segments into
+    a single ``nude``, not ``nude, nude``).
+
+    Empty replacement deletes the matching segments without inserting
+    anything.
+
+    Returns ``text`` unchanged when ``rules_field`` is empty or no rule
+    matches.
     """
     if not text or not rules_field:
         return text
@@ -431,20 +490,30 @@ def _apply_prompt_sr(text: str, rules_field: str) -> str:
         line = raw_line.strip()
         if not line or "=" not in line:
             continue
-        pattern, _, replacement = line.partition("=")
-        pattern = pattern.strip()
-        if not pattern:
+        pattern_part, _, replacement = line.partition("=")
+        replacement = replacement.strip()
+        patterns = [p.strip() for p in pattern_part.split(",") if p.strip()]
+        if not patterns:
             continue
-        if pattern in out:
-            out = out.replace(pattern, replacement)
+        new_out = _strip_patterns_with_replacement(out, patterns, replacement)
+        if new_out != out:
             matched_any = True
+            out = new_out
     if not matched_any:
         return text
-    # Normalize: collapse whitespace, then comma-spacing, then repeated commas
-    out = re.sub(r"\s+", " ", out)
-    out = re.sub(r"\s*,\s*", ", ", out)
-    out = re.sub(r"(,\s*){2,}", ", ", out)
-    return out.strip(" ,")
+    return _normalize_prompt(out)
+
+
+def _parse_detect_tokens(detect_prompt: str) -> list[str]:
+    """Split a SAM3 detect prompt the same way SAM3 does internally — by
+    ``,``, ``/``, ``;``, or newlines — and trim each token. Used by the
+    auto-S/R derivation so every detected concept is stripped from the
+    inherited main prompt.
+    """
+    if not detect_prompt:
+        return []
+    tokens = re.split(r"[,/;\n]", detect_prompt)
+    return [t.strip() for t in tokens if t.strip()]
 
 
 def _as_float(value: Any, default: float) -> float:
@@ -536,6 +605,7 @@ def map_widget_values_to_sam3_args(values: tuple) -> dict[str, Any]:
         "_insert_mode": str(keyed.get("insert_mode") or "After selected"),
         "_inherit_main_prompt": bool(keyed.get("inherit_main_prompt", True)),
         "_inherit_main_neg_prompt": bool(keyed.get("inherit_main_neg_prompt", True)),
+        "_auto_sr_from_detect": bool(keyed.get("auto_sr_from_detect", True)),
         "_prompt_sr": str(keyed.get("prompt_sr") or ""),
     }
 
@@ -564,31 +634,49 @@ def handle_refine_click(gallery_value, selected_index, *all_values):
     insert_mode = args.pop("_insert_mode", "After selected")
     inherit_main = args.pop("_inherit_main_prompt", True)
     inherit_main_neg = args.pop("_inherit_main_neg_prompt", True)
-    sr_rules = args.pop("_prompt_sr", "")
+    auto_sr = args.pop("_auto_sr_from_detect", True)
+    sr_rules_explicit = args.pop("_prompt_sr", "")
 
-    # Strip user-specified tokens from the inherited main prompt(s) BEFORE
-    # merging — lets the user drop e.g. "shirt" so a refine prompt of "nude"
-    # isn't shouted down by the original main prompt's "shirt" token while
-    # still keeping LoRAs, style triggers, and important anatomy context
-    # ("2girls", "grabbing pectorals", etc.) intact. Same rules apply to
-    # negative — useful when main negative has "nude" anti-trigger.
-    cleaned_main = _apply_prompt_sr(main_prompt, sr_rules) if main_prompt else main_prompt
-    cleaned_neg = _apply_prompt_sr(main_neg_prompt, sr_rules) if main_neg_prompt else main_neg_prompt
-
-    # Prompt resolution:
-    # - Inherit ON  + refine empty  -> main only (preserves fallback semantics)
-    # - Inherit ON  + refine filled -> "main, refine"  (LoRAs / style triggers
-    #                                                   in main carry over; the
-    #                                                   refine prompt adds the
-    #                                                   new subject description)
-    # - Inherit OFF + refine empty  -> "" (use the model's unconditional default)
-    # - Inherit OFF + refine filled -> refine only (clean override)
     refine_p = args.get("sam3_inpaint_prompt") or ""
+    detect_p = args.get("sam3_prompt") or ""
+    detect_tokens = _parse_detect_tokens(detect_p) if auto_sr else []
+
+    # Build the implicit S/R rules from the Mask Prompt. Positive gets the
+    # Replacement Prompt as the substitution value (so it's inserted once
+    # right where the detected tokens lived). Negative just deletes — we
+    # don't want the inpaint description leaking into the negative.
+    implicit_positive = (
+        f"{', '.join(detect_tokens)} = {refine_p}".strip()
+        if detect_tokens else ""
+    )
+    implicit_negative = (
+        f"{', '.join(detect_tokens)} = ".strip()
+        if detect_tokens else ""
+    )
+    sr_positive = "\n".join(r for r in (sr_rules_explicit, implicit_positive) if r)
+    sr_negative = "\n".join(r for r in (sr_rules_explicit, implicit_negative) if r)
+
+    cleaned_main = _apply_prompt_sr(main_prompt, sr_positive) if main_prompt else main_prompt
+    cleaned_neg = _apply_prompt_sr(main_neg_prompt, sr_negative) if main_neg_prompt else main_neg_prompt
+
+    # Positive prompt resolution:
+    # - auto-SR ON  : Replacement Prompt was already injected via the implicit
+    #                 rule; don't append a second copy.
+    # - auto-SR OFF : Standard "main + refine" concat (LoRAs in main carry,
+    #                 refine adds new description at the end).
     if inherit_main and cleaned_main:
-        args["sam3_inpaint_prompt"] = f"{cleaned_main}, {refine_p}".rstrip(", ") if refine_p else cleaned_main
+        if auto_sr and detect_tokens:
+            args["sam3_inpaint_prompt"] = cleaned_main
+        else:
+            args["sam3_inpaint_prompt"] = (
+                f"{cleaned_main}, {refine_p}".rstrip(", ") if refine_p else cleaned_main
+            )
+
     refine_n = args.get("sam3_negative_prompt") or ""
     if inherit_main_neg and cleaned_neg:
-        args["sam3_negative_prompt"] = f"{cleaned_neg}, {refine_n}".rstrip(", ") if refine_n else cleaned_neg
+        args["sam3_negative_prompt"] = (
+            f"{cleaned_neg}, {refine_n}".rstrip(", ") if refine_n else cleaned_neg
+        )
 
     if not args["sam3_prompt"]:
         return gallery_value, "<span style='color:#c33'>SAM3 Refine: enter a detect prompt first.</span>"
