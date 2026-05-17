@@ -88,6 +88,7 @@ def make_axis_on_xyz_grid():
         xyz_grid.AxisOption("[SAM3] Mask Mode", str, partial(set_value, field="sam3_mask_mode"), choices=mask_mode_choices),
         xyz_grid.AxisOption("[SAM3] Device", str, partial(set_value, field="sam3_device"), choices=device_choices),
         xyz_grid.AxisOption("[SAM3] Detect Prompt", str, partial(set_value, field="sam3_prompt")),
+        xyz_grid.AxisOption("[SAM3] Exclude Prompt", str, partial(set_value, field="sam3_exclude_prompt")),
         xyz_grid.AxisOption("[SAM3] Inpaint Prompt", str, partial(set_value, field="sam3_inpaint_prompt")),
         xyz_grid.AxisOption("[SAM3] Negative Prompt", str, partial(set_value, field="sam3_negative_prompt")),
         xyz_grid.AxisOption(
@@ -248,6 +249,7 @@ class Sam3MaskScript(scripts.Script):
             "sam3_mode": str(_xyz_or("sam3_mode", "Inpaint")),
             "sam3_mask_mode": str(_xyz_or("sam3_mask_mode", "Individual")),
             "sam3_prompt": str(_xyz_or("sam3_prompt", "face", legacy="prompt")).strip() or "face",
+            "sam3_exclude_prompt": str(_xyz_or("sam3_exclude_prompt", "")),
             "sam3_inpaint_prompt": str(_xyz_or("sam3_inpaint_prompt", "")),
             "sam3_negative_prompt": str(_xyz_or("sam3_negative_prompt", "")),
             "sam3_threshold": float(_xyz_or("sam3_threshold", 0.4, legacy="threshold")),
@@ -337,6 +339,7 @@ class Sam3MaskScript(scripts.Script):
             mask_dilation=int(args.get("sam3_mask_dilation", 0)),
             mask_hull=bool(args.get("sam3_mask_hull", False)),
             mask_outline_px=int(args.get("sam3_mask_outline_px", 0)),
+            exclude_prompt=str(args.get("sam3_exclude_prompt") or ""),
         )
 
         if args.get("sam3_save_artifacts"):

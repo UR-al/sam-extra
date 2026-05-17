@@ -47,6 +47,7 @@ class RefinePanel:
     accordion: gr.Accordion
     selected_index_state: gr.Number  # hidden frontend slot — JS shim fills it
     detect_prompt: gr.Textbox
+    exclude_prompt: gr.Textbox
     inpaint_prompt: gr.Textbox
     negative_prompt: gr.Textbox
     inherit_main_prompt: gr.Checkbox
@@ -95,6 +96,7 @@ class RefinePanel:
         """Ordered list of input widgets — must match ``REFINE_ARG_KEYS``."""
         return [
             self.detect_prompt,
+            self.exclude_prompt,
             self.inpaint_prompt,
             self.negative_prompt,
             self.inherit_main_prompt,
@@ -138,6 +140,7 @@ class RefinePanel:
 
 REFINE_ARG_KEYS = (
     "detect_prompt",
+    "exclude_prompt",
     "inpaint_prompt",
     "negative_prompt",
     "inherit_main_prompt",
@@ -212,6 +215,17 @@ def build_refine_panel(
                     "comma-separated: e.g. 'shirt, necktie' → 'white shirt' / 'black necktie' segments both go."
                 ),
                 elem_id="sam3_refine_target",
+            )
+        with gr.Row():
+            exclude_prompt = gr.Textbox(
+                value="",
+                label="SAM3 Refine Exclude (보호할 영역)",
+                lines=1,
+                placeholder=(
+                    "Optional. Run a second SAM3 detect and subtract from the Target mask.\n"
+                    "e.g. Target='clothes', Exclude='face, eyes, hand' → face/eyes/hand stay untouched."
+                ),
+                elem_id="sam3_refine_exclude",
             )
         with gr.Row():
             inpaint_prompt = gr.Textbox(
@@ -456,6 +470,7 @@ def build_refine_panel(
         accordion=acc,
         selected_index_state=selected_index_state,
         detect_prompt=detect_prompt,
+        exclude_prompt=exclude_prompt,
         inpaint_prompt=inpaint_prompt,
         negative_prompt=negative_prompt,
         inherit_main_prompt=inherit_main_prompt,
@@ -680,6 +695,7 @@ def map_widget_values_to_sam3_args(values: tuple) -> dict[str, Any]:
     return {
         # SAM3 detection
         "sam3_prompt": str(keyed.get("detect_prompt") or "").strip(),
+        "sam3_exclude_prompt": str(keyed.get("exclude_prompt") or "").strip(),
         "sam3_inpaint_prompt": str(keyed.get("inpaint_prompt") or ""),
         "sam3_negative_prompt": str(keyed.get("negative_prompt") or ""),
         "sam3_threshold": _as_float(keyed.get("threshold"), 0.4),
@@ -783,7 +799,9 @@ def _refine_error_return(gallery_value, message: str):
     return gallery_value, message, gr.update(), gr.update()
 
 
-def handle_refine_click(gallery_value, selected_index, *all_values):
+def handle_refine_click(
+    gallery_value, selected_index, *all_values, progress=gr.Progress(track_tqdm=True)
+):
     """Refine-button handler. Returns
     ``(updated_gallery, status_html, html_info, generation_info_json)``.
 
@@ -796,6 +814,16 @@ def handle_refine_click(gallery_value, selected_index, *all_values):
     ``generation_info_json`` is the per-image infotext array that
     ``update_generation_info`` (the standard click-handler) reads when the
     user clicks a different gallery thumbnail.
+
+    ``progress=gr.Progress(track_tqdm=True)`` is a Gradio default-arg sentinel:
+    at call time Gradio injects a Progress object that monkey-patches the
+    ``tqdm`` module so every ``tqdm`` iteration inside the call (the per-step
+    sampling bar that ``process_images`` drives via ``shared.total_tqdm``)
+    forwards its progress to the queue. That's what makes the gallery
+    show a percentage during refine in the Gradio UI — without it the
+    webui cmd shows progress but the browser progress bar stays empty
+    because our click handler bypasses the standard wrap_gradio_gpu_call
+    chain that would normally start/finish a task ID.
 
     Out-of-scope behaviors are returned as HTML status messages rather than
     raised exceptions so the panel stays responsive.

@@ -25,6 +25,7 @@ class Sam3Args(BaseModel, extra=Extra.forbid):
     sam3_mode: Literal["Mask only", "Inpaint"] = "Inpaint"
     sam3_mask_mode: Literal["Combined", "Individual"] = "Individual"
     sam3_prompt: str = "face"
+    sam3_exclude_prompt: str = ""
     sam3_inpaint_prompt: str = ""
     sam3_negative_prompt: str = ""
     sam3_threshold: confloat(ge=0.0, le=1.0) = 0.4
@@ -104,6 +105,7 @@ class Sam3Args(BaseModel, extra=Extra.forbid):
     def extra_params(self) -> dict[str, Any]:
         params = {name: getattr(self, attr) for attr, name in ALL_ARGS}
         ppop = partial(self.ppop, params)
+        ppop("SAM3 Exclude Prompt")
         ppop("SAM3 Inpaint Prompt")
         ppop("SAM3 Negative Prompt")
         ppop("SAM3 Mask Dilation", cond=0)
@@ -154,6 +156,7 @@ ALL_ARGS = ArgsList(
         Arg("sam3_mode", "SAM3 Mode"),
         Arg("sam3_mask_mode", "SAM3 Mask Mode"),
         Arg("sam3_prompt", "SAM3 Prompt"),
+        Arg("sam3_exclude_prompt", "SAM3 Exclude Prompt"),
         Arg("sam3_inpaint_prompt", "SAM3 Inpaint Prompt"),
         Arg("sam3_negative_prompt", "SAM3 Negative Prompt"),
         Arg("sam3_threshold", "SAM3 Threshold"),

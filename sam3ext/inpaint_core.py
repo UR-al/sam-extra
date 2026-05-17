@@ -693,6 +693,7 @@ def run_sam3_refine(
         mask_dilation=int(args.get("sam3_mask_dilation", 0)),
         mask_hull=bool(args.get("sam3_mask_hull", False)),
         mask_outline_px=int(args.get("sam3_mask_outline_px", 0)),
+        exclude_prompt=str(args.get("sam3_exclude_prompt") or ""),
     )
 
     if args.get("sam3_unload_after"):

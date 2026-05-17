@@ -441,6 +441,7 @@ def run_sam3_on_pil(
     mask_dilation: int = 0,
     mask_hull: bool = False,
     mask_outline_px: int = 0,
+    exclude_prompt: str = "",
 ) -> Sam3Result:
     import torch
 
@@ -510,6 +511,35 @@ def run_sam3_on_pil(
         group_mask = _dilate_mask(group_mask, mask_dilation)
         if np.any(group_mask):
             group_masks.append(group_mask)
+
+    # Exclude prompt: detect regions to PROTECT, subtract from every group
+    # mask. Use case: detect="clothes" expands via outline/hull and starts
+    # eating into face/eyes; exclude="face, eyes" detects those and
+    # subtracts → mask covers clothes only, not face. No dilation/hull on
+    # the exclude side — we want a tight mask of what to KEEP.
+    exclude_text = (exclude_prompt or "").strip()
+    if exclude_text and group_masks:
+        exclude_groups = _split_prompt_groups(exclude_text)
+        exclude_pieces: list[np.ndarray] = []
+        for ex_tokens in exclude_groups:
+            for sub_prompt in ex_tokens:
+                split, _, _ = _run_prompt(sub_prompt)
+                exclude_pieces.extend(split)
+        if exclude_pieces:
+            exclude_combined = np.any(np.stack(exclude_pieces, axis=0), axis=0)
+            print(
+                f"[-] SAM3: exclude prompt {exclude_text!r} detected "
+                f"{int(exclude_combined.sum())} px to protect",
+                file=sys.stderr,
+            )
+            group_masks = [(m & ~exclude_combined) for m in group_masks]
+            group_masks = [m for m in group_masks if np.any(m)]
+        else:
+            print(
+                f"[-] SAM3: exclude prompt {exclude_text!r} matched nothing — "
+                f"main mask unchanged",
+                file=sys.stderr,
+            )
 
     if group_masks:
         combined_mask = np.any(np.stack(group_masks, axis=0), axis=0).astype(np.uint8) * 255

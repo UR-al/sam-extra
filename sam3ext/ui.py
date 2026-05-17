@@ -161,6 +161,15 @@ def sam3_ui(is_img2img: bool, buttons: WebuiButtons):
             )
 
         with gr.Row():
+            w.sam3_exclude_prompt = gr.Textbox(
+                value="",
+                label="SAM3 Exclude Prompt",
+                lines=1,
+                placeholder="Optional. Detect+subtract from main mask. e.g. 'face, eyes' protects those from a 'clothes' mask.",
+                elem_id=eid("exclude_prompt"),
+            )
+
+        with gr.Row():
             w.sam3_inpaint_prompt = gr.Textbox(
                 value="",
                 label="SAM3 Inpaint Prompt",
