@@ -45,15 +45,18 @@ class Sam3Args(BaseModel, extra=Extra.forbid):
     sam3_cfg_scale: NonNegativeFloat = 7.0
     sam3_use_sampler: bool = False
     sam3_sampler: str = "Use same sampler"
+    sam3_use_scheduler: bool = False
     sam3_scheduler: str = "Use same scheduler"
+    sam3_use_seed: bool = False
+    sam3_seed: int = -1
     sam3_use_noise_multiplier: bool = False
     sam3_noise_multiplier: confloat(ge=0.0, le=2.0) = 1.0
     sam3_restore_face: bool = False
     sam3_preview_overlay: bool = False
     sam3_save_artifacts: bool = True
     sam3_unload_after: bool = False
-    # ControlNet (Step 2): only meaningful when sam3_mode == "Inpaint" and the
-    # sd_forge_controlnet extension is loaded. Plumbed end-to-end in Step 3.
+    # ControlNet: only meaningful when sam3_mode == "Inpaint" and the
+    # sd_forge_controlnet extension is loaded.
     sam3_cn_enable: bool = False
     sam3_cn_override_external: bool = False
     sam3_cn_model: str = "None"
@@ -104,7 +107,9 @@ class Sam3Args(BaseModel, extra=Extra.forbid):
         )
         ppop("SAM3 Use Separate Steps", ["SAM3 Use Separate Steps", "SAM3 Steps"])
         ppop("SAM3 Use Separate CFG Scale", ["SAM3 Use Separate CFG Scale", "SAM3 CFG Scale"])
-        ppop("SAM3 Use Separate Sampler", ["SAM3 Use Separate Sampler", "SAM3 Sampler", "SAM3 Scheduler"])
+        ppop("SAM3 Use Separate Sampler", ["SAM3 Use Separate Sampler", "SAM3 Sampler"])
+        ppop("SAM3 Use Separate Scheduler", ["SAM3 Use Separate Scheduler", "SAM3 Scheduler"])
+        ppop("SAM3 Use Seed", ["SAM3 Use Seed", "SAM3 Seed"])
         ppop("SAM3 Use Noise Multiplier", ["SAM3 Use Noise Multiplier", "SAM3 Noise Multiplier"])
         ppop("SAM3 Restore Face")
         ppop("SAM3 Preview Overlay")
@@ -157,7 +162,10 @@ ALL_ARGS = ArgsList(
         Arg("sam3_cfg_scale", "SAM3 CFG Scale"),
         Arg("sam3_use_sampler", "SAM3 Use Separate Sampler"),
         Arg("sam3_sampler", "SAM3 Sampler"),
+        Arg("sam3_use_scheduler", "SAM3 Use Separate Scheduler"),
         Arg("sam3_scheduler", "SAM3 Scheduler"),
+        Arg("sam3_use_seed", "SAM3 Use Seed"),
+        Arg("sam3_seed", "SAM3 Seed"),
         Arg("sam3_use_noise_multiplier", "SAM3 Use Noise Multiplier"),
         Arg("sam3_noise_multiplier", "SAM3 Noise Multiplier"),
         Arg("sam3_restore_face", "SAM3 Restore Face"),

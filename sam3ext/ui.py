@@ -139,11 +139,13 @@ def state_init(w: Widgets) -> dict[str, Any]:
 
 def sam3_ui(is_img2img: bool, buttons: WebuiButtons):
     w = Widgets()
+    tab = "img2img" if is_img2img else "txt2img"
+    eid = lambda name: f"sam3_{tab}_{name}"
 
-    with gr.Accordion(SAM3_NAME, open=False):
+    with gr.Accordion(SAM3_NAME, open=False, elem_id=eid("accordion")):
         with gr.Row():
             with gr.Column(scale=3):
-                w.sam3_enable = gr.Checkbox(label="Enable SAM3", value=False)
+                w.sam3_enable = gr.Checkbox(label="Enable SAM3", value=False, elem_id=eid("enable"))
             with gr.Column(scale=5):
                 gr.Markdown("SAM3 local mask refinement")
             with gr.Column(scale=1, min_width=180):
@@ -155,6 +157,7 @@ def sam3_ui(is_img2img: bool, buttons: WebuiButtons):
                 label="SAM3 Detect Prompt",
                 lines=2,
                 placeholder="e.g. face, eyes, hair / hand   ( ',' = OR-merge into one mask, '/' = separate detailer pass )",
+                elem_id=eid("prompt"),
             )
 
         with gr.Row():
@@ -163,6 +166,7 @@ def sam3_ui(is_img2img: bool, buttons: WebuiButtons):
                 label="SAM3 Inpaint Prompt",
                 lines=2,
                 placeholder="Optional inpaint prompt. Blank uses the main prompt.",
+                elem_id=eid("inpaint_prompt"),
             )
 
         with gr.Row():
@@ -171,6 +175,7 @@ def sam3_ui(is_img2img: bool, buttons: WebuiButtons):
                 label="SAM3 Negative Prompt",
                 lines=2,
                 placeholder="Optional inpaint negative prompt. Blank uses the main negative prompt.",
+                elem_id=eid("negative_prompt"),
             )
 
         with gr.Row():
@@ -179,12 +184,14 @@ def sam3_ui(is_img2img: bool, buttons: WebuiButtons):
                 choices=["Mask only", "Inpaint"],
                 value="Inpaint",
                 type="value",
+                elem_id=eid("mode"),
             )
             w.sam3_mask_mode = gr.Dropdown(
                 label="Mask Processing",
                 choices=["Individual", "Combined"],
                 value="Individual",
                 type="value",
+                elem_id=eid("mask_mode"),
             )
             w.sam3_threshold = gr.Slider(
                 label="SAM3 Threshold",
@@ -192,6 +199,7 @@ def sam3_ui(is_img2img: bool, buttons: WebuiButtons):
                 maximum=1.0,
                 step=0.01,
                 value=0.40,
+                elem_id=eid("threshold"),
             )
             w.sam3_mask_dilation = gr.Slider(
                 label="Mask Dilation (px)",
@@ -199,15 +207,17 @@ def sam3_ui(is_img2img: bool, buttons: WebuiButtons):
                 maximum=256,
                 step=1,
                 value=0,
+                elem_id=eid("mask_dilation"),
             )
             w.sam3_mask_hull = gr.Checkbox(
                 label="Convex Hull (wrap strands)",
                 value=False,
+                elem_id=eid("mask_hull"),
             )
             checkpoint_choices = find_checkpoint_options()
             w.sam3_checkpoint = gr.Dropdown(
                 label="SAM3 Checkpoint",
-                elem_id="sam3_checkpoint",
+                elem_id=eid("checkpoint"),
                 choices=checkpoint_choices,
                 value=checkpoint_choices[0] if checkpoint_choices else "sam3.pt",
                 type="value",
@@ -219,21 +229,25 @@ def sam3_ui(is_img2img: bool, buttons: WebuiButtons):
                 choices=["auto", "cuda", "cpu"],
                 value="auto",
                 type="value",
+                elem_id=eid("device"),
             )
             w.sam3_preview_overlay = gr.Checkbox(
                 label="Replace output with overlay preview",
                 value=False,
+                elem_id=eid("preview_overlay"),
             )
             w.sam3_save_artifacts = gr.Checkbox(
                 label="Save mask/overlay artifacts",
                 value=True,
+                elem_id=eid("save_artifacts"),
             )
             w.sam3_unload_after = gr.Checkbox(
                 label="Unload SAM3 from VRAM after detection (~3.5 GB)",
                 value=False,
+                elem_id=eid("unload_after"),
             )
 
-        with gr.Accordion("Inpaint", open=False):
+        with gr.Accordion("Inpaint", open=False, elem_id=eid("inpaint_section")):
             with gr.Row():
                 w.sam3_denoising_strength = gr.Slider(
                     label="Denoising Strength",
@@ -241,6 +255,7 @@ def sam3_ui(is_img2img: bool, buttons: WebuiButtons):
                     maximum=1.0,
                     step=0.01,
                     value=0.40,
+                    elem_id=eid("denoising_strength"),
                 )
                 w.sam3_mask_blur = gr.Slider(
                     label="Mask Blur",
@@ -248,12 +263,14 @@ def sam3_ui(is_img2img: bool, buttons: WebuiButtons):
                     maximum=64,
                     step=1,
                     value=4,
+                    elem_id=eid("mask_blur"),
                 )
 
             with gr.Row():
                 w.sam3_inpaint_only_masked = gr.Checkbox(
                     label="Inpaint only masked",
                     value=True,
+                    elem_id=eid("inpaint_only_masked"),
                 )
                 w.sam3_inpaint_only_masked_padding = gr.Slider(
                     label="Inpaint padding",
@@ -261,12 +278,14 @@ def sam3_ui(is_img2img: bool, buttons: WebuiButtons):
                     maximum=256,
                     step=1,
                     value=32,
+                    elem_id=eid("inpaint_padding"),
                 )
 
             with gr.Row():
                 w.sam3_use_inpaint_width_height = gr.Checkbox(
                     label="Use separate inpaint width/height",
                     value=False,
+                    elem_id=eid("use_wh"),
                 )
                 w.sam3_inpaint_width = gr.Slider(
                     label="Inpaint Width",
@@ -274,6 +293,7 @@ def sam3_ui(is_img2img: bool, buttons: WebuiButtons):
                     maximum=2048,
                     step=8,
                     value=512,
+                    elem_id=eid("inpaint_width"),
                 )
                 w.sam3_inpaint_height = gr.Slider(
                     label="Inpaint Height",
@@ -281,12 +301,14 @@ def sam3_ui(is_img2img: bool, buttons: WebuiButtons):
                     maximum=2048,
                     step=8,
                     value=512,
+                    elem_id=eid("inpaint_height"),
                 )
 
             with gr.Row():
                 w.sam3_use_steps = gr.Checkbox(
                     label="Use separate steps",
                     value=False,
+                    elem_id=eid("use_steps"),
                 )
                 w.sam3_steps = gr.Slider(
                     label="Steps",
@@ -294,10 +316,12 @@ def sam3_ui(is_img2img: bool, buttons: WebuiButtons):
                     maximum=150,
                     step=1,
                     value=28,
+                    elem_id=eid("steps"),
                 )
                 w.sam3_use_cfg_scale = gr.Checkbox(
                     label="Use separate CFG scale",
                     value=False,
+                    elem_id=eid("use_cfg"),
                 )
                 w.sam3_cfg_scale = gr.Slider(
                     label="CFG Scale",
@@ -305,30 +329,53 @@ def sam3_ui(is_img2img: bool, buttons: WebuiButtons):
                     maximum=30.0,
                     step=0.1,
                     value=7.0,
+                    elem_id=eid("cfg_scale"),
                 )
 
             with gr.Row():
                 w.sam3_use_sampler = gr.Checkbox(
                     label="Use separate sampler",
                     value=False,
+                    elem_id=eid("use_sampler"),
                 )
                 w.sam3_sampler = gr.Dropdown(
                     label="Sampler",
                     choices=["Use same sampler", *[s.name for s in _all_samplers]],
                     value="Use same sampler",
                     type="value",
+                    elem_id=eid("sampler"),
+                )
+                w.sam3_use_scheduler = gr.Checkbox(
+                    label="Use separate scheduler",
+                    value=False,
+                    elem_id=eid("use_scheduler"),
                 )
                 w.sam3_scheduler = gr.Dropdown(
                     label="Scheduler",
                     choices=["Use same scheduler", *[s.label for s in _all_schedulers]],
                     value="Use same scheduler",
                     type="value",
+                    elem_id=eid("scheduler"),
+                )
+
+            with gr.Row():
+                w.sam3_use_seed = gr.Checkbox(
+                    label="Use specified seed (instead of parent's)",
+                    value=False,
+                    elem_id=eid("use_seed"),
+                )
+                w.sam3_seed = gr.Number(
+                    label="Seed (-1 = random)",
+                    value=-1,
+                    precision=0,
+                    elem_id=eid("seed"),
                 )
 
             with gr.Row():
                 w.sam3_use_noise_multiplier = gr.Checkbox(
                     label="Use noise multiplier",
                     value=False,
+                    elem_id=eid("use_noise_mult"),
                 )
                 w.sam3_noise_multiplier = gr.Slider(
                     label="Noise Multiplier",
@@ -336,29 +383,40 @@ def sam3_ui(is_img2img: bool, buttons: WebuiButtons):
                     maximum=2.0,
                     step=0.01,
                     value=1.0,
+                    elem_id=eid("noise_mult"),
                 )
                 w.sam3_restore_face = gr.Checkbox(
                     label="Restore face",
                     value=False,
+                    elem_id=eid("restore_face"),
                 )
 
-        with gr.Accordion("ControlNet", open=False):
+        with gr.Accordion("ControlNet", open=False, elem_id=eid("cn_section")):
             cn_models = _controlnet_model_choices()
             cn_modules = _controlnet_module_choices()
             cn_module_default = _default_cn_module(cn_modules)
+
+            gr.Markdown(
+                "**Tip**: LLLite inpaint models (`anima-lllite-inpainting-*`) take a 4-channel "
+                "RGB+mask cond and need the mask to survive preprocessing. The extension "
+                "auto-overrides the Preprocessor to `None` when it detects such a model."
+            )
 
             with gr.Row():
                 w.sam3_cn_enable = gr.Checkbox(
                     label="Enable ControlNet for SAM3 inpaint",
                     value=False,
+                    elem_id=eid("cn_enable"),
                 )
                 w.sam3_cn_override_external = gr.Checkbox(
                     label="Override external CN units (disable other slots during SAM3 pass)",
                     value=False,
+                    elem_id=eid("cn_override"),
                 )
                 w.sam3_cn_pixel_perfect = gr.Checkbox(
                     label="Pixel Perfect",
                     value=True,
+                    elem_id=eid("cn_pp"),
                 )
 
             with gr.Row():
@@ -367,12 +425,14 @@ def sam3_ui(is_img2img: bool, buttons: WebuiButtons):
                     choices=cn_modules,
                     value=cn_module_default,
                     type="value",
+                    elem_id=eid("cn_module"),
                 )
                 w.sam3_cn_model = gr.Dropdown(
                     label="Model",
                     choices=cn_models,
                     value=cn_models[0] if cn_models else "None",
                     type="value",
+                    elem_id=eid("cn_model"),
                 )
 
             with gr.Row():
@@ -382,6 +442,7 @@ def sam3_ui(is_img2img: bool, buttons: WebuiButtons):
                     maximum=2.0,
                     step=0.05,
                     value=1.0,
+                    elem_id=eid("cn_weight"),
                 )
                 w.sam3_cn_guidance_start = gr.Slider(
                     label="Guidance Start",
@@ -389,6 +450,7 @@ def sam3_ui(is_img2img: bool, buttons: WebuiButtons):
                     maximum=1.0,
                     step=0.01,
                     value=0.0,
+                    elem_id=eid("cn_gstart"),
                 )
                 w.sam3_cn_guidance_end = gr.Slider(
                     label="Guidance End",
@@ -396,6 +458,7 @@ def sam3_ui(is_img2img: bool, buttons: WebuiButtons):
                     maximum=1.0,
                     step=0.01,
                     value=1.0,
+                    elem_id=eid("cn_gend"),
                 )
 
             with gr.Row():
@@ -407,11 +470,13 @@ def sam3_ui(is_img2img: bool, buttons: WebuiButtons):
                         "ControlNet is more important",
                     ],
                     value="Balanced",
+                    elem_id=eid("cn_control_mode"),
                 )
                 w.sam3_cn_resize_mode = gr.Radio(
                     label="Resize Mode",
                     choices=["Just Resize", "Crop and Resize", "Resize and Fill"],
                     value="Crop and Resize",
+                    elem_id=eid("cn_resize_mode"),
                 )
 
             with gr.Row():
@@ -421,6 +486,7 @@ def sam3_ui(is_img2img: bool, buttons: WebuiButtons):
                     maximum=2048,
                     step=8,
                     value=512,
+                    elem_id=eid("cn_procres"),
                 )
                 w.sam3_cn_threshold_a = gr.Slider(
                     label="Threshold A (-1 = unused)",
@@ -428,6 +494,7 @@ def sam3_ui(is_img2img: bool, buttons: WebuiButtons):
                     maximum=256,
                     step=1,
                     value=-1,
+                    elem_id=eid("cn_ta"),
                 )
                 w.sam3_cn_threshold_b = gr.Slider(
                     label="Threshold B (-1 = unused)",
@@ -435,6 +502,7 @@ def sam3_ui(is_img2img: bool, buttons: WebuiButtons):
                     maximum=256,
                     step=1,
                     value=-1,
+                    elem_id=eid("cn_tb"),
                 )
 
     state = gr.State(state_init(w))

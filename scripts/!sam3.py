@@ -129,6 +129,7 @@ def make_axis_on_xyz_grid():
         xyz_grid.AxisOption("[SAM3] Inpaint Height", int, partial(set_value, field="sam3_inpaint_height")),
         xyz_grid.AxisOption("[SAM3] Sampler", str, partial(set_value, field="sam3_sampler"), choices=sampler_choices),
         xyz_grid.AxisOption("[SAM3] Scheduler", str, partial(set_value, field="sam3_scheduler"), choices=scheduler_choices),
+        xyz_grid.AxisOption("[SAM3] Seed", int, partial(set_value, field="sam3_seed")),
         xyz_grid.AxisOption("[SAM3] Noise Multiplier", float, partial(set_value, field="sam3_noise_multiplier")),
         xyz_grid.AxisOption(
             "[SAM3] Restore Face",
@@ -263,7 +264,12 @@ class Sam3MaskScript(scripts.Script):
             "sam3_cfg_scale": float(_xyz_or("sam3_cfg_scale", 7.0)),
             "sam3_use_sampler": use_sampler,
             "sam3_sampler": sam3_sampler,
+            "sam3_use_scheduler": bool(state.get("sam3_use_scheduler", False))
+            or ("sam3_scheduler" in xyz_values) or use_sampler,
             "sam3_scheduler": sam3_scheduler,
+            "sam3_use_seed": _as_bool(_xyz_or("sam3_use_seed", False), False)
+            or ("sam3_seed" in xyz_values),
+            "sam3_seed": int(_xyz_or("sam3_seed", -1)),
             "sam3_use_noise_multiplier": bool(state.get("sam3_use_noise_multiplier", False))
             or ("sam3_noise_multiplier" in xyz_values),
             "sam3_noise_multiplier": float(_xyz_or("sam3_noise_multiplier", 1.0)),
@@ -327,7 +333,7 @@ class Sam3MaskScript(scripts.Script):
             seed = None
             if hasattr(p, "all_seeds") and getattr(p, "all_seeds", None):
                 seed = p.all_seeds[0]
-            write_artifacts(result, seed)
+            write_artifacts(result, seed, label=args.get("sam3_prompt"))
 
         if args.get("sam3_unload_after"):
             unload_sam3()

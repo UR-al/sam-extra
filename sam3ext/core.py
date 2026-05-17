@@ -226,7 +226,10 @@ def unload_sam3() -> None:
         pass
 
 
-@lru_cache(maxsize=4)
+# maxsize=2: each cached SAM3 bundle is ~3.5 GB on GPU. 4 was excessive;
+# 2 lets the user A/B between sam3.pt and sam3.safetensors without holding
+# stale entries forever. ``unload_sam3()`` clears this for full VRAM reclaim.
+@lru_cache(maxsize=2)
 def _load_model_bundle(checkpoint_key: str, device: str):
     checkpoint_path = None if checkpoint_key == "__hf__" else Path(checkpoint_key)
     try:
@@ -505,24 +508,54 @@ def run_sam3_on_pil(
     )
 
 
-def write_artifacts(result: Sam3Result, seed: int | None) -> dict[str, str]:
+_FILENAME_SAFE = re.compile(r"[^A-Za-z0-9._-]+")
+
+
+def _sanitize_for_filename(text: str, max_len: int = 32) -> str:
+    """Reduce a free-form prompt to a filesystem-safe slug for artifact
+    filenames. Returns ``"mask"`` when empty so we never produce ``__``."""
+    if not text:
+        return "mask"
+    cleaned = _FILENAME_SAFE.sub("_", text.strip())
+    cleaned = cleaned.strip("_") or "mask"
+    return cleaned[:max_len]
+
+
+def write_artifacts(result: Sam3Result, seed: int | None, label: str | None = None) -> dict[str, str]:
+    """Persist the SAM3 mask/overlay/meta to disk.
+
+    ``label`` (typically the detect prompt) becomes part of the filename so
+    runs with different masks don't all read as ``..._face_...``. Falls back
+    to ``"mask"`` when no label is given.
+    """
     output_dir = DEFAULT_OUTPUT_DIR
     output_dir.mkdir(parents=True, exist_ok=True)
+    slug = _sanitize_for_filename(label or "")
     stem = f"sam3_{seed}" if seed is not None else "sam3"
-    index = 1
-    while True:
+    # Safeguard: cap at 10000 to avoid runaway loops if the output dir gets
+    # thousands of artifacts and the while True can't find a free slot fast.
+    suffix = ""
+    mask_path = overlay_path = meta_path = None
+    for index in range(1, 10001):
         suffix = "" if index == 1 else f"_{index}"
-        mask_path = output_dir / f"{stem}_face_mask{suffix}.png"
-        overlay_path = output_dir / f"{stem}_face_overlay{suffix}.png"
-        meta_path = output_dir / f"{stem}_face_prompt{suffix}.json"
+        mask_path = output_dir / f"{stem}_{slug}_mask{suffix}.png"
+        overlay_path = output_dir / f"{stem}_{slug}_overlay{suffix}.png"
+        meta_path = output_dir / f"{stem}_{slug}_prompt{suffix}.json"
         if not mask_path.exists() and not overlay_path.exists() and not meta_path.exists():
             break
-        index += 1
+    else:
+        # Hit the cap — fall back to a timestamp suffix so saves still succeed.
+        import time as _time
+
+        suffix = f"_{int(_time.time() * 1000)}"
+        mask_path = output_dir / f"{stem}_{slug}_mask{suffix}.png"
+        overlay_path = output_dir / f"{stem}_{slug}_overlay{suffix}.png"
+        meta_path = output_dir / f"{stem}_{slug}_prompt{suffix}.json"
 
     result.mask.save(mask_path)
     result.overlay.save(overlay_path)
     for idx, mask in enumerate(result.masks, start=1):
-        single_mask_path = output_dir / f"{stem}_face_mask_{idx:02d}{suffix}.png"
+        single_mask_path = output_dir / f"{stem}_{slug}_mask_{idx:02d}{suffix}.png"
         mask.save(single_mask_path)
     meta_path.write_text(
         json.dumps(
@@ -530,6 +563,7 @@ def write_artifacts(result: Sam3Result, seed: int | None) -> dict[str, str]:
                 "seed": seed,
                 "device": result.device,
                 "checkpoint": result.checkpoint,
+                "label": label,
                 "boxes": result.boxes,
                 "scores": result.scores,
                 "mask_count": len(result.masks),

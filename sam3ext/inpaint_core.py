@@ -98,13 +98,33 @@ def get_sampler(p, args: dict[str, Any]) -> str | None:
 
 
 def get_scheduler(p, args: dict[str, Any]) -> dict:
+    """Sampler and scheduler used to be coupled to a single ``sam3_use_sampler``
+    toggle — v0.6.0 splits them. ``sam3_use_scheduler=True`` (or the legacy
+    ``sam3_use_sampler=True``) opts into the args-supplied scheduler;
+    otherwise inherit the parent ``p.scheduler``."""
     if not hasattr(p, "scheduler"):
         return {}
-    if args.get("sam3_use_sampler"):
+    opted_in = args.get("sam3_use_scheduler") or args.get("sam3_use_sampler")
+    if opted_in:
         scheduler = args.get("sam3_scheduler", "Use same scheduler")
-        if scheduler != "Use same scheduler":
+        if scheduler not in (None, "", "Use same scheduler"):
             return {"scheduler": scheduler}
     return {"scheduler": getattr(p, "scheduler")}
+
+
+def get_seed(p, args: dict[str, Any]) -> int:
+    """Return the seed to pass to the i2i pass.
+
+    - In-flight: opt-in via ``sam3_use_seed``; otherwise inherit ``p.seed``.
+    - Refine path passes ``sam3_use_seed=True`` unconditionally so the
+      Refine panel's seed (default -1 = random) always wins.
+    """
+    if args.get("sam3_use_seed"):
+        try:
+            return int(args.get("sam3_seed", -1))
+        except (TypeError, ValueError):
+            return -1
+    return getattr(p, "seed", -1) if p is not None else -1
 
 
 def get_noise_multiplier(p, args: dict[str, Any]) -> float:
@@ -121,6 +141,11 @@ def build_i2i(p, image: Image.Image, args: dict[str, Any]) -> StableDiffusionPro
     sampler_name = get_sampler(p, args)
     noise_multiplier = get_noise_multiplier(p, args)
     version_args = get_scheduler(p, args)
+    seed = get_seed(p, args)
+    # inpainting_fill: 2 = latent noise. Same rationale as build_standalone_i2i
+    # (drastic prompt-driven changes need a clean noise start; "1 = original"
+    # leaves color bias that fights the new prompt even at denoise=1).
+    inpainting_fill = int(args.get("sam3_inpainting_fill", 2))
 
     p2 = StableDiffusionProcessingImg2Img(
         init_images=[image],
@@ -128,7 +153,7 @@ def build_i2i(p, image: Image.Image, args: dict[str, Any]) -> StableDiffusionPro
         denoising_strength=float(args["sam3_denoising_strength"]),
         mask=None,
         mask_blur=int(args["sam3_mask_blur"]),
-        inpainting_fill=1,
+        inpainting_fill=inpainting_fill,
         inpaint_full_res=bool(args["sam3_inpaint_only_masked"]),
         inpaint_full_res_padding=int(args["sam3_inpaint_only_masked_padding"]),
         inpainting_mask_invert=0,
@@ -139,7 +164,7 @@ def build_i2i(p, image: Image.Image, args: dict[str, Any]) -> StableDiffusionPro
         prompt="",
         negative_prompt="",
         styles=getattr(p, "styles", []),
-        seed=getattr(p, "seed", -1),
+        seed=seed,
         subseed=getattr(p, "subseed", -1),
         subseed_strength=getattr(p, "subseed_strength", 0),
         seed_resize_from_h=getattr(p, "seed_resize_from_h", 0),
@@ -158,8 +183,11 @@ def build_i2i(p, image: Image.Image, args: dict[str, Any]) -> StableDiffusionPro
         do_not_save_grid=True,
         **version_args,
     )
-    p2.cached_c = [None, None]
-    p2.cached_uc = [None, None]
+    # Match StableDiffusionProcessing's default cached_c / cached_uc shape
+    # (length 3) — earlier length-2 risked IndexError if webui or a script
+    # ever reads index 2.
+    p2.cached_c = [None, None, None]
+    p2.cached_uc = [None, None, None]
     p2.scripts, p2.script_args = script_filter(p)
     p2._sam3_inner = True
     p2.all_hr_prompts = [""]
@@ -304,11 +332,15 @@ def build_standalone_i2i(
     steps = int(args.get("sam3_steps", 28))
     cfg_scale = float(args.get("sam3_cfg_scale", 7.0))
     sampler_name = args.get("sam3_sampler", "Use same sampler")
-    if sampler_name == "Use same sampler":
+    if sampler_name in (None, "", "Use same sampler"):
         sampler_name = "Euler a"
     noise_multiplier = float(args.get("sam3_noise_multiplier", 1.0))
     scheduler = args.get("sam3_scheduler", "Use same scheduler")
-    version_args = {} if scheduler == "Use same scheduler" else {"scheduler": scheduler}
+    version_args = {} if scheduler in (None, "", "Use same scheduler") else {"scheduler": scheduler}
+    try:
+        seed = int(args.get("sam3_seed", -1))
+    except (TypeError, ValueError):
+        seed = -1
 
     # ``inpainting_fill`` semantics (matches webui's img2img inpaint dropdown):
     #   0 = fill          (gray fill in masked area)
@@ -338,7 +370,7 @@ def build_standalone_i2i(
         prompt="",
         negative_prompt="",
         styles=[],
-        seed=-1,
+        seed=seed,
         subseed=-1,
         subseed_strength=0,
         seed_resize_from_h=0,
@@ -357,8 +389,8 @@ def build_standalone_i2i(
         do_not_save_grid=True,
         **version_args,
     )
-    p2.cached_c = [None, None]
-    p2.cached_uc = [None, None]
+    p2.cached_c = [None, None, None]
+    p2.cached_uc = [None, None, None]
     p2.scripts = scripts_runner
     p2.script_args = script_args
     p2._sam3_inner = True
@@ -387,14 +419,19 @@ def _find_sampler_script(runner):
 def override_sampler_script_slot(p2, args: dict[str, Any]) -> None:
     """ScriptSampler.setup runs early in process_images and does
     ``p.steps = steps; p.sampler_name = sampler_name; p.scheduler = scheduler``
-    using whatever values sit in its 3-slot script_args window. In a real
-    Generate click those come from the user's t2i UI; in our standalone
-    refine they come from the component defaults (typically 20 / first
-    sampler / "Automatic"), which then clobber the Refine panel's chosen
-    values.
+    using whatever values sit in its 3-slot script_args window. Without an
+    override, those values come from inherited t2i state (in-flight) or
+    component defaults (standalone refine), which silently clobber what we
+    set via the constructor.
 
-    Find the script, identify its slot, and patch the 3 entries to match
-    what the Refine user actually picked.
+    For EACH of (steps, sampler, scheduler), we patch only when the
+    corresponding ``sam3_use_*`` flag in ``args`` is True. This way:
+
+    - In-flight: the user's per-slot override toggles
+      (``sam3_use_steps`` / ``sam3_use_sampler`` / ``sam3_use_scheduler``)
+      decide what overrides the t2i defaults.
+    - Standalone refine: ``run_sam3_refine`` sets all three flags True so
+      the Refine panel's chosen values always win.
     """
     sampler_script = _find_sampler_script(getattr(p2, "scripts", None))
     if sampler_script is None:
@@ -404,25 +441,40 @@ def override_sampler_script_slot(p2, args: dict[str, Any]) -> None:
     if af is None or at is None or at - af < 3:
         return
 
-    steps = int(args.get("sam3_steps", 28))
-    sampler_name = str(args.get("sam3_sampler") or "Euler a")
-    if sampler_name == "Use same sampler":
-        sampler_name = "Euler a"
-    scheduler = str(args.get("sam3_scheduler") or "Automatic")
-    if scheduler == "Use same scheduler":
-        scheduler = "Automatic"
+    use_steps = bool(args.get("sam3_use_steps"))
+    use_sampler = bool(args.get("sam3_use_sampler"))
+    # Back-compat: pre-0.6 the sampler toggle did both. Honor either flag.
+    use_scheduler = bool(args.get("sam3_use_scheduler") or args.get("sam3_use_sampler"))
+
+    if not (use_steps or use_sampler or use_scheduler):
+        return
 
     script_args = p2.script_args
     args_type = type(script_args)
     patched = list(script_args)
     before = (patched[af + 0], patched[af + 1], patched[af + 2])
-    patched[af + 0] = steps
-    patched[af + 1] = sampler_name
-    patched[af + 2] = scheduler
+
+    if use_steps:
+        patched[af + 0] = int(args.get("sam3_steps", before[0]))
+    if use_sampler:
+        sampler_name = str(args.get("sam3_sampler") or "Euler a")
+        if sampler_name in ("", "Use same sampler"):
+            sampler_name = "Euler a"
+        patched[af + 1] = sampler_name
+    if use_scheduler:
+        scheduler = str(args.get("sam3_scheduler") or "Automatic")
+        if scheduler in ("", "Use same scheduler"):
+            scheduler = "Automatic"
+        patched[af + 2] = scheduler
+
+    after = (patched[af + 0], patched[af + 1], patched[af + 2])
+    if before == after:
+        return
     p2.script_args = args_type(patched) if not isinstance(script_args, list) else patched
     print(
-        f"[-] SAM3 Refine: patched ScriptSampler slot (args[{af}:{at}]) — "
-        f"before {before} → after {(steps, sampler_name, scheduler)}",
+        f"[-] SAM3: patched ScriptSampler slot (args[{af}:{at}]) — "
+        f"before {before} → after {after} "
+        f"(use_steps={use_steps}, use_sampler={use_sampler}, use_scheduler={use_scheduler})",
         file=sys.stderr,
     )
 
@@ -491,16 +543,25 @@ def run_sam3_refine(
 
     Returns ``[]`` when SAM3 finds nothing or every pass is interrupted.
     """
-    from .core import run_sam3_on_pil
+    from .core import run_sam3_on_pil, unload_sam3
+
+    # Standalone refine always overrides the t2i sampler/steps/scheduler/seed
+    # — there's no parent process to inherit from. Set the use_* flags so
+    # override_sampler_script_slot patches all three ScriptSampler slots.
+    args = dict(args)
+    args.setdefault("sam3_use_steps", True)
+    args.setdefault("sam3_use_sampler", True)
+    args.setdefault("sam3_use_scheduler", True)
+    args.setdefault("sam3_use_seed", True)
 
     scripts_runner, script_args_template = build_standalone_scripts_runner()
     if scripts_runner is None:
         print("[-] SAM3 Refine: t2i scripts runner not initialized; aborting.", file=sys.stderr)
         return []
 
-    from modules import shared as _shared
-    allow_huggingface = not getattr(_shared.cmd_opts, "sam3_no_huggingface", False)
+    allow_huggingface = not getattr(shared.cmd_opts, "sam3_no_huggingface", False)
 
+    shared.state.textinfo = "SAM3 Refine: running detection..."
     sam3_result = run_sam3_on_pil(
         image=image,
         prompt=args["sam3_prompt"],
@@ -513,8 +574,6 @@ def run_sam3_refine(
     )
 
     if args.get("sam3_unload_after"):
-        from .core import unload_sam3
-
         unload_sam3()
         print("[-] SAM3 Refine: model unloaded from VRAM (re-loads on next detection).", file=sys.stderr)
 
@@ -527,10 +586,10 @@ def run_sam3_refine(
     # Diagnostic: per-mask coverage so the user can see if SAM3 caught a tiny
     # sliver vs the whole garment, plus the key inpaint knobs in effect.
     try:
-        import numpy as _np
+        import numpy as np
 
         for i, m in enumerate(masks, start=1):
-            arr = _np.asarray(m)
+            arr = np.asarray(m)
             nonzero = int((arr > 127).sum()) if arr.size else 0
             total = int(arr.size) if arr.size else 1
             pct = 100.0 * nonzero / max(total, 1)
@@ -556,12 +615,13 @@ def run_sam3_refine(
     negative_prompt = copy_prompt(args.get("sam3_negative_prompt"), "")
 
     results: list[tuple[Image.Image, str]] = []
-    _shared.state.job_count += len(masks)
+    shared.state.job_count += len(masks)
 
     with pause_total_tqdm():
         for index, mask in enumerate(masks, start=1):
-            if _shared.state.interrupted or _shared.state.skipped:
+            if shared.state.interrupted or shared.state.skipped:
                 break
+            shared.state.textinfo = f"SAM3 Refine: pass {index}/{len(masks)} — preparing"
             p2 = build_standalone_i2i(
                 image,
                 args,
@@ -576,6 +636,7 @@ def run_sam3_refine(
             p2.negative_prompt = negative_prompt
             inject_controlnet_unit(p2, args)
             override_sampler_script_slot(p2, args)
+            shared.state.textinfo = f"SAM3 Refine: pass {index}/{len(masks)} — sampling"
             print(
                 f"[-] SAM3 Refine pass {index}: p2 BEFORE process_images — "
                 f"sampler_name={p2.sampler_name!r}, scheduler={p2.scheduler!r}, "
@@ -588,9 +649,7 @@ def run_sam3_refine(
             )
             processed = None
             try:
-                from modules.processing import process_images as _process_images
-
-                processed = _process_images(p2)
+                processed = process_images(p2)
             except Exception:
                 error = traceback.format_exc()
                 print(
@@ -643,9 +702,9 @@ def run_sam3_refine(
 
 
 def np_any(mask) -> bool:
-    import numpy as _np
+    import numpy as np
 
-    return bool(_np.any(_np.asarray(mask)))
+    return bool(np.any(np.asarray(mask)))
 
 
 def run_inpaint_passes(
@@ -676,6 +735,12 @@ def run_inpaint_passes(
             p2.prompt = prompt
             p2.negative_prompt = negative_prompt
             inject_controlnet_unit(p2, cn_args)
+            # P0 fix: ScriptSampler.setup would otherwise overwrite our
+            # sampler/steps/scheduler back to the inherited t2i values,
+            # silently negating the SAM3 panel's per-slot "Use separate ..."
+            # toggles. The helper checks those flags itself and patches only
+            # the opted-in slots.
+            override_sampler_script_slot(p2, args)
             try:
                 processed = process_images(p2)
             except Exception:

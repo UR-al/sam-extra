@@ -42,6 +42,7 @@ class RefinePanel:
     mask_hull: gr.Checkbox
     mask_blur: gr.Slider
     unload_after: gr.Checkbox
+    seed: gr.Number
     denoising_strength: gr.Slider
     inpaint_only_masked: gr.Checkbox
     inpaint_only_masked_padding: gr.Slider
@@ -81,6 +82,7 @@ class RefinePanel:
             self.mask_hull,
             self.mask_blur,
             self.unload_after,
+            self.seed,
             self.denoising_strength,
             self.inpaint_only_masked,
             self.inpaint_only_masked_padding,
@@ -118,6 +120,7 @@ REFINE_ARG_KEYS = (
     "mask_hull",
     "mask_blur",
     "unload_after",
+    "seed",
     "denoising_strength",
     "inpaint_only_masked",
     "inpaint_only_masked_padding",
@@ -231,6 +234,12 @@ def build_refine_panel(
                 label="Unload SAM3 from VRAM after detection (~3.5 GB — recommended for ≤12 GB GPUs)",
                 value=False,
                 elem_id="sam3_refine_unload_after",
+            )
+            seed = gr.Number(
+                label="Seed (-1 = random)",
+                value=-1,
+                precision=0,
+                elem_id="sam3_refine_seed",
             )
 
         with gr.Row():
@@ -362,6 +371,7 @@ def build_refine_panel(
         mask_hull=mask_hull,
         mask_blur=mask_blur,
         unload_after=unload_after,
+        seed=seed,
         denoising_strength=denoising_strength,
         inpaint_only_masked=inpaint_only_masked,
         inpaint_only_masked_padding=inpaint_only_masked_padding,
@@ -574,6 +584,7 @@ def map_widget_values_to_sam3_args(values: tuple) -> dict[str, Any]:
         "sam3_mask_dilation": _as_int(keyed.get("mask_dilation"), 4),
         "sam3_mask_hull": bool(keyed.get("mask_hull", False)),
         "sam3_unload_after": bool(keyed.get("unload_after", False)),
+        "sam3_seed": _as_int(keyed.get("seed"), -1),
         "sam3_checkpoint": str(keyed.get("checkpoint") or "sam3.pt"),
         "sam3_device": "auto",
         "sam3_mask_mode": str(keyed.get("mask_mode") or "Combined"),
@@ -623,7 +634,10 @@ def _plaintext_to_html(text: str) -> str:
     return f"<p>{escaped.replace(chr(10), '<br>')}</p>"
 
 
-_NO_INFO_UPDATE = object()
+def _refine_error_return(gallery_value, message: str):
+    """4-tuple return shape used by handle_refine_click. ``gr.update()`` for
+    html_info / generation_info leaves them untouched."""
+    return gallery_value, message, gr.update(), gr.update()
 
 
 def handle_refine_click(gallery_value, selected_index, *all_values):
@@ -645,11 +659,9 @@ def handle_refine_click(gallery_value, selected_index, *all_values):
     """
     expected_widget_count = len(REFINE_ARG_KEYS)
     if len(all_values) < expected_widget_count:
-        return (
+        return _refine_error_return(
             gallery_value,
             "<span style='color:#c33'>SAM3 Refine: missing widget values.</span>",
-            gr.update(),
-            gr.update(),
         )
 
     widget_values = all_values[:expected_widget_count]
@@ -710,20 +722,16 @@ def handle_refine_click(gallery_value, selected_index, *all_values):
         )
 
     if not args["sam3_prompt"]:
-        return (
+        return _refine_error_return(
             gallery_value,
             "<span style='color:#c33'>SAM3 Refine: enter a Target (detect prompt) first.</span>",
-            gr.update(),
-            gr.update(),
         )
 
     gallery_list = list(gallery_value or [])
     if not gallery_list:
-        return (
+        return _refine_error_return(
             gallery_value,
             "<span style='color:#c33'>SAM3 Refine: gallery is empty.</span>",
-            gr.update(),
-            gr.update(),
         )
 
     # Hidden Number arrives as float; JS shim defaults to -1 when nothing is
@@ -737,26 +745,22 @@ def handle_refine_click(gallery_value, selected_index, *all_values):
 
     image = _coerce_gallery_item_to_pil(gallery_list[idx])
     if image is None:
-        return (
+        return _refine_error_return(
             gallery_value,
             f"<span style='color:#c33'>SAM3 Refine: could not load selected image (index {idx}).</span>",
-            gr.update(),
-            gr.update(),
         )
 
-    from modules import shared as _shared
+    from modules import shared
 
-    sd_model = getattr(_shared, "sd_model", None)
+    sd_model = getattr(shared, "sd_model", None)
     if sd_model is None:
-        return (
+        return _refine_error_return(
             gallery_value,
             "<span style='color:#c33'>SAM3 Refine: no SD model loaded.</span>",
-            gr.update(),
-            gr.update(),
         )
 
-    outpath_samples = getattr(_shared.opts, "outdir_txt2img_samples", "outputs/txt2img-images")
-    outpath_grids = getattr(_shared.opts, "outdir_txt2img_grids", "outputs/txt2img-grids")
+    outpath_samples = getattr(shared.opts, "outdir_txt2img_samples", "outputs/txt2img-images")
+    outpath_grids = getattr(shared.opts, "outdir_txt2img_grids", "outputs/txt2img-grids")
 
     from .inpaint_core import run_sam3_refine
 
@@ -771,19 +775,15 @@ def handle_refine_click(gallery_value, selected_index, *all_values):
     except Exception:
         error = traceback.format_exc()
         print(f"[-] SAM3 Refine: handler failed:\n{error}", file=sys.stderr)
-        return (
+        return _refine_error_return(
             gallery_value,
-            f"<pre style='color:#c33'>SAM3 Refine failed — see console.</pre>",
-            gr.update(),
-            gr.update(),
+            "<pre style='color:#c33'>SAM3 Refine failed — see console.</pre>",
         )
 
     if not new_pairs:
-        return (
+        return _refine_error_return(
             gallery_value,
             "<span style='color:#c80'>SAM3 Refine: no result (empty mask or interrupted).</span>",
-            gr.update(),
-            gr.update(),
         )
 
     new_images = [img for img, _ in new_pairs]
