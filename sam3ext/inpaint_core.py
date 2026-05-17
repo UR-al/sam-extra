@@ -26,12 +26,21 @@ SCRIPT_EXCLUDE_FILENAMES = frozenset({"!sam3", "sam3_mask"})
 
 @contextmanager
 def pause_total_tqdm():
-    """Hide the outer total-tqdm bar while inner i2i passes run."""
+    """Hide the outer total-tqdm bar while inner i2i passes run.
+
+    Earlier version had an ``except Exception: yield`` block that also
+    swallowed exceptions raised THROUGH the yield (from inside the user's
+    ``with`` body), then yielded a second time — producing
+    ``RuntimeError: generator didn't stop after throw()`` whenever an inner
+    pass raised. Guard only the import here; exceptions from inside the
+    yield propagate normally.
+    """
     try:
         from modules.shared import opts
-        with patch.dict(opts.data, {"multiple_tqdm": False}, clear=False):
-            yield
     except Exception:
+        yield
+        return
+    with patch.dict(opts.data, {"multiple_tqdm": False}, clear=False):
         yield
 
 
@@ -577,17 +586,25 @@ def run_sam3_refine(
                 f"image_mask_set={p2.image_mask is not None}",
                 file=sys.stderr,
             )
+            processed = None
             try:
                 from modules.processing import process_images as _process_images
 
                 processed = _process_images(p2)
             except Exception:
                 error = traceback.format_exc()
-                print(f"[-] SAM3 Refine: pass {index} failed:\n{error}", file=sys.stderr)
-                raise
+                print(
+                    f"[-] SAM3 Refine: pass {index} failed inside process_images "
+                    f"(this is a webui-side error; common causes: OOM during VAE "
+                    f"decode, an alwayson script adding images to x_samples_ddim, "
+                    f"or batch/seed list mismatch). Skipping this mask.\n{error}",
+                    file=sys.stderr,
+                )
             finally:
                 p2.close()
 
+            if processed is None:
+                continue
             if not processed.images:
                 print(f"[-] SAM3 Refine: pass {index} returned no images.", file=sys.stderr)
                 continue
