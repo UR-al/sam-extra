@@ -24,6 +24,31 @@ from modules.processing import StableDiffusionProcessingImg2Img, process_images
 SCRIPT_EXCLUDE_FILENAMES = frozenset({"!sam3", "sam3_mask"})
 
 
+# Maps the user-facing inpainting_fill label (matches webui's img2img
+# "Masked content" dropdown) to the int value StableDiffusionProcessingImg2Img
+# accepts. Accept the int directly too for backward compat with code paths
+# that already pass an int.
+_INPAINTING_FILL_MAP = {
+    "fill": 0,
+    "original": 1,
+    "latent noise": 2,
+    "latent nothing": 3,
+}
+
+
+def _resolve_inpainting_fill(raw, default: int = 2) -> int:
+    if raw is None:
+        return default
+    if isinstance(raw, bool):  # bool is subclass of int, exclude explicitly
+        return default
+    if isinstance(raw, int):
+        return raw if 0 <= raw <= 3 else default
+    try:
+        return _INPAINTING_FILL_MAP[str(raw).strip().lower()]
+    except KeyError:
+        return default
+
+
 @contextmanager
 def pause_total_tqdm():
     """Hide the outer total-tqdm bar while inner i2i passes run.
@@ -145,7 +170,7 @@ def build_i2i(p, image: Image.Image, args: dict[str, Any]) -> StableDiffusionPro
     # inpainting_fill: 2 = latent noise. Same rationale as build_standalone_i2i
     # (drastic prompt-driven changes need a clean noise start; "1 = original"
     # leaves color bias that fights the new prompt even at denoise=1).
-    inpainting_fill = int(args.get("sam3_inpainting_fill", 2))
+    inpainting_fill = _resolve_inpainting_fill(args.get("sam3_inpainting_fill"))
 
     p2 = StableDiffusionProcessingImg2Img(
         init_images=[image],
@@ -351,7 +376,7 @@ def build_standalone_i2i(
     # separation from the original at sampling start. ``1`` (the previous
     # default) was leaving original-color bias even at denoise=1 — visible
     # as a flat-color paint over the unchanged garment.
-    inpainting_fill = int(args.get("sam3_inpainting_fill", 2))
+    inpainting_fill = _resolve_inpainting_fill(args.get("sam3_inpainting_fill"))
 
     p2 = StableDiffusionProcessingImg2Img(
         init_images=[image],
@@ -600,10 +625,12 @@ def run_sam3_refine(
             )
     except Exception:
         pass
+    fill_resolved = _resolve_inpainting_fill(args.get("sam3_inpainting_fill"))
+    fill_label = {0: "fill", 1: "original", 2: "latent noise", 3: "latent nothing"}.get(fill_resolved, "?")
     print(
         f"[-] SAM3 Refine: inpaint settings — denoise={args.get('sam3_denoising_strength')}, "
         f"mask_blur={args.get('sam3_mask_blur')}, only_masked={args.get('sam3_inpaint_only_masked')}, "
-        f"fill={args.get('sam3_inpainting_fill', 2)} (0=fill,1=original,2=latent_noise,3=zeros), "
+        f"fill={fill_resolved} ({fill_label}), "
         f"steps={args.get('sam3_steps')}, cfg={args.get('sam3_cfg_scale')}, "
         f"sampler={args.get('sam3_sampler')!r}, scheduler={args.get('sam3_scheduler')!r}, "
         f"cn_enable={args.get('sam3_cn_enable')}, cn_model={args.get('sam3_cn_model')!r}, "

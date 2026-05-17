@@ -226,10 +226,11 @@ def unload_sam3() -> None:
         pass
 
 
-# maxsize=2: each cached SAM3 bundle is ~3.5 GB on GPU. 4 was excessive;
-# 2 lets the user A/B between sam3.pt and sam3.safetensors without holding
-# stale entries forever. ``unload_sam3()`` clears this for full VRAM reclaim.
-@lru_cache(maxsize=2)
+# maxsize=1: each cached SAM3 bundle is ~3.5 GB on GPU. 16 GB GPUs running
+# Anima/Qwen + LLLite already sit at the OOM edge; keeping more than one
+# bundle pinned just to avoid an occasional re-load isn't worth it.
+# ``unload_sam3()`` clears this for full VRAM reclaim.
+@lru_cache(maxsize=1)
 def _load_model_bundle(checkpoint_key: str, device: str):
     checkpoint_path = None if checkpoint_key == "__hf__" else Path(checkpoint_key)
     try:

@@ -242,8 +242,8 @@ def sam3_ui(is_img2img: bool, buttons: WebuiButtons):
                 elem_id=eid("save_artifacts"),
             )
             w.sam3_unload_after = gr.Checkbox(
-                label="Unload SAM3 from VRAM after detection (~3.5 GB)",
-                value=False,
+                label="Unload SAM3 from VRAM after detection (~3.5 GB) — recommended for ≤16 GB GPUs",
+                value=True,
                 elem_id=eid("unload_after"),
             )
 
@@ -267,6 +267,13 @@ def sam3_ui(is_img2img: bool, buttons: WebuiButtons):
                 )
 
             with gr.Row():
+                w.sam3_inpainting_fill = gr.Dropdown(
+                    label="Masked content (init for masked area)",
+                    choices=["fill", "original", "latent noise", "latent nothing"],
+                    value="latent noise",
+                    type="value",
+                    elem_id=eid("inpainting_fill"),
+                )
                 w.sam3_inpaint_only_masked = gr.Checkbox(
                     label="Inpaint only masked",
                     value=True,

@@ -44,6 +44,7 @@ class RefinePanel:
     unload_after: gr.Checkbox
     seed: gr.Number
     denoising_strength: gr.Slider
+    inpainting_fill: gr.Dropdown
     inpaint_only_masked: gr.Checkbox
     inpaint_only_masked_padding: gr.Slider
     steps: gr.Slider
@@ -84,6 +85,7 @@ class RefinePanel:
             self.unload_after,
             self.seed,
             self.denoising_strength,
+            self.inpainting_fill,
             self.inpaint_only_masked,
             self.inpaint_only_masked_padding,
             self.steps,
@@ -122,6 +124,7 @@ REFINE_ARG_KEYS = (
     "unload_after",
     "seed",
     "denoising_strength",
+    "inpainting_fill",
     "inpaint_only_masked",
     "inpaint_only_masked_padding",
     "steps",
@@ -246,6 +249,13 @@ def build_refine_panel(
             denoising_strength = gr.Slider(
                 label="Denoising Strength", minimum=0.0, maximum=1.0, step=0.01, value=0.75,
                 elem_id="sam3_refine_denoising",
+            )
+            inpainting_fill = gr.Dropdown(
+                label="Masked content",
+                choices=["fill", "original", "latent noise", "latent nothing"],
+                value="latent noise",
+                type="value",
+                elem_id="sam3_refine_inpainting_fill",
             )
             inpaint_only_masked = gr.Checkbox(label="Inpaint only masked", value=False, elem_id="sam3_refine_inpaint_only_masked")
             inpaint_only_masked_padding = gr.Slider(
@@ -373,6 +383,7 @@ def build_refine_panel(
         unload_after=unload_after,
         seed=seed,
         denoising_strength=denoising_strength,
+        inpainting_fill=inpainting_fill,
         inpaint_only_masked=inpaint_only_masked,
         inpaint_only_masked_padding=inpaint_only_masked_padding,
         steps=steps,
@@ -591,6 +602,7 @@ def map_widget_values_to_sam3_args(values: tuple) -> dict[str, Any]:
         # Inpaint
         "sam3_mask_blur": _as_int(keyed.get("mask_blur"), 4),
         "sam3_denoising_strength": _as_float(keyed.get("denoising_strength"), 0.75),
+        "sam3_inpainting_fill": str(keyed.get("inpainting_fill") or "latent noise"),
         "sam3_inpaint_only_masked": bool(keyed.get("inpaint_only_masked", False)),
         "sam3_inpaint_only_masked_padding": _as_int(keyed.get("inpaint_only_masked_padding"), 32),
         "sam3_use_inpaint_width_height": False,

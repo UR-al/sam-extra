@@ -34,6 +34,12 @@ class Sam3Args(BaseModel, extra=Extra.forbid):
     sam3_device: str = "auto"
     sam3_mask_blur: NonNegativeInt = 4
     sam3_denoising_strength: confloat(ge=0.0, le=1.0) = 0.4
+    sam3_inpainting_fill: Literal[
+        "fill",
+        "original",
+        "latent noise",
+        "latent nothing",
+    ] = "latent noise"
     sam3_inpaint_only_masked: bool = True
     sam3_inpaint_only_masked_padding: NonNegativeInt = 32
     sam3_use_inpaint_width_height: bool = False
@@ -54,7 +60,10 @@ class Sam3Args(BaseModel, extra=Extra.forbid):
     sam3_restore_face: bool = False
     sam3_preview_overlay: bool = False
     sam3_save_artifacts: bool = True
-    sam3_unload_after: bool = False
+    # Default ON since v0.6.1: detection bundle holds ~3.5 GB. For 16 GB GPUs
+    # running Anima/Qwen + LLLite, keeping SAM3 resident through the inpaint
+    # pass routinely triggers OOM. Users with plenty of VRAM can uncheck.
+    sam3_unload_after: bool = True
     # ControlNet: only meaningful when sam3_mode == "Inpaint" and the
     # sd_forge_controlnet extension is loaded.
     sam3_cn_enable: bool = False
@@ -100,6 +109,7 @@ class Sam3Args(BaseModel, extra=Extra.forbid):
         ppop("SAM3 Mask Hull")
         ppop("SAM3 Mask Blur", cond=4)
         ppop("SAM3 Denoising Strength", cond=0.4)
+        ppop("SAM3 Inpainting Fill", cond="latent noise")
         ppop("SAM3 Inpaint Only Masked", ["SAM3 Inpaint Only Masked", "SAM3 Inpaint Padding"], cond=True)
         ppop(
             "SAM3 Use Inpaint Width Height",
@@ -114,7 +124,7 @@ class Sam3Args(BaseModel, extra=Extra.forbid):
         ppop("SAM3 Restore Face")
         ppop("SAM3 Preview Overlay")
         ppop("SAM3 Save Artifacts", cond=True)
-        ppop("SAM3 Unload After")
+        ppop("SAM3 Unload After", cond=True)
         # ControlNet block: if disabled, drop the whole subgroup from infotext.
         ppop(
             "SAM3 CN Enable",
@@ -151,6 +161,7 @@ ALL_ARGS = ArgsList(
         Arg("sam3_device", "SAM3 Device"),
         Arg("sam3_mask_blur", "SAM3 Mask Blur"),
         Arg("sam3_denoising_strength", "SAM3 Denoising Strength"),
+        Arg("sam3_inpainting_fill", "SAM3 Inpainting Fill"),
         Arg("sam3_inpaint_only_masked", "SAM3 Inpaint Only Masked"),
         Arg("sam3_inpaint_only_masked_padding", "SAM3 Inpaint Padding"),
         Arg("sam3_use_inpaint_width_height", "SAM3 Use Inpaint Width Height"),

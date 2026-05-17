@@ -116,6 +116,12 @@ def make_axis_on_xyz_grid():
         ),
         xyz_grid.AxisOption("[SAM3] Mask Blur", int, partial(set_value, field="sam3_mask_blur")),
         xyz_grid.AxisOption("[SAM3] Denoising Strength", float, partial(set_value, field="sam3_denoising_strength")),
+        xyz_grid.AxisOption(
+            "[SAM3] Inpainting Fill",
+            str,
+            partial(set_value, field="sam3_inpainting_fill"),
+            choices=lambda: ["fill", "original", "latent noise", "latent nothing"],
+        ),
         xyz_grid.AxisOption("[SAM3] CFG Scale", float, partial(set_value, field="sam3_cfg_scale")),
         xyz_grid.AxisOption("[SAM3] Steps", int, partial(set_value, field="sam3_steps")),
         xyz_grid.AxisOption(
@@ -250,6 +256,7 @@ class Sam3MaskScript(scripts.Script):
             "sam3_device": str(_xyz_or("sam3_device", "auto")),
             "sam3_mask_blur": int(_xyz_or("sam3_mask_blur", 4)),
             "sam3_denoising_strength": float(_xyz_or("sam3_denoising_strength", 0.4)),
+            "sam3_inpainting_fill": str(_xyz_or("sam3_inpainting_fill", "latent noise")),
             "sam3_inpaint_only_masked": _as_bool(
                 _xyz_or("sam3_inpaint_only_masked", True), True
             ),
