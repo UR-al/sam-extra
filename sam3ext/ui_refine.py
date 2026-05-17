@@ -33,6 +33,8 @@ class RefinePanel:
     detect_prompt: gr.Textbox
     inpaint_prompt: gr.Textbox
     negative_prompt: gr.Textbox
+    inherit_main_prompt: gr.Checkbox
+    inherit_main_neg_prompt: gr.Checkbox
     threshold: gr.Slider
     mask_dilation: gr.Slider
     mask_hull: gr.Checkbox
@@ -69,6 +71,8 @@ class RefinePanel:
             self.detect_prompt,
             self.inpaint_prompt,
             self.negative_prompt,
+            self.inherit_main_prompt,
+            self.inherit_main_neg_prompt,
             self.threshold,
             self.mask_dilation,
             self.mask_hull,
@@ -103,6 +107,8 @@ REFINE_ARG_KEYS = (
     "detect_prompt",
     "inpaint_prompt",
     "negative_prompt",
+    "inherit_main_prompt",
+    "inherit_main_neg_prompt",
     "threshold",
     "mask_dilation",
     "mask_hull",
@@ -176,6 +182,16 @@ def build_refine_panel(
                 label="Negative Prompt",
                 lines=1,
                 placeholder="Optional",
+            )
+
+        with gr.Row():
+            inherit_main_prompt = gr.Checkbox(
+                label="Inherit main t2i prompt (carries LoRAs / style triggers — recommended)",
+                value=True,
+            )
+            inherit_main_neg_prompt = gr.Checkbox(
+                label="Inherit main t2i negative prompt",
+                value=True,
             )
 
         with gr.Row():
@@ -301,6 +317,8 @@ def build_refine_panel(
         detect_prompt=detect_prompt,
         inpaint_prompt=inpaint_prompt,
         negative_prompt=negative_prompt,
+        inherit_main_prompt=inherit_main_prompt,
+        inherit_main_neg_prompt=inherit_main_neg_prompt,
         threshold=threshold,
         mask_dilation=mask_dilation,
         mask_hull=mask_hull,
@@ -456,6 +474,8 @@ def map_widget_values_to_sam3_args(values: tuple) -> dict[str, Any]:
         "sam3_cn_threshold_a": _as_float(keyed.get("cn_threshold_a"), -1.0),
         "sam3_cn_threshold_b": _as_float(keyed.get("cn_threshold_b"), -1.0),
         "_insert_mode": str(keyed.get("insert_mode") or "After selected"),
+        "_inherit_main_prompt": bool(keyed.get("inherit_main_prompt", True)),
+        "_inherit_main_neg_prompt": bool(keyed.get("inherit_main_neg_prompt", True)),
     }
 
 
@@ -481,14 +501,23 @@ def handle_refine_click(gallery_value, selected_index, *all_values):
 
     args = map_widget_values_to_sam3_args(widget_values)
     insert_mode = args.pop("_insert_mode", "After selected")
+    inherit_main = args.pop("_inherit_main_prompt", True)
+    inherit_main_neg = args.pop("_inherit_main_neg_prompt", True)
 
-    # Fall back to the main t2i prompts when the Refine panel's own prompts
-    # are left empty (matches the in-flight Sam3MaskScript.postprocess_image
-    # behavior, which uses p.prompt / p.negative_prompt as defaults).
-    if not args.get("sam3_inpaint_prompt"):
-        args["sam3_inpaint_prompt"] = main_prompt
-    if not args.get("sam3_negative_prompt"):
-        args["sam3_negative_prompt"] = main_neg_prompt
+    # Prompt resolution:
+    # - Inherit ON  + refine empty  -> main only (preserves fallback semantics)
+    # - Inherit ON  + refine filled -> "main, refine"  (LoRAs / style triggers
+    #                                                   in main carry over; the
+    #                                                   refine prompt adds the
+    #                                                   new subject description)
+    # - Inherit OFF + refine empty  -> "" (use the model's unconditional default)
+    # - Inherit OFF + refine filled -> refine only (clean override)
+    refine_p = args.get("sam3_inpaint_prompt") or ""
+    if inherit_main and main_prompt:
+        args["sam3_inpaint_prompt"] = f"{main_prompt}, {refine_p}".rstrip(", ") if refine_p else main_prompt
+    refine_n = args.get("sam3_negative_prompt") or ""
+    if inherit_main_neg and main_neg_prompt:
+        args["sam3_negative_prompt"] = f"{main_neg_prompt}, {refine_n}".rstrip(", ") if refine_n else main_neg_prompt
 
     if not args["sam3_prompt"]:
         return gallery_value, "<span style='color:#c33'>SAM3 Refine: enter a detect prompt first.</span>"
