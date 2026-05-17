@@ -24,6 +24,20 @@ from .ui import (
 )
 
 
+def _sd_checkpoint_choices() -> list[str]:
+    """Available Stable Diffusion checkpoints for the Refine "SD Model
+    override" dropdown. Returns ``["Use current"]`` plus webui's
+    checkpoint titles; falls back to just ``["Use current"]`` when the
+    sd_models module isn't importable yet (UI builds before model scan)."""
+    try:
+        from modules import sd_models
+
+        tiles = list(sd_models.checkpoint_tiles())
+    except Exception:
+        tiles = []
+    return ["Use current"] + tiles
+
+
 @dataclass
 class RefinePanel:
     """Container that exposes the panel's components to the script for
@@ -52,6 +66,7 @@ class RefinePanel:
     sampler: gr.Dropdown
     scheduler: gr.Dropdown
     checkpoint: gr.Dropdown
+    sd_model_override: gr.Dropdown
     mask_mode: gr.Radio
     cn_enable: gr.Checkbox
     cn_override_external: gr.Checkbox
@@ -93,6 +108,7 @@ class RefinePanel:
             self.sampler,
             self.scheduler,
             self.checkpoint,
+            self.sd_model_override,
             self.mask_mode,
             self.cn_enable,
             self.cn_override_external,
@@ -132,6 +148,7 @@ REFINE_ARG_KEYS = (
     "sampler",
     "scheduler",
     "checkpoint",
+    "sd_model_override",
     "mask_mode",
     "cn_enable",
     "cn_override_external",
@@ -264,17 +281,22 @@ def build_refine_panel(
             )
 
         with gr.Row():
-            steps = gr.Slider(label="Steps", minimum=1, maximum=150, step=1, value=28, elem_id="sam3_refine_steps")
-            cfg_scale = gr.Slider(label="CFG Scale", minimum=0.0, maximum=30.0, step=0.1, value=7.0, elem_id="sam3_refine_cfg")
+            steps = gr.Slider(label="SAM3 Refine Steps", minimum=1, maximum=150, step=1, value=28, elem_id="sam3_refine_steps")
+            cfg_scale = gr.Slider(label="SAM3 Refine CFG Scale", minimum=0.0, maximum=30.0, step=0.1, value=7.0, elem_id="sam3_refine_cfg")
+            # Unique labels (not bare "Sampler" / "Scheduler") so ui_loadsave's
+            # path-by-label scheme (txt2img/<label>) can't collide with the
+            # standard t2i sampler dropdown or any other extension's same-name
+            # widget. Without this collision avoidance the dropdown value
+            # silently doesn't persist via "Save UI defaults".
             sampler = gr.Dropdown(
-                label="Sampler",
+                label="SAM3 Refine Sampler",
                 choices=samplers or ["Euler a"],
                 value=samplers[0] if samplers else "Euler a",
                 type="value",
                 elem_id="sam3_refine_sampler",
             )
             scheduler = gr.Dropdown(
-                label="Scheduler",
+                label="SAM3 Refine Scheduler",
                 choices=schedulers or ["Automatic"],
                 value=schedulers[0] if schedulers else "Automatic",
                 type="value",
@@ -288,6 +310,14 @@ def build_refine_panel(
                 value=checkpoint_choices[0] if checkpoint_choices else "sam3.pt",
                 type="value",
                 elem_id="sam3_refine_checkpoint",
+            )
+            sd_choices = _sd_checkpoint_choices()
+            sd_model_override = gr.Dropdown(
+                label="SD Model override (Refine pass only)",
+                choices=sd_choices,
+                value="Use current",
+                type="value",
+                elem_id="sam3_refine_sd_model",
             )
 
         with gr.Accordion("ControlNet", open=False):
@@ -391,6 +421,7 @@ def build_refine_panel(
         sampler=sampler,
         scheduler=scheduler,
         checkpoint=checkpoint,
+        sd_model_override=sd_model_override,
         mask_mode=mask_mode,
         cn_enable=cn_enable,
         cn_override_external=cn_override_external,
@@ -612,6 +643,7 @@ def map_widget_values_to_sam3_args(values: tuple) -> dict[str, Any]:
         "sam3_cfg_scale": _as_float(keyed.get("cfg_scale"), 7.0),
         "sam3_sampler": str(keyed.get("sampler") or "Euler a"),
         "sam3_scheduler": str(keyed.get("scheduler") or "Automatic"),
+        "_sd_model_override": str(keyed.get("sd_model_override") or "Use current"),
         "sam3_noise_multiplier": 1.0,
         "sam3_restore_face": False,
         # ControlNet
@@ -686,6 +718,7 @@ def handle_refine_click(gallery_value, selected_index, *all_values):
     insert_mode = args.pop("_insert_mode", "After selected")
     inherit_main = args.pop("_inherit_main_prompt", True)
     inherit_main_neg = args.pop("_inherit_main_neg_prompt", True)
+    sd_model_override = args.pop("_sd_model_override", "Use current")
 
     refine_p = args.get("sam3_inpaint_prompt") or ""
     detect_p = args.get("sam3_prompt") or ""
@@ -776,6 +809,13 @@ def handle_refine_click(gallery_value, selected_index, *all_values):
 
     from .inpaint_core import run_sam3_refine
 
+    # Optional per-Refine checkpoint swap. Forge's process_images applies
+    # ``p.override_settings`` (set_config + reload) and restores after, so
+    # picking a different SD model here only affects this Refine pass.
+    override_settings: dict[str, Any] = {}
+    if sd_model_override and sd_model_override != "Use current":
+        override_settings["sd_model_checkpoint"] = sd_model_override
+
     try:
         new_pairs = run_sam3_refine(
             image,
@@ -783,6 +823,7 @@ def handle_refine_click(gallery_value, selected_index, *all_values):
             sd_model=sd_model,
             outpath_samples=outpath_samples,
             outpath_grids=outpath_grids,
+            override_settings=override_settings,
         )
     except Exception:
         error = traceback.format_exc()

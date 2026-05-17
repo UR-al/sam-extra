@@ -504,6 +504,46 @@ def override_sampler_script_slot(p2, args: dict[str, Any]) -> None:
     )
 
 
+def _disable_inherited_cn_units(script_args, runner) -> None:
+    """Walk ``runner.alwayson_scripts`` for the ControlNet script, find its
+    args_from..args_to window, and replace every ControlNetUnit in that window
+    with a disabled copy.
+
+    Why: the t2i scripts runner's ControlNet inputs are ``gr.State`` objects
+    initialized with the *user's currently-configured t2i CN units* (whatever
+    they had set up before clicking Refine). Without this, a t2i CN unit
+    with LLLite would silently run during Refine even when the Refine panel
+    has cn_enable=False — causing surprise compute (LLLite 112 modules per
+    attention layer) and OOM. ``inject_controlnet_unit`` will turn slot 0
+    back on with the SAM3-supplied unit if the user opted in.
+    """
+    if not script_args:
+        return
+    cn_script = None
+    for script_object in getattr(runner, "alwayson_scripts", []):
+        if Path(getattr(script_object, "filename", "")).stem.lower() == "controlnet":
+            cn_script = script_object
+            break
+    if cn_script is None:
+        return
+    af = getattr(cn_script, "args_from", None)
+    at = getattr(cn_script, "args_to", None)
+    if af is None or at is None or at <= af:
+        return
+    try:
+        from lib_controlnet.external_code import ControlNetUnit
+    except Exception:
+        return
+    for i in range(af, min(at, len(script_args))):
+        existing = script_args[i]
+        try:
+            disabled = copy(existing)
+            disabled.enabled = False
+            script_args[i] = disabled
+        except Exception:
+            script_args[i] = ControlNetUnit(enabled=False, module="None", model="None")
+
+
 def build_standalone_scripts_runner():
     """Clone the t2i script runner with SAM3 itself stripped (avoids
     recursion). Returns ``(runner, script_args)`` ready to drop onto a
@@ -514,9 +554,10 @@ def build_standalone_scripts_runner():
     a real Generate click lets Gradio resolve those to current UI values. For
     our standalone path there is no such click, so we collapse each component
     to its default ``.value``. For most alwayson scripts that means "do
-    nothing"; for ControlNet that means a list of disabled
-    ``ControlNetUnit`` slots ready for ``inject_controlnet_unit`` to overwrite
-    slot 0.
+    nothing"; for ControlNet, the .value is the user's currently-configured
+    t2i CN unit which we then forcibly disable via
+    ``_disable_inherited_cn_units`` so the Refine panel's CN settings are
+    authoritative.
     """
     from modules import scripts as _scripts
 
@@ -544,6 +585,13 @@ def build_standalone_scripts_runner():
     if script_args:
         script_args[0] = 0
 
+    # Force all inherited ControlNet units off. The Refine panel's CN
+    # configuration is the only one that should drive the refine pass; without
+    # this, a t2i CN unit with LLLite would keep running even when the Refine
+    # panel says cn_enable=False — which is exactly the "Refine is slow and
+    # the LLLite isn't supposed to be on" case the v0.6.1 user reported.
+    _disable_inherited_cn_units(script_args, runner)
+
     return runner, script_args
 
 
@@ -554,6 +602,7 @@ def run_sam3_refine(
     sd_model,
     outpath_samples: str,
     outpath_grids: str,
+    override_settings: dict[str, Any] | None = None,
 ) -> list[tuple[Image.Image, str]]:
     """Standalone equivalent of ``run_inpaint_passes`` for the post-generation
     Refine panel: no ``p`` to inherit from, runs once per detected mask, and
@@ -658,6 +707,8 @@ def run_sam3_refine(
                 scripts_runner=scripts_runner,
                 script_args=list(script_args_template),
             )
+            if override_settings:
+                p2.override_settings = dict(override_settings)
             p2.image_mask = mask
             p2.prompt = prompt
             p2.negative_prompt = negative_prompt
