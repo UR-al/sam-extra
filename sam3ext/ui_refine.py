@@ -88,6 +88,7 @@ class RefinePanel:
     cn_threshold_b: gr.Slider
     insert_mode: gr.Radio
     refine_button: gr.Button
+    stop_button: gr.Button
     status: gr.HTML
 
     def all_widgets(self) -> list:
@@ -442,6 +443,12 @@ def build_refine_panel(
                 elem_id="sam3_refine_insert_mode",
             )
             refine_button = gr.Button("▶ Refine", variant="primary", elem_id="sam3_refine_button")
+            # Hidden until the user clicks Refine; the click handler chain
+            # swaps visibility so the same slot becomes a Stop button while
+            # the pass is running. Click → shared.state.interrupted=True,
+            # which run_sam3_refine / process_images both check at every
+            # iteration so the inpaint bails out promptly.
+            stop_button = gr.Button("⏹ Stop", variant="stop", visible=False, elem_id="sam3_refine_stop")
 
         status = gr.HTML(value="", elem_id="sam3_refine_status")
 
@@ -490,6 +497,7 @@ def build_refine_panel(
         cn_threshold_b=cn_threshold_b,
         insert_mode=insert_mode,
         refine_button=refine_button,
+        stop_button=stop_button,
         status=status,
     )
 

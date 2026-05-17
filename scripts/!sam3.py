@@ -419,7 +419,19 @@ def _wire_refine_panel(
     instead of the original t2i prompt leaking through.
     """
 
-    panel.refine_button.click(
+    # Refine button click chain: hide Refine + show Stop → run the
+    # actual refine handler → restore Refine visibility. ``.then()`` chains
+    # the steps so the visibility swap happens before sampling starts and
+    # restores even if the handler raises (errors bubble through to the
+    # last .then). The Stop button below sets shared.state.interrupted
+    # which run_sam3_refine + process_images both poll.
+    refine_show_stop = panel.refine_button.click(
+        fn=lambda: (gr.update(visible=False), gr.update(visible=True)),
+        inputs=[],
+        outputs=[panel.refine_button, panel.stop_button],
+        queue=False,
+    )
+    refine_run = refine_show_stop.then(
         fn=handle_refine_click,
         _js=_REFINE_JS,
         inputs=[
@@ -431,6 +443,25 @@ def _wire_refine_panel(
             generation_info,
         ],
         outputs=[gallery, panel.status, html_info, generation_info],
+    )
+    refine_run.then(
+        fn=lambda: (gr.update(visible=True), gr.update(visible=False)),
+        inputs=[],
+        outputs=[panel.refine_button, panel.stop_button],
+        queue=False,
+    )
+
+    def _stop_refine():
+        from modules import shared as _shared
+
+        _shared.state.interrupted = True
+        _shared.state.skipped = True
+
+    panel.stop_button.click(
+        fn=_stop_refine,
+        inputs=[],
+        outputs=[],
+        queue=False,
     )
 
     # Seed convenience buttons:
