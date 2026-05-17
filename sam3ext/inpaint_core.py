@@ -425,6 +425,12 @@ def run_sam3_refine(
         mask_hull=bool(args.get("sam3_mask_hull", False)),
     )
 
+    if args.get("sam3_unload_after"):
+        from .core import unload_sam3
+
+        unload_sam3()
+        print("[-] SAM3 Refine: model unloaded from VRAM (re-loads on next detection).", file=sys.stderr)
+
     masks_source = sam3_result.masks if args.get("sam3_mask_mode") == "Individual" else None
     masks = [sam3_result.mask] if not masks_source else masks_source
     if not masks or not any(np_any(m) for m in masks):

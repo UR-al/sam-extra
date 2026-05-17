@@ -41,6 +41,7 @@ class RefinePanel:
     mask_dilation: gr.Slider
     mask_hull: gr.Checkbox
     mask_blur: gr.Slider
+    unload_after: gr.Checkbox
     denoising_strength: gr.Slider
     inpaint_only_masked: gr.Checkbox
     inpaint_only_masked_padding: gr.Slider
@@ -80,6 +81,7 @@ class RefinePanel:
             self.mask_dilation,
             self.mask_hull,
             self.mask_blur,
+            self.unload_after,
             self.denoising_strength,
             self.inpaint_only_masked,
             self.inpaint_only_masked_padding,
@@ -117,6 +119,7 @@ REFINE_ARG_KEYS = (
     "mask_dilation",
     "mask_hull",
     "mask_blur",
+    "unload_after",
     "denoising_strength",
     "inpaint_only_masked",
     "inpaint_only_masked_padding",
@@ -222,6 +225,10 @@ def build_refine_panel(
         with gr.Row():
             mask_hull = gr.Checkbox(
                 label="Convex Hull (wrap strands — recommended for hair/fur)",
+                value=False,
+            )
+            unload_after = gr.Checkbox(
+                label="Unload SAM3 from VRAM after detection (~3.5 GB — recommended for ≤12 GB GPUs)",
                 value=False,
             )
 
@@ -339,6 +346,7 @@ def build_refine_panel(
         mask_dilation=mask_dilation,
         mask_hull=mask_hull,
         mask_blur=mask_blur,
+        unload_after=unload_after,
         denoising_strength=denoising_strength,
         inpaint_only_masked=inpaint_only_masked,
         inpaint_only_masked_padding=inpaint_only_masked_padding,
@@ -493,6 +501,7 @@ def map_widget_values_to_sam3_args(values: tuple) -> dict[str, Any]:
         "sam3_threshold": _as_float(keyed.get("threshold"), 0.4),
         "sam3_mask_dilation": _as_int(keyed.get("mask_dilation"), 4),
         "sam3_mask_hull": bool(keyed.get("mask_hull", False)),
+        "sam3_unload_after": bool(keyed.get("unload_after", False)),
         "sam3_checkpoint": str(keyed.get("checkpoint") or "sam3.pt"),
         "sam3_device": "auto",
         "sam3_mask_mode": str(keyed.get("mask_mode") or "Combined"),

@@ -23,7 +23,7 @@ except Exception:
 
 
 from sam3ext import SAM3_NAME, Sam3Args, __version__, run_sam3_on_pil
-from sam3ext.core import find_checkpoint_options, write_artifacts
+from sam3ext.core import find_checkpoint_options, unload_sam3, write_artifacts
 from sam3ext.inpaint_core import apply_prompt_sr, copy_prompt, run_inpaint_passes
 from sam3ext.ui import WebuiButtons, sam3_ui
 from sam3ext.ui_refine import RefinePanel, build_refine_panel, handle_refine_click
@@ -106,6 +106,12 @@ def make_axis_on_xyz_grid():
             "[SAM3] Mask Hull",
             str,
             partial(set_value, field="sam3_mask_hull"),
+            choices=bool_choices,
+        ),
+        xyz_grid.AxisOption(
+            "[SAM3] Unload After",
+            str,
+            partial(set_value, field="sam3_unload_after"),
             choices=bool_choices,
         ),
         xyz_grid.AxisOption("[SAM3] Mask Blur", int, partial(set_value, field="sam3_mask_blur")),
@@ -264,6 +270,7 @@ class Sam3MaskScript(scripts.Script):
             "sam3_restore_face": _as_bool(_xyz_or("sam3_restore_face", False), False),
             "sam3_preview_overlay": bool(state.get("sam3_preview_overlay", False)),
             "sam3_save_artifacts": bool(state.get("sam3_save_artifacts", True)),
+            "sam3_unload_after": _as_bool(_xyz_or("sam3_unload_after", False), False),
             "sam3_cn_enable": _as_bool(_xyz_or("sam3_cn_enable", False), False),
             "sam3_cn_override_external": _as_bool(_xyz_or("sam3_cn_override_external", False), False),
             "sam3_cn_model": str(_xyz_or("sam3_cn_model", "None")),
@@ -321,6 +328,10 @@ class Sam3MaskScript(scripts.Script):
             if hasattr(p, "all_seeds") and getattr(p, "all_seeds", None):
                 seed = p.all_seeds[0]
             write_artifacts(result, seed)
+
+        if args.get("sam3_unload_after"):
+            unload_sam3()
+            print("[-] SAM3: model unloaded from VRAM (re-loads on next detection).", file=sys.stderr)
 
         if not np.any(np.asarray(result.mask)):
             if args.get("sam3_preview_overlay"):

@@ -227,6 +227,10 @@ def sam3_ui(is_img2img: bool, buttons: WebuiButtons):
                 label="Save mask/overlay artifacts",
                 value=True,
             )
+            w.sam3_unload_after = gr.Checkbox(
+                label="Unload SAM3 from VRAM after detection (~3.5 GB)",
+                value=False,
+            )
 
         with gr.Accordion("Inpaint", open=False):
             with gr.Row():

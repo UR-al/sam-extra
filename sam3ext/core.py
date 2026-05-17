@@ -186,6 +186,31 @@ def _apply_sam3_checkpoint(model, checkpoint_path: Path) -> None:
         )
 
 
+def unload_sam3() -> None:
+    """Evict every cached SAM3 model bundle and reclaim VRAM.
+
+    SAM3 is ~3.5 GB on GPU. Once loaded the ``@lru_cache(maxsize=4)`` keeps
+    it pinned for the lifetime of the process, which leaves the downstream
+    inpaint sampler fighting for memory (and triggers Forge's
+    ``--reserve-vram`` warning on smaller GPUs). When ``sam3_unload_after``
+    is on we call this between detection and the inpaint pass: next
+    detection re-loads from disk (~3-5 s) but the sampler gets the full
+    free VRAM in the meantime.
+    """
+    import gc
+
+    _load_model_bundle.cache_clear()
+    gc.collect()
+    try:
+        import torch
+
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.ipc_collect()
+    except Exception:
+        pass
+
+
 @lru_cache(maxsize=4)
 def _load_model_bundle(checkpoint_key: str, device: str):
     checkpoint_path = None if checkpoint_key == "__hf__" else Path(checkpoint_key)

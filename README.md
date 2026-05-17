@@ -106,6 +106,14 @@ Mask Dilation:    8      (SAM3가 너무 타이트하게 잡을 때)
 
 전체-프레임 변경 시(전신 옷 교체 등)는 "Inpaint only masked"를 끄는 게 보통 더 잘 됩니다 — 크롭된 영역만 보면 CN의 포즈/깊이 정보가 약해지기 때문.
 
+## VRAM 절약 (v0.4.9)
+
+SAM3 체크포인트는 ~3.5 GB. 한번 로드되면 \`@lru_cache\`로 영구 캐싱돼서 인페인트 패스도 같은 GPU에서 경합 → ≤12 GB GPU에서 Forge의 \`reserve-vram\` 경고 + 느려짐.
+
+해결: **"Unload SAM3 from VRAM after detection"** 체크박스 (SAM3 패널 / Refine 패널 양쪽). 검출(~2초) 끝나면 SAM3 캐시 비우고 `torch.cuda.empty_cache()` 호출 → 인페인트 사이클이 풀 VRAM 활용. 다음 검출은 다시 ~3~5초 로딩 비용이 들지만 ≤12 GB GPU에선 압도적으로 빠름.
+
+추가 권장: Forge 실행 인자에 `--reserve-vram 2` 붙이기 — 모델 매니저가 헤드룸 2 GB 확보. SAM3 unload와 같이 쓰면 가장 안정적.
+
 ## 마스크 후처리 (v0.4.3)
 
 머리카락이나 모피처럼 가는 strand가 SAM3에 의해 부분적으로 누락되는 경우를 위한 두 가지 마스크 확장 옵션:

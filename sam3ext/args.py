@@ -51,6 +51,7 @@ class Sam3Args(BaseModel, extra=Extra.forbid):
     sam3_restore_face: bool = False
     sam3_preview_overlay: bool = False
     sam3_save_artifacts: bool = True
+    sam3_unload_after: bool = False
     # ControlNet (Step 2): only meaningful when sam3_mode == "Inpaint" and the
     # sd_forge_controlnet extension is loaded. Plumbed end-to-end in Step 3.
     sam3_cn_enable: bool = False
@@ -108,6 +109,7 @@ class Sam3Args(BaseModel, extra=Extra.forbid):
         ppop("SAM3 Restore Face")
         ppop("SAM3 Preview Overlay")
         ppop("SAM3 Save Artifacts", cond=True)
+        ppop("SAM3 Unload After")
         # ControlNet block: if disabled, drop the whole subgroup from infotext.
         ppop(
             "SAM3 CN Enable",
@@ -161,6 +163,7 @@ ALL_ARGS = ArgsList(
         Arg("sam3_restore_face", "SAM3 Restore Face"),
         Arg("sam3_preview_overlay", "SAM3 Preview Overlay"),
         Arg("sam3_save_artifacts", "SAM3 Save Artifacts"),
+        Arg("sam3_unload_after", "SAM3 Unload After"),
         Arg("sam3_cn_enable", "SAM3 CN Enable"),
         Arg("sam3_cn_override_external", "SAM3 CN Override External"),
         Arg("sam3_cn_model", "SAM3 CN Model"),
