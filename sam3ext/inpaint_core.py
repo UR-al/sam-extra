@@ -506,6 +506,16 @@ def run_sam3_refine(
             p2.prompt = prompt
             p2.negative_prompt = negative_prompt
             inject_controlnet_unit(p2, args)
+            print(
+                f"[-] SAM3 Refine pass {index}: p2 BEFORE process_images — "
+                f"sampler_name={p2.sampler_name!r}, scheduler={p2.scheduler!r}, "
+                f"steps={p2.steps}, cfg_scale={p2.cfg_scale}, "
+                f"denoising_strength={p2.denoising_strength}, "
+                f"inpainting_fill={getattr(p2, 'inpainting_fill', None)}, "
+                f"inpaint_full_res={getattr(p2, 'inpaint_full_res', None)}, "
+                f"image_mask_set={p2.image_mask is not None}",
+                file=sys.stderr,
+            )
             try:
                 from modules.processing import process_images as _process_images
 
@@ -531,6 +541,23 @@ def run_sam3_refine(
                     info_text = getattr(processed, "info", "") or ""
             except Exception:
                 info_text = ""
+            # Show what process_images actually USED after fix_p_invalid_sampler_and_scheduler
+            # and any script-side overrides. The "Sampler:" / "Schedule type:"
+            # lines extracted from infotext are authoritative.
+            import re as _re
+
+            actual_sampler = _re.search(r"Sampler:\s*([^,\n]+)", info_text)
+            actual_scheduler = _re.search(r"Schedule type:\s*([^,\n]+)", info_text)
+            actual_steps = _re.search(r"Steps:\s*(\d+)", info_text)
+            actual_cfg = _re.search(r"CFG scale:\s*([\d.]+)", info_text)
+            print(
+                f"[-] SAM3 Refine pass {index}: ACTUAL infotext — "
+                f"sampler={actual_sampler.group(1).strip() if actual_sampler else '???'!r}, "
+                f"scheduler={actual_scheduler.group(1).strip() if actual_scheduler else '???'!r}, "
+                f"steps={actual_steps.group(1) if actual_steps else '???'}, "
+                f"cfg={actual_cfg.group(1) if actual_cfg else '???'}",
+                file=sys.stderr,
+            )
             results.append((processed.images[0].convert("RGB"), info_text))
             print(f"[-] SAM3 Refine: pass {index} completed.", file=sys.stderr)
 
