@@ -370,61 +370,92 @@ def _coerce_gallery_item_to_pil(item: Any) -> Image.Image | None:
     return None
 
 
+def _as_float(value: Any, default: float) -> float:
+    """Bulletproof float coercion: empty string / None / non-numeric → default.
+
+    Sliders return floats and dropdowns return their selected string, but
+    widget-order quirks or browser-side surprises can put an empty textbox
+    value where a number was expected. We previously raised loudly, but the
+    user-facing failure mode (refine button silently broken) is worse than
+    silently falling back to the slider/component default.
+    """
+    if value is None or (isinstance(value, str) and value.strip() == ""):
+        return default
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _as_int(value: Any, default: int) -> int:
+    if value is None or (isinstance(value, str) and value.strip() == ""):
+        return default
+    try:
+        return int(float(value))  # float-first so "12.0" works
+    except (TypeError, ValueError):
+        return default
+
+
 def map_widget_values_to_sam3_args(values: tuple) -> dict[str, Any]:
     """Translate the Refine panel's widget values into the dict shape that
     ``inpaint_core.run_sam3_refine`` expects (same keys as ``Sam3Args``)."""
     keyed = dict(zip(REFINE_ARG_KEYS, values))
-    # Sanity guard: a widget-order shift bug would put a string where a float
-    # is expected (e.g. threshold). Fail loud with the field name so the
-    # mismatch is obvious instead of a cryptic ValueError from float().
-    for k in ("threshold", "denoising_strength", "cfg_scale", "cn_weight", "cn_guidance_start", "cn_guidance_end"):
+    # Defensive: log when a string sneaks into a numeric slot — usually a
+    # widget-order regression. Doesn't raise (we coerce below with _as_float
+    # so the refine still runs with default values for those fields).
+    for k in (
+        "threshold", "denoising_strength", "cfg_scale", "cn_weight",
+        "cn_guidance_start", "cn_guidance_end", "cn_threshold_a", "cn_threshold_b",
+        "mask_dilation", "mask_blur", "inpaint_only_masked_padding", "steps",
+        "cn_processor_res",
+    ):
         v = keyed.get(k)
-        if isinstance(v, str):
-            raise RuntimeError(
-                f"SAM3 Refine: widget-order mismatch — '{k}' received a string "
-                f"({v[:60]!r}...) instead of a number. The inputs list passed "
-                f"to handle_refine_click is out of sync with REFINE_ARG_KEYS."
+        if isinstance(v, str) and v.strip() != "":
+            print(
+                f"[-] SAM3 Refine: numeric slot '{k}' got a string ({v[:60]!r}...) — "
+                f"falling back to default; check REFINE_ARG_KEYS alignment.",
+                file=sys.stderr,
             )
     return {
         # SAM3 detection
-        "sam3_prompt": str(keyed["detect_prompt"] or "").strip(),
-        "sam3_inpaint_prompt": str(keyed["inpaint_prompt"] or ""),
-        "sam3_negative_prompt": str(keyed["negative_prompt"] or ""),
-        "sam3_threshold": float(keyed["threshold"]),
-        "sam3_mask_dilation": int(keyed["mask_dilation"]),
-        "sam3_mask_hull": bool(keyed["mask_hull"]),
-        "sam3_checkpoint": str(keyed["checkpoint"]),
+        "sam3_prompt": str(keyed.get("detect_prompt") or "").strip(),
+        "sam3_inpaint_prompt": str(keyed.get("inpaint_prompt") or ""),
+        "sam3_negative_prompt": str(keyed.get("negative_prompt") or ""),
+        "sam3_threshold": _as_float(keyed.get("threshold"), 0.4),
+        "sam3_mask_dilation": _as_int(keyed.get("mask_dilation"), 4),
+        "sam3_mask_hull": bool(keyed.get("mask_hull", False)),
+        "sam3_checkpoint": str(keyed.get("checkpoint") or "sam3.pt"),
         "sam3_device": "auto",
-        "sam3_mask_mode": str(keyed["mask_mode"]),
+        "sam3_mask_mode": str(keyed.get("mask_mode") or "Combined"),
         # Inpaint
-        "sam3_mask_blur": int(keyed["mask_blur"]),
-        "sam3_denoising_strength": float(keyed["denoising_strength"]),
-        "sam3_inpaint_only_masked": bool(keyed["inpaint_only_masked"]),
-        "sam3_inpaint_only_masked_padding": int(keyed["inpaint_only_masked_padding"]),
+        "sam3_mask_blur": _as_int(keyed.get("mask_blur"), 4),
+        "sam3_denoising_strength": _as_float(keyed.get("denoising_strength"), 0.75),
+        "sam3_inpaint_only_masked": bool(keyed.get("inpaint_only_masked", False)),
+        "sam3_inpaint_only_masked_padding": _as_int(keyed.get("inpaint_only_masked_padding"), 32),
         "sam3_use_inpaint_width_height": False,
         "sam3_inpaint_width": 512,
         "sam3_inpaint_height": 512,
-        "sam3_steps": int(keyed["steps"]),
-        "sam3_cfg_scale": float(keyed["cfg_scale"]),
-        "sam3_sampler": str(keyed["sampler"]),
-        "sam3_scheduler": str(keyed["scheduler"]),
+        "sam3_steps": _as_int(keyed.get("steps"), 28),
+        "sam3_cfg_scale": _as_float(keyed.get("cfg_scale"), 7.0),
+        "sam3_sampler": str(keyed.get("sampler") or "Euler a"),
+        "sam3_scheduler": str(keyed.get("scheduler") or "Automatic"),
         "sam3_noise_multiplier": 1.0,
         "sam3_restore_face": False,
         # ControlNet
-        "sam3_cn_enable": bool(keyed["cn_enable"]),
-        "sam3_cn_override_external": bool(keyed["cn_override_external"]),
-        "sam3_cn_pixel_perfect": bool(keyed["cn_pixel_perfect"]),
-        "sam3_cn_model": str(keyed["cn_model"]),
-        "sam3_cn_module": str(keyed["cn_module"]),
-        "sam3_cn_weight": float(keyed["cn_weight"]),
-        "sam3_cn_guidance_start": float(keyed["cn_guidance_start"]),
-        "sam3_cn_guidance_end": float(keyed["cn_guidance_end"]),
-        "sam3_cn_control_mode": str(keyed["cn_control_mode"]),
-        "sam3_cn_resize_mode": str(keyed["cn_resize_mode"]),
-        "sam3_cn_processor_res": int(keyed["cn_processor_res"]),
-        "sam3_cn_threshold_a": float(keyed["cn_threshold_a"]),
-        "sam3_cn_threshold_b": float(keyed["cn_threshold_b"]),
-        "_insert_mode": str(keyed["insert_mode"]),
+        "sam3_cn_enable": bool(keyed.get("cn_enable", False)),
+        "sam3_cn_override_external": bool(keyed.get("cn_override_external", False)),
+        "sam3_cn_pixel_perfect": bool(keyed.get("cn_pixel_perfect", True)),
+        "sam3_cn_model": str(keyed.get("cn_model") or "None"),
+        "sam3_cn_module": str(keyed.get("cn_module") or "inpaint_only"),
+        "sam3_cn_weight": _as_float(keyed.get("cn_weight"), 1.0),
+        "sam3_cn_guidance_start": _as_float(keyed.get("cn_guidance_start"), 0.0),
+        "sam3_cn_guidance_end": _as_float(keyed.get("cn_guidance_end"), 1.0),
+        "sam3_cn_control_mode": str(keyed.get("cn_control_mode") or "Balanced"),
+        "sam3_cn_resize_mode": str(keyed.get("cn_resize_mode") or "Crop and Resize"),
+        "sam3_cn_processor_res": _as_int(keyed.get("cn_processor_res"), 512),
+        "sam3_cn_threshold_a": _as_float(keyed.get("cn_threshold_a"), -1.0),
+        "sam3_cn_threshold_b": _as_float(keyed.get("cn_threshold_b"), -1.0),
+        "_insert_mode": str(keyed.get("insert_mode") or "After selected"),
     }
 
 
