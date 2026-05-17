@@ -339,6 +339,47 @@ def _dilate_mask(mask: np.ndarray, px: int) -> np.ndarray:
     return dilated.astype(bool)
 
 
+def _edge_aware_dilate(mask: np.ndarray, image_rgb: np.ndarray, max_px: int, canny_low: int = 100, canny_high: int = 200) -> np.ndarray:
+    """Grow ``mask`` outward up to ``max_px`` pixels, but stop the expansion
+    at strong image edges (detected via Canny on the original RGB image).
+
+    Use case: SAM3's silhouette frequently lands a few pixels INSIDE the
+    actual garment boundary. A plain morphological dilation expands by N
+    px everywhere — into the body, into adjacent objects, into the
+    background — which is too aggressive. This routine grows the mask
+    only into regions where there's no edge, which means it walks up to
+    the natural object outline (e.g. a shirt's collar / hem) and stops
+    there. Catches outline residue without bleeding into the next object.
+
+    Iterative single-pixel dilation: at each step, candidate new pixels =
+    dilation - mask; keep only those that aren't on an edge. Bails early
+    when no new pixels can be added.
+    """
+    if max_px <= 0 or image_rgb is None:
+        return mask.astype(bool)
+    import cv2
+
+    if image_rgb.ndim == 3 and image_rgb.shape[2] >= 3:
+        gray = cv2.cvtColor(image_rgb[:, :, :3].astype(np.uint8), cv2.COLOR_RGB2GRAY)
+    else:
+        gray = image_rgb.astype(np.uint8)
+    kernel = np.ones((3, 3), dtype=np.uint8)
+    # Canny returns 1-pixel-thick edges. Our 3×3 dilation can jump over a
+    # single-pixel edge diagonally (3-connected expansion). Thicken the
+    # edge map by 1 px so the wall is 3-thick and impossible to skip.
+    edges = cv2.Canny(gray, canny_low, canny_high)
+    edges = cv2.dilate(edges, kernel) > 0  # bool, thickened
+
+    out = mask.astype(bool)
+    for _ in range(int(max_px)):
+        dilated = cv2.dilate(out.astype(np.uint8), kernel) > 0
+        new_pixels = dilated & ~out & ~edges
+        if not new_pixels.any():
+            break
+        out = out | new_pixels
+    return out
+
+
 def _convex_hull_mask(mask: np.ndarray) -> np.ndarray:
     """Wrap each connected region of ``mask`` in its convex hull.
 
@@ -399,6 +440,7 @@ def run_sam3_on_pil(
     allow_huggingface: bool = True,
     mask_dilation: int = 0,
     mask_hull: bool = False,
+    mask_outline_px: int = 0,
 ) -> Sam3Result:
     import torch
 
@@ -461,6 +503,10 @@ def run_sam3_on_pil(
         group_mask = np.any(np.stack(group_split, axis=0), axis=0)
         if mask_hull:
             group_mask = _convex_hull_mask(group_mask)
+        # Edge-aware expansion BEFORE plain dilation: snap to real object
+        # outline first, then apply user-requested px padding on top.
+        if mask_outline_px > 0:
+            group_mask = _edge_aware_dilate(group_mask, rgb, mask_outline_px)
         group_mask = _dilate_mask(group_mask, mask_dilation)
         if np.any(group_mask):
             group_masks.append(group_mask)

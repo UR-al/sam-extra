@@ -26,7 +26,7 @@ from sam3ext import SAM3_NAME, Sam3Args, __version__, run_sam3_on_pil
 from sam3ext.core import find_checkpoint_options, unload_sam3, write_artifacts
 from sam3ext.inpaint_core import apply_prompt_sr, copy_prompt, run_inpaint_passes
 from sam3ext.ui import WebuiButtons, sam3_ui
-from sam3ext.ui_refine import RefinePanel, build_refine_panel, handle_refine_click
+from sam3ext.ui_refine import RefinePanel, _pull_seed_from_gallery_item, build_refine_panel, handle_refine_click
 
 
 txt2img_submit_button = img2img_submit_button = None
@@ -108,6 +108,7 @@ def make_axis_on_xyz_grid():
             partial(set_value, field="sam3_mask_hull"),
             choices=bool_choices,
         ),
+        xyz_grid.AxisOption("[SAM3] Mask Outline Expand", int, partial(set_value, field="sam3_mask_outline_px")),
         xyz_grid.AxisOption(
             "[SAM3] Unload After",
             str,
@@ -252,6 +253,7 @@ class Sam3MaskScript(scripts.Script):
             "sam3_threshold": float(_xyz_or("sam3_threshold", 0.4, legacy="threshold")),
             "sam3_mask_dilation": int(_xyz_or("sam3_mask_dilation", 0)),
             "sam3_mask_hull": _as_bool(_xyz_or("sam3_mask_hull", False), False),
+            "sam3_mask_outline_px": int(_xyz_or("sam3_mask_outline_px", 0)),
             "sam3_checkpoint": str(_xyz_or("sam3_checkpoint", "sam3.pt", legacy="checkpoint")),
             "sam3_device": str(_xyz_or("sam3_device", "auto")),
             "sam3_mask_blur": int(_xyz_or("sam3_mask_blur", 4)),
@@ -334,6 +336,7 @@ class Sam3MaskScript(scripts.Script):
             allow_huggingface=allow_huggingface,
             mask_dilation=int(args.get("sam3_mask_dilation", 0)),
             mask_hull=bool(args.get("sam3_mask_hull", False)),
+            mask_outline_px=int(args.get("sam3_mask_outline_px", 0)),
         )
 
         if args.get("sam3_save_artifacts"):
@@ -428,6 +431,24 @@ def _wire_refine_panel(
             generation_info,
         ],
         outputs=[gallery, panel.status, html_info, generation_info],
+    )
+
+    # Seed convenience buttons:
+    # - 🎲 → set the Seed Number to -1 (random)
+    # - 🎯 → read the currently-selected gallery item's PNG metadata,
+    #        extract "Seed: N", and put it in the Seed Number
+    panel.seed_random_button.click(
+        fn=lambda: -1,
+        inputs=[],
+        outputs=[panel.seed],
+        queue=False,
+    )
+    panel.seed_pull_button.click(
+        fn=_pull_seed_from_gallery_item,
+        _js="(...args) => { try { args[1] = selected_gallery_index(); } catch (e) { args[1] = -1; } return args; }",
+        inputs=[gallery, panel.selected_index_state],
+        outputs=[panel.seed],
+        queue=False,
     )
 
 

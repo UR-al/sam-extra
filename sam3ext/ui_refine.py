@@ -54,9 +54,14 @@ class RefinePanel:
     threshold: gr.Slider
     mask_dilation: gr.Slider
     mask_hull: gr.Checkbox
+    mask_outline_px: gr.Slider
     mask_blur: gr.Slider
     unload_after: gr.Checkbox
     seed: gr.Number
+    seed_random_button: gr.Button
+    seed_pull_button: gr.Button
+    resize_mode: gr.Radio
+    mask_invert: gr.Checkbox
     denoising_strength: gr.Slider
     inpainting_fill: gr.Dropdown
     inpaint_only_masked: gr.Checkbox
@@ -96,9 +101,12 @@ class RefinePanel:
             self.threshold,
             self.mask_dilation,
             self.mask_hull,
+            self.mask_outline_px,
             self.mask_blur,
             self.unload_after,
             self.seed,
+            self.resize_mode,
+            self.mask_invert,
             self.denoising_strength,
             self.inpainting_fill,
             self.inpaint_only_masked,
@@ -136,9 +144,12 @@ REFINE_ARG_KEYS = (
     "threshold",
     "mask_dilation",
     "mask_hull",
+    "mask_outline_px",
     "mask_blur",
     "unload_after",
     "seed",
+    "resize_mode",
+    "mask_invert",
     "denoising_strength",
     "inpainting_fill",
     "inpaint_only_masked",
@@ -250,16 +261,47 @@ def build_refine_panel(
                 value=False,
                 elem_id="sam3_refine_mask_hull",
             )
+            mask_outline_px = gr.Slider(
+                label="Outline expand (edge-aware px) — catches shirt outline residue",
+                minimum=0,
+                maximum=64,
+                step=1,
+                value=0,
+                elem_id="sam3_refine_mask_outline_px",
+            )
             unload_after = gr.Checkbox(
-                label="Unload SAM3 from VRAM after detection (~3.5 GB — recommended for ≤12 GB GPUs)",
+                label="Unload SAM3 from VRAM after detection",
                 value=False,
                 elem_id="sam3_refine_unload_after",
             )
+
+        with gr.Row():
             seed = gr.Number(
                 label="Seed (-1 = random)",
                 value=-1,
                 precision=0,
+                scale=4,
                 elem_id="sam3_refine_seed",
+            )
+            seed_random_button = gr.Button("🎲", scale=0, min_width=40, elem_id="sam3_refine_seed_random")
+            seed_pull_button = gr.Button(
+                "🎯 Pull from selected",
+                scale=0,
+                min_width=160,
+                elem_id="sam3_refine_seed_pull",
+            )
+
+        with gr.Row():
+            resize_mode = gr.Radio(
+                label="Resize mode",
+                choices=["Just Resize", "Crop and Resize", "Resize and Fill"],
+                value="Just Resize",
+                elem_id="sam3_refine_resize_mode",
+            )
+            mask_invert = gr.Checkbox(
+                label="Mask mode: inpaint not-masked (invert)",
+                value=False,
+                elem_id="sam3_refine_mask_invert",
             )
 
         with gr.Row():
@@ -409,9 +451,14 @@ def build_refine_panel(
         threshold=threshold,
         mask_dilation=mask_dilation,
         mask_hull=mask_hull,
+        mask_outline_px=mask_outline_px,
         mask_blur=mask_blur,
         unload_after=unload_after,
         seed=seed,
+        seed_random_button=seed_random_button,
+        seed_pull_button=seed_pull_button,
+        resize_mode=resize_mode,
+        mask_invert=mask_invert,
         denoising_strength=denoising_strength,
         inpainting_fill=inpainting_fill,
         inpaint_only_masked=inpaint_only_masked,
@@ -625,8 +672,11 @@ def map_widget_values_to_sam3_args(values: tuple) -> dict[str, Any]:
         "sam3_threshold": _as_float(keyed.get("threshold"), 0.4),
         "sam3_mask_dilation": _as_int(keyed.get("mask_dilation"), 4),
         "sam3_mask_hull": bool(keyed.get("mask_hull", False)),
+        "sam3_mask_outline_px": _as_int(keyed.get("mask_outline_px"), 0),
         "sam3_unload_after": bool(keyed.get("unload_after", False)),
         "sam3_seed": _as_int(keyed.get("seed"), -1),
+        "_resize_mode": str(keyed.get("resize_mode") or "Just Resize"),
+        "_mask_invert": bool(keyed.get("mask_invert", False)),
         "sam3_checkpoint": str(keyed.get("checkpoint") or "sam3.pt"),
         "sam3_device": "auto",
         "sam3_mask_mode": str(keyed.get("mask_mode") or "Combined"),
@@ -678,6 +728,42 @@ def _plaintext_to_html(text: str) -> str:
     return f"<p>{escaped.replace(chr(10), '<br>')}</p>"
 
 
+def _pull_seed_from_gallery_item(gallery_value, selected_index):
+    """Read the selected gallery image's PNG metadata, extract the
+    ``Seed: N`` value, and return it. Falls back to -1 on any failure
+    (no selection, file unreadable, no Seed in metadata, etc.) — the
+    Refine handler treats -1 as random per webui convention."""
+    try:
+        items = list(gallery_value or [])
+        if not items:
+            return -1
+        try:
+            idx = int(selected_index) if selected_index is not None else -1
+        except (TypeError, ValueError):
+            idx = -1
+        if idx < 0 or idx >= len(items):
+            idx = len(items) - 1
+        item = items[idx]
+        # Resolve item → file path (Gallery items can be dict / tuple / str)
+        path = None
+        if isinstance(item, dict):
+            path = item.get("name") or item.get("path") or item.get("data")
+        elif isinstance(item, (tuple, list)) and item:
+            path = item[0]
+        elif isinstance(item, str):
+            path = item
+        if not isinstance(path, str) or not os.path.isfile(path):
+            return -1
+        with Image.open(path) as img:
+            params = img.info.get("parameters", "") or img.info.get("Parameters", "")
+        m = re.search(r"Seed:\s*(-?\d+)", params)
+        if m:
+            return int(m.group(1))
+    except Exception:
+        pass
+    return -1
+
+
 def _refine_error_return(gallery_value, message: str):
     """4-tuple return shape used by handle_refine_click. ``gr.update()`` for
     html_info / generation_info leaves them untouched."""
@@ -719,6 +805,10 @@ def handle_refine_click(gallery_value, selected_index, *all_values):
     inherit_main = args.pop("_inherit_main_prompt", True)
     inherit_main_neg = args.pop("_inherit_main_neg_prompt", True)
     sd_model_override = args.pop("_sd_model_override", "Use current")
+    resize_mode = args.pop("_resize_mode", "Just Resize")
+    mask_invert = args.pop("_mask_invert", False)
+    args["sam3_resize_mode"] = resize_mode
+    args["sam3_mask_invert"] = mask_invert
 
     refine_p = args.get("sam3_inpaint_prompt") or ""
     detect_p = args.get("sam3_prompt") or ""

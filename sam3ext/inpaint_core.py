@@ -380,16 +380,24 @@ def build_standalone_i2i(
     # as a flat-color paint over the unchanged garment.
     inpainting_fill = _resolve_inpainting_fill(args.get("sam3_inpainting_fill"))
 
+    resize_mode_label = str(args.get("sam3_resize_mode") or "Just Resize")
+    resize_mode_int = {
+        "Just Resize": 0,
+        "Crop and Resize": 1,
+        "Resize and Fill": 2,
+    }.get(resize_mode_label, 0)
+    mask_invert_int = 1 if bool(args.get("sam3_mask_invert", False)) else 0
+
     p2 = StableDiffusionProcessingImg2Img(
         init_images=[image],
-        resize_mode=0,
+        resize_mode=resize_mode_int,
         denoising_strength=float(args["sam3_denoising_strength"]),
         mask=None,
         mask_blur=int(args["sam3_mask_blur"]),
         inpainting_fill=inpainting_fill,
         inpaint_full_res=bool(args["sam3_inpaint_only_masked"]),
         inpaint_full_res_padding=int(args["sam3_inpaint_only_masked_padding"]),
-        inpainting_mask_invert=0,
+        inpainting_mask_invert=mask_invert_int,
         initial_noise_multiplier=noise_multiplier,
         sd_model=sd_model,
         outpath_samples=outpath_samples,
@@ -684,6 +692,7 @@ def run_sam3_refine(
         allow_huggingface=allow_huggingface,
         mask_dilation=int(args.get("sam3_mask_dilation", 0)),
         mask_hull=bool(args.get("sam3_mask_hull", False)),
+        mask_outline_px=int(args.get("sam3_mask_outline_px", 0)),
     )
 
     if args.get("sam3_unload_after"):

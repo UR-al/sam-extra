@@ -214,6 +214,14 @@ def sam3_ui(is_img2img: bool, buttons: WebuiButtons):
                 value=False,
                 elem_id=eid("mask_hull"),
             )
+            w.sam3_mask_outline_px = gr.Slider(
+                label="Outline expand (edge-aware, px) — catches outline residue",
+                minimum=0,
+                maximum=64,
+                step=1,
+                value=0,
+                elem_id=eid("mask_outline_px"),
+            )
             checkpoint_choices = find_checkpoint_options()
             w.sam3_checkpoint = gr.Dropdown(
                 label="SAM3 Checkpoint",
