@@ -248,6 +248,16 @@ def build_i2i(p, image: Image.Image, args: dict[str, Any]) -> StableDiffusionPro
     # ever reads index 2.
     p2.cached_c = [None, None, None]
     p2.cached_uc = [None, None, None]
+    # 부모(메인 생성)에서 상속한 sampler/scheduler/steps 보존.
+    # 아래 script_args 대입이 Forge 내장 ScriptSampler.setup을 즉시 발화시켜
+    # p2.sampler_name/steps/scheduler를 그 스크립트의 슬롯 기본값(보통
+    # DPM++ 2M / Automatic / 20)으로 덮어쓴다. 메인 생성의 실제 샘플러
+    # (예: ER SDE / beta57)는 API top-level sampler_name으로 적용돼 그 슬롯엔
+    # 들어있지 않으므로, 'Use same'일 때 override_sampler_script_slot이 이
+    # base 값으로 복원해야 인페인트도 동일 샘플러로 돈다.
+    p2._sam3_base_steps = steps
+    p2._sam3_base_sampler = sampler_name
+    p2._sam3_base_scheduler = version_args.get("scheduler", getattr(p, "scheduler", None))
     p2.scripts, p2.script_args = script_filter(p)
     p2._sam3_inner = True
     p2.all_hr_prompts = [""]
@@ -459,6 +469,11 @@ def build_standalone_i2i(
     )
     p2.cached_c = [None, None, None]
     p2.cached_uc = [None, None, None]
+    # base 보존 (build_i2i와 동일 이유 — script_args 대입이 sampler 슬롯을 덮어씀).
+    # standalone refine은 부모 p가 없으므로 args에서 계산한 값이 곧 base.
+    p2._sam3_base_steps = steps
+    p2._sam3_base_sampler = sampler_name
+    p2._sam3_base_scheduler = version_args.get("scheduler", None)
     p2.scripts = scripts_runner
     p2.script_args = script_args
     p2._sam3_inner = True
@@ -532,8 +547,37 @@ def override_sampler_script_slot(p2, args: dict[str, Any]) -> None:
     # Back-compat: pre-0.6 the sampler toggle did both. Honor either flag.
     use_scheduler = bool(args.get("sam3_use_scheduler") or args.get("sam3_use_sampler"))
 
-    if not (use_steps or use_sampler or use_scheduler):
-        return
+    # build_i2i/build_standalone_i2i가 stash해둔, ScriptSampler.setup이 덮어쓰기
+    # '직전'의 상속(base) 값. 핵심 수정:
+    #   'Use same'(use_X=False)일 때 과거에는 아무것도 안 써서, setup이 슬롯
+    #   기본값(DPM++ 2M / Automatic)으로 덮어쓴 p2 값을 그대로 사용 → 메인 생성이
+    #   ER SDE/beta57(별도 샘플러)이어도 인페인트는 DPM++로 떨어졌음.
+    #   이제 'Use same'이면 이 base(=부모 p.sampler_name 등, 즉 메인 생성의 실제
+    #   샘플러)로 '복원'한다. → 인페인트가 메인과 동일 샘플러로 돈다.
+    base_steps = getattr(p2, "_sam3_base_steps", p2.steps)
+    base_sampler = getattr(p2, "_sam3_base_sampler", p2.sampler_name)
+    base_scheduler = getattr(p2, "_sam3_base_scheduler", p2.scheduler)
+
+    # 최종값: use_X면 args 지정값(단 'Use same' 표기는 base로), 아니면 base.
+    if use_steps:
+        try:
+            steps_final = int(args.get("sam3_steps", base_steps))
+        except (TypeError, ValueError):
+            steps_final = base_steps
+    else:
+        steps_final = base_steps
+
+    if use_sampler:
+        sn = str(args.get("sam3_sampler") or "")
+        sampler_final = base_sampler if sn in ("", "Use same sampler") else sn
+    else:
+        sampler_final = base_sampler
+
+    if use_scheduler:
+        sc = str(args.get("sam3_scheduler") or "")
+        scheduler_final = base_scheduler if sc in ("", "Use same scheduler") else sc
+    else:
+        scheduler_final = base_scheduler
 
     script_args = p2.script_args
     args_type = type(script_args)
@@ -541,26 +585,16 @@ def override_sampler_script_slot(p2, args: dict[str, Any]) -> None:
     slot_before = (patched[af + 0], patched[af + 1], patched[af + 2])
     p2_before = (p2.steps, p2.sampler_name, p2.scheduler)
 
-    if use_steps:
-        steps_val = int(args.get("sam3_steps", slot_before[0]))
-        patched[af + 0] = steps_val
-        p2.steps = steps_val
-    if use_sampler:
-        sampler_name = str(args.get("sam3_sampler") or "")
-        if sampler_name in ("", "Use same sampler"):
-            # 'Use same' = override 금지 → build_i2i가 이미 p2에 상속해둔
-            # 부모(base) 샘플러 유지. (이전엔 Euler a로 강제 폴백했음)
-            sampler_name = p2.sampler_name
-        patched[af + 1] = sampler_name
-        p2.sampler_name = sampler_name
-    if use_scheduler:
-        scheduler = str(args.get("sam3_scheduler") or "")
-        if scheduler in ("", "Use same scheduler"):
-            # 'Use same' = override 금지 → 부모(base) 스케줄러 유지.
-            # (이전엔 Automatic으로 강제 폴백했음)
-            scheduler = p2.scheduler
-        patched[af + 2] = scheduler
-        p2.scheduler = scheduler
+    # steps는 항상 정수가 보장되므로 무조건 기록.
+    patched[af + 0] = steps_final
+    p2.steps = steps_final
+    # sampler/scheduler는 빈 값이면 건드리지 않음 (None/'' 대입으로 깨지지 않게).
+    if sampler_final not in (None, ""):
+        patched[af + 1] = sampler_final
+        p2.sampler_name = sampler_final
+    if scheduler_final not in (None, ""):
+        patched[af + 2] = scheduler_final
+        p2.scheduler = scheduler_final
 
     slot_after = (patched[af + 0], patched[af + 1], patched[af + 2])
     p2_after = (p2.steps, p2.sampler_name, p2.scheduler)
@@ -571,7 +605,8 @@ def override_sampler_script_slot(p2, args: dict[str, Any]) -> None:
         f"[-] SAM3: ScriptSampler override applied — "
         f"slot {slot_before} → {slot_after}, "
         f"p2 attrs {p2_before} → {p2_after} "
-        f"(use_steps={use_steps}, use_sampler={use_sampler}, use_scheduler={use_scheduler})",
+        f"(use_steps={use_steps}, use_sampler={use_sampler}, use_scheduler={use_scheduler}; "
+        f"base(restore) steps={base_steps!r} sampler={base_sampler!r} sched={base_scheduler!r})",
         file=sys.stderr,
     )
 
