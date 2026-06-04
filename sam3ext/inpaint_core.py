@@ -20,6 +20,39 @@ from PIL import Image
 from modules import shared
 from modules.processing import StableDiffusionProcessingImg2Img, process_images
 
+try:  # Forge/A1111 VRAM 정리 유틸 (버전별 위치 차이 흡수)
+    from modules import devices as _devices
+except Exception:  # pragma: no cover
+    _devices = None
+
+
+def _reclaim_vram() -> None:
+    """인페인트 패스 직전 누적 단편화 메모리 회수.
+
+    base 생성 + ADetailer 검출 + SAM3 검출 사이클을 거치며 PyTorch
+    예약 캐시가 단편화돼, 인페인트용 KModel reload 시 가용 VRAM이
+    수 GB 부족해지는 현상(16GB GPU에서 6.9GB까지 떨어짐) 완화.
+    torch.cuda.empty_cache() + Forge devices.torch_gc() 둘 다 시도.
+    """
+    try:
+        import torch
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.ipc_collect()
+    except Exception:
+        pass
+    try:
+        if _devices is not None and hasattr(_devices, "torch_gc"):
+            _devices.torch_gc()
+    except Exception:
+        pass
+    try:  # Forge backend memory_management (있으면 더 강력)
+        from backend import memory_management as _mm
+        if hasattr(_mm, "soft_empty_cache"):
+            _mm.soft_empty_cache()
+    except Exception:
+        pass
+
 
 SCRIPT_EXCLUDE_FILENAMES = frozenset({"!sam3", "sam3_mask"})
 
@@ -513,15 +546,19 @@ def override_sampler_script_slot(p2, args: dict[str, Any]) -> None:
         patched[af + 0] = steps_val
         p2.steps = steps_val
     if use_sampler:
-        sampler_name = str(args.get("sam3_sampler") or "Euler a")
+        sampler_name = str(args.get("sam3_sampler") or "")
         if sampler_name in ("", "Use same sampler"):
-            sampler_name = "Euler a"
+            # 'Use same' = override 금지 → build_i2i가 이미 p2에 상속해둔
+            # 부모(base) 샘플러 유지. (이전엔 Euler a로 강제 폴백했음)
+            sampler_name = p2.sampler_name
         patched[af + 1] = sampler_name
         p2.sampler_name = sampler_name
     if use_scheduler:
-        scheduler = str(args.get("sam3_scheduler") or "Automatic")
+        scheduler = str(args.get("sam3_scheduler") or "")
         if scheduler in ("", "Use same scheduler"):
-            scheduler = "Automatic"
+            # 'Use same' = override 금지 → 부모(base) 스케줄러 유지.
+            # (이전엔 Automatic으로 강제 폴백했음)
+            scheduler = p2.scheduler
         patched[af + 2] = scheduler
         p2.scheduler = scheduler
 
@@ -875,6 +912,9 @@ def run_inpaint_passes(
         for index, mask in enumerate(masks, start=1):
             if shared.state.interrupted or shared.state.skipped:
                 break
+            # ★ 인페인트 KModel reload 전 단편화 VRAM 회수 — base/검출
+            #   사이클에서 누적된 예약 캐시를 비워 가용 VRAM 최대 확보 (OOM 완화)
+            _reclaim_vram()
             p2 = build_i2i(p, current_image, args)
             p2.image_mask = mask
             p2.init_images[0] = current_image
