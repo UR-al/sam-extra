@@ -736,7 +736,7 @@ def run_sam3_refine(
 
     Returns ``[]`` when SAM3 finds nothing or every pass is interrupted.
     """
-    from .core import run_sam3_on_pil, unload_sam3
+    from .core import Sam3Result, run_sam3_on_pil, unload_sam3
 
     # Standalone refine always overrides the t2i sampler/steps/scheduler/seed
     # — there's no parent process to inherit from. Set the use_* flags so
@@ -746,6 +746,10 @@ def run_sam3_refine(
     args.setdefault("sam3_use_sampler", True)
     args.setdefault("sam3_use_scheduler", True)
     args.setdefault("sam3_use_seed", True)
+
+    # User-drawn mask handed in by the Refine handler. Pulled here (not via
+    # Sam3Args) because it's a numpy array, not a serializable scalar.
+    user_mask = args.pop("_user_mask", None)
 
     scripts_runner, script_args_template = build_standalone_scripts_runner()
     if scripts_runner is None:
@@ -766,6 +770,7 @@ def run_sam3_refine(
         mask_hull=bool(args.get("sam3_mask_hull", False)),
         mask_outline_px=int(args.get("sam3_mask_outline_px", 0)),
         exclude_prompt=str(args.get("sam3_exclude_prompt") or ""),
+        user_mask=user_mask,
     )
 
     if args.get("sam3_unload_after"):

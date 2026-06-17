@@ -442,6 +442,7 @@ def run_sam3_on_pil(
     mask_hull: bool = False,
     mask_outline_px: int = 0,
     exclude_prompt: str = "",
+    user_mask: np.ndarray | None = None,
 ) -> Sam3Result:
     import torch
 
@@ -511,6 +512,45 @@ def run_sam3_on_pil(
         group_mask = _dilate_mask(group_mask, mask_dilation)
         if np.any(group_mask):
             group_masks.append(group_mask)
+
+    # Intersection narrowing with the user's drawn mask. Runs AFTER text
+    # detect+hull+dilation so SAM3 is allowed to expand to the real object
+    # boundary first, then we clip down to the user's hand-drawn ROI.
+    # Rule (per user spec):
+    #   M_intersect = M_user & M_sam3_combined
+    #   target = M_intersect if M_intersect.any() else M_user
+    # → SAM3 snaps the rough scribble to the actual object edge, but if
+    #   SAM3 missed the area entirely (e.g. text prompt didn't match,
+    #   threshold too high) the user's scribble is preserved as-is, so a
+    #   manual mask never silently collapses to nothing.
+    # The narrowed result becomes a single group mask, so downstream
+    # exclude / individual-vs-combined logic still works unchanged.
+    if user_mask is not None:
+        if user_mask.shape != (h, w):
+            um_pil = Image.fromarray(user_mask.astype(np.uint8) * 255, mode="L").resize(
+                (w, h), Image.NEAREST
+            )
+            user_mask = np.asarray(um_pil) > 127
+        sam3_combined = (
+            np.any(np.stack(group_masks, axis=0), axis=0)
+            if group_masks
+            else np.zeros((h, w), dtype=bool)
+        )
+        intersection = user_mask & sam3_combined
+        if bool(intersection.any()):
+            group_masks = [intersection]
+            print(
+                f"[-] SAM3: user mask ({int(user_mask.sum())}px) ∩ SAM3 "
+                f"({int(sam3_combined.sum())}px) → narrowed to {int(intersection.sum())}px",
+                file=sys.stderr,
+            )
+        else:
+            group_masks = [user_mask]
+            print(
+                f"[-] SAM3: user mask ({int(user_mask.sum())}px) did not "
+                f"overlap SAM3 detect — using user mask as-is",
+                file=sys.stderr,
+            )
 
     # Exclude prompt: detect regions to PROTECT, subtract from every group
     # mask. Use case: detect="clothes" expands via outline/hull and starts

@@ -23,6 +23,17 @@ from .ui import (
     _default_cn_module,
 )
 
+try:
+    from modules_forge.forge_canvas.canvas import ForgeCanvas
+
+    _FORGE_CANVAS_AVAILABLE = True
+except Exception:
+    # Forge runs this codebase; if the canvas import ever fails (different
+    # webui fork, partial install) we degrade gracefully — the Manual Mask
+    # accordion just doesn't render and the rest of the panel works.
+    ForgeCanvas = None  # type: ignore[assignment]
+    _FORGE_CANVAS_AVAILABLE = False
+
 
 def _sd_checkpoint_choices() -> list[str]:
     """Available Stable Diffusion checkpoints for the Refine "SD Model
@@ -91,10 +102,21 @@ class RefinePanel:
     refine_button: gr.Button
     stop_button: gr.Button
     status: gr.HTML
+    # Manual-mask canvas slots (None when ForgeCanvas isn't importable).
+    # canvas_bg / canvas_fg are LogicalImage Textbox slots backing the
+    # background image and the user's drawn scribble layer respectively.
+    canvas_bg: Any = None
+    canvas_fg: Any = None
+    canvas_load_button: gr.Button | None = None
 
     def all_widgets(self) -> list:
-        """Ordered list of input widgets — must match ``REFINE_ARG_KEYS``."""
-        return [
+        """Ordered list of input widgets — must match ``REFINE_ARG_KEYS``.
+
+        The two canvas slots (``canvas_bg``/``canvas_fg``) come at the very
+        end so older REFINE_ARG_KEYS prefixes still align with map_widget_
+        values_to_sam3_args even when ForgeCanvas isn't available.
+        """
+        widgets = [
             self.detect_prompt,
             self.exclude_prompt,
             self.inpaint_prompt,
@@ -136,6 +158,13 @@ class RefinePanel:
             self.cn_threshold_b,
             self.insert_mode,
         ]
+        # Append canvas slots when the component is available so the user's
+        # drawn mask + (optionally) overridden source image reach the click
+        # handler. Both come through as base64 PNG data URLs via LogicalImage's
+        # preprocess; the handler decodes them.
+        if self.canvas_bg is not None and self.canvas_fg is not None:
+            widgets.extend([self.canvas_bg, self.canvas_fg])
+        return widgets
 
 
 REFINE_ARG_KEYS = (
@@ -179,6 +208,11 @@ REFINE_ARG_KEYS = (
     "cn_threshold_a",
     "cn_threshold_b",
     "insert_mode",
+    # Canvas slots — only appended when ForgeCanvas is available (see
+    # ``RefinePanel.all_widgets``). Keep them last so the rest of the keys
+    # are positionally stable when the canvas is absent.
+    "canvas_background",
+    "canvas_foreground",
 )
 
 
@@ -204,6 +238,51 @@ def build_refine_panel(
             "Pick an image in the gallery above, then enter prompts and click **Refine**. "
             "The result is inserted next to the selected image — chain refines by reselecting."
         )
+
+        # Manual-mask accordion — collapsed by default so the panel still
+        # reads cleanly when no one wants to draw. When opened, the user can
+        # load the selected gallery image into the canvas and scribble a
+        # rough mask. The Refine handler ANDs the user's scribble with
+        # SAM3's text-detected mask (intersection narrowing): SAM3 snaps
+        # the rough scribble to the real object boundary, and if SAM3
+        # missed the area entirely the user's scribble survives intact.
+        canvas_bg = None
+        canvas_fg = None
+        canvas_load_button = None
+        if _FORGE_CANVAS_AVAILABLE:
+            with gr.Accordion(
+                "Manual Mask (optional — narrow SAM3 to your scribble)",
+                open=False,
+                elem_id="sam3_refine_manual_mask",
+            ):
+                gr.Markdown(
+                    "1) **📋 Load selected to canvas** to bring the selected gallery image in. "
+                    "2) Scribble roughly over the area you want refined. "
+                    "3) Hit **▶ Refine** — SAM3 runs its text detect, **intersects** with your scribble, "
+                    "and falls back to your scribble if SAM3 found nothing inside it."
+                )
+                with gr.Row():
+                    canvas_load_button = gr.Button(
+                        "📋 Load selected to canvas",
+                        scale=0,
+                        min_width=200,
+                        elem_id="sam3_refine_canvas_load",
+                    )
+                _canvas = ForgeCanvas(
+                    elem_id="sam3_refine_canvas",
+                    # Black scribble on contrast layer matches the inpaint
+                    # tab's UX; ``contrast_scribbles=True`` makes a low-
+                    # opacity mask visible over arbitrary images.
+                    contrast_scribbles=True,
+                    scribble_color="#000000",
+                    scribble_color_fixed=True,
+                    scribble_alpha=80,
+                    scribble_alpha_fixed=True,
+                    scribble_softness_fixed=True,
+                    height=480,
+                )
+                canvas_bg = _canvas.background
+                canvas_fg = _canvas.foreground
 
         with gr.Row():
             detect_prompt = gr.Textbox(
@@ -514,7 +593,56 @@ def build_refine_panel(
         refine_button=refine_button,
         stop_button=stop_button,
         status=status,
+        canvas_bg=canvas_bg,
+        canvas_fg=canvas_fg,
+        canvas_load_button=canvas_load_button,
     )
+
+
+def _extract_user_mask(value: Any) -> np.ndarray | None:
+    """ForgeCanvas foreground (LogicalImage with ``numpy=False``) → boolean
+    ``H×W`` mask of pixels the user actually scribbled on.
+
+    The foreground payload is an RGBA PIL image where the alpha channel is
+    non-zero exactly where the brush hit. An all-transparent (empty)
+    scribble returns ``None`` so the Refine path treats it as "no manual
+    mask" instead of an all-false mask that would zero out the SAM3 result.
+    """
+    if value is None:
+        return None
+    try:
+        if isinstance(value, np.ndarray):
+            arr = value
+        elif isinstance(value, Image.Image):
+            arr = np.array(value.convert("RGBA"))
+        else:
+            return None
+        if arr.ndim != 3 or arr.shape[2] < 4:
+            return None
+        alpha = arr[..., 3]
+        drawn = alpha > 0
+        if not bool(drawn.any()):
+            return None
+        return drawn
+    except Exception:
+        return None
+
+
+def _coerce_canvas_background(value: Any) -> Image.Image | None:
+    """ForgeCanvas background → RGB PIL image, or ``None`` when the canvas
+    is empty. Used to override the SAM3 input image when the user dropped
+    a different image into the canvas than the one they had selected in
+    the gallery."""
+    if value is None:
+        return None
+    try:
+        if isinstance(value, Image.Image):
+            return value.convert("RGB")
+        if isinstance(value, np.ndarray):
+            return Image.fromarray(value).convert("RGB")
+    except Exception:
+        return None
+    return None
 
 
 def _coerce_gallery_item_to_pil(item: Any) -> Image.Image | None:
@@ -742,6 +870,12 @@ def map_widget_values_to_sam3_args(values: tuple) -> dict[str, Any]:
         "_insert_mode": str(keyed.get("insert_mode") or "After selected"),
         "_inherit_main_prompt": bool(keyed.get("inherit_main_prompt", True)),
         "_inherit_main_neg_prompt": bool(keyed.get("inherit_main_neg_prompt", True)),
+        # Canvas slots — pulled out as raw payloads (PIL Image or None) and
+        # decoded into the actual override image / user_mask further down in
+        # handle_refine_click. Stored under leading-underscore keys so they
+        # never reach Sam3Args's pydantic model.
+        "_canvas_background": keyed.get("canvas_background"),
+        "_canvas_foreground": keyed.get("canvas_foreground"),
     }
 
 
@@ -757,11 +891,40 @@ def _plaintext_to_html(text: str) -> str:
     return f"<p>{escaped.replace(chr(10), '<br>')}</p>"
 
 
-def _pull_seed_from_gallery_item(gallery_value, selected_index):
-    """Read the selected gallery image's PNG metadata, extract the
-    ``Seed: N`` value, and return it. Falls back to -1 on any failure
-    (no selection, file unreadable, no Seed in metadata, etc.) — the
-    Refine handler treats -1 as random per webui convention."""
+_SEED_RE = re.compile(r"Seed:\s*(-?\d+)")
+
+
+def _extract_seed_from_text(text: str) -> int | None:
+    if not text:
+        return None
+    m = _SEED_RE.search(text)
+    if not m:
+        return None
+    try:
+        return int(m.group(1))
+    except (TypeError, ValueError):
+        return None
+
+
+def _pull_seed_from_gallery_item(gallery_value, selected_index, generation_info_json: str = ""):
+    """Return the seed that was actually used to render the gallery item the
+    user picked.
+
+    Resolution order:
+
+    1. ``generation_info_json["infotexts"][idx]`` — the per-image infotext
+       string Forge populates when it generates a batch. Most authoritative,
+       and survives Gradio re-encoding the gallery thumbnail (which is what
+       was breaking the previous PNG-only path — Gradio strips the
+       ``parameters`` PNG chunk when it caches a smaller display thumb).
+    2. ``Image.open(path).info["parameters"]`` — direct PNG metadata. Only
+       reachable when the gallery item resolves to a real on-disk file with
+       its original metadata intact.
+
+    Returns ``-1`` on every failure mode (no selection, parse miss, …) —
+    webui treats -1 as "pick a fresh random seed", so the Refine button
+    stays usable.
+    """
     try:
         items = list(gallery_value or [])
         if not items:
@@ -772,8 +935,19 @@ def _pull_seed_from_gallery_item(gallery_value, selected_index):
             idx = -1
         if idx < 0 or idx >= len(items):
             idx = len(items) - 1
+
+        if generation_info_json:
+            try:
+                info = json.loads(generation_info_json)
+                infotexts = info.get("infotexts") or []
+                if 0 <= idx < len(infotexts):
+                    seed = _extract_seed_from_text(infotexts[idx])
+                    if seed is not None:
+                        return seed
+            except Exception:
+                pass
+
         item = items[idx]
-        # Resolve item → file path (Gallery items can be dict / tuple / str)
         path = None
         if isinstance(item, dict):
             path = item.get("name") or item.get("path") or item.get("data")
@@ -781,13 +955,12 @@ def _pull_seed_from_gallery_item(gallery_value, selected_index):
             path = item[0]
         elif isinstance(item, str):
             path = item
-        if not isinstance(path, str) or not os.path.isfile(path):
-            return -1
-        with Image.open(path) as img:
-            params = img.info.get("parameters", "") or img.info.get("Parameters", "")
-        m = re.search(r"Seed:\s*(-?\d+)", params)
-        if m:
-            return int(m.group(1))
+        if isinstance(path, str) and os.path.isfile(path):
+            with Image.open(path) as img:
+                params = img.info.get("parameters", "") or img.info.get("Parameters", "")
+            seed = _extract_seed_from_text(params)
+            if seed is not None:
+                return seed
     except Exception:
         pass
     return -1
@@ -848,8 +1021,22 @@ def handle_refine_click(
     sd_model_override = args.pop("_sd_model_override", "Use current")
     resize_mode = args.pop("_resize_mode", "Just Resize")
     mask_invert = args.pop("_mask_invert", False)
+    canvas_bg_raw = args.pop("_canvas_background", None)
+    canvas_fg_raw = args.pop("_canvas_foreground", None)
     args["sam3_resize_mode"] = resize_mode
     args["sam3_mask_invert"] = mask_invert
+
+    canvas_image = _coerce_canvas_background(canvas_bg_raw)
+    user_mask = _extract_user_mask(canvas_fg_raw)
+    # User mask is meaningful only against the same image SAM3 detects on.
+    # Drop a stray scribble if the user emptied the canvas — without the
+    # background we can't match coordinates.
+    if user_mask is not None and canvas_image is None:
+        print(
+            "[-] SAM3 Refine: scribble present but canvas background empty — ignoring scribble.",
+            file=sys.stderr,
+        )
+        user_mask = None
 
     refine_p = args.get("sam3_inpaint_prompt") or ""
     detect_p = args.get("sam3_prompt") or ""
@@ -897,34 +1084,56 @@ def handle_refine_click(
             f"{cleaned_neg}, {refine_n}".rstrip(", ") if refine_n else cleaned_neg
         )
 
-    if not args["sam3_prompt"]:
+    # Target prompt can be empty IF the user supplied a manual mask — the
+    # scribble itself becomes the target then (SAM3 detection is skipped).
+    if not args["sam3_prompt"] and user_mask is None:
         return _refine_error_return(
             gallery_value,
-            "<span style='color:#c33'>SAM3 Refine: enter a Target (detect prompt) first.</span>",
+            "<span style='color:#c33'>SAM3 Refine: enter a Target (detect prompt) or draw a manual mask first.</span>",
         )
 
     gallery_list = list(gallery_value or [])
-    if not gallery_list:
-        return _refine_error_return(
-            gallery_value,
-            "<span style='color:#c33'>SAM3 Refine: gallery is empty.</span>",
-        )
 
-    # Hidden Number arrives as float; JS shim defaults to -1 when nothing is
-    # selected. Coerce + clamp to a valid index.
-    try:
-        idx = int(selected_index) if selected_index is not None else -1
-    except (TypeError, ValueError):
-        idx = -1
-    if idx < 0 or idx >= len(gallery_list):
-        idx = len(gallery_list) - 1  # default to last item
+    # Source-image resolution order:
+    #   1. ForgeCanvas background (user may have dropped a different image
+    #      onto the canvas — that's the one their scribble lines up with)
+    #   2. Selected gallery item
+    # When the canvas is in play, the gallery is allowed to be empty.
+    if canvas_image is not None:
+        image = canvas_image
+        idx = -1  # marker: result append still works via gallery_list checks
+    else:
+        if not gallery_list:
+            return _refine_error_return(
+                gallery_value,
+                "<span style='color:#c33'>SAM3 Refine: gallery is empty.</span>",
+            )
+        try:
+            idx = int(selected_index) if selected_index is not None else -1
+        except (TypeError, ValueError):
+            idx = -1
+        if idx < 0 or idx >= len(gallery_list):
+            idx = len(gallery_list) - 1
+        image = _coerce_gallery_item_to_pil(gallery_list[idx])
+        if image is None:
+            return _refine_error_return(
+                gallery_value,
+                f"<span style='color:#c33'>SAM3 Refine: could not load selected image (index {idx}).</span>",
+            )
 
-    image = _coerce_gallery_item_to_pil(gallery_list[idx])
-    if image is None:
-        return _refine_error_return(
-            gallery_value,
-            f"<span style='color:#c33'>SAM3 Refine: could not load selected image (index {idx}).</span>",
-        )
+    # Match scribble dimensions to the source image. ForgeCanvas hands the
+    # background and foreground at the same resolution, but if the user
+    # dropped an image of one size and we scaled it differently, snap the
+    # mask to the SAM3 input dimensions with nearest-neighbor.
+    if user_mask is not None:
+        target_size = (image.height, image.width)  # (H, W) for numpy
+        if user_mask.shape != target_size:
+            mask_pil = Image.fromarray(user_mask.astype(np.uint8) * 255, mode="L").resize(
+                (image.width, image.height), Image.NEAREST
+            )
+            user_mask = np.asarray(mask_pil) > 127
+
+    args["_user_mask"] = user_mask
 
     from modules import shared
 
@@ -973,7 +1182,9 @@ def handle_refine_click(
     new_images = [img for img, _ in new_pairs]
     new_infotexts = [info for _, info in new_pairs]
 
-    if insert_mode == "At end":
+    # Canvas-only path (idx=-1) has no anchor in the gallery — fall through
+    # to "append at end" so the result lands somewhere sensible.
+    if insert_mode == "At end" or idx < 0:
         updated = gallery_list + new_images
     else:
         updated = gallery_list[: idx + 1] + new_images + gallery_list[idx + 1 :]
@@ -989,7 +1200,7 @@ def handle_refine_click(
     existing_infotexts = list(info_payload.get("infotexts") or [""] * len(gallery_list))
     while len(existing_infotexts) < len(gallery_list):
         existing_infotexts.append("")
-    if insert_mode == "At end":
+    if insert_mode == "At end" or idx < 0:
         merged_infotexts = existing_infotexts + new_infotexts
     else:
         merged_infotexts = (

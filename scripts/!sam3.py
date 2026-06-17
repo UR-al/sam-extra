@@ -480,10 +480,37 @@ def _wire_refine_panel(
     panel.seed_pull_button.click(
         fn=_pull_seed_from_gallery_item,
         _js="(...args) => { try { args[1] = selected_gallery_index(); } catch (e) { args[1] = -1; } return args; }",
-        inputs=[gallery, panel.selected_index_state],
+        inputs=[gallery, panel.selected_index_state, generation_info],
         outputs=[panel.seed],
         queue=False,
     )
+
+    # Manual-mask "Load selected to canvas" button: copy the currently-
+    # selected gallery image into the ForgeCanvas background slot so the
+    # user can scribble over it. The JS shim populates args[1] with the
+    # actual selection index just like the Refine button does.
+    if panel.canvas_load_button is not None and panel.canvas_bg is not None:
+        def _load_to_canvas(gallery_value, selected_index):
+            from sam3ext.ui_refine import _coerce_gallery_item_to_pil
+
+            items = list(gallery_value or [])
+            if not items:
+                return None
+            try:
+                idx = int(selected_index) if selected_index is not None else -1
+            except (TypeError, ValueError):
+                idx = -1
+            if idx < 0 or idx >= len(items):
+                idx = len(items) - 1
+            return _coerce_gallery_item_to_pil(items[idx])
+
+        panel.canvas_load_button.click(
+            fn=_load_to_canvas,
+            _js="(...args) => { try { args[1] = selected_gallery_index(); } catch (e) { args[1] = -1; } return args; }",
+            inputs=[gallery, panel.selected_index_state],
+            outputs=[panel.canvas_bg],
+            queue=False,
+        )
 
     # Auto seed pull on gallery change: when t2i Generate finishes (or our
     # Refine appends a new image), the gallery's value updates and Gradio
@@ -491,15 +518,17 @@ def _wire_refine_panel(
     # generated/refined one and the most useful default for the next
     # Refine click. The user can still manually click 🎯 after selecting
     # a different older image.
-    def _auto_pull_seed_from_latest(gallery_value):
+    def _auto_pull_seed_from_latest(gallery_value, generation_info_json):
         items = list(gallery_value or [])
         if not items:
             return -1
-        return _pull_seed_from_gallery_item(gallery_value, len(items) - 1)
+        return _pull_seed_from_gallery_item(
+            gallery_value, len(items) - 1, generation_info_json
+        )
 
     gallery.change(
         fn=_auto_pull_seed_from_latest,
-        inputs=[gallery],
+        inputs=[gallery, generation_info],
         outputs=[panel.seed],
         queue=False,
         show_progress=False,
