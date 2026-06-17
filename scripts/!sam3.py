@@ -198,6 +198,34 @@ class Sam3MaskScript(scripts.Script):
                 i2i_button=img2img_submit_button,
             ),
         )
+        # v0.8.1: render the Anima Tile-Repair accordion as a SIBLING of the
+        # SAM3 mask accordion (same t2i scripts column). Previously the panel
+        # was rendered in on_after_component into the gallery sidebar group
+        # next to Refine — but the user wanted it directly below SAM3, which
+        # is the alwayson-scripts area, so it has to be created here inside
+        # the script's ui() callback while the same gr.Blocks context is open.
+        #
+        # Only render on t2i: i2i has no Refine/Anima companion panel either.
+        # anima_panel is intentionally NOT added to the returned components
+        # list — it's wired through its own button.click in on_after_component
+        # so its widgets don't pollute the SAM3 alwayson script_args.
+        global anima_panel
+        if not is_img2img and anima_panel is None and anima_available():
+            try:
+                anima_panel = build_anima_panel()
+            except Exception:
+                error = traceback.format_exc()
+                print(
+                    f"[-] SAM3: failed to render Anima panel:\n{error}",
+                    file=sys.stderr,
+                )
+        elif not is_img2img and not anima_available():
+            print(
+                "[-] SAM3: anima_vendor/ not present; Tile-Repair panel "
+                "skipped. Re-run install.py to clone kohya-ss/sd-scripts.",
+                file=sys.stderr,
+            )
+
         self.infotext_fields = [(components[0], "SAM3 Enable"), *infotext_fields]
         return components
 
@@ -393,6 +421,11 @@ txt2img_html_info_component = None
 txt2img_generation_info_component = None
 refine_panel: RefinePanel | None = None
 anima_panel: AnimaPanel | None = None
+# Set True the first time on_after_component wires the Anima panel's click
+# chain. Distinct from `anima_panel is None` because the panel is created
+# in Sam3MaskScript.ui() (alwayson script ui callback) but wiring needs the
+# gallery component captured later via on_after_component.
+anima_wired: bool = False
 
 
 # JS shim: replace the placeholder selected_index slot (index 1 in the inputs
@@ -617,7 +650,7 @@ def on_after_component(component, **kwargs):
     global txt2img_submit_button, img2img_submit_button
     global txt2img_gallery_component, txt2img_prompt_component, txt2img_neg_prompt_component
     global txt2img_html_info_component, txt2img_generation_info_component
-    global refine_panel, anima_panel
+    global refine_panel
 
     elem_id = kwargs.get("elem_id")
     if elem_id == "txt2img_generate":
@@ -664,32 +697,26 @@ def on_after_component(component, **kwargs):
             error = traceback.format_exc()
             print(f"[-] SAM3: failed to render Refine panel:\n{error}", file=sys.stderr)
 
-        # Render Anima Tile-Repair panel directly under Refine, in the same
-        # hidden gr.Group. install.py shallow-clones kohya-ss/sd-scripts into
-        # anima_vendor/ on first run; if the clone failed (offline / no git),
-        # anima_available() returns False and we just skip — the rest of the
-        # SAM3 extension keeps working.
-        if anima_panel is None and anima_available():
+        # v0.8.1: the Anima panel is now created inside Sam3MaskScript.ui()
+        # (alongside the SAM3 mask accordion). Here we only wire its click
+        # chain — we need the t2i gallery / generation_info components that
+        # this callback captures.
+        global anima_wired
+        if anima_panel is not None and not anima_wired:
             try:
-                anima_panel = build_anima_panel()
                 _wire_anima_panel(
                     anima_panel,
                     txt2img_gallery_component,
                     txt2img_html_info_component,
                     txt2img_generation_info_component,
                 )
+                anima_wired = True
             except Exception:
                 error = traceback.format_exc()
                 print(
-                    f"[-] SAM3: failed to render Anima panel:\n{error}",
+                    f"[-] SAM3: failed to wire Anima panel:\n{error}",
                     file=sys.stderr,
                 )
-        elif not anima_available():
-            print(
-                "[-] SAM3: anima_vendor/ not present; Tile-Repair panel "
-                "skipped. Re-run install.py to clone kohya-ss/sd-scripts.",
-                file=sys.stderr,
-            )
 
 
 script_callbacks.on_after_component(on_after_component)
