@@ -1,7 +1,11 @@
 from __future__ import annotations
 
 import importlib.util
+import os
+import subprocess
+import sys
 from importlib.metadata import version
+from pathlib import Path
 
 from packaging.version import parse
 
@@ -59,3 +63,87 @@ def check_environment():
 
 
 check_environment()
+
+
+# ---------------------------------------------------------------------------
+# v0.8.0 Anima vendor bootstrap — shallow-clone kohya-ss/sd-scripts once.
+# ---------------------------------------------------------------------------
+# Forge runs install.py as a subprocess at extension load (launch_utils.py),
+# so this happens before scripts/!sam3.py ever imports. Failure is non-fatal:
+# the Anima panel just hides itself, the rest of the SAM3 extension still
+# works.
+
+_ANIMA_REPO = "https://github.com/kohya-ss/sd-scripts.git"
+_ANIMA_BRANCH = "main"
+_ANIMA_ROOT = Path(__file__).resolve().parent / "anima_vendor"
+# Sentinel = the actual entrypoint upstream ships. If the clone was
+# interrupted partway through, this file will be missing and the next run
+# re-attempts cleanly.
+_ANIMA_SENTINEL = _ANIMA_ROOT / "anima_minimal_inference.py"
+
+
+def _have_git() -> bool:
+    try:
+        subprocess.check_call(
+            ["git", "--version"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        return True
+    except Exception:
+        return False
+
+
+def ensure_anima_vendor() -> bool:
+    """Clone kohya-ss/sd-scripts into ``anima_vendor/`` if the sentinel file
+    is missing. Idempotent.
+
+    Returns True when the vendor tree is usable after this call, False when
+    bootstrap failed (the Anima panel reads ``anima_available()`` to decide
+    whether to render).
+    """
+    if _ANIMA_SENTINEL.exists():
+        return True
+
+    if not _have_git():
+        print(
+            "[forge_sam3_extension] Anima panel disabled: 'git' not on PATH. "
+            "Install git, or clone kohya-ss/sd-scripts manually into "
+            f"{_ANIMA_ROOT}",
+            file=sys.stderr,
+        )
+        return False
+
+    _ANIMA_ROOT.parent.mkdir(parents=True, exist_ok=True)
+    print(
+        f"[forge_sam3_extension] cloning sd-scripts → {_ANIMA_ROOT} "
+        "(first-run, ~30s)",
+        file=sys.stderr,
+    )
+    try:
+        subprocess.check_call(
+            [
+                "git",
+                "clone",
+                "--depth",
+                "1",
+                "--single-branch",
+                "--branch",
+                _ANIMA_BRANCH,
+                _ANIMA_REPO,
+                str(_ANIMA_ROOT),
+            ],
+            env={**os.environ, "GIT_TERMINAL_PROMPT": "0"},
+        )
+    except subprocess.CalledProcessError as e:
+        print(
+            f"[forge_sam3_extension] Anima vendor clone failed (exit "
+            f"{e.returncode}); the Anima panel will be disabled.",
+            file=sys.stderr,
+        )
+        return False
+
+    return _ANIMA_SENTINEL.exists()
+
+
+ensure_anima_vendor()

@@ -8,3 +8,6 @@ models/
 *.safetensors
 .claude/
 pip
+
+# v0.8.0 — shallow clone of kohya-ss/sd-scripts populated by install.py
+anima_vendor/

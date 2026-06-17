@@ -1,0 +1,615 @@
+"""Anima Tile-Repair core — framework-agnostic wrapper around the
+kohya-ss/sd-scripts Anima inference pipeline.
+
+This module is the v0.8.0 entry point for the Anima Tile-Repair panel that
+lives below the SAM3 in-flight accordion. It does NOT import Gradio (UI lives
+in ``ui_anima.py``).
+
+Pipeline ↔ ComfyUI workflow equivalence
+---------------------------------------
+The user-supplied ComfyUI workflow runs:
+
+    LoadImage(source)
+      ├── ResizeImagesByShorterEdge → VAEEncode → KSampler.latent_image
+      │     (denoise=1.0; latent_image is shape-only — sampling starts from
+      │      pure noise)
+      └── AnimaLLLiteApply(image=source, strength=1.0, start=0, end=1)
+            → KSampler conditioning
+
+We reproduce the exact same effect by:
+
+1. Calling the vendor's ``anima_minimal_inference_control_net_lllite``
+   monkey-patches so ``load_dit_model`` attaches ``ControlNetLLLiteDiT`` and
+   ``generate_body`` sets ``cond_image = source`` before sampling.
+2. Driving the standard ``ami.generate()`` loop (Flow Matching, ``flow_shift``,
+   ``infer_steps``, ``guidance_scale``).
+3. Decoding the bf16 latent via the Qwen-Image AutoencoderKL.
+
+No init-image plumbing is required — the source image flows into the network
+via the LLLite cond_image, exactly like ComfyUI's AnimaLLLiteApply node.
+"""
+from __future__ import annotations
+
+import gc
+import io
+import os
+import sys
+import tempfile
+import traceback
+from contextlib import contextmanager
+from dataclasses import dataclass, field
+from pathlib import Path
+from types import SimpleNamespace
+from typing import Any
+
+import numpy as np
+import torch
+from PIL import Image
+
+EXTENSION_ROOT = Path(__file__).resolve().parent.parent
+ANIMA_VENDOR = EXTENSION_ROOT / "anima_vendor"
+# Sentinel matches install.ensure_anima_vendor's check — same file
+# upstream ships at repo root.
+ANIMA_SENTINEL = ANIMA_VENDOR / "anima_minimal_inference.py"
+ANIMA_LLLITE_SENTINEL = ANIMA_VENDOR / "anima_minimal_inference_control_net_lllite.py"
+
+
+# ---------------------------------------------------------------------------
+# Public dataclass — the click handler builds one of these from widget values.
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class AnimaTileRepairArgs:
+    """All settings the panel collects. Mirrors the field set we exposed in
+    ``ui_anima.ANIMA_ARG_KEYS`` so adding/removing a widget only touches the
+    UI module and this dataclass in lockstep."""
+
+    # Models
+    lllite_model: str = "None"          # basename under models/ControlNet/
+    dit_override: str = "Use Forge current"
+    te_override: str = "Use Forge current"
+    vae_override: str = "Use Forge current"
+    # LoRA stack (4 fixed slots, bypass by leaving "None" / weight 0)
+    lora_slots: list[tuple[str, float]] = field(default_factory=lambda: [("None", 0.0)] * 4)
+    # Prompts
+    positive: str = ""
+    negative: str = ""
+    # Sampler (vendor defaults — no Turbo LoRA assumed)
+    steps: int = 50
+    cfg: float = 3.5
+    flow_shift: float = 5.0
+    seed: int = -1
+    # Output size
+    width: int = 1024
+    height: int = 1024
+    # LLLite conditioning schedule
+    lllite_strength: float = 1.0
+    lllite_start: float = 0.0
+    lllite_end: float = 1.0
+    lllite_multiplier: float = 1.0
+    # Housekeeping
+    unload_forge_before: bool = True
+    insert_mode: str = "After selected"
+
+
+# ---------------------------------------------------------------------------
+# Vendor bootstrap (sys.path injection)
+# ---------------------------------------------------------------------------
+
+_VENDOR_INJECTED = False
+
+
+def _ensure_vendor_importable() -> bool:
+    """Add ``anima_vendor/`` to sys.path so ``import anima_minimal_inference``
+    and ``from library import ...`` resolve. Idempotent."""
+    global _VENDOR_INJECTED
+    if _VENDOR_INJECTED:
+        return True
+    if not ANIMA_SENTINEL.exists():
+        return False
+    p = str(ANIMA_VENDOR)
+    if p not in sys.path:
+        sys.path.insert(0, p)
+    _VENDOR_INJECTED = True
+    return True
+
+
+def anima_available() -> bool:
+    """Cheap probe used by ui_anima.py to decide whether to render. Doesn't
+    actually import the vendor (would be slow at UI build time)."""
+    return ANIMA_SENTINEL.exists()
+
+
+# ---------------------------------------------------------------------------
+# Path resolvers (Forge model-folder scanners)
+# ---------------------------------------------------------------------------
+
+
+def _models_path() -> Path | None:
+    try:
+        from modules import paths
+
+        return Path(paths.models_path)
+    except Exception:
+        return None
+
+
+def list_dit_choices() -> list[str]:
+    """Anima DiT checkpoints. Filters ``models/Stable-diffusion/`` by
+    ``anima`` substring to avoid polluting the dropdown with every SDXL
+    checkpoint. ``Use Forge current`` always wins as the first entry."""
+    out = ["Use Forge current"]
+    root = _models_path()
+    if root is not None:
+        sd_dir = root / "Stable-diffusion"
+        if sd_dir.is_dir():
+            out.extend(
+                sorted(p.name for p in sd_dir.glob("*.safetensors") if "anima" in p.name.lower())
+            )
+    return out
+
+
+def list_te_choices() -> list[str]:
+    out = ["Use Forge current"]
+    root = _models_path()
+    if root is not None:
+        te_dir = root / "text_encoder"
+        if te_dir.is_dir():
+            out.extend(sorted(p.name for p in te_dir.glob("*.safetensors")))
+    return out
+
+
+def list_vae_choices() -> list[str]:
+    out = ["Use Forge current"]
+    try:
+        from modules import sd_vae
+
+        sd_vae.refresh_vae_list()
+        out.extend(sorted(sd_vae.vae_dict.keys()))
+    except Exception:
+        # If we can't refresh the dict, fall back to a folder scan so the
+        # dropdown isn't empty.
+        root = _models_path()
+        if root is not None:
+            vae_dir = root / "VAE"
+            if vae_dir.is_dir():
+                out.extend(sorted(p.name for p in vae_dir.glob("*.safetensors")))
+    return out
+
+
+def list_lllite_choices() -> list[str]:
+    """LLLite checkpoints. Forge's ControlNet folder is the user's convention
+    (``models/ControlNet/animaTileRepair_v10.safetensors`` etc.)."""
+    out = ["None"]
+    root = _models_path()
+    if root is None:
+        return out
+    # Some Forge variants use lowercase 'controlnet', user's tree uses both.
+    for variant in ("ControlNet", "controlnet"):
+        cn_dir = root / variant
+        if not cn_dir.is_dir():
+            continue
+        # Match anima*/lllite* substrings so generic SDXL CN checkpoints
+        # don't clutter the dropdown. ``saftensors`` typo handled too.
+        for ext in (".safetensors", ".saftensors"):
+            for p in sorted(cn_dir.glob(f"*{ext}")):
+                lower = p.name.lower()
+                if "anima" in lower or "lllite" in lower:
+                    out.append(p.name)
+        # only one variant — first hit wins
+        if len(out) > 1:
+            break
+    return out
+
+
+def list_lora_choices() -> list[str]:
+    out = ["None"]
+    root = _models_path()
+    if root is not None:
+        for variant in ("Lora", "lora"):
+            lora_dir = root / variant
+            if not lora_dir.is_dir():
+                continue
+            out.extend(sorted(p.name for p in lora_dir.glob("*.safetensors")))
+            break
+    return out
+
+
+# ---------------------------------------------------------------------------
+# "Use Forge current" → concrete path mapping
+# ---------------------------------------------------------------------------
+
+
+def _resolve_forge_current_dit() -> str | None:
+    try:
+        from modules import sd_models
+
+        ci = sd_models.select_checkpoint()
+        return ci.filename if ci is not None else None
+    except Exception:
+        return None
+
+
+def _resolve_forge_current_vae() -> str | None:
+    try:
+        from modules import sd_vae
+
+        # Forge stores the in-memory VAE path here when one is loaded.
+        path = getattr(sd_vae, "loaded_vae_file", None)
+        if path:
+            return str(path)
+    except Exception:
+        pass
+    return None
+
+
+def _resolve_lllite_path(name: str) -> str | None:
+    """Map an LLLite dropdown choice (basename) back to an absolute path."""
+    if not name or name == "None":
+        return None
+    root = _models_path()
+    if root is None:
+        return None
+    for variant in ("ControlNet", "controlnet"):
+        cn_dir = root / variant
+        candidate = cn_dir / name
+        if candidate.is_file():
+            return str(candidate)
+    return None
+
+
+def _resolve_te_path(name: str) -> str | None:
+    if not name or name == "Use Forge current":
+        return None
+    root = _models_path()
+    if root is None:
+        return None
+    candidate = root / "text_encoder" / name
+    return str(candidate) if candidate.is_file() else None
+
+
+def _resolve_vae_path(name: str) -> str | None:
+    if not name or name == "Use Forge current":
+        return None
+    try:
+        from modules import sd_vae
+
+        return sd_vae.vae_dict.get(name)
+    except Exception:
+        return None
+
+
+def _resolve_lora_path(name: str) -> str | None:
+    if not name or name == "None":
+        return None
+    root = _models_path()
+    if root is None:
+        return None
+    for variant in ("Lora", "lora"):
+        candidate = root / variant / name
+        if candidate.is_file():
+            return str(candidate)
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Forge SD model swap
+# ---------------------------------------------------------------------------
+
+
+@contextmanager
+def forge_sd_unloaded():
+    """Push the current Forge SD model out of VRAM during Anima inference,
+    then let Forge lazy-reload on the next t2i sampling step.
+
+    CRITICAL distinction (verified against backend/memory_management.py +
+    modules/sd_models.py):
+
+    - ``backend.memory_management.unload_all_models()`` clears VRAM without
+      destroying ``model_data.sd_model``. ``model_data.forge_hash`` is
+      preserved, so the next ``forge_model_reload()`` early-returns and the
+      user does NOT pay a full disk reload.
+    - ``sd_models.unload_model_weights()`` NUKES the in-memory model
+      (replaces with FakeInitialModel + clears forge_hash). The next t2i
+      would have to re-read the checkpoint from disk. Do not call it from
+      here.
+    """
+    try:
+        from backend import memory_management as mm
+
+        mm.unload_all_models()
+        mm.soft_empty_cache()
+        gc.collect()
+    except Exception:
+        # If Forge's memory layer isn't importable we just skip — Anima's
+        # own loader will create VRAM pressure that Forge will resolve on
+        # its next sampling step.
+        pass
+    try:
+        yield
+    finally:
+        try:
+            from backend import memory_management as mm
+
+            mm.soft_empty_cache()
+            gc.collect()
+        except Exception:
+            pass
+
+
+@contextmanager
+def _nullctx():
+    yield
+
+
+# ---------------------------------------------------------------------------
+# argparse.Namespace builder (matches anima_minimal_inference's CLI shape)
+# ---------------------------------------------------------------------------
+
+
+def _build_anima_args(repair: AnimaTileRepairArgs, control_image_path: str) -> SimpleNamespace:
+    """Build the argparse-Namespace shape that the vendor's
+    ``anima_minimal_inference`` + LLLite monkey-patch expect.
+
+    ``control_image_path`` is a temp PNG of the source image (the LLLite
+    extension reads it from disk via ``--control_image``).
+    """
+    ns = SimpleNamespace()
+
+    # --- prompts ---
+    ns.prompt = repair.positive
+    ns.negative_prompt = repair.negative or ""
+
+    # --- sampling ---
+    ns.image_size = [int(repair.height), int(repair.width)]  # [H, W] per vendor convention
+    ns.infer_steps = int(repair.steps)
+    ns.guidance_scale = float(repair.cfg)
+    ns.flow_shift = float(repair.flow_shift)
+    ns.seed = int(repair.seed) if repair.seed >= 0 else None
+
+    # --- model paths ---
+    dit = (
+        _resolve_forge_current_dit()
+        if repair.dit_override == "Use Forge current"
+        else None
+    )
+    if repair.dit_override != "Use Forge current":
+        root = _models_path()
+        if root is not None:
+            dit = str(root / "Stable-diffusion" / repair.dit_override)
+    ns.dit = dit  # vendor key is --dit
+
+    # Text encoder — vendor key is --text_encoder
+    if repair.te_override == "Use Forge current":
+        ns.text_encoder = None
+    else:
+        ns.text_encoder = _resolve_te_path(repair.te_override)
+
+    # VAE — vendor key is --vae
+    if repair.vae_override == "Use Forge current":
+        ns.vae = _resolve_forge_current_vae()
+    else:
+        ns.vae = _resolve_vae_path(repair.vae_override)
+    ns.vae_chunk_size = None
+    ns.vae_disable_cache = False
+    ns.qwen_image_vae_2d = False
+
+    # --- LoRA stack (parallel lists, vendor takes nargs='*') ---
+    weights: list[str] = []
+    multipliers: list[float] = []
+    for name, weight in repair.lora_slots:
+        path = _resolve_lora_path(name)
+        if path is None:
+            continue
+        if weight == 0.0:
+            continue
+        weights.append(path)
+        multipliers.append(float(weight))
+    ns.lora_weight = weights or None
+    ns.lora_multiplier = multipliers if multipliers else 1.0
+    ns.include_patterns = None
+    ns.exclude_patterns = None
+
+    # --- LLLite specific ---
+    ns.lllite_weights = _resolve_lllite_path(repair.lllite_model)
+    ns.control_image = control_image_path
+    ns.lllite_multiplier = float(repair.lllite_multiplier)
+    # Architecture overrides — let the loader read them from metadata.
+    ns.lllite_cond_emb_dim = None
+    ns.lllite_mlp_dim = None
+    ns.lllite_target_layers = None
+    ns.lllite_cond_dim = None
+    ns.lllite_cond_resblocks = None
+    ns.lllite_use_aspp = None
+    ns.lllite_cond_in_channels = None
+    ns.lllite_inpaint_masked_input = None
+    ns.mask_image = None  # 3-channel tile-repair has no inpaint mask
+
+    # --- precision / runtime ---
+    ns.fp8 = False
+    ns.fp8_scaled = False
+    ns.text_encoder_cpu = False
+    ns.device = None  # auto cuda/cpu
+    ns.attn_mode = "torch"  # sdpa-equivalent; verified the only safe option
+    ns.output_type = "images"
+    ns.no_metadata = False
+    ns.latent_path = None
+    ns.lycoris = False
+
+    # --- save / batch flags (we never actually save via vendor) ---
+    ns.save_path = tempfile.gettempdir()  # vendor checks; we ignore its file
+    ns.from_file = None
+    ns.interactive = False
+
+    return ns
+
+
+# ---------------------------------------------------------------------------
+# Output conversion
+# ---------------------------------------------------------------------------
+
+
+def _tensor_to_pil(pixels: torch.Tensor) -> Image.Image:
+    """Convert the vendor's decoded pixel tensor to a PIL RGB image.
+
+    vendor decode_latent returns either BCTHW (T=1) or BCHW depending on the
+    Qwen-Image AutoencoderKL flavor. Both layouts collapse to a single
+    HxWx3 numpy array in [0, 1].
+    """
+    t = pixels
+    if t.ndim == 5:
+        t = t[0, :, 0]  # B C T H W → C H W
+    elif t.ndim == 4:
+        t = t[0]
+    elif t.ndim == 3:
+        pass  # already C H W
+    else:
+        raise ValueError(f"unexpected pixel tensor rank {t.ndim}")
+    t = t.float().clamp(-1.0, 1.0)
+    # Anima decode_to_pixels returns either [-1,1] or [0,1] depending on the
+    # vae flavor. Detect and normalize.
+    if float(t.min()) < -0.01:
+        t = (t + 1.0) * 0.5
+    arr = (t.permute(1, 2, 0).cpu().numpy() * 255.0).round().astype(np.uint8)
+    return Image.fromarray(arr, mode="RGB")
+
+
+def _build_infotext(repair: AnimaTileRepairArgs, seed_used: int) -> str:
+    """One-line infotext for the gallery splice, modeled after Forge's
+    standard ``Parameters:`` string so the gallery sidebar shows something
+    meaningful when the user clicks the refined thumbnail."""
+    parts = [
+        repair.positive or "",
+        f"Negative prompt: {repair.negative}" if repair.negative else None,
+        (
+            f"Steps: {repair.steps}, "
+            f"CFG scale: {repair.cfg}, "
+            f"Seed: {seed_used}, "
+            f"Size: {repair.width}x{repair.height}, "
+            f"Flow shift: {repair.flow_shift}, "
+            f"LLLite: {repair.lllite_model} (mult {repair.lllite_multiplier}, "
+            f"strength {repair.lllite_strength}, "
+            f"sched {repair.lllite_start:.2f}-{repair.lllite_end:.2f})"
+        ),
+        "Anima Tile-Repair: on",
+    ]
+    return "\n".join(p for p in parts if p)
+
+
+# ---------------------------------------------------------------------------
+# Top-level entry called by ui_anima.handle_anima_click
+# ---------------------------------------------------------------------------
+
+
+def run_tile_repair(
+    source: Image.Image,
+    repair: AnimaTileRepairArgs,
+) -> list[tuple[Image.Image, str]]:
+    """Single-pass Anima Tile-Repair against ``source``. Returns the same
+    ``[(pil, infotext)]`` shape as ``inpaint_core.run_sam3_refine`` so the
+    gallery splice logic in ``ui_anima.handle_anima_click`` is byte-for-byte
+    identical to ``ui_refine.handle_refine_click``.
+
+    Raises ``RuntimeError`` on vendor missing — the UI catches and shows it as
+    a red status banner.
+    """
+    if not _ensure_vendor_importable():
+        raise RuntimeError(
+            "Anima vendor missing. Re-run install.py or clone "
+            "kohya-ss/sd-scripts into anima_vendor/."
+        )
+    if not ANIMA_LLLITE_SENTINEL.exists():
+        raise RuntimeError(
+            "Vendor present but anima_minimal_inference_control_net_lllite.py "
+            "is missing. Re-clone the vendor tree."
+        )
+    if repair.lllite_model in (None, "", "None"):
+        raise RuntimeError(
+            "Pick an LLLite model (e.g. animaTileRepair_v10.safetensors)."
+        )
+
+    # Apply the LLLite monkey-patches by importing the extension module.
+    # It patches ami.parse_args / parse_prompt_line / load_dit_model /
+    # generate_body — exactly the four hooks we need to make the LLLite
+    # cond_image reach the DiT.
+    import anima_minimal_inference_control_net_lllite  # type: ignore  # noqa: F401
+    import anima_minimal_inference as ami  # type: ignore
+
+    # Vendor ami.generate() expects the source image as a file on disk
+    # (--control_image path). Save the gallery PIL to a tempfile.
+    with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tf:
+        source.convert("RGB").save(tf, format="PNG")
+        control_image_path = tf.name
+
+    out_pairs: list[tuple[Image.Image, str]] = []
+    try:
+        # IMPORTANT: dimensions must be divisible by 32 (vendor check_inputs
+        # raises otherwise). Snap to nearest multiple of 32 below the target.
+        repair.width = max(256, (int(repair.width) // 32) * 32)
+        repair.height = max(256, (int(repair.height) // 32) * 32)
+
+        args = _build_anima_args(repair, control_image_path)
+
+        # Resolve "Use Forge current" DiT if still None — vendor will balk
+        # without a DiT path.
+        if not args.dit:
+            args.dit = _resolve_forge_current_dit()
+        if not args.dit:
+            raise RuntimeError(
+                "No DiT checkpoint resolved. Either select a model in the "
+                "panel or load one in Forge first."
+            )
+
+        ctx = forge_sd_unloaded() if repair.unload_forge_before else _nullctx()
+        with ctx:
+            # Set the tokenize/encode strategies up front (vendor main() does
+            # this; we have to do it before ami.generate() because we're
+            # bypassing main()).
+            from library import strategy_anima, strategy_base  # type: ignore
+
+            strategy_base.TokenizeStrategy.set_strategy(
+                strategy_anima.AnimaTokenizeStrategy(
+                    qwen3_path=args.text_encoder,
+                    t5_tokenizer_path=None,
+                    qwen3_max_length=512,
+                    t5_max_length=512,
+                )
+            )
+            strategy_base.TextEncodingStrategy.set_strategy(
+                strategy_anima.AnimaTextEncodingStrategy()
+            )
+
+            device = torch.device(
+                "cuda" if torch.cuda.is_available() else "cpu"
+            )
+            args.device = device
+
+            gen_settings = ami.get_generation_settings(args)
+            latent = ami.generate(args, gen_settings)
+
+            # Decode — vendor loads VAE separately to keep DiT in VRAM during
+            # sampling and frees it before the VAE pass.
+            from library import anima_train_utils  # type: ignore
+
+            vae = anima_train_utils.load_qwen_image_vae(
+                args, device="cpu", disable_mmap=True
+            )
+            vae.to(torch.bfloat16).eval()
+            pixels = ami.decode_latent(vae, latent, device)
+            pil = _tensor_to_pil(pixels)
+
+            seed_used = (
+                int(args.seed) if args.seed is not None else -1
+            )
+            out_pairs.append((pil, _build_infotext(repair, seed_used)))
+    except Exception:
+        traceback.print_exc(file=sys.stderr)
+        raise
+    finally:
+        try:
+            os.unlink(control_image_path)
+        except Exception:
+            pass
+
+    return out_pairs

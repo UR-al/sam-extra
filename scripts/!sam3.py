@@ -23,9 +23,11 @@ except Exception:
 
 
 from sam3ext import SAM3_NAME, Sam3Args, __version__, run_sam3_on_pil
+from sam3ext.anima_core import anima_available
 from sam3ext.core import find_checkpoint_options, unload_sam3, write_artifacts
 from sam3ext.inpaint_core import apply_prompt_sr, copy_prompt, run_inpaint_passes
 from sam3ext.ui import WebuiButtons, sam3_ui
+from sam3ext.ui_anima import AnimaPanel, build_anima_panel, handle_anima_click
 from sam3ext.ui_refine import RefinePanel, _pull_seed_from_gallery_item, build_refine_panel, handle_refine_click
 
 
@@ -390,6 +392,7 @@ txt2img_neg_prompt_component = None
 txt2img_html_info_component = None
 txt2img_generation_info_component = None
 refine_panel: RefinePanel | None = None
+anima_panel: AnimaPanel | None = None
 
 
 # JS shim: replace the placeholder selected_index slot (index 1 in the inputs
@@ -535,11 +538,86 @@ def _wire_refine_panel(
     )
 
 
+# JS shim identical to Refine's — replaces selected_index in args slot 1
+# with the live frontend selection.
+_ANIMA_JS = (
+    "(...args) => {"
+    "  try { args[1] = selected_gallery_index(); } catch (e) { args[1] = -1; }"
+    "  return args;"
+    "}"
+)
+
+
+def _wire_anima_panel(
+    panel: AnimaPanel,
+    gallery,
+    html_info,
+    generation_info,
+):
+    """Wire the Anima Tile-Repair button — mirror of ``_wire_refine_panel``
+    minus the prompt-inheritance plumbing (Anima has its own prompt textbox)
+    and minus the auto-seed-pull on gallery.change (Refine's already handles
+    that, no need to double-fire).
+    """
+    # Refine→Stop visibility swap, same chain shape as the Refine panel.
+    show_stop = panel.repair_button.click(
+        fn=lambda: (gr.update(visible=False), gr.update(visible=True)),
+        inputs=[],
+        outputs=[panel.repair_button, panel.stop_button],
+        queue=False,
+    )
+    run = show_stop.then(
+        fn=handle_anima_click,
+        _js=_ANIMA_JS,
+        inputs=[
+            gallery,
+            panel.selected_index_state,
+            *panel.all_widgets(),
+            generation_info,
+        ],
+        outputs=[gallery, panel.status, html_info, generation_info],
+    )
+    run.then(
+        fn=lambda: (gr.update(visible=True), gr.update(visible=False)),
+        inputs=[],
+        outputs=[panel.repair_button, panel.stop_button],
+        queue=False,
+    )
+
+    def _stop_anima():
+        from modules import shared as _shared
+
+        _shared.state.interrupted = True
+        _shared.state.skipped = True
+
+    panel.stop_button.click(
+        fn=_stop_anima,
+        inputs=[],
+        outputs=[],
+        queue=False,
+    )
+
+    # Seed convenience buttons — same handlers Refine uses (reuse imports).
+    panel.seed_random_button.click(
+        fn=lambda: -1,
+        inputs=[],
+        outputs=[panel.seed],
+        queue=False,
+    )
+    panel.seed_pull_button.click(
+        fn=_pull_seed_from_gallery_item,
+        _js=_ANIMA_JS,
+        inputs=[gallery, panel.selected_index_state, generation_info],
+        outputs=[panel.seed],
+        queue=False,
+    )
+
+
 def on_after_component(component, **kwargs):
     global txt2img_submit_button, img2img_submit_button
     global txt2img_gallery_component, txt2img_prompt_component, txt2img_neg_prompt_component
     global txt2img_html_info_component, txt2img_generation_info_component
-    global refine_panel
+    global refine_panel, anima_panel
 
     elem_id = kwargs.get("elem_id")
     if elem_id == "txt2img_generate":
@@ -585,6 +663,33 @@ def on_after_component(component, **kwargs):
         except Exception:
             error = traceback.format_exc()
             print(f"[-] SAM3: failed to render Refine panel:\n{error}", file=sys.stderr)
+
+        # Render Anima Tile-Repair panel directly under Refine, in the same
+        # hidden gr.Group. install.py shallow-clones kohya-ss/sd-scripts into
+        # anima_vendor/ on first run; if the clone failed (offline / no git),
+        # anima_available() returns False and we just skip — the rest of the
+        # SAM3 extension keeps working.
+        if anima_panel is None and anima_available():
+            try:
+                anima_panel = build_anima_panel()
+                _wire_anima_panel(
+                    anima_panel,
+                    txt2img_gallery_component,
+                    txt2img_html_info_component,
+                    txt2img_generation_info_component,
+                )
+            except Exception:
+                error = traceback.format_exc()
+                print(
+                    f"[-] SAM3: failed to render Anima panel:\n{error}",
+                    file=sys.stderr,
+                )
+        elif not anima_available():
+            print(
+                "[-] SAM3: anima_vendor/ not present; Tile-Repair panel "
+                "skipped. Re-run install.py to clone kohya-ss/sd-scripts.",
+                file=sys.stderr,
+            )
 
 
 script_callbacks.on_after_component(on_after_component)
