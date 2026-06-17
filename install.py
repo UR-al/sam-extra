@@ -147,3 +147,39 @@ def ensure_anima_vendor() -> bool:
 
 
 ensure_anima_vendor()
+
+
+# Anima vendor pulls a few packages that aren't part of the SAM3 core deps.
+# We don't auto-pip these (torchvision in particular needs to match the
+# installed torch+cuda ABI, and forcing a wrong wheel breaks Forge itself).
+# Just emit a one-line breadcrumb so the user knows what to install before
+# clicking ▶ Anima Tile-Repair.
+_ANIMA_DEPS = (
+    "torchvision",  # match torch CUDA build manually
+    "imagesize",
+    "accelerate",
+    "transformers",
+    "diffusers",
+    "einops",
+    "huggingface_hub",
+    "safetensors",
+)
+
+
+def check_anima_environment():
+    if not _ANIMA_SENTINEL.exists():
+        return  # vendor missing — panel won't render anyway
+    missing = [pkg for pkg in _ANIMA_DEPS if not is_installed(pkg)]
+    if missing:
+        joined = " ".join(missing)
+        print(
+            "[forge_sam3_extension] Anima panel: missing deps "
+            f"({', '.join(missing)}). Install in the Forge venv before "
+            f"clicking ▶ Anima Tile-Repair, e.g.\n"
+            f"   pip install {joined}\n"
+            f"(For torchvision, match your installed torch's CUDA build.)",
+            file=sys.stderr,
+        )
+
+
+check_anima_environment()

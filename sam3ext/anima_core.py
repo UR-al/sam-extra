@@ -102,17 +102,88 @@ _VENDOR_INJECTED = False
 
 def _ensure_vendor_importable() -> bool:
     """Add ``anima_vendor/`` to sys.path so ``import anima_minimal_inference``
-    and ``from library import ...`` resolve. Idempotent."""
+    and ``from library import ...`` resolve. Idempotent.
+
+    Also ensures ``anima_vendor/networks/__init__.py`` exists so the directory
+    is unambiguously a regular package rather than a namespace package — this
+    matters because Forge's ``extensions-builtin/sd_forge_lora/networks.py``
+    is a *single-file* module also named ``networks`` and it's already cached
+    in ``sys.modules`` at extension-load time. See ``_vendor_sys_modules``
+    below for the runtime swap that hides that cached module during anima
+    inference.
+    """
     global _VENDOR_INJECTED
     if _VENDOR_INJECTED:
         return True
     if not ANIMA_SENTINEL.exists():
         return False
+
+    # Force the vendor networks/ to be a regular package so Python's package
+    # finder doesn't have to do namespace-package logic alongside whatever
+    # other 'networks' module is already in sys.modules.
+    nets_init = ANIMA_VENDOR / "networks" / "__init__.py"
+    if not nets_init.exists():
+        try:
+            nets_init.parent.mkdir(parents=True, exist_ok=True)
+            nets_init.write_text("", encoding="utf-8")
+        except Exception:
+            pass
+
     p = str(ANIMA_VENDOR)
     if p not in sys.path:
         sys.path.insert(0, p)
     _VENDOR_INJECTED = True
     return True
+
+
+@contextmanager
+def _vendor_sys_modules():
+    """Hide Forge's ``sd_forge_lora.networks`` (and any other ``library`` /
+    ``networks`` collision) from sys.modules so the vendor's namespace
+    packages are findable for the duration of an anima inference call.
+
+    Why: Forge's builtin LoRA extension imports its own
+    ``extensions-builtin/sd_forge_lora/networks.py`` at startup. That puts a
+    *module* (single .py file) named ``networks`` into ``sys.modules`` that
+    stays there forever. When the vendor's ``library/lora_utils.py`` then
+    does ``from networks.loha import ...``, Python finds the cached module
+    instead of our vendor directory and raises::
+
+        ModuleNotFoundError: No module named 'networks.loha'; 'networks' is
+        not a package
+
+    The fix is to pop the cached ``networks`` (and any submodule) on entry,
+    let the vendor's import find the package directory, and restore the
+    original modules on exit so the LoRA extension still works on the next
+    t2i Generate.
+
+    ``library`` gets the same treatment defensively even though no known
+    shadow currently exists.
+    """
+    saved: dict[str, Any] = {}
+    for key in list(sys.modules):
+        if (
+            key == "networks"
+            or key.startswith("networks.")
+            or key == "library"
+            or key.startswith("library.")
+        ):
+            saved[key] = sys.modules.pop(key)
+    try:
+        yield
+    finally:
+        # Drop whatever the vendor injected (so sd_forge_lora's import
+        # finds its single-file networks again) then restore the previously
+        # cached modules.
+        for key in list(sys.modules):
+            if (
+                key == "networks"
+                or key.startswith("networks.")
+                or key == "library"
+                or key.startswith("library.")
+            ):
+                sys.modules.pop(key, None)
+        sys.modules.update(saved)
 
 
 def anima_available() -> bool:
@@ -529,87 +600,106 @@ def run_tile_repair(
             "Pick an LLLite model (e.g. animaTileRepair_v10.safetensors)."
         )
 
-    # Apply the LLLite monkey-patches by importing the extension module.
-    # It patches ami.parse_args / parse_prompt_line / load_dit_model /
-    # generate_body — exactly the four hooks we need to make the LLLite
-    # cond_image reach the DiT.
-    import anima_minimal_inference_control_net_lllite  # type: ignore  # noqa: F401
-    import anima_minimal_inference as ami  # type: ignore
-
-    # Vendor ami.generate() expects the source image as a file on disk
-    # (--control_image path). Save the gallery PIL to a tempfile.
-    with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tf:
-        source.convert("RGB").save(tf, format="PNG")
-        control_image_path = tf.name
-
     out_pairs: list[tuple[Image.Image, str]] = []
-    try:
-        # IMPORTANT: dimensions must be divisible by 32 (vendor check_inputs
-        # raises otherwise). Snap to nearest multiple of 32 below the target.
-        repair.width = max(256, (int(repair.width) // 32) * 32)
-        repair.height = max(256, (int(repair.height) // 32) * 32)
-
-        args = _build_anima_args(repair, control_image_path)
-
-        # Resolve "Use Forge current" DiT if still None — vendor will balk
-        # without a DiT path.
-        if not args.dit:
-            args.dit = _resolve_forge_current_dit()
-        if not args.dit:
-            raise RuntimeError(
-                "No DiT checkpoint resolved. Either select a model in the "
-                "panel or load one in Forge first."
-            )
-
-        ctx = forge_sd_unloaded() if repair.unload_forge_before else _nullctx()
-        with ctx:
-            # Set the tokenize/encode strategies up front (vendor main() does
-            # this; we have to do it before ami.generate() because we're
-            # bypassing main()).
-            from library import strategy_anima, strategy_base  # type: ignore
-
-            strategy_base.TokenizeStrategy.set_strategy(
-                strategy_anima.AnimaTokenizeStrategy(
-                    qwen3_path=args.text_encoder,
-                    t5_tokenizer_path=None,
-                    qwen3_max_length=512,
-                    t5_max_length=512,
-                )
-            )
-            strategy_base.TextEncodingStrategy.set_strategy(
-                strategy_anima.AnimaTextEncodingStrategy()
-            )
-
-            device = torch.device(
-                "cuda" if torch.cuda.is_available() else "cpu"
-            )
-            args.device = device
-
-            gen_settings = ami.get_generation_settings(args)
-            latent = ami.generate(args, gen_settings)
-
-            # Decode — vendor loads VAE separately to keep DiT in VRAM during
-            # sampling and frees it before the VAE pass.
-            from library import anima_train_utils  # type: ignore
-
-            vae = anima_train_utils.load_qwen_image_vae(
-                args, device="cpu", disable_mmap=True
-            )
-            vae.to(torch.bfloat16).eval()
-            pixels = ami.decode_latent(vae, latent, device)
-            pil = _tensor_to_pil(pixels)
-
-            seed_used = (
-                int(args.seed) if args.seed is not None else -1
-            )
-            out_pairs.append((pil, _build_infotext(repair, seed_used)))
-    except Exception:
-        traceback.print_exc(file=sys.stderr)
-        raise
-    finally:
+    control_image_path: str | None = None
+    # _vendor_sys_modules() pops sd_forge_lora's cached ``networks`` module so
+    # the vendor's namespace package is discoverable. The swap MUST stay
+    # active for the whole inference call because the vendor lazily imports
+    # submodules during sampling. The ``with`` block guarantees restore on
+    # both success and exception paths.
+    with _vendor_sys_modules():
+        # Apply the LLLite monkey-patches by importing the extension module.
+        # It patches ami.parse_args / parse_prompt_line / load_dit_model /
+        # generate_body — the four hooks we need to make the LLLite cond
+        # image reach the DiT.
         try:
-            os.unlink(control_image_path)
+            import anima_minimal_inference_control_net_lllite  # type: ignore  # noqa: F401
+            import anima_minimal_inference as ami  # type: ignore
+        except ModuleNotFoundError as e:
+            # Re-throw with a humanized message so the UI status banner
+            # tells the user exactly what to pip install instead of a raw
+            # traceback. install.py already breadcrumbed at extension load
+            # but the user may have started Forge before reading stderr.
+            missing = getattr(e, "name", str(e))
+            raise RuntimeError(
+                f"Anima 의존성 누락: '{missing}'. Forge venv에서\n"
+                f"   pip install {missing}\n"
+                f"실행 후 Forge 재시작하세요. "
+                f"(torchvision은 torch CUDA 빌드와 같은 버전으로 맞추세요.)"
+            ) from e
+
+        # Vendor ami.generate() expects the source image as a file on disk
+        # (--control_image path). Save the gallery PIL to a tempfile.
+        with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tf:
+            source.convert("RGB").save(tf, format="PNG")
+            control_image_path = tf.name
+
+        try:
+            # IMPORTANT: dimensions must be divisible by 32 (vendor
+            # check_inputs raises otherwise). Snap to nearest multiple of 32.
+            repair.width = max(256, (int(repair.width) // 32) * 32)
+            repair.height = max(256, (int(repair.height) // 32) * 32)
+
+            args = _build_anima_args(repair, control_image_path)
+
+            # Resolve "Use Forge current" DiT if still None — vendor will
+            # balk without a DiT path.
+            if not args.dit:
+                args.dit = _resolve_forge_current_dit()
+            if not args.dit:
+                raise RuntimeError(
+                    "No DiT checkpoint resolved. Either select a model in "
+                    "the panel or load one in Forge first."
+                )
+
+            ctx = forge_sd_unloaded() if repair.unload_forge_before else _nullctx()
+            with ctx:
+                # Set the tokenize/encode strategies up front (vendor main()
+                # does this; we have to do it ourselves because we're
+                # bypassing main()).
+                from library import strategy_anima, strategy_base  # type: ignore
+
+                strategy_base.TokenizeStrategy.set_strategy(
+                    strategy_anima.AnimaTokenizeStrategy(
+                        qwen3_path=args.text_encoder,
+                        t5_tokenizer_path=None,
+                        qwen3_max_length=512,
+                        t5_max_length=512,
+                    )
+                )
+                strategy_base.TextEncodingStrategy.set_strategy(
+                    strategy_anima.AnimaTextEncodingStrategy()
+                )
+
+                device = torch.device(
+                    "cuda" if torch.cuda.is_available() else "cpu"
+                )
+                args.device = device
+
+                gen_settings = ami.get_generation_settings(args)
+                latent = ami.generate(args, gen_settings)
+
+                # Decode — vendor loads VAE separately to keep DiT in VRAM
+                # during sampling and frees it before the VAE pass.
+                from library import anima_train_utils  # type: ignore
+
+                vae = anima_train_utils.load_qwen_image_vae(
+                    args, device="cpu", disable_mmap=True
+                )
+                vae.to(torch.bfloat16).eval()
+                pixels = ami.decode_latent(vae, latent, device)
+                pil = _tensor_to_pil(pixels)
+
+                seed_used = int(args.seed) if args.seed is not None else -1
+                out_pairs.append((pil, _build_infotext(repair, seed_used)))
         except Exception:
-            pass
+            traceback.print_exc(file=sys.stderr)
+            raise
+        finally:
+            if control_image_path:
+                try:
+                    os.unlink(control_image_path)
+                except Exception:
+                    pass
 
     return out_pairs
