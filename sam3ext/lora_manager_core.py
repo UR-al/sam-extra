@@ -78,6 +78,33 @@ _CSS_OVERRIDES = {
         "    max-width: min(90vw, 680px) !important;\n"
         "}\n"
     ),
+    # Donation / support UI removal. GPL-3.0 permits feature removal; we only
+    # hide DOM nodes via CSS — LICENSE, copyright notices, and author
+    # attribution (README/source headers) are untouched, so §5(c) "Appropriate
+    # Legal Notices" stay intact. This file is @import-ed by style.css so the
+    # rules apply globally (header + banners), not just inside the modal.
+    "static/css/components/modal/support-modal.css": (
+        "/* Header triggers that open the support/donation modal */\n"
+        "#supportToggleBtn { display: none !important; }\n"
+        "#hamburgerDropdown .dropdown-item[data-action=\"support\"] { display: none !important; }\n"
+        "#hamburgerDropdown .dropdown-divider { display: none !important; }\n"
+        "/* Entire 'Support This Project' modal (Ko-fi, Patreon, WeChat QR,\n"
+        "   supporters list, social links all live inside it) */\n"
+        "#supportModal { display: none !important; }\n"
+        "/* Defensive per-element rules (durable if the modal is refactored) */\n"
+        "#supportModal a.kofi-button,\n"
+        "#supportModal a.patreon-button,\n"
+        "#supportModal #toggleQRCode,\n"
+        "#supportModal #qrCodeContainer,\n"
+        "#supportModal .support-right,\n"
+        "#specialThanksGrid,\n"
+        "#supportersGrid { display: none !important; }\n"
+        "/* JS-injected live community-support donation banner */\n"
+        "#banner-container .banner-item[data-banner-id=\"community-support\"] { display: none !important; }\n"
+        "/* Donation links replayed in the banner-history panel */\n"
+        "#bannerHistoryList a.banner-history-action[href*=\"ko-fi.com\"],\n"
+        "#bannerHistoryList a.banner-history-action[href*=\"afdian.com\"] { display: none !important; }\n"
+    ),
 }
 
 
@@ -108,6 +135,80 @@ def apply_css_overrides() -> None:
                 f"[-] LoRA Manager: failed to apply CSS override to {rel_path}: {e}",
                 file=sys.stderr,
             )
+
+
+# ---------------------------------------------------------------------------
+# Update-check disable (stop the manager nagging about willmiao upstream)
+# ---------------------------------------------------------------------------
+# The notification center's only feature that actually follows the ORIGINAL
+# project is the backend update check (py/routes/update_routes.py), which polls
+# api.github.com/repos/willmiao/ComfyUI-Lora-Manager releases and surfaces an
+# "update available" dot. There is no settings.json flag for it, and the
+# frontend gate is per-browser localStorage — so we can't toggle it at spawn.
+# We vendor a pinned copy (install.py controls the version), so the user can't
+# act on upstream releases anyway; the nag is pure noise. We short-circuit
+# check_updates() to always report "no update" via a marker-guarded source
+# patch (same idempotent, re-applied-on-reclone pattern as the CSS overrides).
+#
+# Repointing the check to UR-al/sam-extra is deliberately NOT done: the
+# manager compares against its own pyproject version (1.1.4), so our SAM3
+# repo's tags would yield nonsensical results, and its self-update would
+# overwrite the pinned vendor tree.
+
+_UPDATE_PATCH_MARKER = "# === forge_sam3 update-check disabled (auto-applied) ==="
+_UPDATE_ROUTE_REL = "py/routes/update_routes.py"
+# Unique line (verified) at the top of check_updates()'s try-block; `nightly`
+# and `web`/`UpdateRoutes` are all in scope right after it.
+_UPDATE_ANCHOR = (
+    "            nightly = request.query.get('nightly', 'false').lower() == 'true'\n"
+)
+_UPDATE_INJECT = (
+    _UPDATE_ANCHOR
+    + "            " + _UPDATE_PATCH_MARKER + "\n"
+    + "            # Forge: vendor pinned by install.py; user can't act on\n"
+    + "            # willmiao upstream releases — suppress the update nag.\n"
+    + "            return web.json_response({\n"
+    + "                'success': True,\n"
+    + "                'current_version': UpdateRoutes._get_local_version(),\n"
+    + "                'latest_version': UpdateRoutes._get_local_version(),\n"
+    + "                'update_available': False,\n"
+    + "                'changelog': '',\n"
+    + "                'nightly': nightly,\n"
+    + "            })\n"
+)
+
+
+def apply_update_check_patch() -> None:
+    """Disable the vendored update check so the LoRA Manager stops nagging
+    about willmiao upstream releases. Idempotent + marker-guarded; re-applied
+    automatically when the vendor tree is re-cloned. Best-effort."""
+    if not LM_VENDOR.is_dir():
+        return
+    target = LM_VENDOR / _UPDATE_ROUTE_REL
+    try:
+        if not target.is_file():
+            return
+        src = target.read_text(encoding="utf-8", errors="replace")
+        if _UPDATE_PATCH_MARKER in src:
+            return
+        if _UPDATE_ANCHOR not in src:
+            print(
+                "[-] LoRA Manager: update-check anchor not found; "
+                "skipping update-disable patch (upstream layout changed).",
+                file=sys.stderr,
+            )
+            return
+        patched = src.replace(_UPDATE_ANCHOR, _UPDATE_INJECT, 1)
+        target.write_text(patched, encoding="utf-8")
+        print(
+            f"[-] LoRA Manager: disabled update check in {_UPDATE_ROUTE_REL}",
+            file=sys.stderr,
+        )
+    except Exception as e:
+        print(
+            f"[-] LoRA Manager: failed to apply update-check patch: {e}",
+            file=sys.stderr,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -306,6 +407,10 @@ def get_or_spawn(port: int = DEFAULT_PORT, wait_seconds: float = 3.0) -> dict[st
             pass
         try:
             apply_css_overrides()
+        except Exception:
+            pass
+        try:
+            apply_update_check_patch()
         except Exception:
             pass
 
