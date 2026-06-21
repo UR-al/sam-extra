@@ -26,6 +26,8 @@ from .anima_core import (
     list_lora_choices,
     list_te_choices,
     list_vae_choices,
+    default_te_choice,
+    default_vae_choice,
     run_tile_repair,
 )
 from .ui_refine import _coerce_gallery_item_to_pil, _plaintext_to_html
@@ -214,14 +216,14 @@ def build_anima_panel() -> AnimaPanel:
             te_override = gr.Dropdown(
                 label="SAM3 Anima Text Encoder Override",
                 choices=te_choices,
-                value="Use Forge current",
+                value=default_te_choice(te_choices),
                 type="value",
                 elem_id="sam3_anima_te",
             )
             vae_override = gr.Dropdown(
                 label="SAM3 Anima VAE Override",
                 choices=vae_choices,
-                value="Use Forge current",
+                value=default_vae_choice(vae_choices),
                 type="value",
                 elem_id="sam3_anima_vae",
             )

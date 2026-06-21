@@ -274,6 +274,28 @@ def list_lllite_choices() -> list[str]:
     return out
 
 
+def default_te_choice(choices: list[str]) -> str:
+    """Pick a sensible default Text Encoder for the dropdown. Anima needs a
+    Qwen3 TE — auto-select a file that looks like one so the panel works out
+    of the box (the user's anima_baseV10_txt.safetensors etc.) instead of the
+    always-failing 'Use Forge current'."""
+    for hint in ("qwen3", "qwen_3", "qwen", "anima", "_txt", "text_encoder", "te"):
+        for c in choices:
+            if c != "Use Forge current" and hint in c.lower():
+                return c
+    return choices[0] if choices else "Use Forge current"
+
+
+def default_vae_choice(choices: list[str]) -> str:
+    """Pick a sensible default VAE — Anima needs the Qwen-Image VAE, not the
+    SDXL one Forge holds."""
+    for hint in ("qwen_image", "qwen-image", "qwen", "anima"):
+        for c in choices:
+            if c != "Use Forge current" and hint in c.lower():
+                return c
+    return choices[0] if choices else "Use Forge current"
+
+
 def list_lora_choices() -> list[str]:
     out = ["None"]
     root = _models_path()
@@ -478,7 +500,10 @@ def _build_anima_args(repair: AnimaTileRepairArgs, control_image_path: str) -> S
         weights.append(path)
         multipliers.append(float(weight))
     ns.lora_weight = weights or None
-    ns.lora_multiplier = multipliers if multipliers else 1.0
+    # None (not scalar 1.0) when empty — the vendor's
+    # load_safetensors_with_lora_and_fp8 / load_anima_model handle None
+    # safely; a stray scalar would break the TE-LoRA list path.
+    ns.lora_multiplier = multipliers if multipliers else None
     ns.include_patterns = None
     ns.exclude_patterns = None
 
@@ -652,6 +677,26 @@ def run_tile_repair(
                     "the panel or load one in Forge first."
                 )
 
+            # Anima REQUIRES a Qwen3 text encoder + a Qwen-Image VAE. Neither
+            # is what Forge holds as "current" (Forge's VAE is SDXL-shaped →
+            # strict load fails; there's no standalone Qwen3 TE concept). Fail
+            # early with an actionable message instead of an opaque ValueError
+            # deep in the vendor's tokenizer/VAE loader.
+            if not args.text_encoder:
+                raise RuntimeError(
+                    "Anima는 Qwen3 Text Encoder가 필수입니다. 패널의 "
+                    "'SAM3 Anima Text Encoder Override' 드롭다운에서 "
+                    "models/text_encoder/ 의 Qwen3 .safetensors를 선택하세요. "
+                    "('Use Forge current'는 Anima용 TE를 제공하지 못합니다.)"
+                )
+            if not args.vae:
+                raise RuntimeError(
+                    "Anima는 Qwen-Image VAE가 필수입니다. 패널의 "
+                    "'SAM3 Anima VAE Override' 드롭다운에서 Qwen-Image VAE를 "
+                    "명시적으로 선택하세요. ('Use Forge current'는 SDXL VAE라 "
+                    "strict load에서 실패합니다.)"
+                )
+
             ctx = forge_sd_unloaded() if repair.unload_forge_before else _nullctx()
             with ctx:
                 # Set the tokenize/encode strategies up front (vendor main()
@@ -692,8 +737,17 @@ def run_tile_repair(
 
                 seed_used = int(args.seed) if args.seed is not None else -1
                 out_pairs.append((pil, _build_infotext(repair, seed_used)))
-        except Exception:
+        except Exception as e:
             traceback.print_exc(file=sys.stderr)
+            # Humanize the most common load failure: a non-Anima DiT/VAE was
+            # selected (Forge's SDXL checkpoint/VAE) → state_dict key/shape
+            # mismatch deep in the loader.
+            msg = str(e).lower()
+            if "size mismatch" in msg or "missing key" in msg or "unexpected key" in msg:
+                raise RuntimeError(
+                    "모델 로드 실패 — 선택한 DiT/VAE가 Anima(Qwen-Image) 체크포인트가 "
+                    "아닐 수 있습니다. Anima DiT + Qwen-Image VAE + Qwen3 TE를 사용하세요."
+                ) from e
             raise
         finally:
             if control_image_path:
