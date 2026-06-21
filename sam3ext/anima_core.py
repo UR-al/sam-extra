@@ -91,6 +91,12 @@ class AnimaTileRepairArgs:
     # Housekeeping
     unload_forge_before: bool = True
     insert_mode: str = "After selected"
+    # Restoration mode + PiD (Pixel Diffusion Decoder) option
+    restore_mode: str = "Anima Tile-Repair"   # or "PiD Upscale"
+    pid_checkpoint: str = ""
+    pid_scale: float = 4.0
+    pid_steps: int = 8
+    pid_degrade: float = 0.4
 
 
 # ---------------------------------------------------------------------------
@@ -204,6 +210,26 @@ def _models_path() -> Path | None:
         return Path(paths.models_path)
     except Exception:
         return None
+
+
+_PID_NONE = "(no PiD checkpoint found)"
+
+
+def list_pid_checkpoints() -> list[str]:
+    """Forge checkpoints whose name contains 'PiD'. Forge Neo auto-enables PiD
+    mode (backend/loader.py: dynamic_args.pid = 'PiD' in repo_name) when such a
+    checkpoint is loaded; PiD then runs as an img2img restoration/upscale.
+    Returns a sentinel when none are present so the dropdown isn't empty."""
+    out: list[str] = []
+    try:
+        from modules import sd_models
+
+        for title in sd_models.checkpoint_tiles():
+            if "pid" in str(title).lower():
+                out.append(title)
+    except Exception:
+        pass
+    return out or [_PID_NONE]
 
 
 def list_dit_choices() -> list[str]:
@@ -757,3 +783,119 @@ def run_tile_repair(
                     pass
 
     return out_pairs
+
+
+def run_pid_upscale(
+    source: Image.Image,
+    *,
+    pid_checkpoint: str,
+    scale: float = 4.0,
+    degrade_sigma: float = 0.4,
+    steps: int = 8,
+    sampler: str = "Euler",
+) -> list[tuple[Image.Image, str]]:
+    """PiD (Pixel Diffusion Decoder) restoration/upscale via Forge Neo's NATIVE
+    pipeline. PiD is a first-class diffusion engine (backend/diffusion_engine/
+    pid.py); Forge auto-enables PiD mode when a checkpoint whose name contains
+    'PiD' is loaded (backend/loader.py). It runs as img2img where
+    ``denoising_strength`` is reinterpreted as the degrade sigma and the mask
+    must be None (modules/processing.py PiD branches). So we just run a
+    standalone img2img with the PiD checkpoint swapped in via override_settings;
+    Forge handles all the PiD specifics.
+
+    Returns ``[(pil, infotext)]`` — same shape as run_tile_repair so the gallery
+    splice in ui_anima is reused.
+    """
+    if not pid_checkpoint or pid_checkpoint in ("", "None", _PID_NONE):
+        raise RuntimeError(
+            "PiD 체크포인트가 없습니다. nvidia/PiD 모델(파일명/repo에 'PiD' 포함)을 "
+            "models/Stable-diffusion/ 에 넣고 새로고침하세요."
+        )
+
+    from modules import shared
+    from modules.processing import process_images
+
+    from .inpaint_core import (
+        build_standalone_i2i,
+        build_standalone_scripts_runner,
+        override_sampler_script_slot,
+        pause_total_tqdm,
+    )
+
+    sd_model = getattr(shared, "sd_model", None)
+    if sd_model is None:
+        raise RuntimeError("PiD: no SD model loaded in Forge.")
+    outpath_samples = getattr(shared.opts, "outdir_txt2img_samples", "outputs/txt2img-images")
+    outpath_grids = getattr(shared.opts, "outdir_txt2img_grids", "outputs/txt2img-grids")
+
+    runner, script_args = build_standalone_scripts_runner()
+    if runner is None:
+        raise RuntimeError("PiD: img2img scripts runner not initialized.")
+
+    src = source.convert("RGB")
+    # PiD targets pixel space (3, H, W); snap to /32 like the rest of the pipeline.
+    w = max(256, (int(src.width * scale) // 32) * 32)
+    h = max(256, (int(src.height * scale) // 32) * 32)
+
+    # Synthesize the sam3_* args build_standalone_i2i expects. PiD-relevant bits:
+    # denoising_strength → degrade sigma (Forge reinterprets it), no mask,
+    # explicit target size, CFG 1.0 (PiD is condition-driven).
+    args: dict[str, Any] = {
+        "sam3_use_inpaint_width_height": True,
+        "sam3_inpaint_width": w,
+        "sam3_inpaint_height": h,
+        "sam3_use_steps": True,
+        "sam3_steps": int(steps),
+        "sam3_use_cfg_scale": True,
+        "sam3_cfg_scale": 1.0,
+        "sam3_use_sampler": True,
+        "sam3_sampler": sampler or "Euler",
+        "sam3_use_scheduler": True,
+        "sam3_scheduler": "Automatic",
+        "sam3_use_seed": True,
+        "sam3_seed": -1,
+        "sam3_noise_multiplier": 1.0,
+        "sam3_denoising_strength": float(degrade_sigma),
+        "sam3_inpainting_fill": "original",
+        "sam3_inpaint_only_masked": False,
+        "sam3_inpaint_only_masked_padding": 0,
+        "sam3_mask_blur": 0,
+        "sam3_resize_mode": "Just Resize",
+        "sam3_mask_invert": False,
+        "sam3_restore_face": False,
+    }
+
+    results: list[tuple[Image.Image, str]] = []
+    with pause_total_tqdm():
+        p2 = build_standalone_i2i(
+            src,
+            args,
+            sd_model=sd_model,
+            outpath_samples=outpath_samples,
+            outpath_grids=outpath_grids,
+            scripts_runner=runner,
+            script_args=list(script_args),
+        )
+        # Swap to the PiD checkpoint for this pass; Forge restores after.
+        p2.override_settings = {"sd_model_checkpoint": pid_checkpoint}
+        p2.image_mask = None  # PiD asserts no mask
+        p2.prompt = ""
+        p2.negative_prompt = ""
+        override_sampler_script_slot(p2, args)
+        try:
+            processed = process_images(p2)
+        finally:
+            p2.close()
+        if processed is not None and processed.images:
+            info = ""
+            try:
+                if getattr(processed, "infotexts", None):
+                    info = processed.infotexts[0] or ""
+                if not info:
+                    info = getattr(processed, "info", "") or ""
+            except Exception:
+                info = ""
+            if not info:
+                info = f"PiD upscale x{scale}, degrade σ {degrade_sigma}\nPiD: {pid_checkpoint}"
+            results.append((processed.images[0].convert("RGB"), info))
+    return results

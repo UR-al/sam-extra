@@ -26,9 +26,11 @@ from .anima_core import (
     list_lora_choices,
     list_te_choices,
     list_vae_choices,
+    list_pid_checkpoints,
     default_te_choice,
     default_vae_choice,
     run_tile_repair,
+    run_pid_upscale,
 )
 from .ui_refine import _coerce_gallery_item_to_pil, _plaintext_to_html
 
@@ -71,6 +73,12 @@ class AnimaPanel:
     # Housekeeping
     unload_forge_before: gr.Checkbox = None  # type: ignore[assignment]
     insert_mode: gr.Radio = None  # type: ignore[assignment]
+    # Restoration mode + PiD (Pixel Diffusion Decoder) option
+    restore_mode: gr.Radio = None  # type: ignore[assignment]
+    pid_checkpoint: gr.Dropdown = None  # type: ignore[assignment]
+    pid_scale: gr.Slider = None  # type: ignore[assignment]
+    pid_steps: gr.Slider = None  # type: ignore[assignment]
+    pid_degrade: gr.Slider = None  # type: ignore[assignment]
     # Run / Stop
     repair_button: gr.Button = None  # type: ignore[assignment]
     stop_button: gr.Button = None  # type: ignore[assignment]
@@ -102,6 +110,12 @@ class AnimaPanel:
             self.lllite_multiplier,
             self.unload_forge_before,
             self.insert_mode,
+            # PiD option (appended last to keep ANIMA_ARG_KEYS prefix stable)
+            self.restore_mode,
+            self.pid_checkpoint,
+            self.pid_scale,
+            self.pid_steps,
+            self.pid_degrade,
         ])
         return out
 
@@ -129,6 +143,11 @@ ANIMA_ARG_KEYS: tuple[str, ...] = (
     "lllite_multiplier",
     "unload_forge_before",
     "insert_mode",
+    "restore_mode",
+    "pid_checkpoint",
+    "pid_scale",
+    "pid_steps",
+    "pid_degrade",
 )
 
 
@@ -390,10 +409,64 @@ def build_anima_panel() -> AnimaPanel:
                 elem_id="sam3_anima_insert_mode",
             )
 
+        # --- Restoration mode: Anima tile-repair vs PiD upscale --------
+        pid_choices = list_pid_checkpoints()
+        with gr.Accordion(
+            "Restoration Mode (Anima Tile-Repair / PiD Upscale)",
+            open=False,
+            elem_id="sam3_anima_restore_accordion",
+        ):
+            gr.Markdown(
+                "기본은 **Anima Tile-Repair**(ControlNet-LLLite). "
+                "**PiD Upscale**는 Forge Neo 네이티브 PiD(Pixel Diffusion Decoder) "
+                "초해상 복원 — 파일명에 `PiD`가 포함된 체크포인트를 "
+                "`models/Stable-diffusion/`에 넣어야 동작합니다 "
+                "(없으면 드롭다운에 안내가 뜹니다). 마스크 미사용·전체 이미지 업스케일."
+            )
+            restore_mode = gr.Radio(
+                label="SAM3 Anima Restoration Mode",
+                choices=["Anima Tile-Repair", "PiD Upscale"],
+                value="Anima Tile-Repair",
+                elem_id="sam3_anima_restore_mode",
+            )
+            with gr.Row():
+                pid_checkpoint = gr.Dropdown(
+                    label="SAM3 Anima PiD Checkpoint",
+                    choices=pid_choices,
+                    value=pid_choices[0] if pid_choices else "(no PiD checkpoint found)",
+                    type="value",
+                    elem_id="sam3_anima_pid_ckpt",
+                )
+                pid_scale = gr.Slider(
+                    label="SAM3 Anima PiD Resize (x)",
+                    minimum=1.0,
+                    maximum=4.0,
+                    step=0.5,
+                    value=4.0,
+                    elem_id="sam3_anima_pid_scale",
+                )
+            with gr.Row():
+                pid_steps = gr.Slider(
+                    label="SAM3 Anima PiD Steps",
+                    minimum=1,
+                    maximum=50,
+                    step=1,
+                    value=8,
+                    elem_id="sam3_anima_pid_steps",
+                )
+                pid_degrade = gr.Slider(
+                    label="SAM3 Anima PiD Degrade σ (denoise 재해석)",
+                    minimum=0.0,
+                    maximum=1.0,
+                    step=0.05,
+                    value=0.4,
+                    elem_id="sam3_anima_pid_degrade",
+                )
+
         # --- Run / Stop ------------------------------------------------
         with gr.Row():
             repair_button = gr.Button(
-                "▶ Anima Tile-Repair",
+                "▶ Run (Tile-Repair / PiD)",
                 variant="primary",
                 elem_id="sam3_anima_repair_button",
             )
@@ -432,6 +505,11 @@ def build_anima_panel() -> AnimaPanel:
         lllite_multiplier=lllite_multiplier,
         unload_forge_before=unload_forge_before,
         insert_mode=insert_mode,
+        restore_mode=restore_mode,
+        pid_checkpoint=pid_checkpoint,
+        pid_scale=pid_scale,
+        pid_steps=pid_steps,
+        pid_degrade=pid_degrade,
         repair_button=repair_button,
         stop_button=stop_button,
         status=status,
@@ -474,6 +552,11 @@ def _map_widget_values(values: tuple) -> AnimaTileRepairArgs:
         lllite_multiplier=_as_float(keyed.get("lllite_multiplier"), 1.0),
         unload_forge_before=bool(keyed.get("unload_forge_before", True)),
         insert_mode=str(keyed.get("insert_mode") or "After selected"),
+        restore_mode=str(keyed.get("restore_mode") or "Anima Tile-Repair"),
+        pid_checkpoint=str(keyed.get("pid_checkpoint") or ""),
+        pid_scale=_as_float(keyed.get("pid_scale"), 4.0),
+        pid_steps=_as_int(keyed.get("pid_steps"), 8),
+        pid_degrade=_as_float(keyed.get("pid_degrade"), 0.4),
     )
 
 
@@ -491,14 +574,6 @@ def handle_anima_click(
     ``progress=gr.Progress(track_tqdm=True)`` makes the browser progress bar
     pick up the vendor's per-step tqdm — same trick as the Refine panel.
     """
-    if not anima_available():
-        return _anima_error_return(
-            gallery_value,
-            "<span style='color:#c33'>Anima vendor missing — install.py "
-            "didn't clone kohya-ss/sd-scripts. Re-run Forge or clone "
-            "manually into <code>anima_vendor/</code>.</span>",
-        )
-
     expected_widget_count = len(ANIMA_ARG_KEYS)
     if len(all_values) < expected_widget_count:
         return _anima_error_return(
@@ -511,12 +586,24 @@ def handle_anima_click(
     current_info_json = str(extras[0]) if len(extras) > 0 else ""
 
     repair = _map_widget_values(widget_values)
+    is_pid = repair.restore_mode == "PiD Upscale"
 
-    if not repair.positive.strip():
-        return _anima_error_return(
-            gallery_value,
-            "<span style='color:#c33'>SAM3 Anima: prompt is empty.</span>",
-        )
+    # Anima Tile-Repair needs the vendored sd-scripts + a prompt. PiD Upscale
+    # uses Forge Neo's NATIVE pipeline (no vendor) and is condition-driven (no
+    # prompt), so those checks only apply to the Anima path.
+    if not is_pid:
+        if not anima_available():
+            return _anima_error_return(
+                gallery_value,
+                "<span style='color:#c33'>Anima vendor missing — install.py "
+                "didn't clone kohya-ss/sd-scripts. Re-run Forge or clone "
+                "manually into <code>anima_vendor/</code>.</span>",
+            )
+        if not repair.positive.strip():
+            return _anima_error_return(
+                gallery_value,
+                "<span style='color:#c33'>SAM3 Anima: prompt is empty.</span>",
+            )
 
     gallery_list = list(gallery_value or [])
     if not gallery_list:
@@ -541,12 +628,21 @@ def handle_anima_click(
         )
 
     try:
-        new_pairs = run_tile_repair(source, repair)
+        if is_pid:
+            new_pairs = run_pid_upscale(
+                source,
+                pid_checkpoint=repair.pid_checkpoint,
+                scale=repair.pid_scale,
+                degrade_sigma=repair.pid_degrade,
+                steps=repair.pid_steps,
+            )
+        else:
+            new_pairs = run_tile_repair(source, repair)
     except Exception as exc:
         traceback.print_exc(file=sys.stderr)
         return _anima_error_return(
             gallery_value,
-            f"<pre style='color:#c33'>SAM3 Anima failed: "
+            f"<pre style='color:#c33'>SAM3 {'PiD' if is_pid else 'Anima'} failed: "
             f"{type(exc).__name__}: {exc}</pre>",
         )
 
