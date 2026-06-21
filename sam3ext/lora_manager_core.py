@@ -185,13 +185,23 @@ def manager_url(port: int) -> str:
     return f"http://{DEFAULT_HOST}:{port}/loras"
 
 
-def get_or_spawn(port: int = DEFAULT_PORT, wait_seconds: float = 40.0) -> dict[str, Any]:
+def get_or_spawn(port: int = DEFAULT_PORT, wait_seconds: float = 3.0) -> dict[str, Any]:
     """Lazy entry point called by the UI bridge. Returns
-    ``{"url": ..., "port": ..., "status": "running"|"spawned"|"error",
+    ``{"url": ..., "port": ..., "status": "running"|"spawned"|"starting"|"error",
        "message": ...}``.
 
-    - If a server already answers on ``port`` (ours or an external one), reuse.
-    - Otherwise spawn standalone.py as a child and poll until healthy.
+    - ``running``  — a server already answered on ``port`` (reused).
+    - ``spawned``  — we started it and it became healthy within ``wait_seconds``.
+    - ``starting`` — we started it but it's still booting (the JS side then
+      polls the URL until it answers).
+    - ``error``    — vendor missing or the process died on launch.
+
+    NON-BLOCKING by design: the first run of the manager scans + hashes the
+    whole LoRA library (observed ~266 s for 1487 models) and aiohttp does not
+    open the port until that on_startup scan finishes. We therefore do NOT
+    block the Gradio event waiting for health — we kick the process off,
+    give it a short grace poll, then hand "starting" back so the browser can
+    poll the URL itself and show scan progress.
     """
     global _proc, _proc_port
 
@@ -269,8 +279,10 @@ def get_or_spawn(port: int = DEFAULT_PORT, wait_seconds: float = 40.0) -> dict[s
                 "message": f"spawn failed: {e}",
             }
 
-    # Poll for readiness OUTSIDE the lock so other callers can short-circuit
-    # on _health_ok once we're up.
+    # Short grace poll OUTSIDE the lock — only to catch the fast case where
+    # the cache is already serialized and the server comes up in a second or
+    # two. If it's still scanning, return "starting" immediately; the JS side
+    # polls the URL until it answers (handles arbitrarily long first-run scans).
     import time
 
     deadline_steps = int(max(1, wait_seconds / 0.5))
@@ -293,12 +305,14 @@ def get_or_spawn(port: int = DEFAULT_PORT, wait_seconds: float = 40.0) -> dict[s
             }
         time.sleep(0.5)
 
+    # Still booting (most likely a first-run library scan). Hand back the URL
+    # with a "starting" status; the browser polls it.
     return {
         "url": manager_url(port),
         "port": port,
-        "status": "error",
-        "message": f"timed out after {wait_seconds}s waiting for the server. "
-        f"Check {LM_LOG.name}.",
+        "status": "starting",
+        "message": "server is booting (first run scans the LoRA library — this "
+        "can take several minutes for large collections)",
     }
 
 
