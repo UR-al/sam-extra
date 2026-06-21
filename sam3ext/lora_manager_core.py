@@ -34,6 +34,11 @@ LM_STANDALONE = LM_VENDOR / "standalone.py"
 LM_SETTINGS = LM_VENDOR / "settings.json"
 LM_LOG = LM_VENDOR / "forge_standalone.log"
 
+# Marker so our appended CSS override is applied exactly once per vendor copy
+# (and re-applied automatically if the vendor tree is re-cloned, since the
+# fresh file won't contain the marker).
+_CSS_MARKER = "/* === forge_sam3 css override (auto-applied) === */"
+
 DEFAULT_PORT = 8765
 DEFAULT_HOST = "127.0.0.1"
 
@@ -46,6 +51,63 @@ _spawn_lock = threading.Lock()
 def lora_manager_available() -> bool:
     """Cheap probe used by the UI bridge — vendor cloned and entrypoint present."""
     return LM_STANDALONE.exists()
+
+
+# ---------------------------------------------------------------------------
+# CSS overrides (small UX patches to the vendored UI)
+# ---------------------------------------------------------------------------
+# The manager runs as a separate cross-origin server, so Forge can't inject
+# CSS into the iframe. Instead we append our overrides directly to vendor CSS
+# files on disk (idempotent, marker-guarded). aiohttp serves static files from
+# disk per request, so a browser hard-refresh picks up the change without
+# restarting the server. Re-clone of the vendor wipes our edits → re-applied.
+
+_CSS_OVERRIDES = {
+    # Fetch-all progress overlay: the status line is a single string
+    #   "Processing (n/total) <LONG LORA NAME> | ❌ N failed | ⏭️ N skipped"
+    # and .loading-status is white-space:nowrap + overflow:hidden + ellipsis,
+    # so a long filename eats the line and clips the "failed/skipped" counters.
+    # Allow wrapping so the counters drop to the next line instead of clipping.
+    "static/css/components/loading.css": (
+        ".loading-status {\n"
+        "    white-space: normal !important;\n"
+        "    overflow: visible !important;\n"
+        "    text-overflow: clip !important;\n"
+        "    word-break: break-word !important;\n"
+        "    line-height: 1.4 !important;\n"
+        "    max-width: min(90vw, 680px) !important;\n"
+        "}\n"
+    ),
+}
+
+
+def apply_css_overrides() -> None:
+    """Append our marker-guarded CSS overrides to the vendor's CSS files.
+
+    Idempotent: skips files that already contain ``_CSS_MARKER``. Safe to call
+    on every spawn. Best-effort — failures are logged, never fatal.
+    """
+    if not LM_VENDOR.is_dir():
+        return
+    for rel_path, css in _CSS_OVERRIDES.items():
+        target = LM_VENDOR / rel_path
+        try:
+            if not target.is_file():
+                continue
+            existing = target.read_text(encoding="utf-8", errors="replace")
+            if _CSS_MARKER in existing:
+                continue
+            with target.open("a", encoding="utf-8") as fh:
+                fh.write(f"\n\n{_CSS_MARKER}\n{css}")
+            print(
+                f"[-] LoRA Manager: applied CSS override to {rel_path}",
+                file=sys.stderr,
+            )
+        except Exception as e:
+            print(
+                f"[-] LoRA Manager: failed to apply CSS override to {rel_path}: {e}",
+                file=sys.stderr,
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -240,6 +302,10 @@ def get_or_spawn(port: int = DEFAULT_PORT, wait_seconds: float = 3.0) -> dict[st
 
         try:
             ensure_settings_json()
+        except Exception:
+            pass
+        try:
+            apply_css_overrides()
         except Exception:
             pass
 
