@@ -1,11 +1,15 @@
 # sam-extra (Forge SAM3 Extension)
 
-SAM3 / SAM3.1 마스크 + 인페인트 확장. 두 가지 워크플로 제공:
+SAM3 / SAM3.1 마스크 + 인페인트 확장. 네 가지 워크플로 제공:
 
 1. **In-flight** — t2i/img2img 생성 직후 자동으로 SAM3 마스킹 → 인페인트 (ADetailer 스타일)
 2. **Refine 패널** (v0.4.0+) — 갤러리에서 이미지 골라 즉시 SAM3+인페인트+CN으로 재손질, 결과를 갤러리에 누적
+3. **Anima Tile-Repair** (v0.8.0+) — [kohya-ss/sd-scripts](https://github.com/kohya-ss/sd-scripts)의 Anima ControlNet-LLLite 추론을 가져와 임베드 (Apache-2.0)
+4. **LoRA Manager** (v0.9.0+) — [willmiao/ComfyUI-Lora-Manager](https://github.com/willmiao/ComfyUI-Lora-Manager)를 그대로 가져와 extra-networks 탭에 임베드 (GPL-3.0)
 
 ControlNet 통합 (LLLite 인페인트 모델 자동 호환 처리), 옷 교체용 Target/Replacement 워크플로, 시드 고정, VRAM 절약 옵션, XYZ plot 다축 등 지원.
+
+> 워크플로 3·4는 외부 프로젝트를 vendored하여 통합한 것입니다. 자세한 출처는 아래 [출처 / 크레딧](#출처--크레딧-credits) 참고.
 
 ---
 
@@ -235,9 +239,13 @@ t2i Generate → 갤러리 N장
 
 ---
 
-## 워크플로 4: LoRA Manager 통합 (v0.9.0+)
+## 워크플로 4: LoRA Manager 통합 (v0.9.0+, v0.9.1에서 정상 작동)
+
+> **출처 명시:** 이 기능은 [**willmiao/ComfyUI-Lora-Manager**](https://github.com/willmiao/ComfyUI-Lora-Manager) (GPL-3.0) 프로젝트를 **그대로 가져와(vendored)** Forge에 임베드한 것입니다. LoRA 관리 UI/기능 전부는 원저자 willmiao의 저작물이며, 이 확장은 그 standalone 서버를 Forge UI 안에서 띄우는 통합 레이어만 추가합니다.
 
 [willmiao/ComfyUI-Lora-Manager](https://github.com/willmiao/ComfyUI-Lora-Manager)를 Forge에 통합. extra-networks 탭 strip(🎴 버튼으로 여는 Checkpoints/LoRA 카드 영역)에 **Manage 탭**을 추가해서 LoRA 관리(civitai 다운로드, 메타데이터/트리거워드 편집, recipe, preview)를 Forge 안에서 바로 합니다.
+
+> **첫 실행 주의:** 서버가 처음 뜰 때 전체 LoRA 라이브러리를 스캔/해싱합니다 (예: 1487개 ≈ 4~5분). 이 동안 Manage 탭에 "LoRA 모델 스캔 중..." 진행 표시가 나오고, 끝나면 자동으로 UI가 로드됩니다. 두 번째 실행부터는 캐시 덕분에 즉시 뜹니다.
 
 ### 동작 방식
 
@@ -261,14 +269,34 @@ t2i Generate → 갤러리 N장
 
 txt2img + img2img 양쪽 extra-networks strip 모두에 주입됩니다.
 
+### 포함 기능 / 빠지는 기능
+
+standalone 웹 UI 기능(검색·다운로드·정리·프리뷰·메타데이터·트리거워드·레시피·통계 등)은 **원본과 100% 동일하게** 동작합니다. 빠지는 것은 ComfyUI 노드 그래프 전용 기능뿐입니다:
+
+- **ComfyUI 커스텀 노드(Lora Loader, Trigger Words Toggle, Save Recipe 등) — N/A.** Forge엔 노드 그래프가 없습니다. LoRA 실제 적용은 Forge 본체가 담당 (프롬프트에 `<lora:이름:0.8>` 입력 / extra-networks 카드 클릭).
+- **생성 직후 자동 레시피 캡처 제한** (라이브 생성 메타데이터 수집은 ComfyUI 실행 엔진에 의존 → standalone에서 mock). 단 이미지 파일 기반 수동 레시피 임포트는 정상.
+
 ### 한계
 
 - iframe 임베드라 Forge Gradio 테마와 시각적으로 완전히 통합되지는 않음 (manager 자체 UI)
-- manager의 일부 클립보드 기능은 브라우저 cross-origin 정책에 따라 제한될 수 있음
 - `git` PATH 필요 (vendor clone)
+
+---
+
+## 출처 / 크레딧 (Credits)
+
+이 확장은 아래 외부 프로젝트를 **그대로 가져와(vendored, shallow clone)** Forge에 통합합니다. 핵심 기능의 저작권은 각 원저자에게 있으며, 본 확장은 Forge 통합 레이어만 제공합니다. vendor 디렉터리는 저장소에 포함되지 않고 `install.py`가 첫 실행 시 자동으로 clone합니다.
+
+| 기능 | 원본 프로젝트 | 라이선스 | vendor 위치 |
+|---|---|---|---|
+| **LoRA Manager** (워크플로 4) | [willmiao/ComfyUI-Lora-Manager](https://github.com/willmiao/ComfyUI-Lora-Manager) | GPL-3.0 | `lora_manager_vendor/` |
+| **Anima Tile-Repair** (워크플로 3) | [kohya-ss/sd-scripts](https://github.com/kohya-ss/sd-scripts) (`anima_minimal_inference*`) | Apache-2.0 | `anima_vendor/` |
+| SAM3 검출 | Meta SAM3 / `sam3` PyPI 패키지 | (해당 라이선스) | — |
+
+원저자분들께 감사드립니다. 각 프로젝트의 라이선스 전문은 vendor 디렉터리의 `LICENSE` 파일을 참고하세요.
 
 ---
 
 ## 라이선스
 
-내부 사용.
+본 확장(통합 레이어) 자체는 내부 사용. 단, 임베드한 LoRA Manager가 **GPL-3.0**이므로 재배포 시 GPL-3.0 조건을 따릅니다. (vendor 코드는 저장소에 포함되지 않으며 런타임에 clone됩니다.)
