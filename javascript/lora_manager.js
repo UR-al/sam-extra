@@ -280,6 +280,67 @@
             });
     }
 
+    // ---- "Add LoRA" bridge (iframe → parent prompt insertion) -----------
+    // forge_bridge.js (inside the manager iframe) intercepts the LoRA card
+    // send action and postMessages {type:'sam3-add-lora', text:'<lora:...>'}.
+    // Here we insert that into the active tab's POSITIVE prompt, mirroring
+    // Forge's native cardClicked/updatePromptArea.
+    function sam3ActiveTab() {
+        try {
+            var sel = app().querySelector("#tabs > div.tab-nav button.selected");
+            var label = sel ? (sel.textContent || "").toLowerCase() : "";
+            if (label.indexOf("img2img") !== -1) return "img2img";
+            if (label.indexOf("txt2img") !== -1) return "txt2img";
+        } catch (e) {}
+        var i2i = app().querySelector("#img2img_prompt");
+        if (i2i && i2i.offsetParent !== null) return "img2img";
+        return "txt2img";
+    }
+
+    function sam3PositiveTextarea(tab) {
+        return app().querySelector("#" + tab + "_prompt > label > textarea")
+            || app().querySelector("#" + tab + "_prompt textarea");
+    }
+
+    function sam3Separator() {
+        try {
+            if (typeof opts !== "undefined" && opts &&
+                typeof opts.extra_networks_add_text_separator === "string") {
+                return opts.extra_networks_add_text_separator;
+            }
+        } catch (e) {}
+        return ", ";
+    }
+
+    function sam3InsertLora(text) {
+        if (!text) return;
+        var tab = sam3ActiveTab();
+        var ta = sam3PositiveTextarea(tab);
+        if (!ta) { console.log("[SAM3] add-lora: no positive prompt textarea for", tab); return; }
+        var cur = ta.value || "";
+        if (cur.indexOf(text) === -1) {
+            ta.value = cur.length ? (cur + sam3Separator() + text) : text;
+        }
+        // Mirror ui.js updateInput so Gradio registers the change.
+        var ev = new Event("input", { bubbles: true });
+        try { Object.defineProperty(ev, "target", { value: ta }); } catch (e) {}
+        ta.dispatchEvent(ev);
+        try { ta.focus(); } catch (e) {}
+    }
+
+    function attachLoraBridge() {
+        if (window.__sam3LoraBridgeAttached) return;
+        window.__sam3LoraBridgeAttached = true;
+        window.addEventListener("message", function (ev) {
+            var d = ev && ev.data;
+            if (!d || typeof d !== "object") return;
+            if (d.type !== "sam3-add-lora") return;
+            // port is dynamic / cross-origin, so validate by message shape.
+            if (typeof d.text !== "string" || d.text.indexOf("<lora:") !== 0) return;
+            sam3InsertLora(d.text);
+        });
+    }
+
     function start() {
         tryAll();
         // Keep trying as the DOM finishes building (heavy first render).
@@ -288,6 +349,7 @@
         var iv = setInterval(tryAll, 800);
         setTimeout(function () { try { obs.disconnect(); } catch (e) {} clearInterval(iv); }, 300000);
 
+        attachLoraBridge();
         // config affects only replace-mode/availability — fetch independently.
         loadConfig();
     }

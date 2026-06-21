@@ -105,6 +105,19 @@ _CSS_OVERRIDES = {
         "#bannerHistoryList a.banner-history-action[href*=\"ko-fi.com\"],\n"
         "#bannerHistoryList a.banner-history-action[href*=\"afdian.com\"] { display: none !important; }\n"
     ),
+    # Notes field real-placeholder (Bug B). The source patch (apply_modal_bug_
+    # patches) makes the notes div start EMPTY with a data-placeholder attr;
+    # this CSS renders that placeholder via :empty::before so it clears on
+    # focus/typing in every locale (the old code injected the localized text as
+    # real content and only cleared the hardcoded English string). Appended to
+    # style.css (always loaded, not previously patched).
+    "static/css/style.css": (
+        ".notes-content:empty::before {\n"
+        "    content: attr(data-placeholder);\n"
+        "    opacity: 0.45;\n"
+        "    pointer-events: none;\n"
+        "}\n"
+    ),
 }
 
 
@@ -209,6 +222,317 @@ def apply_update_check_patch() -> None:
             f"[-] LoRA Manager: failed to apply update-check patch: {e}",
             file=sys.stderr,
         )
+
+
+# ---------------------------------------------------------------------------
+# Forge Neo rewire — convert ComfyUI interactions to Forge Neo
+# ---------------------------------------------------------------------------
+# 1. In-iframe bridge (forge_bridge.js): intercept the LoRA card "send to
+#    ComfyUI" action (the .fa-paper-plane icon), build the <lora:name:weight>
+#    syntax from the card's dataset (verified: ModelCard.js uses
+#    card.dataset.file_name/folder/usage_tips; handleSendToWorkflow at :166;
+#    syntax format uiHelpers.js buildLoraSyntax), and postMessage it to the
+#    parent Forge window — where javascript/lora_manager.js inserts it into the
+#    active tab's positive prompt (cross-origin: postMessage is the only path).
+#    Also rebrands "ComfyUI" → "Forge Neo" labels as a DOM fallback.
+# 2. base.html gets a <script> tag for the bridge (served via /loras_static).
+# 3. locale JSON: "ComfyUI" → "Forge Neo", send-action labels → "Add LoRA".
+# All marker-guarded / value-compared + re-applied on re-clone.
+
+_BRIDGE_REL = "static/forge_bridge.js"
+_BRIDGE_MARKER = "/* forge_bridge.js (forge_sam3) */"
+_BRIDGE_JS = r'''/* forge_bridge.js (forge_sam3) */
+/* Runs INSIDE the vendored LoRA Manager iframe (cross-origin from Forge).
+ * Converts the "send to ComfyUI" card action into "Add LoRA" → posts the
+ * <lora:...> syntax to the parent Forge window, which inserts it into the
+ * active tab's positive prompt. Also rebrands ComfyUI -> Forge Neo. */
+(function () {
+    "use strict";
+    function isLoras() {
+        var p = document.body && document.body.getAttribute("data-page");
+        return p === "loras";
+    }
+    function syntaxFormat() {
+        try {
+            var s = window.state && window.state.global && window.state.global.settings;
+            return (s && s.lora_syntax_format) || "standard";
+        } catch (e) { return "standard"; }
+    }
+    function num(v) {
+        if (v === null || v === undefined || v === "") return null;
+        var n = typeof v === "number" ? v : parseFloat(v);
+        return isNaN(n) ? null : n;
+    }
+    function buildSyntax(fileName, tips) {
+        tips = tips || {};
+        var strength = num(tips.strength); if (strength === null) strength = 1;
+        var clipSrc = (tips.clip_strength !== undefined && tips.clip_strength !== null)
+            ? tips.clip_strength : tips.clipStrength;
+        var clip = num(clipSrc);
+        var name = (syntaxFormat() === "legacy") ? fileName.split("/").pop() : fileName;
+        if (clip !== null) return "<lora:" + name + ":" + strength + ":" + clip + ">";
+        return "<lora:" + name + ":" + strength + ">";
+    }
+    function syntaxFromCard(card) {
+        var tips = {};
+        try { tips = JSON.parse(card.dataset.usage_tips || "{}"); } catch (e) { tips = {}; }
+        var folder = card.dataset.folder || "";
+        var file = card.dataset.file_name || "";
+        if (!file) return null;
+        var loraName = folder ? (folder + "/" + file) : file;
+        return buildSyntax(loraName, tips);
+    }
+    /* Capture-phase intercept — runs BEFORE the vendor's bubble-phase
+     * delegation on #modelGrid, so stopImmediatePropagation blocks the
+     * backend send (which fails in standalone) and we postMessage instead. */
+    document.addEventListener("click", function (e) {
+        var icon = e.target && e.target.closest && e.target.closest(".fa-paper-plane");
+        if (!icon) return;
+        if (!isLoras()) return;
+        var card = icon.closest && icon.closest(".model-card");
+        if (!card) return;
+        var syntax = syntaxFromCard(card);
+        if (!syntax) return;
+        e.preventDefault();
+        e.stopImmediatePropagation();
+        try { window.parent.postMessage({ type: "sam3-add-lora", text: syntax }, "*"); } catch (err) {}
+        try {
+            icon.style.transition = "transform .15s";
+            icon.style.transform = "scale(1.4)";
+            setTimeout(function () { icon.style.transform = ""; }, 180);
+        } catch (e2) {}
+    }, true);
+
+    /* Label rebrand fallback (locale patch is primary). */
+    function relabel(root) {
+        if (!root || !root.querySelectorAll) return;
+        try {
+            root.querySelectorAll("i.fa-paper-plane[title]").forEach(function (el) {
+                var t = el.getAttribute("title") || "";
+                if (/comfy|workflow|send/i.test(t)) el.setAttribute("title", "Add LoRA");
+            });
+            root.querySelectorAll("[title]").forEach(function (el) {
+                var t = el.getAttribute("title");
+                if (t && t.indexOf("ComfyUI") !== -1) el.setAttribute("title", t.replace(/ComfyUI/g, "Forge Neo"));
+            });
+        } catch (e) {}
+    }
+    function walkTextOnce() {
+        try {
+            var w = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT, null);
+            var n, hits = [];
+            while ((n = w.nextNode())) { if (n.nodeValue && n.nodeValue.indexOf("ComfyUI") !== -1) hits.push(n); }
+            hits.forEach(function (t) { t.nodeValue = t.nodeValue.replace(/ComfyUI/g, "Forge Neo"); });
+        } catch (e) {}
+    }
+    function init() {
+        relabel(document); walkTextOnce();
+        try {
+            var obs = new MutationObserver(function (muts) {
+                muts.forEach(function (m) {
+                    if (m.addedNodes) m.addedNodes.forEach(function (nd) { if (nd.nodeType === 1) relabel(nd); });
+                });
+            });
+            obs.observe(document.body, { childList: true, subtree: true });
+        } catch (e) {}
+    }
+    if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", init);
+    else init();
+})();
+'''
+
+
+def write_forge_bridge() -> None:
+    """Write the in-iframe bridge into vendor static (idempotent by content)."""
+    if not LM_VENDOR.is_dir():
+        return
+    target = LM_VENDOR / _BRIDGE_REL
+    try:
+        if target.is_file():
+            existing = target.read_text(encoding="utf-8", errors="replace")
+            if existing.strip() == _BRIDGE_JS.strip():
+                return
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(_BRIDGE_JS, encoding="utf-8")
+        print(f"[-] LoRA Manager: wrote {_BRIDGE_REL}", file=sys.stderr)
+    except Exception as e:
+        print(f"[-] LoRA Manager: failed to write bridge: {e}", file=sys.stderr)
+
+
+_TEMPLATE_REL = "templates/base.html"
+_TPL_MARKER = "<!-- forge_sam3 bridge (auto-applied) -->"
+_TPL_ANCHOR = "    {% block head_scripts %}{% endblock %}\n"
+_TPL_INJECT = (
+    "    " + _TPL_MARKER + "\n"
+    "    <script src=\"/loras_static/forge_bridge.js?v={{ version }}\"></script>\n"
+    + _TPL_ANCHOR
+)
+
+
+def inject_bridge_script_tag() -> None:
+    """Splice the bridge <script> just before {% block head_scripts %} in
+    base.html (classic script so it runs in the iframe immediately)."""
+    if not LM_VENDOR.is_dir():
+        return
+    target = LM_VENDOR / _TEMPLATE_REL
+    try:
+        if not target.is_file():
+            return
+        src = target.read_text(encoding="utf-8", errors="replace")
+        if _TPL_MARKER in src:
+            return
+        if _TPL_ANCHOR not in src:
+            print(
+                "[-] LoRA Manager: base.html anchor not found; skipping bridge "
+                "<script> injection (upstream layout changed).",
+                file=sys.stderr,
+            )
+            return
+        target.write_text(src.replace(_TPL_ANCHOR, _TPL_INJECT, 1), encoding="utf-8")
+        print(
+            f"[-] LoRA Manager: injected bridge <script> into {_TEMPLATE_REL}",
+            file=sys.stderr,
+        )
+    except Exception as e:
+        print(
+            f"[-] LoRA Manager: failed to inject bridge script: {e}",
+            file=sys.stderr,
+        )
+
+
+# Locale rebrand: send-action labels → "Add LoRA"; blanket ComfyUI → Forge Neo.
+_LOCALE_ADD_LORA_KEYS = (
+    "modelCard.actions.sendToWorkflow",
+    "modelCard.actions.sendCheckpointToWorkflow",
+    "modelCard.actions.sendEmbeddingToWorkflow",
+    "modals.model.actions.sendToWorkflow",
+    "modals.model.actions.sendToWorkflowText",
+    "loras.contextMenu.sendToWorkflowAppend",
+    "loras.contextMenu.sendToWorkflowReplace",
+)
+
+
+def _set_json_path(obj: dict, dotted: str, value: str) -> bool:
+    cur = obj
+    parts = dotted.split(".")
+    for p in parts[:-1]:
+        if not isinstance(cur, dict) or p not in cur:
+            return False
+        cur = cur[p]
+    last = parts[-1]
+    if isinstance(cur, dict) and last in cur and cur[last] != value:
+        cur[last] = value
+        return True
+    return False
+
+
+def apply_locale_forge_neo() -> None:
+    """Rebrand ComfyUI→Forge Neo and send-action labels→Add LoRA across every
+    locale file. Idempotent by value comparison; re-applied on re-clone."""
+    if not LM_VENDOR.is_dir():
+        return
+    loc_dir = LM_VENDOR / "locales"
+    if not loc_dir.is_dir():
+        return
+    for jf in loc_dir.glob("*.json"):
+        try:
+            data = json.loads(jf.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        changed = False
+
+        for k in _LOCALE_ADD_LORA_KEYS:
+            if _set_json_path(data, k, "Add LoRA"):
+                changed = True
+
+        def walk(node):
+            nonlocal changed
+            if isinstance(node, dict):
+                for kk, vv in list(node.items()):
+                    if isinstance(vv, str):
+                        if "ComfyUI" in vv:
+                            node[kk] = vv.replace("ComfyUI", "Forge Neo")
+                            changed = True
+                    else:
+                        walk(vv)
+            elif isinstance(node, list):
+                for i, vv in enumerate(node):
+                    if isinstance(vv, str):
+                        if "ComfyUI" in vv:
+                            node[i] = vv.replace("ComfyUI", "Forge Neo")
+                            changed = True
+                    else:
+                        walk(vv)
+
+        walk(data)
+        if changed:
+            try:
+                jf.write_text(
+                    json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8"
+                )
+                print(f"[-] LoRA Manager: rebranded locale {jf.name}", file=sys.stderr)
+            except Exception as e:
+                print(f"[-] LoRA Manager: failed locale {jf.name}: {e}", file=sys.stderr)
+
+
+# Bug A (Usage Tips X) + Bug B (Notes placeholder) — minimal source patches.
+_BUGA_FILE = "static/js/components/shared/PresetTags.js"
+_BUGA_OLD = "    const currentPresets = parsePresets(loraCard.dataset.usage_tips);\n"
+_BUGA_NEW = (
+    "    /* forge_sam3: loraCard is null when the card is virtual-scrolled out;\n"
+    "       fall back to the modal's stored usage_tips so removal still works. */\n"
+    "    const currentPresets = parsePresets(\n"
+    "        (loraCard && loraCard.dataset.usage_tips) ||\n"
+    "        (document.getElementById('modelModal') && document.getElementById('modelModal').dataset.usageTips) ||\n"
+    "        '{}');\n"
+)
+
+_BUGB_FILE = "static/js/components/shared/ModelModal.js"
+# Render: don't inject the localized placeholder as real text; use data-placeholder.
+_BUGB_OLD_RENDER = (
+    "<div class=\"notes-content\" contenteditable=\"true\" spellcheck=\"false\">"
+    "${modelWithFullData.notes || translate('modals.model.metadata.addNotesPlaceholder', {}, 'Add your notes here...')}</div>"
+)
+_BUGB_NEW_RENDER = (
+    "<div class=\"notes-content\" contenteditable=\"true\" spellcheck=\"false\" "
+    "data-placeholder=\"${translate('modals.model.metadata.addNotesPlaceholder', {}, 'Add your notes here...')}\">"
+    "${modelWithFullData.notes || ''}</div>"
+)
+# Blur: keep the field truly empty (CSS :empty::before shows the placeholder)
+# instead of refilling the hardcoded English string.
+_BUGB_OLD_BLUR = "                    this.textContent = 'Add your notes here...';\n"
+_BUGB_NEW_BLUR = "                    this.textContent = '';  /* forge_sam3: real placeholder via CSS */\n"
+
+
+def apply_modal_bug_patches() -> None:
+    """Source-patch the two LoRA-modal bugs (idempotent by content compare)."""
+    if not LM_VENDOR.is_dir():
+        return
+    # Bug A
+    a = LM_VENDOR / _BUGA_FILE
+    try:
+        if a.is_file():
+            src = a.read_text(encoding="utf-8", errors="replace")
+            if "forge_sam3: loraCard is null" not in src and _BUGA_OLD in src:
+                a.write_text(src.replace(_BUGA_OLD, _BUGA_NEW, 1), encoding="utf-8")
+                print(f"[-] LoRA Manager: patched Bug A in {_BUGA_FILE}", file=sys.stderr)
+    except Exception as e:
+        print(f"[-] LoRA Manager: Bug A patch failed: {e}", file=sys.stderr)
+    # Bug B (render + blur)
+    b = LM_VENDOR / _BUGB_FILE
+    try:
+        if b.is_file():
+            src = b.read_text(encoding="utf-8", errors="replace")
+            new = src
+            if _BUGB_OLD_RENDER in new:
+                new = new.replace(_BUGB_OLD_RENDER, _BUGB_NEW_RENDER, 1)
+            if _BUGB_OLD_BLUR in new:
+                new = new.replace(_BUGB_OLD_BLUR, _BUGB_NEW_BLUR, 1)
+            if new != src:
+                b.write_text(new, encoding="utf-8")
+                print(f"[-] LoRA Manager: patched Bug B in {_BUGB_FILE}", file=sys.stderr)
+    except Exception as e:
+        print(f"[-] LoRA Manager: Bug B patch failed: {e}", file=sys.stderr)
 
 
 # ---------------------------------------------------------------------------
@@ -413,6 +737,16 @@ def get_or_spawn(port: int = DEFAULT_PORT, wait_seconds: float = 3.0) -> dict[st
             apply_update_check_patch()
         except Exception:
             pass
+        for _patch in (
+            write_forge_bridge,
+            inject_bridge_script_tag,
+            apply_locale_forge_neo,
+            apply_modal_bug_patches,
+        ):
+            try:
+                _patch()
+            except Exception:
+                pass
 
         # Spawn. CREATE_NO_WINDOW on Windows so no extra console pops up; logs
         # go to forge_standalone.log for debugging.
