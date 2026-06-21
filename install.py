@@ -183,3 +183,127 @@ def check_anima_environment():
 
 
 check_anima_environment()
+
+
+# ---------------------------------------------------------------------------
+# v0.9.0 LoRA Manager vendor bootstrap — shallow-clone willmiao/
+# ComfyUI-Lora-Manager + auto-install its (lightweight, pure-python) deps.
+# ---------------------------------------------------------------------------
+# Unlike the Anima vendor, the LoRA Manager's extra deps are all small
+# pure-python packages (aiohttp-socks, piexif, olefile, natsort, aiosqlite,
+# beautifulsoup4) with no torch/cuda ABI coupling, so auto-installing the
+# missing ones is safe and was explicitly opted into by the user.
+
+_LM_REPO = "https://github.com/willmiao/ComfyUI-Lora-Manager.git"
+_LM_BRANCH = "main"
+_LM_ROOT = Path(__file__).resolve().parent / "lora_manager_vendor"
+_LM_SENTINEL = _LM_ROOT / "standalone.py"
+
+# pip name -> import name (for is_installed's find_spec check)
+_LM_DEP_IMPORT = {
+    "aiohttp": "aiohttp",
+    "aiohttp-socks": "aiohttp_socks",
+    "jinja2": "jinja2",
+    "safetensors": "safetensors",
+    "piexif": "piexif",
+    "Pillow": "PIL",
+    "olefile": "olefile",
+    "toml": "toml",
+    "numpy": "numpy",
+    "natsort": "natsort",
+    "GitPython": "git",
+    "aiosqlite": "aiosqlite",
+    "beautifulsoup4": "bs4",
+    "platformdirs": "platformdirs",
+    "pyyaml": "yaml",
+    "brotli": "brotli",
+}
+
+
+def ensure_lora_manager_vendor() -> bool:
+    """Clone willmiao/ComfyUI-Lora-Manager into ``lora_manager_vendor/`` if
+    the sentinel (standalone.py) is missing. Idempotent.
+
+    Returns True when the vendor tree is usable after this call.
+    """
+    if _LM_SENTINEL.exists():
+        return True
+
+    if not _have_git():
+        print(
+            "[forge_sam3_extension] LoRA Manager disabled: 'git' not on PATH. "
+            "Install git, or clone willmiao/ComfyUI-Lora-Manager manually "
+            f"into {_LM_ROOT}",
+            file=sys.stderr,
+        )
+        return False
+
+    _LM_ROOT.parent.mkdir(parents=True, exist_ok=True)
+    print(
+        f"[forge_sam3_extension] cloning ComfyUI-Lora-Manager → {_LM_ROOT} "
+        "(first-run, ~20s)",
+        file=sys.stderr,
+    )
+    try:
+        subprocess.check_call(
+            [
+                "git",
+                "clone",
+                "--depth",
+                "1",
+                "--single-branch",
+                "--branch",
+                _LM_BRANCH,
+                _LM_REPO,
+                str(_LM_ROOT),
+            ],
+            env={**os.environ, "GIT_TERMINAL_PROMPT": "0"},
+        )
+    except subprocess.CalledProcessError as e:
+        print(
+            f"[forge_sam3_extension] LoRA Manager clone failed (exit "
+            f"{e.returncode}); the Manage tab will be disabled.",
+            file=sys.stderr,
+        )
+        return False
+
+    return _LM_SENTINEL.exists()
+
+
+def check_lora_manager_environment():
+    """Auto-install the LoRA Manager's missing pure-python deps into the
+    Forge venv (user opted into auto-install). No version pins — we only add
+    packages that are entirely absent so existing Forge packages are never
+    downgraded."""
+    if not _LM_SENTINEL.exists():
+        return
+
+    # Seed import_name so is_installed resolves the non-obvious ones.
+    for pip_name, imp in _LM_DEP_IMPORT.items():
+        import_name.setdefault(pip_name, imp)
+
+    missing = [pip for pip in _LM_DEP_IMPORT if not is_installed(pip)]
+    if not missing:
+        return
+
+    joined = " ".join(missing)
+    print(
+        f"[forge_sam3_extension] LoRA Manager: installing missing deps "
+        f"({', '.join(missing)}) into the Forge venv...",
+        file=sys.stderr,
+    )
+    try:
+        subprocess.check_call(
+            [sys.executable, "-m", "pip", "install", *missing],
+            env={**os.environ, "PIP_DISABLE_PIP_VERSION_CHECK": "1"},
+        )
+    except subprocess.CalledProcessError as e:
+        print(
+            f"[forge_sam3_extension] LoRA Manager dep install failed (exit "
+            f"{e.returncode}). Install manually:\n   pip install {joined}",
+            file=sys.stderr,
+        )
+
+
+ensure_lora_manager_vendor()
+check_lora_manager_environment()

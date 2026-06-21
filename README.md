@@ -235,6 +235,40 @@ t2i Generate → 갤러리 N장
 
 ---
 
+## 워크플로 4: LoRA Manager 통합 (v0.9.0+)
+
+[willmiao/ComfyUI-Lora-Manager](https://github.com/willmiao/ComfyUI-Lora-Manager)를 Forge에 통합. extra-networks 탭 strip(🎴 버튼으로 여는 Checkpoints/LoRA 카드 영역)에 **Manage 탭**을 추가해서 LoRA 관리(civitai 다운로드, 메타데이터/트리거워드 편집, recipe, preview)를 Forge 안에서 바로 합니다.
+
+### 동작 방식
+
+- standalone aiohttp 서버를 **lazy spawn** — Manage 탭을 처음 열 때만 백그라운드 프로세스로 실행 (최초 ~10초)
+- Manage 탭 안에 `<iframe>`으로 manager UI 임베드
+- Forge의 LoRA/checkpoint/embeddings 폴더 경로를 manager `settings.json`에 자동 동기화
+- Forge 종료 시 서버 자동 종료 (atexit)
+
+### 의존성 자동 설치
+
+확장 첫 로드 시 `install.py`가:
+1. `willmiao/ComfyUI-Lora-Manager`를 `lora_manager_vendor/`로 shallow clone (~20초)
+2. 누락된 경량 deps(aiohttp-socks, piexif, olefile, natsort, aiosqlite, beautifulsoup4)를 Forge venv에 자동 `pip install`
+
+### 설정 (Settings → SAM3 LoRA Manager)
+
+| 옵션 | 기본값 | 설명 |
+|---|---|---|
+| Manage 탭 배치 | `Add Manage tab (keep LoRA)` | LoRA 탭 옆에 Manage 탭 추가 / `Replace LoRA tab`이면 LoRA 탭 자리를 대체 |
+| 서버 포트 | `8765` | ComfyUI 기본 8188과 충돌 회피. 재시작 후 적용 |
+
+txt2img + img2img 양쪽 extra-networks strip 모두에 주입됩니다.
+
+### 한계
+
+- iframe 임베드라 Forge Gradio 테마와 시각적으로 완전히 통합되지는 않음 (manager 자체 UI)
+- manager의 일부 클립보드 기능은 브라우저 cross-origin 정책에 따라 제한될 수 있음
+- `git` PATH 필요 (vendor clone)
+
+---
+
 ## 라이선스
 
 내부 사용.

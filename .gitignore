@@ -11,3 +11,6 @@ pip
 
 # v0.8.0 — shallow clone of kohya-ss/sd-scripts populated by install.py
 anima_vendor/
+
+# v0.9.0 — shallow clone of willmiao/ComfyUI-Lora-Manager populated by install.py
+lora_manager_vendor/
