@@ -65,10 +65,12 @@ end-to-end 런타임 검증이 1회 필요합니다. 콘솔의 ``[AnimaSafePAG]`
 from __future__ import annotations
 
 import sys
+import traceback
+from functools import partial
 
 import gradio as gr
 
-from modules import scripts
+from modules import script_callbacks, scripts
 
 try:
     import torch
@@ -372,6 +374,73 @@ def _get_diffusion_model(unet):
 
 
 # ---------------------------------------------------------------------------
+# XYZ plot integration — lets users grid an ON/OFF (and param) comparison.
+# The AxisOption apply functions mutate ``p`` per grid cell; the script's
+# ``process_before_every_sampling`` then reads ``p._anima_safe_pag_xyz`` and
+# overrides its own UI args from it (same pattern as the SAM3 script).
+# ---------------------------------------------------------------------------
+
+
+def _pag_xyz_set(p, x, xs, *, field: str):
+    if not hasattr(p, "_anima_safe_pag_xyz"):
+        p._anima_safe_pag_xyz = {}
+    p._anima_safe_pag_xyz[field] = x
+
+
+def _make_pag_xyz_axis() -> None:
+    xyz_grid = None
+    for script in scripts.scripts_data:
+        if script.script_class.__module__ == "xyz_grid.py":
+            xyz_grid = script.module
+            break
+    if xyz_grid is None:
+        return
+
+    bool_choices = lambda: ["True", "False"]  # noqa: E731
+
+    axis = [
+        # The headline request: ON/OFF comparison grid.
+        xyz_grid.AxisOption(
+            "[Anima PAG] Enable", str,
+            partial(_pag_xyz_set, field="enabled"), choices=bool_choices,
+        ),
+        xyz_grid.AxisOption("[Anima PAG] Scale", float, partial(_pag_xyz_set, field="scale")),
+        xyz_grid.AxisOption(
+            "[Anima PAG] Perturbation Strength", float,
+            partial(_pag_xyz_set, field="strength"),
+        ),
+        xyz_grid.AxisOption(
+            "[Anima PAG] Block Indices", str,
+            partial(_pag_xyz_set, field="blocks"),
+        ),
+        xyz_grid.AxisOption("[Anima PAG] Start Percent", float, partial(_pag_xyz_set, field="start")),
+        xyz_grid.AxisOption("[Anima PAG] End Percent", float, partial(_pag_xyz_set, field="end")),
+        xyz_grid.AxisOption("[Anima PAG] Rescale", float, partial(_pag_xyz_set, field="rescale")),
+    ]
+
+    if not any(a.label.startswith("[Anima PAG]") for a in xyz_grid.axis_options):
+        xyz_grid.axis_options.extend(axis)
+
+
+def _pag_on_before_ui() -> None:
+    try:
+        _make_pag_xyz_axis()
+    except Exception:
+        _log("xyz_grid axis registration failed:\n" + traceback.format_exc())
+
+
+script_callbacks.on_before_ui(_pag_on_before_ui)
+
+
+def _as_bool(value, default: bool) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return default
+    return str(value).strip().lower() in {"true", "1", "yes", "on"}
+
+
+# ---------------------------------------------------------------------------
 # The extension script
 # ---------------------------------------------------------------------------
 
@@ -436,10 +505,18 @@ class AnimaSafePAG(scripts.Script):
     def process_before_every_sampling(self, p, *args, **kwargs):
         if torch is None:
             return
+
+        # XYZ-plot overrides (set per grid cell by the AxisOption apply fns).
+        xyz = getattr(p, "_anima_safe_pag_xyz", {}) or {}
+
         try:
             enabled = bool(args[0]) if len(args) > 0 else False
         except Exception:
             enabled = False
+        # An [Anima PAG] Enable axis wins over the checkbox — this is what makes
+        # the ON/OFF comparison grid work regardless of the UI toggle state.
+        if "enabled" in xyz:
+            enabled = _as_bool(xyz["enabled"], enabled)
 
         if not enabled:
             _STATE["on"] = False
@@ -453,6 +530,23 @@ class AnimaSafePAG(scripts.Script):
             _STATE["on"] = False
             _log(f"bad args, disabling: {type(e).__name__}: {e}")
             return
+
+        # Per-field XYZ overrides for the numeric/string knobs.
+        def _xyz_num(key, cur):
+            if key in xyz:
+                try:
+                    return float(xyz[key])
+                except (TypeError, ValueError):
+                    return cur
+            return cur
+
+        scale = _xyz_num("scale", scale)
+        strength = _xyz_num("strength", strength)
+        start = _xyz_num("start", start)
+        end = _xyz_num("end", end)
+        rescale = _xyz_num("rescale", rescale)
+        if "blocks" in xyz:
+            block_spec = str(xyz["blocks"])
 
         sd_model = getattr(p, "sd_model", None)
         engine = type(sd_model).__name__ if sd_model is not None else "?"
@@ -506,6 +600,13 @@ class AnimaSafePAG(scripts.Script):
             unet.set_model_unet_function_wrapper(_model_wrapper)
             unet.set_model_sampler_post_cfg_function(_post_cfg)
             p.sd_model.forge_objects.unet = unet
+            # Record in PNG metadata so ON cells of a grid are identifiable.
+            if not hasattr(p, "extra_generation_params"):
+                p.extra_generation_params = {}
+            p.extra_generation_params["Anima Safe PAG"] = (
+                f"scale={scale}, strength={strength}, blocks={sorted(targets)}, "
+                f"range={_STATE['start']:.2f}-{_STATE['end']:.2f}, rescale={rescale}"
+            )
             _log(
                 f"attached ✅ engine=Anima blocks={nblocks} targets={sorted(targets)} "
                 f"scale={scale} strength={strength} rescale={rescale} "

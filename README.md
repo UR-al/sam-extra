@@ -347,6 +347,14 @@ Forge Neo 실제 샘플링 경로(`backend/sampling/sampling_function.py`)는 Co
 | Start~End percent | 0.0~0.7 | 적용할 샘플링 구간 (나머지 스텝은 원가) |
 | Rescale | 0.20 | 대비/채도 과다 억제 |
 
+### XYZ Plot 비교
+
+XYZ plot 축에 `[Anima PAG] …` 항목이 추가됩니다. **`[Anima PAG] Enable`** 축을
+`True, False`로 두면 **PAG ON/OFF 비교 그리드**를 바로 뽑을 수 있습니다(UI 체크박스
+상태와 무관하게 축 값이 우선). 그 외 `Scale / Perturbation Strength / Block Indices /
+Start·End Percent / Rescale` 축도 제공되어 세기·블록 스윕이 가능합니다. ON 셀은 PNG
+메타데이터의 `Anima Safe PAG: …` 마커로 식별됩니다.
+
 ---
 
 ## 출처 / 크레딧 (Credits)
