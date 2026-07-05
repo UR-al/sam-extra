@@ -103,6 +103,27 @@ _STATE: dict = {
     "cond_raw": None,     # stashed normal cond model-output
     "uncond_raw": None,   # stashed normal uncond model-output
     "gqa_warned": False,  # emit the GQA-skip note only once
+    "apg_autooff_rescale": True,  # skip PAG rescale while APG is on (toggleable)
+}
+
+
+# ---------------------------------------------------------------------------
+# APG (Adaptive Projected Guidance) — a separate, model-agnostic post-CFG
+# guidance variant. It REPLACES the CFG-combine result with a projected one so
+# high guidance no longer oversaturates. Runs on any engine (not just Anima);
+# unlike PAG it needs no attention patching, only the post_cfg args.
+#
+# With eta=1, norm_threshold=0, momentum=0 it reduces EXACTLY to standard CFG,
+# so it is safe as a default-on-but-neutral toggle.
+# ---------------------------------------------------------------------------
+
+_APG: dict = {
+    "on": False,
+    "eta": 0.0,           # weight of the cond-parallel guidance component
+    "norm_threshold": 15.0,  # clamp guidance L2 norm to this (0 = disabled)
+    "momentum": 0.0,      # running-average coefficient across steps
+    "avg": None,          # momentum buffer (per-generation)
+    "last_sigma": None,   # to detect a new sampling pass (sigma goes up → reset)
 }
 
 
@@ -288,45 +309,119 @@ def _model_wrapper(apply_model, w):
         return apply_model(x, ts, **c)
 
 
+def _project(v0, v1):
+    """Decompose ``v0`` into (parallel, orthogonal) components relative to the
+    direction of ``v1``. Per-sample (reduce over every dim except batch)."""
+    dims = list(range(1, v1.ndim))
+    v1n = torch.nn.functional.normalize(v1, dim=dims)
+    parallel = (v0 * v1n).sum(dim=dims, keepdim=True) * v1n
+    orthogonal = v0 - parallel
+    return parallel, orthogonal
+
+
+def _apply_apg(args, cond_scale):
+    """Adaptive Projected Guidance — returns a replacement CFG-combine result
+    in denoised space. With eta=1, norm_threshold=0, momentum=0 this is exactly
+    standard CFG. Falls back to None (→ caller keeps the original denoised) on
+    any problem."""
+    try:
+        cond = args["cond_denoised"].float()
+        uncond = args["uncond_denoised"].float()
+        guidance = cond - uncond
+
+        # Momentum: running average across steps; reset on a new pass (sigma up).
+        mom = float(_APG["momentum"])
+        if mom != 0.0:
+            sigma = args.get("sigma")
+            cur = float(sigma.flatten()[0]) if sigma is not None else None
+            last = _APG["last_sigma"]
+            avg = _APG["avg"]
+            if (avg is None or avg.shape != guidance.shape
+                    or (cur is not None and last is not None and cur > last + 1e-6)):
+                avg = torch.zeros_like(guidance)
+            avg = mom * avg + guidance
+            _APG["avg"] = avg
+            _APG["last_sigma"] = cur
+            guidance = avg
+
+        # Norm clamp: keep the guidance vector under a fixed L2 magnitude.
+        nt = float(_APG["norm_threshold"])
+        if nt > 0.0:
+            dims = list(range(1, guidance.ndim))
+            gnorm = guidance.norm(p=2, dim=dims, keepdim=True)
+            scale = torch.clamp(nt / gnorm.clamp_min(1e-8), max=1.0)
+            guidance = guidance * scale
+
+        # Project onto cond, downweight the parallel (saturating) component.
+        parallel, orthogonal = _project(guidance, cond)
+        modified = orthogonal + float(_APG["eta"]) * parallel
+
+        # uncond + w*modified  →  standard CFG when modified == (cond-uncond).
+        return uncond + float(cond_scale) * modified
+    except Exception as e:
+        _log(f"APG skipped: {type(e).__name__}: {e}")
+        return None
+
+
+def _apply_pag(args, base):
+    """Add the PAG guidance term onto ``base`` (denoised space), then rescale.
+    Uses the empirically-recovered ``c_out`` so it holds for eps / v / flow
+    parameterizations alike. Returns ``base`` unchanged on any problem."""
+    cd = args["cond_denoised"].float()
+    ud = args["uncond_denoised"].float()
+    cond_raw = _STATE["cond_raw"]
+    uncond_raw = _STATE["uncond_raw"]
+    pag_raw = _STATE["pag_raw"]
+    if cond_raw is None or uncond_raw is None:
+        return base
+    if cd.shape != cond_raw.shape or pag_raw.shape != cond_raw.shape:
+        return base
+
+    # (cd-ud) = c_out*(cond_raw-uncond_raw). Recover c_out by least squares.
+    do = cond_raw - uncond_raw
+    dd = cd - ud
+    denom = (do * do).sum()
+    if float(denom) <= 1e-8:
+        return base
+    c_out = (dd * do).sum() / denom
+
+    # cond_denoised - pag_denoised = c_out*(cond_raw - pag_raw)
+    guidance = float(_STATE["scale"]) * c_out * (cond_raw - pag_raw)
+    result = base + guidance
+
+    # Rescale — auto-skipped while APG is on (APG already governs magnitude),
+    # unless the user turned that guard off.
+    r = float(_STATE["rescale"])
+    apg_governs = _APG["on"] and _STATE.get("apg_autooff_rescale", True)
+    if r > 0 and not apg_governs:
+        dims = list(range(1, result.ndim))
+        std_c = cd.std(dim=dims, keepdim=True).clamp_min(1e-6)
+        std_r = result.std(dim=dims, keepdim=True).clamp_min(1e-6)
+        factor = r * (std_c / std_r) + (1.0 - r)
+        result = result * factor
+    return result
+
+
 def _post_cfg(args):
-    """post_cfg_function: steer the CFG result away from the pag prediction,
-    then rescale. All maths in denoised (x0) space via empirically-recovered
-    ``c_out`` so it holds for eps / v / flow-matching parameterizations alike.
+    """post_cfg orchestrator. Order: APG recomputes the CFG-combine base (if on),
+    then PAG guidance is layered on top (if on). Because PAG adds its term at
+    post_cfg via a recovered ``c_out``, it composes on top of ANY base — standard
+    CFG, APG, or a built-in like MaHiRo/RescaleCFG.
     """
     denoised = args["denoised"]
-    if _STATE["pag_raw"] is None or not _STATE["on"] or torch is None:
+    if torch is None:
         return denoised
     try:
-        cd = args["cond_denoised"].float()
-        ud = args["uncond_denoised"].float()
-        cond_raw = _STATE["cond_raw"]
-        uncond_raw = _STATE["uncond_raw"]
-        pag_raw = _STATE["pag_raw"]
-        if cond_raw is None or uncond_raw is None:
-            return denoised
-        if cd.shape != cond_raw.shape or pag_raw.shape != cond_raw.shape:
-            return denoised
+        result = denoised.float()
 
-        # denoised = c_skip*x + c_out*model_out (c_skip, c_out scalar per step).
-        # → (cd-ud) = c_out*(cond_raw-uncond_raw). Recover c_out by least squares.
-        do = cond_raw - uncond_raw
-        dd = cd - ud
-        denom = (do * do).sum()
-        if float(denom) <= 1e-8:
-            return denoised
-        c_out = (dd * do).sum() / denom
+        if _APG["on"]:
+            apg = _apply_apg(args, args.get("cond_scale", 1.0))
+            if apg is not None:
+                result = apg
 
-        # cond_denoised - pag_denoised = c_out*(cond_raw - pag_raw)
-        guidance = float(_STATE["scale"]) * c_out * (cond_raw - pag_raw)
-        result = denoised.float() + guidance
+        if _STATE["on"] and _STATE["pag_raw"] is not None:
+            result = _apply_pag(args, result)
 
-        r = float(_STATE["rescale"])
-        if r > 0:
-            dims = list(range(1, result.ndim))
-            std_c = cd.std(dim=dims, keepdim=True).clamp_min(1e-6)
-            std_r = result.std(dim=dims, keepdim=True).clamp_min(1e-6)
-            factor = r * (std_c / std_r) + (1.0 - r)
-            result = result * factor
         return result.to(denoised.dtype)
     except Exception as e:
         _log(f"post_cfg fallback → unmodified cfg: {type(e).__name__}: {e}")
@@ -416,9 +511,17 @@ def _make_pag_xyz_axis() -> None:
         xyz_grid.AxisOption("[Anima PAG] Start Percent", float, partial(_pag_xyz_set, field="start")),
         xyz_grid.AxisOption("[Anima PAG] End Percent", float, partial(_pag_xyz_set, field="end")),
         xyz_grid.AxisOption("[Anima PAG] Rescale", float, partial(_pag_xyz_set, field="rescale")),
+        # APG axes (ON/OFF + the three knobs) for the same style of comparison.
+        xyz_grid.AxisOption(
+            "[Anima APG] Enable", str,
+            partial(_pag_xyz_set, field="apg_enabled"), choices=bool_choices,
+        ),
+        xyz_grid.AxisOption("[Anima APG] Eta", float, partial(_pag_xyz_set, field="apg_eta")),
+        xyz_grid.AxisOption("[Anima APG] Norm Threshold", float, partial(_pag_xyz_set, field="apg_norm")),
+        xyz_grid.AxisOption("[Anima APG] Momentum", float, partial(_pag_xyz_set, field="apg_momentum")),
     ]
 
-    if not any(a.label.startswith("[Anima PAG]") for a in xyz_grid.axis_options):
+    if not any(a.label.startswith(("[Anima PAG]", "[Anima APG]")) for a in xyz_grid.axis_options):
         xyz_grid.axis_options.extend(axis)
 
 
@@ -500,7 +603,50 @@ class AnimaSafePAG(scripts.Script):
                 minimum=0.0, maximum=1.0, step=0.01, value=0.20,
                 elem_id="anima_safe_pag_rescale",
             )
-        return [enabled, scale, strength, block_indices, start_percent, end_percent, rescale]
+
+            gr.Markdown("---\n### APG (Adaptive Projected Guidance)")
+            gr.Markdown(
+                "높은 CFG의 **과채도·번짐을 만드는 성분만 골라 억제**해 guidance를 세게 "
+                "밀어도 자연스럽게 유지합니다. RescaleCFG의 상위호환이며 **추가 forward "
+                "없이** CFG 합성 지점에서 계산만 바꿉니다. PAG와 독립이라 같이 켜도 됩니다 "
+                "(APG가 베이스를 만들고 PAG가 그 위에 구조를 더함). Anima 외 모델에서도 동작."
+            )
+            apg_enabled = gr.Checkbox(
+                label="Enable APG",
+                value=False,
+                elem_id="anima_safe_pag_apg_enable",
+            )
+            apg_autooff = gr.Checkbox(
+                label="APG 켜지면 PAG rescale 자동 끄기 (이중 크기보정 방지)",
+                value=True,
+                elem_id="anima_safe_pag_apg_autooff",
+            )
+            with gr.Accordion("APG Advanced (세부값)", open=False):
+                gr.Markdown(
+                    "기본값이면 무난합니다. 파고들 때: **eta**=평행(과채도) 성분 비중 "
+                    "(0=최대 억제, 1=표준 CFG로 환원), **norm threshold**=guidance 크기 "
+                    "상한(0=off), **momentum**=스텝 간 running-average(음수 권장, 0=off). "
+                    "guidance 세기는 메인 **CFG Scale** 슬라이더를 그대로 씁니다."
+                )
+                apg_eta = gr.Slider(
+                    label="APG eta (평행 성분 비중 · 낮을수록 과채도↓)",
+                    minimum=-10.0, maximum=10.0, step=0.05, value=0.0,
+                    elem_id="anima_safe_pag_apg_eta",
+                )
+                apg_norm = gr.Slider(
+                    label="APG norm threshold (guidance 크기 상한 · 0=off)",
+                    minimum=0.0, maximum=50.0, step=0.5, value=15.0,
+                    elem_id="anima_safe_pag_apg_norm",
+                )
+                apg_momentum = gr.Slider(
+                    label="APG momentum (스텝 간 running-average · 음수 권장 · 0=off)",
+                    minimum=-1.0, maximum=1.0, step=0.05, value=0.0,
+                    elem_id="anima_safe_pag_apg_momentum",
+                )
+        return [
+            enabled, scale, strength, block_indices, start_percent, end_percent, rescale,
+            apg_enabled, apg_eta, apg_norm, apg_momentum, apg_autooff,
+        ]
 
     def process_before_every_sampling(self, p, *args, **kwargs):
         if torch is None:
@@ -509,29 +655,6 @@ class AnimaSafePAG(scripts.Script):
         # XYZ-plot overrides (set per grid cell by the AxisOption apply fns).
         xyz = getattr(p, "_anima_safe_pag_xyz", {}) or {}
 
-        try:
-            enabled = bool(args[0]) if len(args) > 0 else False
-        except Exception:
-            enabled = False
-        # An [Anima PAG] Enable axis wins over the checkbox — this is what makes
-        # the ON/OFF comparison grid work regardless of the UI toggle state.
-        if "enabled" in xyz:
-            enabled = _as_bool(xyz["enabled"], enabled)
-
-        if not enabled:
-            _STATE["on"] = False
-            return
-
-        try:
-            scale = float(args[1]); strength = float(args[2])
-            block_spec = str(args[3]); start = float(args[4])
-            end = float(args[5]); rescale = float(args[6])
-        except Exception as e:
-            _STATE["on"] = False
-            _log(f"bad args, disabling: {type(e).__name__}: {e}")
-            return
-
-        # Per-field XYZ overrides for the numeric/string knobs.
         def _xyz_num(key, cur):
             if key in xyz:
                 try:
@@ -540,83 +663,137 @@ class AnimaSafePAG(scripts.Script):
                     return cur
             return cur
 
-        scale = _xyz_num("scale", scale)
-        strength = _xyz_num("strength", strength)
-        start = _xyz_num("start", start)
-        end = _xyz_num("end", end)
-        rescale = _xyz_num("rescale", rescale)
-        if "blocks" in xyz:
-            block_spec = str(xyz["blocks"])
+        def _arg(i, default):
+            return args[i] if len(args) > i else default
+
+        # ---- PAG enable (checkbox, XYZ can override for ON/OFF grids) ----
+        try:
+            pag_enabled = bool(_arg(0, False))
+        except Exception:
+            pag_enabled = False
+        if "enabled" in xyz:
+            pag_enabled = _as_bool(xyz["enabled"], pag_enabled)
+
+        # ---- APG enable ----
+        try:
+            apg_enabled = bool(_arg(7, False))
+        except Exception:
+            apg_enabled = False
+        if "apg_enabled" in xyz:
+            apg_enabled = _as_bool(xyz["apg_enabled"], apg_enabled)
+
+        # Nothing to do → make sure neither leaks into this generation.
+        if not pag_enabled and not apg_enabled:
+            _STATE["on"] = False
+            _APG["on"] = False
+            return
+
+        # ---- Read every knob (with XYZ overrides) ----
+        try:
+            scale = _xyz_num("scale", float(_arg(1, 4.0)))
+            strength = _xyz_num("strength", float(_arg(2, 0.75)))
+            block_spec = str(xyz["blocks"]) if "blocks" in xyz else str(_arg(3, ""))
+            start = _xyz_num("start", float(_arg(4, 0.0)))
+            end = _xyz_num("end", float(_arg(5, 0.7)))
+            rescale = _xyz_num("rescale", float(_arg(6, 0.20)))
+            apg_eta = _xyz_num("apg_eta", float(_arg(8, 0.0)))
+            apg_norm = _xyz_num("apg_norm", float(_arg(9, 15.0)))
+            apg_momentum = _xyz_num("apg_momentum", float(_arg(10, 0.0)))
+            apg_autooff = _as_bool(_arg(11, True), True)
+        except Exception as e:
+            _STATE["on"] = False
+            _APG["on"] = False
+            _log(f"bad args, disabling: {type(e).__name__}: {e}")
+            return
 
         sd_model = getattr(p, "sd_model", None)
         engine = type(sd_model).__name__ if sd_model is not None else "?"
-        if engine != "Anima":
-            _STATE["on"] = False
-            _log(f"engine={engine} (not 'Anima') — Safe PAG only supports Anima/"
-                 "Cosmos DiT. Skipping.")
-            return
-
         forge_objects = getattr(sd_model, "forge_objects", None)
         unet = getattr(forge_objects, "unet", None)
         if unet is None:
             _STATE["on"] = False
-            _log("no forge_objects.unet — cannot attach PAG.")
+            _APG["on"] = False
+            _log("no forge_objects.unet — cannot attach guidance.")
             return
 
-        dm = _get_diffusion_model(unet)
-        if dm is None:
+        # ---- APG: model-agnostic, needs no patching. Reset momentum buffer. ----
+        if apg_enabled:
+            _APG.update(
+                on=True, eta=apg_eta, norm_threshold=apg_norm,
+                momentum=apg_momentum, avg=None, last_sigma=None,
+            )
+        else:
+            _APG["on"] = False
+        _STATE["apg_autooff_rescale"] = apg_autooff
+
+        # ---- PAG: Anima-only, needs the attention patch + a diffusion_model. ----
+        pag_ok = False
+        targets: set = set()
+        nblocks = 0
+        if pag_enabled:
+            if engine != "Anima":
+                _log(f"engine={engine} (not 'Anima') — PAG skipped (APG still runs "
+                     "if enabled).")
+            else:
+                dm = _get_diffusion_model(unet)
+                if dm is None:
+                    _log("could not resolve diffusion_model — PAG skipped.")
+                else:
+                    nblocks = _ensure_patched(dm)
+                    if nblocks:
+                        targets = _parse_blocks(block_spec, nblocks)
+                        if targets:
+                            pag_ok = True
+                        else:
+                            _log("no valid target blocks — PAG skipped.")
+
+        if pag_ok:
+            _STATE.update(
+                on=True, scale=scale, strength=strength, rescale=rescale,
+                targets=targets, start=min(start, end), end=max(start, end),
+                total=int(getattr(p, "steps", 20) or 20),
+                step=0, b0=None, active=0, pag_raw=None,
+            )
+        else:
             _STATE["on"] = False
-            _log("could not resolve diffusion_model — skipping.")
+
+        if not _STATE["on"] and not _APG["on"]:
             return
 
-        nblocks = _ensure_patched(dm)
-        if nblocks == 0:
-            _STATE["on"] = False
-            return
-
-        targets = _parse_blocks(block_spec, nblocks)
-        if not targets:
-            _STATE["on"] = False
-            _log("no valid target blocks — skipping.")
-            return
-
-        _STATE.update(
-            on=True,
-            scale=scale,
-            strength=strength,
-            rescale=rescale,
-            targets=targets,
-            start=min(start, end),
-            end=max(start, end),
-            total=int(getattr(p, "steps", 20) or 20),
-            step=0,
-            b0=None,
-            active=0,
-            pag_raw=None,
-        )
-
+        # ---- Attach hooks (clone so Forge core / other gens are untouched) ----
         try:
             unet = unet.clone()
-            unet.set_model_unet_function_wrapper(_model_wrapper)
+            if _STATE["on"]:
+                unet.set_model_unet_function_wrapper(_model_wrapper)
             unet.set_model_sampler_post_cfg_function(_post_cfg)
             p.sd_model.forge_objects.unet = unet
-            # Record in PNG metadata so ON cells of a grid are identifiable.
+
             if not hasattr(p, "extra_generation_params"):
                 p.extra_generation_params = {}
-            p.extra_generation_params["Anima Safe PAG"] = (
-                f"scale={scale}, strength={strength}, blocks={sorted(targets)}, "
-                f"range={_STATE['start']:.2f}-{_STATE['end']:.2f}, rescale={rescale}"
-            )
+            if _STATE["on"]:
+                p.extra_generation_params["Anima Safe PAG"] = (
+                    f"scale={scale}, strength={strength}, blocks={sorted(targets)}, "
+                    f"range={_STATE['start']:.2f}-{_STATE['end']:.2f}, rescale={rescale}"
+                )
+            if _APG["on"]:
+                p.extra_generation_params["Anima APG"] = (
+                    f"eta={apg_eta}, norm={apg_norm}, momentum={apg_momentum}"
+                )
             _log(
-                f"attached ✅ engine=Anima blocks={nblocks} targets={sorted(targets)} "
-                f"scale={scale} strength={strength} rescale={rescale} "
-                f"range={_STATE['start']:.2f}-{_STATE['end']:.2f}"
+                f"attached ✅ engine={engine} "
+                f"PAG={'on' if _STATE['on'] else 'off'} "
+                f"(blocks={sorted(targets)} scale={scale} strength={strength} "
+                f"rescale={'auto-off' if (_APG['on'] and apg_autooff) else rescale}) "
+                f"APG={'on' if _APG['on'] else 'off'} "
+                f"(eta={apg_eta} norm={apg_norm} mom={apg_momentum})"
             )
         except Exception as e:
             _STATE["on"] = False
+            _APG["on"] = False
             _log(f"failed to attach hooks: {type(e).__name__}: {e}")
 
     def postprocess(self, p, processed, *args):
-        # Belt-and-suspenders: make sure PAG doesn't leak into a later non-PAG
+        # Belt-and-suspenders: make sure guidance doesn't leak into a later
         # generation if forge_objects reuse ever changed.
         _STATE["on"] = False
+        _APG["on"] = False

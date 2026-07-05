@@ -347,13 +347,36 @@ Forge Neo 실제 샘플링 경로(`backend/sampling/sampling_function.py`)는 Co
 | Start~End percent | 0.0~0.7 | 적용할 샘플링 구간 (나머지 스텝은 원가) |
 | Rescale | 0.20 | 대비/채도 과다 억제 |
 
+### APG (Adaptive Projected Guidance) — 같은 패널의 형제 기능 (v0.9.9+)
+
+높은 CFG가 만드는 **과채도·번짐 성분만 골라 억제**해, guidance를 세게 밀어도 자연스럽게
+유지합니다(RescaleCFG의 상위호환). **추가 forward 없이** CFG 합성 지점(post-CFG)에서 계산만
+바꾸며, **Anima 외 모델에서도 동작**합니다. PAG와 독립이라 **같이 켜도 됩니다** — APG가
+프롬프트/색이 안정된 베이스를 만들고 그 위에 PAG가 구조를 더합니다(우리 post-CFG는 `c_out`
+실측 복원으로 베이스가 표준 CFG·APG·MaHiRo 무엇이든 그 위에 얹힘).
+
+| 필드 | 기본값 | 설명 |
+|---|---|---|
+| Enable APG | off | 켜면 CFG 합성을 APG로 대체 |
+| APG 켜지면 PAG rescale 자동 끄기 | on(토글) | 이중 크기보정 방지. 끄면 둘 다 적용 |
+| eta *(Advanced)* | 0.0 | 평행(과채도) 성분 비중. **1.0 = 표준 CFG로 환원**, 0 = 최대 억제 |
+| norm threshold *(Advanced)* | 15.0 | guidance L2 크기 상한(0=off) |
+| momentum *(Advanced)* | 0.0 | 스텝 간 running-average(음수 권장, 0=off) |
+
+guidance 세기는 메인 **CFG Scale** 슬라이더를 그대로 사용합니다. 세부값은 "APG Advanced"
+아코디언에서 조절(기본은 쉽게, 필요 시 깊게).
+
+> 조합 원칙: **Perturbation(PAG/SEG/SLG) 중 하나 + 크기보정(APG 또는 rescale) 중 하나**.
+> APG를 켜면 PAG 내부 rescale은 자동으로 꺼집니다(위 토글로 해제 가능).
+
 ### XYZ Plot 비교
 
-XYZ plot 축에 `[Anima PAG] …` 항목이 추가됩니다. **`[Anima PAG] Enable`** 축을
+XYZ plot 축에 `[Anima PAG] …` 와 `[Anima APG] …` 항목이 추가됩니다. **`[Anima PAG] Enable`** 축을
 `True, False`로 두면 **PAG ON/OFF 비교 그리드**를 바로 뽑을 수 있습니다(UI 체크박스
 상태와 무관하게 축 값이 우선). 그 외 `Scale / Perturbation Strength / Block Indices /
-Start·End Percent / Rescale` 축도 제공되어 세기·블록 스윕이 가능합니다. ON 셀은 PNG
-메타데이터의 `Anima Safe PAG: …` 마커로 식별됩니다.
+Start·End Percent / Rescale` 축, 그리고 **`[Anima APG] Enable`**(ON/OFF) 및
+`Eta / Norm Threshold / Momentum` 축도 제공됩니다. ON 셀은 PNG 메타데이터의
+`Anima Safe PAG: …` / `Anima APG: …` 마커로 식별됩니다.
 
 ---
 
