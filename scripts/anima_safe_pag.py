@@ -88,18 +88,30 @@ def _log(msg: str) -> None:
 # ---------------------------------------------------------------------------
 
 _STATE: dict = {
-    "on": False,          # PAG active for the current generation
-    "scale": 4.0,         # guidance strength
-    "strength": 0.75,     # attention perturbation blend (normal ↔ value-only)
+    "on": False,          # any perturbation guidance active this generation
+    # Attention-perturbation method: "pag" (value-only) or "seg" (toward-mean),
+    # mutually exclusive; None → no attention perturbation (SLG only).
+    "attn_method": "pag",
+    "attn_scale": 4.0,    # guidance strength for the attention-perturbation term
+    "strength": 0.75,     # blend amount (pag: →value; seg: →uniform/mean)
+    "attn_targets": set(),  # block indices for attention perturbation
+    # SLG (Skip Layer Guidance): skip whole blocks on a separate weak prediction.
+    "slg_on": False,
+    "slg_scale": 3.0,
+    "slg_targets": set(),  # block indices to skip
+    "auto_decay": True,   # halve each scale when >1 perturbation is active (toggle)
     "rescale": 0.20,      # std-matching rescale factor
-    "targets": set(),     # block indices to perturb
     "start": 0.0,         # start percent of sampling
     "end": 0.7,           # end percent of sampling
     "total": 20,          # total steps this pass
     "step": 0,            # current step counter
-    "b0": None,           # first index of the appended pag rows (or None)
+    # Row ranges of the appended weak predictions in the enlarged batch.
+    "attn_b0": None, "attn_b1": None,   # attention-perturbed cond rows
+    "slg_b0": None, "slg_b1": None,     # layer-skipped cond rows
+    "any_b0": None,       # min appended index (marks "inside enlarged forward")
     "active": 0,          # >0 while inside a targeted self_attn.forward
-    "pag_raw": None,      # stashed pag model-output for this step
+    "attn_raw": None,     # stashed attention-perturbed model-output
+    "slg_raw": None,      # stashed layer-skipped model-output
     "cond_raw": None,     # stashed normal cond model-output
     "uncond_raw": None,   # stashed normal uncond model-output
     "gqa_warned": False,  # emit the GQA-skip note only once
@@ -136,36 +148,50 @@ def _patched_sdpa(query, key, value, *args, **kwargs):
     """Drop-in for ``backend.nn.anima.scaled_dot_product_attention``.
 
     Runs the real attention, then — only while inside a *targeted* self_attn
-    forward (``active>0``) and only for the appended pag rows (``b0``) — blends
-    the output toward the raw value path (identity attention). This is the
-    "soft PAG" perturbation.
+    forward (``active>0``) and only for the appended attention-perturbed rows
+    ``[attn_b0:attn_b1]`` — blends the output toward:
+      * the raw value path  (PAG: identity attention → out≈value), or
+      * the seq-uniform mean (SEG-approx: smoothed/uniform attention).
     """
     orig = _STATE.get("_orig_sdpa")
     out = orig(query, key, value, *args, **kwargs)
     try:
-        b0 = _STATE["b0"]
-        if _STATE["active"] > 0 and b0 is not None and b0 < out.shape[0]:
-            if value.shape == out.shape:
-                out = out.clone()
-                out[b0:] = torch.lerp(out[b0:], value[b0:], float(_STATE["strength"]))
-            elif not _STATE["gqa_warned"]:
-                _STATE["gqa_warned"] = True
-                _log(
-                    "self-attn value/out head layout differ (grouped-query?) — "
-                    "skipping perturbation on this block; PAG will be weaker."
-                )
+        a0, a1 = _STATE["attn_b0"], _STATE["attn_b1"]
+        method = _STATE["attn_method"]
+        if _STATE["active"] > 0 and a0 is not None and method and a1 <= out.shape[0]:
+            strength = float(_STATE["strength"])
+            if method == "pag":
+                if value.shape == out.shape:
+                    out = out.clone()
+                    out[a0:a1] = torch.lerp(out[a0:a1], value[a0:a1], strength)
+                elif not _STATE["gqa_warned"]:
+                    _STATE["gqa_warned"] = True
+                    _log("self-attn value/out head layout differ (grouped-query?)"
+                         " — skipping PAG perturbation on this block.")
+            elif method == "seg":
+                # SEG-approx: blur attention toward uniform → mean of values over
+                # the sequence axis (dim=2 for [B, heads, seq, dim]).
+                seqdim = out.ndim - 2
+                vmean = value.mean(dim=seqdim, keepdim=True)
+                if vmean.shape[1] == out.shape[1] and vmean.shape[-1] == out.shape[-1]:
+                    out = out.clone()
+                    out[a0:a1] = torch.lerp(
+                        out[a0:a1], vmean[a0:a1].expand_as(out[a0:a1]), strength
+                    )
+                elif not _STATE["gqa_warned"]:
+                    _STATE["gqa_warned"] = True
+                    _log("self-attn head layout differ — skipping SEG on this block.")
     except Exception as e:  # never let the patch break sampling
         _log(f"sdpa perturb skipped: {type(e).__name__}: {e}")
     return out
 
 
 def _make_selfattn_wrapper(idx: int, orig_forward):
-    """Wrap a block's ``self_attn.forward`` to raise the ``active`` flag only
-    for the configured target blocks, and only during the appended pag forward
-    (``b0`` set)."""
+    """Wrap ``self_attn.forward`` to raise ``active`` only for the attention
+    target blocks, and only during the appended enlarged forward (``any_b0``)."""
 
     def _wrapped(*args, **kwargs):
-        if _STATE["b0"] is not None and idx in _STATE["targets"]:
+        if _STATE["any_b0"] is not None and idx in _STATE["attn_targets"]:
             _STATE["active"] += 1
             try:
                 return orig_forward(*args, **kwargs)
@@ -176,9 +202,31 @@ def _make_selfattn_wrapper(idx: int, orig_forward):
     return _wrapped
 
 
+def _make_block_wrapper(idx: int, orig_forward):
+    """Wrap a whole ``block.forward`` for SLG: for the layer-skipped rows
+    ``[slg_b0:slg_b1]`` make the block a no-op (output = input), i.e. skip its
+    contribution → a weak "implicit model" prediction."""
+
+    def _wrapped(*args, **kwargs):
+        out = orig_forward(*args, **kwargs)
+        try:
+            s0, s1 = _STATE["slg_b0"], _STATE["slg_b1"]
+            if s0 is not None and idx in _STATE["slg_targets"] and torch.is_tensor(out):
+                x_in = args[0] if args else kwargs.get("x")
+                if (torch.is_tensor(x_in) and x_in.shape == out.shape
+                        and s1 <= out.shape[0]):
+                    out = out.clone()
+                    out[s0:s1] = x_in[s0:s1]
+        except Exception as e:
+            _log(f"slg skip skipped: {type(e).__name__}: {e}")
+        return out
+
+    return _wrapped
+
+
 def _ensure_patched(diffusion_model) -> int:
-    """Idempotently install the SDPA patch + per-block self_attn wrappers.
-    Returns the number of transformer blocks (0 if the structure is unexpected).
+    """Idempotently install the SDPA patch + per-block self_attn wrappers (for
+    PAG/SEG) + per-block forward wrappers (for SLG). Returns the block count.
     """
     try:
         from backend.nn import anima as anima_mod
@@ -188,7 +236,7 @@ def _ensure_patched(diffusion_model) -> int:
 
     if not hasattr(anima_mod, "scaled_dot_product_attention"):
         _log("backend.nn.anima has no module-global scaled_dot_product_attention "
-             "— cannot perturb attention on this build. PAG disabled.")
+             "— cannot perturb attention on this build.")
         return 0
 
     if not getattr(anima_mod, "_pag_sdpa_patched", False):
@@ -202,22 +250,29 @@ def _ensure_patched(diffusion_model) -> int:
         _log("diffusion_model has no .blocks — unexpected Anima structure.")
         return 0
 
-    wrapped = 0
+    wrapped_sa = wrapped_bl = 0
     for idx, block in enumerate(blocks):
+        # SLG: wrap the whole block forward.
+        if not getattr(block, "_pag_block_wrapped", False):
+            try:
+                block._pag_orig_block_forward = block.forward
+                block.forward = _make_block_wrapper(idx, block._pag_orig_block_forward)
+                block._pag_block_wrapped = True
+                wrapped_bl += 1
+            except Exception as e:
+                _log(f"failed to wrap block {idx} forward: {type(e).__name__}: {e}")
+        # PAG/SEG: wrap the self_attn forward.
         sa = getattr(block, "self_attn", None)
-        if sa is None:
-            continue
-        if getattr(sa, "_pag_wrapped", False):
-            continue
-        try:
-            sa._pag_orig_forward = sa.forward
-            sa.forward = _make_selfattn_wrapper(idx, sa._pag_orig_forward)
-            sa._pag_wrapped = True
-            wrapped += 1
-        except Exception as e:
-            _log(f"failed to wrap block {idx} self_attn: {type(e).__name__}: {e}")
-    if wrapped:
-        _log(f"wrapped {wrapped} self_attn block(s)")
+        if sa is not None and not getattr(sa, "_pag_wrapped", False):
+            try:
+                sa._pag_orig_forward = sa.forward
+                sa.forward = _make_selfattn_wrapper(idx, sa._pag_orig_forward)
+                sa._pag_wrapped = True
+                wrapped_sa += 1
+            except Exception as e:
+                _log(f"failed to wrap block {idx} self_attn: {type(e).__name__}: {e}")
+    if wrapped_sa or wrapped_bl:
+        _log(f"wrapped {wrapped_sa} self_attn + {wrapped_bl} block forward(s)")
     return len(blocks)
 
 
@@ -252,28 +307,42 @@ def _percent_in_range() -> bool:
 # ---------------------------------------------------------------------------
 
 
+def _clear_markers():
+    _STATE["any_b0"] = None
+    _STATE["attn_b0"] = _STATE["attn_b1"] = None
+    _STATE["slg_b0"] = _STATE["slg_b1"] = None
+
+
 def _model_wrapper(apply_model, w):
-    """model_function_wrapper: run one enlarged ``apply_model`` that also
-    produces the perturbed (pag) prediction for the cond rows."""
+    """model_function_wrapper: run ONE enlarged ``apply_model`` that also
+    produces the weak predictions (attention-perturbed for PAG/SEG and/or
+    layer-skipped for SLG) by appending copies of the cond rows to the batch.
+    No separate forward — every weak prediction rides the same kernel launch.
+    """
     x = w.get("input")
     ts = w.get("timestep")
     c = w.get("c") or {}
     cou = w.get("cond_or_uncond")
 
-    _STATE["pag_raw"] = None
+    _STATE["attn_raw"] = None
+    _STATE["slg_raw"] = None
     if not _STATE["on"] or torch is None:
         return apply_model(x, ts, **c)
 
     _STATE["step"] += 1
     try:
-        # Only the standard 2-group (cond + uncond) batching is supported;
-        # anything else (no CFG, composition, unknown layout) → plain path.
         if cou is None or len(cou) != 2:
             return apply_model(x, ts, **c)
         if not _percent_in_range():
             return apply_model(x, ts, **c)
-        # ControlNet etc. inject batched tensors we can't safely widen.
         if c.get("control") is not None:
+            return apply_model(x, ts, **c)
+
+        attn_on = bool(_STATE["attn_method"]) and float(_STATE["attn_scale"]) > 0 \
+            and bool(_STATE["attn_targets"])
+        slg_on = bool(_STATE["slg_on"]) and float(_STATE["slg_scale"]) > 0 \
+            and bool(_STATE["slg_targets"])
+        if not attn_on and not slg_on:
             return apply_model(x, ts, **c)
 
         batch = x.shape[0]
@@ -286,25 +355,45 @@ def _model_wrapper(apply_model, w):
             return apply_model(x, ts, **c)
 
         idx = torch.tensor(cond_idx, device=x.device, dtype=torch.long)
-        x_ext = torch.cat([x, x.index_select(0, idx)], dim=0)
-        ts_ext = torch.cat([ts, ts.index_select(0, idx)], dim=0)
-        c_ext = _extend_c(c, idx, batch)
+        n = len(cond_idx)
 
-        _STATE["b0"] = batch
+        # Lay out the appended weak-prediction rows.
+        cursor = batch
+        appended = []
+        a0 = a1 = s0 = s1 = None
+        if attn_on:
+            a0, a1 = cursor, cursor + n
+            appended.append(idx); cursor += n
+        if slg_on:
+            s0, s1 = cursor, cursor + n
+            appended.append(idx); cursor += n
+
+        app_idx = torch.cat(appended) if len(appended) > 1 else appended[0]
+        x_ext = torch.cat([x, x.index_select(0, app_idx)], dim=0)
+        ts_ext = torch.cat([ts, ts.index_select(0, app_idx)], dim=0)
+        c_ext = _extend_c(c, app_idx, batch)
+
+        _STATE["attn_b0"], _STATE["attn_b1"] = a0, a1
+        _STATE["slg_b0"], _STATE["slg_b1"] = s0, s1
+        _STATE["any_b0"] = batch
         try:
             out_ext = apply_model(x_ext, ts_ext, **c_ext)
         finally:
-            _STATE["b0"] = None
+            _clear_markers()
 
         out = out_ext[:batch]
         uidx = torch.tensor(uncond_idx, device=x.device, dtype=torch.long)
-        _STATE["pag_raw"] = out_ext[batch:].detach().float()
+        if a0 is not None:
+            _STATE["attn_raw"] = out_ext[a0:a1].detach().float()
+        if s0 is not None:
+            _STATE["slg_raw"] = out_ext[s0:s1].detach().float()
         _STATE["cond_raw"] = out.index_select(0, idx).detach().float()
         _STATE["uncond_raw"] = out.index_select(0, uidx).detach().float()
         return out
     except Exception as e:
-        _STATE["b0"] = None
-        _STATE["pag_raw"] = None
+        _clear_markers()
+        _STATE["attn_raw"] = None
+        _STATE["slg_raw"] = None
         _log(f"wrapper fallback → normal apply_model: {type(e).__name__}: {e}")
         return apply_model(x, ts, **c)
 
@@ -363,18 +452,22 @@ def _apply_apg(args, cond_scale):
         return None
 
 
-def _apply_pag(args, base):
-    """Add the PAG guidance term onto ``base`` (denoised space), then rescale.
-    Uses the empirically-recovered ``c_out`` so it holds for eps / v / flow
-    parameterizations alike. Returns ``base`` unchanged on any problem."""
+def _apply_perturbation(args, base):
+    """Add the perturbation-guidance term(s) onto ``base`` (denoised space):
+    ``scale·(cond_denoised − weak_denoised)`` for each active weak prediction
+    (attention-perturbed for PAG/SEG, and/or layer-skipped for SLG). Uses the
+    empirically-recovered ``c_out`` so it holds for eps/v/flow alike. When more
+    than one is active AND ``auto_decay`` is on, each scale is divided by the
+    active count. Returns ``base`` unchanged on any problem."""
     cd = args["cond_denoised"].float()
     ud = args["uncond_denoised"].float()
     cond_raw = _STATE["cond_raw"]
     uncond_raw = _STATE["uncond_raw"]
-    pag_raw = _STATE["pag_raw"]
+    attn_raw = _STATE["attn_raw"]
+    slg_raw = _STATE["slg_raw"]
     if cond_raw is None or uncond_raw is None:
         return base
-    if cd.shape != cond_raw.shape or pag_raw.shape != cond_raw.shape:
+    if cd.shape != cond_raw.shape:
         return base
 
     # (cd-ud) = c_out*(cond_raw-uncond_raw). Recover c_out by least squares.
@@ -385,12 +478,21 @@ def _apply_pag(args, base):
         return base
     c_out = (dd * do).sum() / denom
 
-    # cond_denoised - pag_denoised = c_out*(cond_raw - pag_raw)
-    guidance = float(_STATE["scale"]) * c_out * (cond_raw - pag_raw)
-    result = base + guidance
+    terms = []
+    if attn_raw is not None and attn_raw.shape == cond_raw.shape:
+        terms.append((float(_STATE["attn_scale"]), attn_raw))
+    if slg_raw is not None and slg_raw.shape == cond_raw.shape:
+        terms.append((float(_STATE["slg_scale"]), slg_raw))
+    if not terms:
+        return base
 
-    # Rescale — auto-skipped while APG is on (APG already governs magnitude),
-    # unless the user turned that guard off.
+    decay = 1.0 / len(terms) if (_STATE["auto_decay"] and len(terms) > 1) else 1.0
+    result = base
+    for scale, weak in terms:
+        # cond_denoised - weak_denoised = c_out*(cond_raw - weak_raw)
+        result = result + (scale * decay) * c_out * (cond_raw - weak)
+
+    # Rescale — auto-skipped while APG governs magnitude (toggleable).
     r = float(_STATE["rescale"])
     apg_governs = _APG["on"] and _STATE.get("apg_autooff_rescale", True)
     if r > 0 and not apg_governs:
@@ -404,9 +506,9 @@ def _apply_pag(args, base):
 
 def _post_cfg(args):
     """post_cfg orchestrator. Order: APG recomputes the CFG-combine base (if on),
-    then PAG guidance is layered on top (if on). Because PAG adds its term at
-    post_cfg via a recovered ``c_out``, it composes on top of ANY base — standard
-    CFG, APG, or a built-in like MaHiRo/RescaleCFG.
+    then perturbation guidance (PAG/SEG/SLG) is layered on top. Because the
+    perturbation term is added via a recovered ``c_out``, it composes on top of
+    ANY base — standard CFG, APG, or a built-in like MaHiRo/RescaleCFG.
     """
     denoised = args["denoised"]
     if torch is None:
@@ -419,15 +521,16 @@ def _post_cfg(args):
             if apg is not None:
                 result = apg
 
-        if _STATE["on"] and _STATE["pag_raw"] is not None:
-            result = _apply_pag(args, result)
+        if _STATE["on"] and (_STATE["attn_raw"] is not None or _STATE["slg_raw"] is not None):
+            result = _apply_perturbation(args, result)
 
         return result.to(denoised.dtype)
     except Exception as e:
         _log(f"post_cfg fallback → unmodified cfg: {type(e).__name__}: {e}")
         return denoised
     finally:
-        _STATE["pag_raw"] = None
+        _STATE["attn_raw"] = None
+        _STATE["slg_raw"] = None
 
 
 # ---------------------------------------------------------------------------
@@ -496,21 +599,35 @@ def _make_pag_xyz_axis() -> None:
     axis = [
         # The headline request: ON/OFF comparison grid.
         xyz_grid.AxisOption(
-            "[Anima PAG] Enable", str,
+            "[Anima Pert] Enable", str,
             partial(_pag_xyz_set, field="enabled"), choices=bool_choices,
         ),
-        xyz_grid.AxisOption("[Anima PAG] Scale", float, partial(_pag_xyz_set, field="scale")),
         xyz_grid.AxisOption(
-            "[Anima PAG] Perturbation Strength", float,
+            "[Anima Pert] Attn Method", str,
+            partial(_pag_xyz_set, field="method"),
+            choices=lambda: ["PAG", "SEG", "None"],
+        ),
+        xyz_grid.AxisOption("[Anima Pert] Attn Scale", float, partial(_pag_xyz_set, field="scale")),
+        xyz_grid.AxisOption(
+            "[Anima Pert] Perturbation Strength", float,
             partial(_pag_xyz_set, field="strength"),
         ),
         xyz_grid.AxisOption(
-            "[Anima PAG] Block Indices", str,
+            "[Anima Pert] Attn Block Indices", str,
             partial(_pag_xyz_set, field="blocks"),
         ),
-        xyz_grid.AxisOption("[Anima PAG] Start Percent", float, partial(_pag_xyz_set, field="start")),
-        xyz_grid.AxisOption("[Anima PAG] End Percent", float, partial(_pag_xyz_set, field="end")),
-        xyz_grid.AxisOption("[Anima PAG] Rescale", float, partial(_pag_xyz_set, field="rescale")),
+        xyz_grid.AxisOption(
+            "[Anima Pert] SLG Enable", str,
+            partial(_pag_xyz_set, field="slg_enabled"), choices=bool_choices,
+        ),
+        xyz_grid.AxisOption("[Anima Pert] SLG Scale", float, partial(_pag_xyz_set, field="slg_scale")),
+        xyz_grid.AxisOption(
+            "[Anima Pert] SLG Block Indices", str,
+            partial(_pag_xyz_set, field="slg_blocks"),
+        ),
+        xyz_grid.AxisOption("[Anima Pert] Start Percent", float, partial(_pag_xyz_set, field="start")),
+        xyz_grid.AxisOption("[Anima Pert] End Percent", float, partial(_pag_xyz_set, field="end")),
+        xyz_grid.AxisOption("[Anima Pert] Rescale", float, partial(_pag_xyz_set, field="rescale")),
         # APG axes (ON/OFF + the three knobs) for the same style of comparison.
         xyz_grid.AxisOption(
             "[Anima APG] Enable", str,
@@ -521,7 +638,7 @@ def _make_pag_xyz_axis() -> None:
         xyz_grid.AxisOption("[Anima APG] Momentum", float, partial(_pag_xyz_set, field="apg_momentum")),
     ]
 
-    if not any(a.label.startswith(("[Anima PAG]", "[Anima APG]")) for a in xyz_grid.axis_options):
+    if not any(a.label.startswith(("[Anima Pert]", "[Anima APG]")) for a in xyz_grid.axis_options):
         xyz_grid.axis_options.extend(axis)
 
 
@@ -553,40 +670,65 @@ class AnimaSafePAG(scripts.Script):
     sorting_priority = 98
 
     def title(self):
-        return "Anima Safe PAG"
+        return "Anima Perturbation Guidance"
 
     def show(self, is_img2img):
         return scripts.AlwaysVisible
 
     def ui(self, is_img2img):
-        with gr.Accordion("Anima Safe PAG (Perturbed Attention Guidance)", open=False):
+        with gr.Accordion("Anima Perturbation Guidance (PAG / SEG / SLG)", open=False):
             gr.Markdown(
-                "Anima/Cosmos/Predict2 계열 **DiT 전용** soft-PAG. 후반 self-attention을 "
-                "부드럽게 흐린 *약한 예측*을 만들어 CFG 결과를 그 반대로 밀어 구조·디테일을 "
-                "개선합니다. **Anima 엔진이 로드된 경우에만** 동작하며, 그 외 모델·오류 시 "
-                "일반 생성으로 폴백합니다. PAG는 원리상 cond 예측을 한 번 더 계산하지만 "
-                "여기서는 별도 forward 없이 **같은 배치에 접어** 오버헤드를 최소화합니다."
+                "Anima/Cosmos/Predict2 계열 **DiT 전용** perturbation guidance. 후반 블록에 "
+                "*약한 예측*을 만들어 CFG를 그 반대로 밀어 구조·디테일을 강화합니다. **Anima "
+                "엔진에서만** 동작하고 그 외/오류 시 폴백합니다. 약한 예측은 별도 forward 없이 "
+                "**같은 배치에 접어** 계산합니다.\n\n"
+                "- **PAG**(value-only) ↔ **SEG**(uniform/blur)는 성격이 겹쳐 **택1**\n"
+                "- **SLG**(레이어 스킵)는 PAG/SEG와 **병용 가능**"
             )
             enabled = gr.Checkbox(
-                label="Enable Anima Safe PAG",
+                label="Enable Perturbation Guidance",
                 value=False,
                 elem_id="anima_safe_pag_enable",
             )
+            attn_method = gr.Radio(
+                label="Attention perturbation (PAG ↔ SEG 택1 · None=SLG만)",
+                choices=["PAG", "SEG", "None"],
+                value="PAG",
+                elem_id="anima_safe_pag_method",
+            )
             scale = gr.Slider(
-                label="PAG scale (guidance strength)",
+                label="Attention guidance scale (PAG/SEG)",
                 minimum=0.0, maximum=15.0, step=0.1, value=4.0,
                 elem_id="anima_safe_pag_scale",
             )
             strength = gr.Slider(
-                label="Perturbation strength (normal ↔ value-only)",
+                label="Perturbation strength (PAG: →value · SEG: →uniform)",
                 minimum=0.0, maximum=1.0, step=0.01, value=0.75,
                 elem_id="anima_safe_pag_strength",
             )
             block_indices = gr.Textbox(
-                label="Block indices (빈칸=후반 절반 자동, 예: 18 / 14-27 / 14,16,18)",
+                label="Attention block indices (빈칸=후반 절반 자동, 예: 18 / 14-27)",
                 value="",
                 elem_id="anima_safe_pag_blocks",
             )
+
+            gr.Markdown("**SLG (Skip Layer Guidance)** — PAG/SEG와 병용 가능")
+            slg_on = gr.Checkbox(
+                label="Enable SLG (skip layers)",
+                value=False,
+                elem_id="anima_safe_pag_slg_enable",
+            )
+            slg_scale = gr.Slider(
+                label="SLG guidance scale",
+                minimum=0.0, maximum=15.0, step=0.1, value=3.0,
+                elem_id="anima_safe_pag_slg_scale",
+            )
+            slg_blocks = gr.Textbox(
+                label="SLG skip block indices (빈칸=후반 절반 자동)",
+                value="",
+                elem_id="anima_safe_pag_slg_blocks",
+            )
+
             with gr.Row():
                 start_percent = gr.Slider(
                     label="Start percent",
@@ -602,6 +744,11 @@ class AnimaSafePAG(scripts.Script):
                 label="Rescale (대비/채도 과다 억제)",
                 minimum=0.0, maximum=1.0, step=0.01, value=0.20,
                 elem_id="anima_safe_pag_rescale",
+            )
+            auto_decay = gr.Checkbox(
+                label="여러 perturbation 동시 사용 시 각 scale 자동 감쇠 (÷활성 수)",
+                value=True,
+                elem_id="anima_safe_pag_auto_decay",
             )
 
             gr.Markdown("---\n### APG (Adaptive Projected Guidance)")
@@ -644,7 +791,9 @@ class AnimaSafePAG(scripts.Script):
                     elem_id="anima_safe_pag_apg_momentum",
                 )
         return [
-            enabled, scale, strength, block_indices, start_percent, end_percent, rescale,
+            enabled, attn_method, scale, strength, block_indices,
+            slg_on, slg_scale, slg_blocks,
+            start_percent, end_percent, rescale, auto_decay,
             apg_enabled, apg_eta, apg_norm, apg_momentum, apg_autooff,
         ]
 
@@ -666,40 +815,46 @@ class AnimaSafePAG(scripts.Script):
         def _arg(i, default):
             return args[i] if len(args) > i else default
 
-        # ---- PAG enable (checkbox, XYZ can override for ON/OFF grids) ----
+        # ---- Perturbation enable (checkbox, XYZ can override for ON/OFF grids) ----
         try:
-            pag_enabled = bool(_arg(0, False))
+            pert_enabled = bool(_arg(0, False))
         except Exception:
-            pag_enabled = False
+            pert_enabled = False
         if "enabled" in xyz:
-            pag_enabled = _as_bool(xyz["enabled"], pag_enabled)
+            pert_enabled = _as_bool(xyz["enabled"], pert_enabled)
 
         # ---- APG enable ----
         try:
-            apg_enabled = bool(_arg(7, False))
+            apg_enabled = bool(_arg(12, False))
         except Exception:
             apg_enabled = False
         if "apg_enabled" in xyz:
             apg_enabled = _as_bool(xyz["apg_enabled"], apg_enabled)
 
-        # Nothing to do → make sure neither leaks into this generation.
-        if not pag_enabled and not apg_enabled:
+        if not pert_enabled and not apg_enabled:
             _STATE["on"] = False
             _APG["on"] = False
             return
 
         # ---- Read every knob (with XYZ overrides) ----
         try:
-            scale = _xyz_num("scale", float(_arg(1, 4.0)))
-            strength = _xyz_num("strength", float(_arg(2, 0.75)))
-            block_spec = str(xyz["blocks"]) if "blocks" in xyz else str(_arg(3, ""))
-            start = _xyz_num("start", float(_arg(4, 0.0)))
-            end = _xyz_num("end", float(_arg(5, 0.7)))
-            rescale = _xyz_num("rescale", float(_arg(6, 0.20)))
-            apg_eta = _xyz_num("apg_eta", float(_arg(8, 0.0)))
-            apg_norm = _xyz_num("apg_norm", float(_arg(9, 15.0)))
-            apg_momentum = _xyz_num("apg_momentum", float(_arg(10, 0.0)))
-            apg_autooff = _as_bool(_arg(11, True), True)
+            method_str = str(xyz["method"] if "method" in xyz else _arg(1, "PAG")).strip().lower()
+            attn_method = method_str if method_str in ("pag", "seg") else None
+            scale = _xyz_num("scale", float(_arg(2, 4.0)))
+            strength = _xyz_num("strength", float(_arg(3, 0.75)))
+            block_spec = str(xyz["blocks"]) if "blocks" in xyz else str(_arg(4, ""))
+            slg_on = _as_bool(xyz["slg_enabled"], _as_bool(_arg(5, False), False)) \
+                if "slg_enabled" in xyz else _as_bool(_arg(5, False), False)
+            slg_scale = _xyz_num("slg_scale", float(_arg(6, 3.0)))
+            slg_block_spec = str(xyz["slg_blocks"]) if "slg_blocks" in xyz else str(_arg(7, ""))
+            start = _xyz_num("start", float(_arg(8, 0.0)))
+            end = _xyz_num("end", float(_arg(9, 0.7)))
+            rescale = _xyz_num("rescale", float(_arg(10, 0.20)))
+            auto_decay = _as_bool(_arg(11, True), True)
+            apg_eta = _xyz_num("apg_eta", float(_arg(13, 0.0)))
+            apg_norm = _xyz_num("apg_norm", float(_arg(14, 15.0)))
+            apg_momentum = _xyz_num("apg_momentum", float(_arg(15, 0.0)))
+            apg_autooff = _as_bool(_arg(16, True), True)
         except Exception as e:
             _STATE["on"] = False
             _APG["on"] = False
@@ -726,34 +881,42 @@ class AnimaSafePAG(scripts.Script):
             _APG["on"] = False
         _STATE["apg_autooff_rescale"] = apg_autooff
 
-        # ---- PAG: Anima-only, needs the attention patch + a diffusion_model. ----
-        pag_ok = False
-        targets: set = set()
+        # ---- Perturbation: Anima-only, needs the attention/block patches. ----
+        pert_ok = False
+        attn_targets: set = set()
+        slg_targets: set = set()
         nblocks = 0
-        if pag_enabled:
+        if pert_enabled:
             if engine != "Anima":
-                _log(f"engine={engine} (not 'Anima') — PAG skipped (APG still runs "
-                     "if enabled).")
+                _log(f"engine={engine} (not 'Anima') — perturbation skipped (APG "
+                     "still runs if enabled).")
             else:
                 dm = _get_diffusion_model(unet)
                 if dm is None:
-                    _log("could not resolve diffusion_model — PAG skipped.")
+                    _log("could not resolve diffusion_model — perturbation skipped.")
                 else:
                     nblocks = _ensure_patched(dm)
                     if nblocks:
-                        targets = _parse_blocks(block_spec, nblocks)
-                        if targets:
-                            pag_ok = True
+                        if attn_method and scale > 0:
+                            attn_targets = _parse_blocks(block_spec, nblocks)
+                        if slg_on and slg_scale > 0:
+                            slg_targets = _parse_blocks(slg_block_spec, nblocks)
+                        if (attn_method and attn_targets) or (slg_on and slg_targets):
+                            pert_ok = True
                         else:
-                            _log("no valid target blocks — PAG skipped.")
+                            _log("no valid target blocks — perturbation skipped.")
 
-        if pag_ok:
+        if pert_ok:
             _STATE.update(
-                on=True, scale=scale, strength=strength, rescale=rescale,
-                targets=targets, start=min(start, end), end=max(start, end),
+                on=True, attn_method=(attn_method if attn_targets else None),
+                attn_scale=scale, strength=strength, attn_targets=attn_targets,
+                slg_on=bool(slg_on and slg_targets), slg_scale=slg_scale,
+                slg_targets=slg_targets, auto_decay=auto_decay, rescale=rescale,
+                start=min(start, end), end=max(start, end),
                 total=int(getattr(p, "steps", 20) or 20),
-                step=0, b0=None, active=0, pag_raw=None,
+                step=0, active=0, attn_raw=None, slg_raw=None,
             )
+            _clear_markers()
         else:
             _STATE["on"] = False
 
@@ -771,9 +934,16 @@ class AnimaSafePAG(scripts.Script):
             if not hasattr(p, "extra_generation_params"):
                 p.extra_generation_params = {}
             if _STATE["on"]:
-                p.extra_generation_params["Anima Safe PAG"] = (
-                    f"scale={scale}, strength={strength}, blocks={sorted(targets)}, "
-                    f"range={_STATE['start']:.2f}-{_STATE['end']:.2f}, rescale={rescale}"
+                parts = []
+                if _STATE["attn_method"]:
+                    parts.append(f"{_STATE['attn_method'].upper()} scale={scale} "
+                                 f"strength={strength} blocks={sorted(attn_targets)}")
+                if _STATE["slg_on"]:
+                    parts.append(f"SLG scale={slg_scale} skip={sorted(slg_targets)}")
+                p.extra_generation_params["Anima Perturbation Guidance"] = (
+                    "; ".join(parts)
+                    + f"; range={_STATE['start']:.2f}-{_STATE['end']:.2f}"
+                    + f"; auto_decay={auto_decay}"
                 )
             if _APG["on"]:
                 p.extra_generation_params["Anima APG"] = (
@@ -781,8 +951,10 @@ class AnimaSafePAG(scripts.Script):
                 )
             _log(
                 f"attached ✅ engine={engine} "
-                f"PAG={'on' if _STATE['on'] else 'off'} "
-                f"(blocks={sorted(targets)} scale={scale} strength={strength} "
+                f"pert={'on' if _STATE['on'] else 'off'} "
+                f"(attn={_STATE['attn_method']}:{sorted(attn_targets)} scale={scale} "
+                f"slg={_STATE['slg_on']}:{sorted(slg_targets)} scale={slg_scale} "
+                f"auto_decay={auto_decay} "
                 f"rescale={'auto-off' if (_APG['on'] and apg_autooff) else rescale}) "
                 f"APG={'on' if _APG['on'] else 'off'} "
                 f"(eta={apg_eta} norm={apg_norm} mom={apg_momentum})"
