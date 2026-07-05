@@ -140,6 +140,21 @@ _APG: dict = {
 
 
 # ---------------------------------------------------------------------------
+# Adaptive Guidance — skip the uncond (negative) forward in the later steps,
+# where it barely affects the result, for a near-lossless speedup. Implemented
+# in the model_function_wrapper by running cond-only and setting the uncond
+# output equal to cond (→ CFG collapses to the cond prediction that step).
+# Model-agnostic; shares the wrapper with perturbation guidance.
+# ---------------------------------------------------------------------------
+
+_ADG: dict = {
+    "on": False,
+    "start": 0.5,     # skip uncond once this fraction of steps has elapsed
+    "interval": 0,    # 0 = skip every step after start; N>0 = still keep uncond every Nth step
+}
+
+
+# ---------------------------------------------------------------------------
 # Attention perturbation — patch the anima module-global SDPA once (idempotent).
 # ---------------------------------------------------------------------------
 
@@ -296,10 +311,41 @@ def _extend_c(c: dict, idx_tensor, batch: int) -> dict:
     return out
 
 
-def _percent_in_range() -> bool:
+def _select_c(c: dict, idx_tensor, batch: int) -> dict:
+    """Keep only the ``idx_tensor`` rows of every batched tensor (for the
+    Adaptive-Guidance cond-only forward). Non-tensor entries pass through."""
+    out = {}
+    for k, v in c.items():
+        if k == "transformer_options":
+            out[k] = v
+            continue
+        if torch.is_tensor(v) and v.shape[0] == batch:
+            out[k] = v.index_select(0, idx_tensor)
+        else:
+            out[k] = v
+    return out
+
+
+def _pct_now() -> float:
     total = max(1, int(_STATE["total"]))
-    pct = _STATE["step"] / total
+    return _STATE["step"] / total
+
+
+def _percent_in_range() -> bool:
+    pct = _pct_now()
     return _STATE["start"] <= pct <= _STATE["end"]
+
+
+def _adg_should_skip() -> bool:
+    """Adaptive Guidance: skip the uncond forward this step?"""
+    if not _ADG["on"]:
+        return False
+    if _pct_now() < float(_ADG["start"]):
+        return False
+    iv = int(_ADG["interval"])
+    if iv > 0 and (_STATE["step"] % iv == 0):
+        return False  # periodically keep an uncond forward for safety
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -326,23 +372,14 @@ def _model_wrapper(apply_model, w):
 
     _STATE["attn_raw"] = None
     _STATE["slg_raw"] = None
-    if not _STATE["on"] or torch is None:
+    if not (_STATE["on"] or _ADG["on"]) or torch is None:
         return apply_model(x, ts, **c)
 
     _STATE["step"] += 1
     try:
         if cou is None or len(cou) != 2:
             return apply_model(x, ts, **c)
-        if not _percent_in_range():
-            return apply_model(x, ts, **c)
         if c.get("control") is not None:
-            return apply_model(x, ts, **c)
-
-        attn_on = bool(_STATE["attn_method"]) and float(_STATE["attn_scale"]) > 0 \
-            and bool(_STATE["attn_targets"])
-        slg_on = bool(_STATE["slg_on"]) and float(_STATE["slg_scale"]) > 0 \
-            and bool(_STATE["slg_targets"])
-        if not attn_on and not slg_on:
             return apply_model(x, ts, **c)
 
         batch = x.shape[0]
@@ -355,7 +392,35 @@ def _model_wrapper(apply_model, w):
             return apply_model(x, ts, **c)
 
         idx = torch.tensor(cond_idx, device=x.device, dtype=torch.long)
+        uidx = torch.tensor(uncond_idx, device=x.device, dtype=torch.long)
         n = len(cond_idx)
+
+        # --- Adaptive Guidance: in the late steps, run cond-only and set the
+        # uncond output = cond → CFG collapses to cond (guidance neutralized),
+        # saving the uncond half of the batch. Takes precedence over the
+        # (adds-work) perturbation path in those steps. ---
+        if _adg_should_skip():
+            x_c = x.index_select(0, idx)
+            ts_c = ts.index_select(0, idx)
+            c_c = _select_c(c, idx, batch)
+            out_c = apply_model(x_c, ts_c, **c_c)
+            out_full = torch.empty(
+                (batch,) + tuple(out_c.shape[1:]),
+                device=out_c.device, dtype=out_c.dtype,
+            )
+            out_full.index_copy_(0, idx, out_c)
+            out_full.index_copy_(0, uidx, out_c)  # uncond := cond
+            return out_full
+
+        if not _STATE["on"] or not _percent_in_range():
+            return apply_model(x, ts, **c)
+
+        attn_on = bool(_STATE["attn_method"]) and float(_STATE["attn_scale"]) > 0 \
+            and bool(_STATE["attn_targets"])
+        slg_on = bool(_STATE["slg_on"]) and float(_STATE["slg_scale"]) > 0 \
+            and bool(_STATE["slg_targets"])
+        if not attn_on and not slg_on:
+            return apply_model(x, ts, **c)
 
         # Lay out the appended weak-prediction rows.
         cursor = batch
@@ -382,7 +447,6 @@ def _model_wrapper(apply_model, w):
             _clear_markers()
 
         out = out_ext[:batch]
-        uidx = torch.tensor(uncond_idx, device=x.device, dtype=torch.long)
         if a0 is not None:
             _STATE["attn_raw"] = out_ext[a0:a1].detach().float()
         if s0 is not None:
@@ -636,9 +700,17 @@ def _make_pag_xyz_axis() -> None:
         xyz_grid.AxisOption("[Anima APG] Eta", float, partial(_pag_xyz_set, field="apg_eta")),
         xyz_grid.AxisOption("[Anima APG] Norm Threshold", float, partial(_pag_xyz_set, field="apg_norm")),
         xyz_grid.AxisOption("[Anima APG] Momentum", float, partial(_pag_xyz_set, field="apg_momentum")),
+        # Adaptive Guidance (speed) axes.
+        xyz_grid.AxisOption(
+            "[Anima AdaptiveG] Enable", str,
+            partial(_pag_xyz_set, field="adg_enabled"), choices=bool_choices,
+        ),
+        xyz_grid.AxisOption("[Anima AdaptiveG] Skip After", float, partial(_pag_xyz_set, field="adg_start")),
+        xyz_grid.AxisOption("[Anima AdaptiveG] Keep Every", float, partial(_pag_xyz_set, field="adg_interval")),
     ]
 
-    if not any(a.label.startswith(("[Anima Pert]", "[Anima APG]")) for a in xyz_grid.axis_options):
+    if not any(a.label.startswith(("[Anima Pert]", "[Anima APG]", "[Anima AdaptiveG]"))
+               for a in xyz_grid.axis_options):
         xyz_grid.axis_options.extend(axis)
 
 
@@ -790,11 +862,40 @@ class AnimaSafePAG(scripts.Script):
                     minimum=-1.0, maximum=1.0, step=0.05, value=0.0,
                     elem_id="anima_safe_pag_apg_momentum",
                 )
+
+            gr.Markdown("---\n### Adaptive Guidance (속도)")
+            gr.Markdown(
+                "샘플링 **후반부에는 uncond(네거티브) 예측 기여가 미미**하므로, 지정 지점 "
+                "이후 uncond forward를 **생략**해 그 스텝 배치를 절반으로 줄입니다(무손실에 "
+                "가까운 속도↑). 추가 계산이 아니라 **빼는** 쪽이며 모든 모델에서 동작합니다. "
+                "생략 스텝에서는 perturbation도 함께 쉬어 CFG가 cond로 붕괴됩니다."
+            )
+            adg_enabled = gr.Checkbox(
+                label="Enable Adaptive Guidance (후반 uncond 생략)",
+                value=False,
+                elem_id="anima_safe_pag_adg_enable",
+            )
+            adg_start = gr.Slider(
+                label="Skip after (이 지점 이후 uncond 생략)",
+                minimum=0.0, maximum=1.0, step=0.01, value=0.5,
+                elem_id="anima_safe_pag_adg_start",
+            )
+            with gr.Accordion("Adaptive Guidance Advanced (세부값)", open=False):
+                gr.Markdown(
+                    "**keep every N** — 생략 구간에서도 N스텝마다 uncond를 한 번씩 유지해 "
+                    "품질을 보수적으로 지킵니다(0=항상 생략, 값 클수록 더 자주 생략)."
+                )
+                adg_interval = gr.Slider(
+                    label="Keep every N steps (0 = 항상 생략)",
+                    minimum=0, maximum=10, step=1, value=0,
+                    elem_id="anima_safe_pag_adg_interval",
+                )
         return [
             enabled, attn_method, scale, strength, block_indices,
             slg_on, slg_scale, slg_blocks,
             start_percent, end_percent, rescale, auto_decay,
             apg_enabled, apg_eta, apg_norm, apg_momentum, apg_autooff,
+            adg_enabled, adg_start, adg_interval,
         ]
 
     def process_before_every_sampling(self, p, *args, **kwargs):
@@ -831,9 +932,18 @@ class AnimaSafePAG(scripts.Script):
         if "apg_enabled" in xyz:
             apg_enabled = _as_bool(xyz["apg_enabled"], apg_enabled)
 
-        if not pert_enabled and not apg_enabled:
+        # ---- Adaptive Guidance enable ----
+        try:
+            adg_enabled = bool(_arg(17, False))
+        except Exception:
+            adg_enabled = False
+        if "adg_enabled" in xyz:
+            adg_enabled = _as_bool(xyz["adg_enabled"], adg_enabled)
+
+        if not pert_enabled and not apg_enabled and not adg_enabled:
             _STATE["on"] = False
             _APG["on"] = False
+            _ADG["on"] = False
             return
 
         # ---- Read every knob (with XYZ overrides) ----
@@ -855,9 +965,12 @@ class AnimaSafePAG(scripts.Script):
             apg_norm = _xyz_num("apg_norm", float(_arg(14, 15.0)))
             apg_momentum = _xyz_num("apg_momentum", float(_arg(15, 0.0)))
             apg_autooff = _as_bool(_arg(16, True), True)
+            adg_start = _xyz_num("adg_start", float(_arg(18, 0.5)))
+            adg_interval = int(_xyz_num("adg_interval", float(_arg(19, 0))))
         except Exception as e:
             _STATE["on"] = False
             _APG["on"] = False
+            _ADG["on"] = False
             _log(f"bad args, disabling: {type(e).__name__}: {e}")
             return
 
@@ -880,6 +993,12 @@ class AnimaSafePAG(scripts.Script):
         else:
             _APG["on"] = False
         _STATE["apg_autooff_rescale"] = apg_autooff
+
+        # ---- Adaptive Guidance: model-agnostic, needs no patching. ----
+        if adg_enabled:
+            _ADG.update(on=True, start=adg_start, interval=max(0, adg_interval))
+        else:
+            _ADG["on"] = False
 
         # ---- Perturbation: Anima-only, needs the attention/block patches. ----
         pert_ok = False
@@ -913,20 +1032,25 @@ class AnimaSafePAG(scripts.Script):
                 slg_on=bool(slg_on and slg_targets), slg_scale=slg_scale,
                 slg_targets=slg_targets, auto_decay=auto_decay, rescale=rescale,
                 start=min(start, end), end=max(start, end),
-                total=int(getattr(p, "steps", 20) or 20),
-                step=0, active=0, attn_raw=None, slg_raw=None,
+                active=0, attn_raw=None, slg_raw=None,
             )
             _clear_markers()
         else:
             _STATE["on"] = False
 
-        if not _STATE["on"] and not _APG["on"]:
+        if not _STATE["on"] and not _APG["on"] and not _ADG["on"]:
             return
+
+        # Step counter / total drive both perturbation range and AG gating.
+        _STATE["total"] = int(getattr(p, "steps", 20) or 20)
+        _STATE["step"] = 0
 
         # ---- Attach hooks (clone so Forge core / other gens are untouched) ----
         try:
             unet = unet.clone()
-            if _STATE["on"]:
+            # The wrapper is needed for perturbation AND for Adaptive Guidance
+            # (both manipulate the cond/uncond batch before apply_model).
+            if _STATE["on"] or _ADG["on"]:
                 unet.set_model_unet_function_wrapper(_model_wrapper)
             unet.set_model_sampler_post_cfg_function(_post_cfg)
             p.sd_model.forge_objects.unet = unet
@@ -949,6 +1073,10 @@ class AnimaSafePAG(scripts.Script):
                 p.extra_generation_params["Anima APG"] = (
                     f"eta={apg_eta}, norm={apg_norm}, momentum={apg_momentum}"
                 )
+            if _ADG["on"]:
+                p.extra_generation_params["Anima Adaptive Guidance"] = (
+                    f"skip_after={_ADG['start']:.2f}, keep_every={_ADG['interval']}"
+                )
             _log(
                 f"attached ✅ engine={engine} "
                 f"pert={'on' if _STATE['on'] else 'off'} "
@@ -957,11 +1085,14 @@ class AnimaSafePAG(scripts.Script):
                 f"auto_decay={auto_decay} "
                 f"rescale={'auto-off' if (_APG['on'] and apg_autooff) else rescale}) "
                 f"APG={'on' if _APG['on'] else 'off'} "
-                f"(eta={apg_eta} norm={apg_norm} mom={apg_momentum})"
+                f"(eta={apg_eta} norm={apg_norm} mom={apg_momentum}) "
+                f"AdaptiveG={'on' if _ADG['on'] else 'off'} "
+                f"(skip_after={_ADG['start']} keep_every={_ADG['interval']})"
             )
         except Exception as e:
             _STATE["on"] = False
             _APG["on"] = False
+            _ADG["on"] = False
             _log(f"failed to attach hooks: {type(e).__name__}: {e}")
 
     def postprocess(self, p, processed, *args):
@@ -969,3 +1100,4 @@ class AnimaSafePAG(scripts.Script):
         # generation if forge_objects reuse ever changed.
         _STATE["on"] = False
         _APG["on"] = False
+        _ADG["on"] = False
