@@ -738,8 +738,12 @@ def _as_bool(value, default: bool) -> bool:
 
 
 class AnimaSafePAG(scripts.Script):
-    # Run late so any other script has set up the unet first (mirrors the PoC).
-    sorting_priority = 98
+    # sorting_priority governs BOTH the accordion position and the
+    # process order (lower = higher up / earlier). 0 keeps this panel in the
+    # SAM3 extension block right under the SAM3 accordion. We still clone from
+    # the CURRENT forge_objects.unet, so other unet-patching scripts compose
+    # regardless of order.
+    sorting_priority = 0
 
     def title(self):
         return "Anima Perturbation Guidance"
