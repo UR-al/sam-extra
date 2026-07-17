@@ -102,6 +102,9 @@ class RefinePanel:
     refine_button: gr.Button
     stop_button: gr.Button
     status: gr.HTML
+    # Regional style-swap preset — one click sets the guide-tuned values on the
+    # existing widgets (no new script args). See docs/REGIONAL_STYLE_SWAP.md.
+    regional_preset_button: gr.Button
     # Manual-mask canvas slots (None when ForgeCanvas isn't importable).
     # canvas_bg / canvas_fg are LogicalImage Textbox slots backing the
     # background image and the user's drawn scribble layer respectively.
@@ -529,6 +532,21 @@ def build_refine_panel(
                 )
 
         with gr.Row():
+            regional_preset_button = gr.Button(
+                "🎭 Regional Swap preset",
+                scale=0,
+                min_width=200,
+                elem_id="sam3_refine_regional_preset",
+            )
+            gr.Markdown(
+                "가이드(RegionalSampler) 기본값을 세팅합니다: Euler · CFG 5 · 33 steps · "
+                "denoise 0.76(=base_only_steps 8) · mask blur 16 · inherit OFF · inpaint only "
+                "masked · fill original. **Scheduler는 sgm_uniform으로 직접** 선택하세요. "
+                "이후 Replacement에 region 프롬프트+`<lora:…:0.8>`, 🎯로 seed를 맞추면 됩니다. "
+                "→ docs/REGIONAL_STYLE_SWAP.md"
+            )
+
+        with gr.Row():
             insert_mode = gr.Radio(
                 label="SAM3 Refine Insert Result",
                 choices=["After selected", "At end"],
@@ -593,6 +611,7 @@ def build_refine_panel(
         refine_button=refine_button,
         stop_button=stop_button,
         status=status,
+        regional_preset_button=regional_preset_button,
         canvas_bg=canvas_bg,
         canvas_fg=canvas_fg,
         canvas_load_button=canvas_load_button,
