@@ -521,6 +521,42 @@ def _wire_refine_panel(
         queue=False,
     )
 
+    # 🎭 Regional Swap preset — set the guide's (RegionalSampler) values on the
+    # existing Refine widgets in one click. Only touches widgets we're confident
+    # exist by choice/label; scheduler is left for the user (sgm_uniform label
+    # varies) as noted in the panel. See docs/REGIONAL_STYLE_SWAP.md.
+    def _apply_regional_preset():
+        return (
+            gr.update(value="Euler"),      # sampler (deterministic)
+            gr.update(value=5.0),          # cfg_scale
+            gr.update(value=33),           # steps
+            gr.update(value=0.76),         # denoising_strength (= base_only_steps 8)
+            gr.update(value=16),           # mask_blur (= overlap_factor 16)
+            gr.update(value=False),        # inherit_main_prompt
+            gr.update(value=False),        # inherit_main_neg_prompt
+            gr.update(value=True),         # inpaint_only_masked
+            gr.update(value=32),           # inpaint_only_masked_padding
+            gr.update(value="original"),   # inpainting_fill
+        )
+
+    panel.regional_preset_button.click(
+        fn=_apply_regional_preset,
+        inputs=[],
+        outputs=[
+            panel.sampler,
+            panel.cfg_scale,
+            panel.steps,
+            panel.denoising_strength,
+            panel.mask_blur,
+            panel.inherit_main_prompt,
+            panel.inherit_main_neg_prompt,
+            panel.inpaint_only_masked,
+            panel.inpaint_only_masked_padding,
+            panel.inpainting_fill,
+        ],
+        queue=False,
+    )
+
     # Manual-mask "Load selected to canvas" button: copy the currently-
     # selected gallery image into the ForgeCanvas background slot so the
     # user can scribble over it. The JS shim populates args[1] with the
