@@ -3,6 +3,33 @@
 버전 태그는 GitHub Releases에도 발행됩니다. 아래는 요약이며, guidance/속도 기능의
 상세는 [docs/GUIDANCE.md](docs/GUIDANCE.md)를 참고하세요.
 
+## v0.9.17 — Gradio `state_holder` KeyError 수정
+
+생성/Refine 후 콘솔에 `KeyError: <숫자>` (gradio `state_holder.py` `__contains__`) 트레이스백이
+찍히던 문제 수정.
+
+- **원인**: 핸들러가 `gr.update()`를 반환하면 gradio가 **요청 시점에** 해당 컴포넌트를 다시
+  만든다(`blocks.py` `postprocess_data`: `state[block._id] = block.__class__(**constructor_args)`,
+  `render=False` 강제 주입). 이 `constructor_args`에는 **원본 elem_id가 그대로** 들어있고,
+  webui는 `gradio.components.Component.__init__`를 패치해 두었기 때문에
+  (`modules/gradio_extensions.py`) 이 일회용 인스턴스에 대해서도 `on_after_component`가
+  발화한다. `render()`가 호출되지 않아 이 인스턴스의 `_id`는
+  `demo.default_config.blocks`에 등록되지 않는데, `SessionState.blocks_config`는 그 dict의
+  얕은 스냅샷이라 이후 해당 컴포넌트를 건드리는 이벤트에서 `KeyError`가 난다.
+- **증상 경로**: `_refine_error_return` / `_anima_error_return`이
+  `outputs=[gallery, status, html_info, generation_info]`로 배선돼 있어, Refine/Anima의
+  early-return마다 `html_info_txt2img`·`generation_info_txt2img` 에코가 발생 → 캐시해 둔
+  전역이 미등록 컴포넌트로 덮이고, `refine_panel` 센티넬까지 오염될 수 있었음.
+- **수정**: `on_after_component`가 **실제로 등록된 컴포넌트에 대해서만** 동작하도록 가드 추가.
+  `Context.root_block`은 ContextVar가 아닌 프로세스 전역이라 Reload UI 중 in-flight 요청
+  에코가 새는 레이스가 남으므로, 등록 여부(`component._id in ...default_config.blocks`)를
+  직접 확인한다. UI 빌드 중에는 완전한 no-op이라 기능 변화 없음
+  (Compact 프롬프트 레이아웃의 `render=False` 컨테이너 자식도 즉시 등록되므로 안전).
+- **부수 수정**: `modules/api/api.py`가 임시 `with gr.Blocks():` 안에서 모든 스크립트의
+  `ui()`를 재실행하는데, 실제 빌드에서 `build_anima_panel()`이 실패했을 경우 그 패스가 죽은
+  패널을 잡아 Tile-Repair가 프로세스 내내 비활성화될 수 있었음 → `anima_build_attempted`
+  플래그로 차단.
+
 ## v0.9.16 — 경량화 패스 (기능 제거 없음)
 
 전체 코드 감사 후 상시/반복 비용만 안전하게 트림. 모든 기능 유지.
