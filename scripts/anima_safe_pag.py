@@ -153,6 +153,10 @@ _ADG: dict = {
     "interval": 0,    # 0 = skip every step after start; N>0 = still keep uncond every Nth step
 }
 
+# Original (unpatched) anima SDPA — module global so the permanently-installed
+# wrapper reads it with zero dict lookups on the disabled fast-path.
+_ORIG_SDPA = None
+
 
 # ---------------------------------------------------------------------------
 # Attention perturbation — patch the anima module-global SDPA once (idempotent).
@@ -168,12 +172,15 @@ def _patched_sdpa(query, key, value, *args, **kwargs):
       * the raw value path  (PAG: identity attention → out≈value), or
       * the seq-uniform mean (SEG-approx: smoothed/uniform attention).
     """
-    orig = _STATE.get("_orig_sdpa")
-    out = orig(query, key, value, *args, **kwargs)
+    out = _ORIG_SDPA(query, key, value, *args, **kwargs)
+    # Disabled fast-path: not inside a targeted perturbation forward → return
+    # immediately (one bool check) without touching the rest of _STATE.
+    if _STATE["active"] <= 0 or _STATE["attn_b0"] is None:
+        return out
     try:
         a0, a1 = _STATE["attn_b0"], _STATE["attn_b1"]
         method = _STATE["attn_method"]
-        if _STATE["active"] > 0 and a0 is not None and method and a1 <= out.shape[0]:
+        if method and a1 <= out.shape[0]:
             strength = float(_STATE["strength"])
             if method == "pag":
                 if value.shape == out.shape:
@@ -255,7 +262,8 @@ def _ensure_patched(diffusion_model) -> int:
         return 0
 
     if not getattr(anima_mod, "_pag_sdpa_patched", False):
-        _STATE["_orig_sdpa"] = anima_mod.scaled_dot_product_attention
+        global _ORIG_SDPA
+        _ORIG_SDPA = anima_mod.scaled_dot_product_attention
         anima_mod.scaled_dot_product_attention = _patched_sdpa
         anima_mod._pag_sdpa_patched = True
         _log("patched backend.nn.anima.scaled_dot_product_attention ✅")
@@ -576,6 +584,13 @@ def _post_cfg(args):
     """
     denoised = args["denoised"]
     if torch is None:
+        return denoised
+    # Nothing to combine (e.g. only Adaptive Guidance active) → return as-is
+    # without the float() round-trip / two latent-sized allocations per step.
+    has_pert = _STATE["on"] and (_STATE["attn_raw"] is not None or _STATE["slg_raw"] is not None)
+    if not _APG["on"] and not has_pert:
+        _STATE["attn_raw"] = None
+        _STATE["slg_raw"] = None
         return denoised
     try:
         result = denoised.float()
@@ -1105,3 +1120,10 @@ class AnimaSafePAG(scripts.Script):
         _STATE["on"] = False
         _APG["on"] = False
         _ADG["on"] = False
+        # Drop the stashed latent-sized tensors so they don't sit in VRAM
+        # between generations (they'd otherwise linger until the next gen).
+        _STATE["cond_raw"] = None
+        _STATE["uncond_raw"] = None
+        _STATE["attn_raw"] = None
+        _STATE["slg_raw"] = None
+        _APG["avg"] = None

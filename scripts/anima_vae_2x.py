@@ -170,6 +170,14 @@ def _build_decoder(path: str, device, dtype):
                  f"checkpoint.)")
         model = model.to(device=device, dtype=dtype).eval()
         _log(f"built 12ch Wan decoder from {os.path.basename(path)} ✅")
+        # Keep only the most-recent decoder resident — evict others so trying
+        # different 2x VAEs in a session doesn't accumulate decoders in VRAM.
+        for old in [k for k in _DECODER_CACHE if k != key]:
+            _DECODER_CACHE.pop(old, None)
+        try:
+            torch.cuda.empty_cache()
+        except Exception:
+            pass
         _DECODER_CACHE[key] = model
         return model
     except Exception as e:
@@ -264,7 +272,15 @@ class _VAE2xWrapper:
 # ---------------------------------------------------------------------------
 
 
+_VAE_FILE_CACHE: list[str] | None = None
+
+
 def _list_vae_files() -> list[str]:
+    # Cached: ui() runs once per tab at startup — avoid a second
+    # refresh_vae_list() folder scan for the i2i tab.
+    global _VAE_FILE_CACHE
+    if _VAE_FILE_CACHE is not None:
+        return _VAE_FILE_CACHE
     out = ["None"]
     try:
         from modules import sd_vae
@@ -272,6 +288,7 @@ def _list_vae_files() -> list[str]:
         out.extend(sorted(sd_vae.vae_dict.keys()))
     except Exception:
         pass
+    _VAE_FILE_CACHE = out
     return out
 
 

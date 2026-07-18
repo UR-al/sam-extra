@@ -3,6 +3,23 @@
 버전 태그는 GitHub Releases에도 발행됩니다. 아래는 요약이며, guidance/속도 기능의
 상세는 [docs/GUIDANCE.md](docs/GUIDANCE.md)를 참고하세요.
 
+## v0.9.16 — 경량화 패스 (기능 제거 없음)
+
+전체 코드 감사 후 상시/반복 비용만 안전하게 트림. 모든 기능 유지.
+
+- **매 생성 비용 ↓ (일반 non-Anima 포함)**: `Sam3MaskScript.process`가 SAM3 꺼짐 + XYZ
+  없음이면 ~50필드 payload 조립 + `Sam3Args` pydantic 검증을 **건너뜀**(early-return).
+- **매 스텝 비용 ↓**: `_post_cfg`가 합칠 게 없으면(예: Adaptive Guidance만 켜짐) `float()`
+  왕복/latent 2회 할당 없이 즉시 반환.
+- **어텐션 콜당 비용 ↓**: 영구 설치되는 SDPA 래퍼가 원본을 `_STATE.get()` 대신 모듈 전역
+  `_ORIG_SDPA`로 참조 + 비활성 fast-path를 bool 체크 1회로 단축.
+- **VRAM ↓**: (a) PAG가 스택한 latent 텐서(cond/uncond/attn/slg_raw + APG momentum)를
+  `postprocess`에서 해제. (b) VAE 2x 디코더 캐시를 **최근 1개로 상한**(나머지 evict +
+  `empty_cache`). (c) VAE 파일 목록 스캔을 memoize(탭별 재스캔 방지).
+
+감사 결론: import-타임 디스크 스캔/불필요 무거운 import 없음, 기능 OFF 시 base Forge 대비
+거의 무비용. 위 항목만 실제 개선 여지였음.
+
 ## v0.9.15 — Regional Style-Swap (RegionalSampler 워크플로 재현)
 
 rouge-kasshoku의 "Anima Crossover Couple / RegionalSampler" 가이드(스타일 블리딩 해결)를
