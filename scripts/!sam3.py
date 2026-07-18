@@ -7,6 +7,7 @@ from typing import Any, NamedTuple
 
 import gradio as gr
 import numpy as np
+from gradio.context import Context
 from PIL import Image
 
 from modules import script_callbacks, scripts, shared
@@ -209,8 +210,16 @@ class Sam3MaskScript(scripts.Script):
         # anima_panel is intentionally NOT added to the returned components
         # list — it's wired through its own button.click in on_after_component
         # so its widgets don't pollute the SAM3 alwayson script_args.
-        global anima_panel
-        if not is_img2img and anima_panel is None and anima_available():
+        #
+        # Gate on anima_build_attempted rather than `anima_panel is None`: the API
+        # re-runs every script's ui() inside a throwaway `with gr.Blocks()`
+        # (modules/api/api.py, init_default_script_args) after create_ui() has
+        # finished. If the real build above had raised, that pass would rebuild the
+        # panel into the throwaway and leave anima_panel holding components that
+        # belong to no live Blocks — permanently dead for the process.
+        global anima_panel, anima_build_attempted
+        if not is_img2img and not anima_build_attempted and anima_available():
+            anima_build_attempted = True
             try:
                 anima_panel = build_anima_panel()
             except Exception:
@@ -428,6 +437,9 @@ txt2img_html_info_component = None
 txt2img_generation_info_component = None
 refine_panel: RefinePanel | None = None
 anima_panel: AnimaPanel | None = None
+# Set True the first time Sam3MaskScript.ui() tries to build the Anima panel,
+# whether or not it succeeded, so the API's throwaway-Blocks ui() pass can't retry.
+anima_build_attempted: bool = False
 # Set True the first time on_after_component wires the Anima panel's click
 # chain. Distinct from `anima_panel is None` because the panel is created
 # in Sam3MaskScript.ui() (alwayson script ui callback) but wiring needs the
@@ -694,6 +706,34 @@ def on_after_component(component, **kwargs):
     global txt2img_gallery_component, txt2img_prompt_component, txt2img_neg_prompt_component
     global txt2img_html_info_component, txt2img_generation_info_component
     global refine_panel
+
+    # Gradio rebuilds a component at *request* time whenever a handler returns
+    # gr.update() for it — blocks.py postprocess_data does
+    #     state[block._id] = block.__class__(**constructor_args | {"render": False})
+    # and constructor_args still carries the original elem_id. webui patches
+    # gradio.components.Component.__init__ (modules/gradio_extensions.py), so
+    # this callback also fires for those throwaway instances, with the very
+    # elem_ids we match on below.
+    #
+    # gradio forces render=False on that rebuild (blocks.py:1740), so render()
+    # never runs and the instance's _id never lands in demo.default_config.blocks.
+    # SessionState.blocks_config is only a shallow snapshot of that dict
+    # (BlocksConfig.__copy__), so caching such an instance and later wiring it as
+    # an event output makes gradio raise
+    #     KeyError: <id>   in state_holder.__contains__
+    # the next time the event fires.
+    #
+    # Testing registration directly is what we actually care about, and it is
+    # exact: by the time webui fires this callback, Component.__init__ has already
+    # returned, so every genuine component is registered — including one declared
+    # inside a render=False container (only the container itself defers, cf. the
+    # Compact prompt layout in modules/ui_toprow.py). Checking Context.root_block
+    # alone would still leak if an in-flight request echoed during a Reload UI
+    # rebuild, since it is a process-wide global rather than a ContextVar.
+    if Context.root_block is None:
+        return
+    if component._id not in Context.root_block.default_config.blocks:
+        return
 
     elem_id = kwargs.get("elem_id")
     if elem_id == "txt2img_generate":
