@@ -255,6 +255,13 @@ class Sam3MaskScript(scripts.Script):
         if "enabled" in xyz_values:
             enabled = str(xyz_values.get("enabled")).lower() == "true"
 
+        # Fast path: SAM3 off and no XYZ override → skip building the ~50-field
+        # payload + Sam3Args validation on every (incl. plain non-Anima) gen.
+        # postprocess_image only reads args["enabled"] when disabled.
+        if not enabled and not xyz_values:
+            p._sam3_args = {"enabled": False}
+            return
+
         def _xyz_or(state_key: str, default: Any, *, legacy: str | None = None) -> Any:
             if state_key in xyz_values:
                 return xyz_values[state_key]
