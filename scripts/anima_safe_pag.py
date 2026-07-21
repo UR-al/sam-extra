@@ -42,14 +42,14 @@ So we:
 
 Attention perturbation
 ----------------------
-``backend/nn/anima.py`` computes self-attention as a bare
-``scaled_dot_product_attention(q, k, v)`` module-global call inside
-``block.self_attn`` (``TransformerBlock``). We wrap that module global so, for
-the appended pag rows only, the attention output becomes
-``lerp(sdpa(q,k,v), v, strength)`` — the value-only ("identity attention")
-path. Value carries no RoPE, so this is rotary-safe. On grouped-query models
-(``v`` head count != output head count) the shapes differ and we skip the
-perturbation rather than corrupt the tensor.
+Forge has used two Anima attention paths over time: older builds call a
+module-global ``scaled_dot_product_attention`` while current Forge Neo builds
+route ``SelfCrossAttention.torch_attention_op`` through ``attention_function``.
+We patch whichever path the loaded build actually uses so, for the appended
+PAG rows only, the pre-projection attention output becomes a blend toward the
+raw value path ("identity attention"). Value carries no RoPE, so this is
+rotary-safe. On grouped-query models (``v`` head count != output head count)
+the shapes differ and we skip the perturbation rather than corrupt the tensor.
 
 Safety
 ------
@@ -153,14 +153,56 @@ _ADG: dict = {
     "interval": 0,    # 0 = skip every step after start; N>0 = still keep uncond every Nth step
 }
 
-# Original (unpatched) anima SDPA — module global so the permanently-installed
-# wrapper reads it with zero dict lookups on the disabled fast-path.
+# Original (unpatched) Anima attention functions. Current Forge Neo uses the
+# class-level op; _ORIG_SDPA is retained for compatibility with older builds.
+_ORIG_ANIMA_ATTN_OP = None
 _ORIG_SDPA = None
 
 
 # ---------------------------------------------------------------------------
-# Attention perturbation — patch the anima module-global SDPA once (idempotent).
+# Attention perturbation — patch the active Anima attention path once.
 # ---------------------------------------------------------------------------
+
+
+def _patched_anima_attention_op(query, key, value, *args, **kwargs):
+    """Drop-in for current Forge Neo's ``SelfCrossAttention.torch_attention_op``.
+
+    The inputs are ``[B, seq, heads, dim]`` and the original output is
+    ``[B, seq, heads*dim]``. Perturbing here keeps the operation before
+    ``output_proj``, matching the older SDPA patch semantically.
+    """
+    out = _ORIG_ANIMA_ATTN_OP(query, key, value, *args, **kwargs)
+    if _STATE["active"] <= 0 or _STATE["attn_b0"] is None:
+        return out
+    try:
+        a0, a1 = _STATE["attn_b0"], _STATE["attn_b1"]
+        method = _STATE["attn_method"]
+        if not method or a1 > out.shape[0]:
+            return out
+
+        # attention_function returns merged heads. Convert value to the same
+        # pre-projection layout before blending the appended weak rows.
+        value_path = value.reshape(value.shape[0], value.shape[1], -1)
+        if value_path.shape != out.shape:
+            if not _STATE["gqa_warned"]:
+                _STATE["gqa_warned"] = True
+                _log("self-attn value/out head layout differ (grouped-query?)"
+                     " — skipping attention perturbation on this block.")
+            return out
+
+        strength = float(_STATE["strength"])
+        out = out.clone()
+        if method == "pag":
+            target = value_path[a0:a1]
+        elif method == "seg":
+            # Uniform attention is the sequence-wise mean of values.
+            target = value_path[a0:a1].mean(dim=1, keepdim=True).expand_as(out[a0:a1])
+        else:
+            return out
+        out[a0:a1] = torch.lerp(out[a0:a1], target, strength)
+    except Exception as e:  # never let the patch break sampling
+        _log(f"attention perturb skipped: {type(e).__name__}: {e}")
+    return out
 
 
 def _patched_sdpa(query, key, value, *args, **kwargs):
@@ -247,8 +289,10 @@ def _make_block_wrapper(idx: int, orig_forward):
 
 
 def _ensure_patched(diffusion_model) -> int:
-    """Idempotently install the SDPA patch + per-block self_attn wrappers (for
-    PAG/SEG) + per-block forward wrappers (for SLG). Returns the block count.
+    """Install the active attention patch plus the per-block PAG/SLG wrappers.
+
+    Current Forge Neo uses ``SelfCrossAttention.torch_attention_op``. The
+    module-global SDPA fallback is only for older Forge builds.
     """
     try:
         from backend.nn import anima as anima_mod
@@ -256,17 +300,25 @@ def _ensure_patched(diffusion_model) -> int:
         _log(f"cannot import backend.nn.anima: {type(e).__name__}: {e}")
         return 0
 
-    if not hasattr(anima_mod, "scaled_dot_product_attention"):
-        _log("backend.nn.anima has no module-global scaled_dot_product_attention "
-             "— cannot perturb attention on this build.")
+    attn_cls = getattr(anima_mod, "SelfCrossAttention", None)
+    if attn_cls is not None and hasattr(attn_cls, "torch_attention_op"):
+        if not getattr(attn_cls, "_pag_attention_op_patched", False):
+            global _ORIG_ANIMA_ATTN_OP
+            _ORIG_ANIMA_ATTN_OP = attn_cls.torch_attention_op
+            attn_cls.torch_attention_op = staticmethod(_patched_anima_attention_op)
+            attn_cls._pag_attention_op_patched = True
+            _log("patched backend.nn.anima.SelfCrossAttention.torch_attention_op ✅")
+    elif hasattr(anima_mod, "scaled_dot_product_attention"):
+        if not getattr(anima_mod, "_pag_sdpa_patched", False):
+            global _ORIG_SDPA
+            _ORIG_SDPA = anima_mod.scaled_dot_product_attention
+            anima_mod.scaled_dot_product_attention = _patched_sdpa
+            anima_mod._pag_sdpa_patched = True
+            _log("patched backend.nn.anima.scaled_dot_product_attention ✅")
+    else:
+        _log("backend.nn.anima has no supported attention entry point — "
+             "cannot perturb attention on this build.")
         return 0
-
-    if not getattr(anima_mod, "_pag_sdpa_patched", False):
-        global _ORIG_SDPA
-        _ORIG_SDPA = anima_mod.scaled_dot_product_attention
-        anima_mod.scaled_dot_product_attention = _patched_sdpa
-        anima_mod._pag_sdpa_patched = True
-        _log("patched backend.nn.anima.scaled_dot_product_attention ✅")
 
     blocks = getattr(diffusion_model, "blocks", None)
     if blocks is None:
