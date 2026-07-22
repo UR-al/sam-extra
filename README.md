@@ -11,7 +11,9 @@ SAM3 / SAM3.1 마스크 + 인페인트 확장. 다섯 가지 워크플로 제공
 ControlNet 통합 (LLLite 인페인트 모델 자동 호환 처리), 옷 교체용 Target/Replacement 워크플로, 시드 고정, VRAM 절약 옵션, XYZ plot 다축 등 지원.
 
 또한 SAM3와 **완전히 분리된 독립 기능**으로 **Anima Guidance & Speed Suite**(PAG/SEG/SLG ·
-APG · Detail Daemon · Adaptive Guidance)를 제공합니다 (v0.9.8+). → **[docs/GUIDANCE.md](docs/GUIDANCE.md)**
+APG · Detail Daemon · Adaptive Guidance)를 제공합니다 (v0.9.8+). 기능마다 구현 방식과 검증 수준이
+다르므로, 사용 전에 반드시 아래 **[구현·검증 상태](#구현검증-상태)**와
+**[상세 가이드](docs/GUIDANCE.md)**를 확인하세요.
 
 그리고 **Anima VAE 2x** (v0.9.14+, 실험) — spacepxl 2x Wan-VAE 파인튜닝을 디코더로 써서
 speckle↓·skin/hair 정리(`scripts/anima_vae_2x.py`). Qwen/Wan VAE latent 공유로 Anima에도 적용.
@@ -341,23 +343,65 @@ txt2img 실험 세 개를 한 탭에서 전환합니다. 각 작업공간에는 
 ## 별도 기능: Anima Guidance & Speed Suite (v0.9.8+)
 
 SAM3와 **완전히 분리된 독립 기능 모음**입니다. `sam3ext`를 전혀 import하지 않고 Forge 코어도
-건드리지 않으며, 전 구간 폴백으로 켜 둬도 안전합니다.
+건드리지 않습니다. 다만 아래 기능을 모두 같은 완성도나 같은 알고리즘으로 간주하면 안 됩니다.
 
-| 기능 | 효과 | 추가 forward | 대상 |
+> [!IMPORTANT]
+> 현재 **실제 Anima 생성과 고정 시드 A/B로 확인된 perturbation 경로는 PAG**입니다. SEG는
+> 근사 구현, SLG·APG·Adaptive Guidance는 제한이 있는 실험 구현입니다. 특히 **APG는 CFG=1에서
+> 사용하지 마세요.**
+
+### 구현·검증 상태
+
+| 기능 | 이 확장에서 실제로 하는 일 | 현재 판정 | 적용 범위 / 핵심 제한 |
 |---|---|---|---|
-| **PAG / SEG / SLG** | 구조·디테일 강화 (perturbation guidance) | 있음(배치 접기) | Anima DiT |
-| **APG** | 높은 CFG 과채도·번짐 억제 | 없음 | 모든 모델 |
-| **Detail Daemon** | 질감·잔디테일↑ | 없음 | 모든 모델 |
-| **Adaptive Guidance** | 후반 uncond 생략 → 속도↑ | 음수(생략) | 모든 모델 |
+| **PAG** | Anima attention을 교란한 weak prediction을 만들고 원래 prediction과의 차이를 guidance로 더함 | **검증됨** — Forge Neo 2.27 + `anima_baseV10` 실제 생성 고정 시드 A/B 및 `[Anima Pert] Enable` XYZ True/False 픽셀 차이 확인 | Anima DiT 전용. 다른 파생 모델은 별도 확인 필요. ControlNet 사용 시 perturbation을 자동 중지 |
+| **SEG** | weak row의 attention 출력을 `mean(value)` 방향으로 섞음 | **근사 구현** — attention tensor 단위 테스트만 있음 | Anima DiT 전용. 공식 SEG의 Gaussian query blur와 수학적으로 동일하지 않음 |
+| **SLG** | 선택한 Anima block의 weak row 출력을 해당 block 입력으로 되돌린 뒤 guidance 차이를 더함 | **잠정 구현** — 정적 경로는 연결됐으나 전용 회귀/E2E 테스트 없음 | Anima DiT 전용. ControlNet 사용 시 자동 중지 |
+| **APG** | Forge가 CFG를 계산한 뒤의 denoised x0 공간에서 projection·norm·momentum을 적용 | **실험 구현** — 출력 변화는 있으나 reference APG와 동등하다고 보장하지 않음 | **CFG>1에서만 사용. CFG=1 미지원**. sampler prediction 공간에서 동작하는 reference와 계산 위치가 다름 |
+| **Detail Daemon** | denoising 구간에 따라 디테일 보정량을 조절 | **별도 실험 기능** — 이번 Guidance 경로 검사 범위 밖 | 모델 공통. 별도 스크립트와 토글 사용 |
+| **Adaptive Guidance** | 지정한 `Skip after` 이후 Forge가 한 배치로 묶은 uncond row의 계산을 생략 | **단순화 구현** — 실제 스킵 여부는 실행 환경 의존 | 논문의 cosine-similarity 기반 adaptive 판정이 아님. low-VRAM 분리 호출에서는 스킵·속도 향상 없음 |
 
-- 스크립트: `scripts/anima_safe_pag.py`(Perturbation·APG·Adaptive Guidance),
-  `scripts/anima_detail_daemon.py`(Detail Daemon).
-- 조합 원칙: **Perturbation(PAG/SEG/SLG) 하나 + 크기보정(APG 또는 rescale) 하나** + Detail
-  Daemon/Adaptive Guidance는 독립적으로 병용. 모든 자동동작은 토글, 세부값은 Advanced.
-- ⚠️ 실험 기능 — 실제 Anima 체크포인트로 런타임 검증 1회 필요(콘솔 `[AnimaSafePAG]` /
-  `[AnimaDetailDaemon]` 로그로 확인).
+### 반드시 알아둘 제한
 
-**세부 사용법·파라미터·동작 원리·XYZ·크레딧은 → [docs/GUIDANCE.md](docs/GUIDANCE.md)**
+- **APG + CFG=1은 지원하지 않습니다.** Forge가 CFG=1에서 uncond prediction을 만들지 않는 경로와
+  현재 post-CFG APG 계산이 맞지 않아 결과가 매우 어두워지거나 무너질 수 있습니다. APG는 CFG를
+  1보다 크게 설정한 뒤 고정 시드 A/B로 확인하세요.
+- SEG의 이름은 기능 계열을 나타내지만, 현재 코드는 공식 SEG의 Gaussian blur를 그대로 이식한
+  것이 아닙니다. 공식 알고리즘과 동일한 결과가 필요한 작업에는 사용하지 마세요.
+- SLG는 현재 Anima block 입출력 형상에 맞춰 연결되어 있지만 전용 단위 테스트와 실제 모델 A/B
+  검증이 아직 없습니다.
+- Adaptive Guidance는 cond/uncond를 Forge가 **같은 batch로 호출할 때만** uncond row를 건너뜁니다.
+  low-VRAM 모드처럼 두 호출로 나뉘면 화질 변화도, 속도 이득도 없습니다. 특정 속도 향상률을
+  보장하지 않으며 ControlNet·일부 transformer option 조합도 아직 검증하지 않았습니다.
+- 기존 자동 테스트는 PAG 경로 중심입니다. SEG는 tensor 동작 테스트 1개만 있고 SLG·APG·Adaptive
+  Guidance 전용 회귀/E2E 테스트는 아직 없으므로, 이 표의 “실험” 기능을 전체 검증 완료로 해석하지
+  마세요.
+
+### 조합과 권장 사용 순서
+
+1. Anima에서는 먼저 **PAG만** 켜고 고정 시드로 OFF/ON 결과를 비교합니다.
+2. PAG와 SEG는 라디오에서 하나만 선택합니다. SLG는 별도 토글이라 PAG 또는 SEG와 병용할 수
+   있지만 아직 전용 E2E 검증이 없으므로, 먼저 각각 단독으로 비교하고 병용 시 scale 자동 감쇠를
+   켜세요.
+3. APG를 함께 쓸 때는 **CFG>1**을 사용합니다. APG가 켜지면 perturbation 쪽 rescale은 중복 보정을
+   피하기 위해 자동으로 꺼집니다.
+4. Adaptive Guidance의 skip 구간에서는 perturbation correction도 쉬며, 후반 결과는 adaptive skip이
+   우선합니다. 실제 속도 향상은 같은 설정으로 실행 시간을 비교해 확인하세요.
+5. ControlNet을 함께 쓰면 PAG/SEG/SLG는 충돌 방지를 위해 적용하지 않습니다.
+
+콘솔의 `[AnimaSafePAG]` 로그에서 hook 부착, 첫 perturbation delta, weak/applied 횟수를 확인할 수
+있습니다. 로그가 없거나 applied가 0이면 기능이 실제 생성에 적용된 것으로 판단하지 마세요.
+
+- 구현: `scripts/anima_safe_pag.py`(PAG/SEG/SLG·APG·Adaptive Guidance),
+  `scripts/anima_detail_daemon.py`(Detail Daemon)
+- 테스트: `tests/test_anima_safe_pag.py`
+- 상세 UI·파라미터·XYZ 사용법: **[docs/GUIDANCE.md](docs/GUIDANCE.md)** — 기능 판정과 안전 제한은
+  이 README의 현재 표를 우선합니다.
+- 알고리즘 참고: [SEG 공식 구현](https://github.com/SusungHong/SEG-SDXL),
+  [SLG 참고 구현](https://github.com/Stability-AI/sd3.5),
+  [APG 논문](https://arxiv.org/abs/2410.02416) 및
+  [Diffusers APG 구현](https://github.com/huggingface/diffusers/blob/main/src/diffusers/guiders/adaptive_projected_guidance.py),
+  [Adaptive Guidance 논문](https://arxiv.org/abs/2312.12487)
 
 ---
 
