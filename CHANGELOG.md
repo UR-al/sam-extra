@@ -3,6 +3,29 @@
 버전 태그는 GitHub Releases에도 발행됩니다. 아래는 요약이며, guidance/속도 기능의
 상세는 [docs/GUIDANCE.md](docs/GUIDANCE.md)를 참고하세요.
 
+## v0.9.18 — Anima PAG 검정 실루엣 붕괴 수정
+
+`[Anima Pert] Enable=True`에서 이미지가 검게 붕괴하던 PAG 실행 경로를 Forge Neo의
+실제 denoised(x0) 훅·상류 Safe-PAG 수식에 맞게 수정.
+
+- **핵심 원인 1 — 잘못된 rescale**: 기존은 매 스텝 `CFG base + PAG correction`
+  전체에 스케일 팩터를 곱해 밝기/에너지를 반복적으로 0 방향으로 빼앗음. 상류와
+  동일하게 팩터는 **PAG correction에만** 적용하여 correction=0이면 CFG base가
+  bit-identical로 보존됨.
+- **핵심 원인 2 — 과도한 기본 블록**: 빈칸을 28블록 후반 전체 `14-27`로 해석하던
+  로컬 동작을 상류 권장 단일 블록 `18`로 변경. UI/SLG/문서도 동일하게 맞춤.
+- **x0 직접 보정**: Forge `model.apply_model` 결과는 이미 predictor 변환된 x0이므로,
+  잘못된 raw-output/`c_out` 추정을 제거하고 `cond_x0 - weak_x0`를 직접 사용. 이로써
+  Forge의 CFG=1 uncond 생략 경로에서도 PAG가 실제 적용됨.
+- **XYZ 상태 누수 수정**: `p.extra_generation_params`를 재사용하는 True/False 셀 사이에
+  이전 PAG/APG/AdaptiveG infotext가 남지 않도록 셀별 정리.
+- **안전성**: XYZ/API에서 slider 범위를 우회한 NaN/Inf/과도한 scale·strength·range·
+  rescale 입력을 유한값 + UI 범위로 정규화. 첫 유효 weak delta와 generation summary
+  로그를 추가해 무효 훅을 즉시 구분할 수 있음.
+- **검증**: PAG 회귀 테스트 8개 통과. `anima_baseV10` 실제 생성(20 steps, seed 동일)에서
+  PAG False/True 변경 픽셀 98.58%, True 평균 RGB 103.89로 검정 붕괴 없이 weak/apply
+  14/14 스텝 실행을 확인.
+
 ## v0.9.17 — Gradio `state_holder` KeyError 수정
 
 생성/Refine 후 콘솔에 `KeyError: <숫자>` (gradio `state_holder.py` `__contains__`) 트레이스백이

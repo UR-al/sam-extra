@@ -31,14 +31,13 @@ So we:
      batch and run a SINGLE ``apply_model`` (no separate forward → the extra
      PAG prediction rides along in the same kernel launch). Self-attention on
      the appended rows is perturbed (value-only lerp). We return the original
-     rows untouched, so CFG proceeds exactly as normal, and stash the pag raw
-     output.
-  2. In ``post_cfg_function`` we recover the model's denoise scale ``c_out``
-     empirically from ``(cond_denoised-uncond_denoised)`` vs the raw cond/uncond
-     outputs, convert the pag prediction into denoised (x0) space *exactly*
-     (parameterization-agnostic), and apply
-     ``result = cfg_result + scale*(cond_denoised - pag_denoised)`` followed by
-     the std-matching rescale.
+     rows untouched, so CFG proceeds exactly as normal, and stash the PAG x0
+     prediction.
+  2. ``model.apply_model`` already returns the predictor-converted denoised
+     (x0) prediction in Forge. In ``post_cfg_function`` we therefore apply the
+     original Safe-PAG correction directly:
+     ``guidance = scale*(cond_denoised - pag_denoised)`` and
+     ``result = cfg_result + rescale(guidance)``.
 
 Attention perturbation
 ----------------------
@@ -57,13 +56,13 @@ Everything is wrapped in try/except and ALWAYS falls back to the normal
 ``apply_model`` / ``denoised`` on any error, so enabling this can never break a
 generation — worst case it logs and renders normally.
 
-⚠️ 실험 기능 — 정적으로는 Forge Neo `neo` 브랜치 소스(sampling_function.py /
-patcher/base.py / nn/anima.py)와 일치하도록 작성했으나, 실제 Anima 체크포인트로
-end-to-end 런타임 검증이 1회 필요합니다. 콘솔의 ``[AnimaSafePAG]`` 로그로 경로가
-살아있는지 확인하세요.
+⚠️ 실험 기능 — Forge Neo 2.27 + `anima_baseV10`에서 True/False end-to-end
+생성을 검증했습니다. 다른 Anima 파생/정밀 조합은 콘솔의 ``[AnimaSafePAG]``
+첫 weak delta와 generation summary로 실제 적용 여부를 확인하세요.
 """
 from __future__ import annotations
 
+import math
 import sys
 import traceback
 from functools import partial
@@ -105,18 +104,32 @@ _STATE: dict = {
     "end": 0.7,           # end percent of sampling
     "total": 20,          # total steps this pass
     "step": 0,            # current step counter
+    # A sampling step may invoke the model wrapper more than once when Forge
+    # cannot fit cond+uncond in one batch. post_cfg closes the step after all
+    # of those calls have completed.
+    "step_open": False,
     # Row ranges of the appended weak predictions in the enlarged batch.
     "attn_b0": None, "attn_b1": None,   # attention-perturbed cond rows
     "slg_b0": None, "slg_b1": None,     # layer-skipped cond rows
     "any_b0": None,       # min appended index (marks "inside enlarged forward")
     "active": 0,          # >0 while inside a targeted self_attn.forward
-    "attn_raw": None,     # stashed attention-perturbed model-output
-    "slg_raw": None,      # stashed layer-skipped model-output
-    "cond_raw": None,     # stashed normal cond model-output
-    "uncond_raw": None,   # stashed normal uncond model-output
+    "attn_raw": None,     # stashed attention-perturbed denoised x0
+    "slg_raw": None,      # stashed layer-skipped denoised x0
     "gqa_warned": False,  # emit the GQA-skip note only once
     "apg_autooff_rescale": True,  # skip PAG rescale while APG is on (toggleable)
+    # Per-generation diagnostics. These make a silent no-op distinguishable
+    # from a genuinely active XYZ True cell in the WebUI console.
+    "wrapper_calls": 0,
+    "weak_steps": 0,
+    "applied_steps": 0,
+    "delta_logged": False,
 }
+
+_EXTRA_GENERATION_PARAM_KEYS = (
+    "Anima Perturbation Guidance",
+    "Anima APG",
+    "Anima Adaptive Guidance",
+)
 
 
 # ---------------------------------------------------------------------------
@@ -157,6 +170,7 @@ _ADG: dict = {
 # class-level op; _ORIG_SDPA is retained for compatibility with older builds.
 _ORIG_ANIMA_ATTN_OP = None
 _ORIG_SDPA = None
+_PATCH_OWNER = object()
 
 
 # ---------------------------------------------------------------------------
@@ -205,6 +219,9 @@ def _patched_anima_attention_op(query, key, value, *args, **kwargs):
     return out
 
 
+_patched_anima_attention_op._anima_pag_owner = _PATCH_OWNER
+
+
 def _patched_sdpa(query, key, value, *args, **kwargs):
     """Drop-in for ``backend.nn.anima.scaled_dot_product_attention``.
 
@@ -250,6 +267,9 @@ def _patched_sdpa(query, key, value, *args, **kwargs):
     return out
 
 
+_patched_sdpa._anima_pag_owner = _PATCH_OWNER
+
+
 def _make_selfattn_wrapper(idx: int, orig_forward):
     """Wrap ``self_attn.forward`` to raise ``active`` only for the attention
     target blocks, and only during the appended enlarged forward (``any_b0``)."""
@@ -263,6 +283,7 @@ def _make_selfattn_wrapper(idx: int, orig_forward):
                 _STATE["active"] -= 1
         return orig_forward(*args, **kwargs)
 
+    _wrapped._anima_pag_owner = _PATCH_OWNER
     return _wrapped
 
 
@@ -285,6 +306,7 @@ def _make_block_wrapper(idx: int, orig_forward):
             _log(f"slg skip skipped: {type(e).__name__}: {e}")
         return out
 
+    _wrapped._anima_pag_owner = _PATCH_OWNER
     return _wrapped
 
 
@@ -302,16 +324,36 @@ def _ensure_patched(diffusion_model) -> int:
 
     attn_cls = getattr(anima_mod, "SelfCrossAttention", None)
     if attn_cls is not None and hasattr(attn_cls, "torch_attention_op"):
-        if not getattr(attn_cls, "_pag_attention_op_patched", False):
-            global _ORIG_ANIMA_ATTN_OP
-            _ORIG_ANIMA_ATTN_OP = attn_cls.torch_attention_op
+        global _ORIG_ANIMA_ATTN_OP
+        current = attn_cls.torch_attention_op
+        original = getattr(attn_cls, "_pag_orig_attention_op", None)
+        if (original is None
+                and (getattr(current, "_anima_pag_owner", None) is not None
+                     or getattr(current, "__name__", "") == "_patched_anima_attention_op")):
+            # Recover the core function from a wrapper left behind by an older
+            # script module after WebUI's "reload scripts" action.
+            original = getattr(current, "__globals__", {}).get("_ORIG_ANIMA_ATTN_OP")
+        if original is None:
+            original = current
+        attn_cls._pag_orig_attention_op = original
+        _ORIG_ANIMA_ATTN_OP = original
+        if getattr(current, "_anima_pag_owner", None) is not _PATCH_OWNER:
             attn_cls.torch_attention_op = staticmethod(_patched_anima_attention_op)
             attn_cls._pag_attention_op_patched = True
             _log("patched backend.nn.anima.SelfCrossAttention.torch_attention_op ✅")
     elif hasattr(anima_mod, "scaled_dot_product_attention"):
-        if not getattr(anima_mod, "_pag_sdpa_patched", False):
-            global _ORIG_SDPA
-            _ORIG_SDPA = anima_mod.scaled_dot_product_attention
+        global _ORIG_SDPA
+        current = anima_mod.scaled_dot_product_attention
+        original = getattr(anima_mod, "_pag_orig_sdpa", None)
+        if (original is None
+                and (getattr(current, "_anima_pag_owner", None) is not None
+                     or getattr(current, "__name__", "") == "_patched_sdpa")):
+            original = getattr(current, "__globals__", {}).get("_ORIG_SDPA")
+        if original is None:
+            original = current
+        anima_mod._pag_orig_sdpa = original
+        _ORIG_SDPA = original
+        if getattr(current, "_anima_pag_owner", None) is not _PATCH_OWNER:
             anima_mod.scaled_dot_product_attention = _patched_sdpa
             anima_mod._pag_sdpa_patched = True
             _log("patched backend.nn.anima.scaled_dot_product_attention ✅")
@@ -328,9 +370,10 @@ def _ensure_patched(diffusion_model) -> int:
     wrapped_sa = wrapped_bl = 0
     for idx, block in enumerate(blocks):
         # SLG: wrap the whole block forward.
-        if not getattr(block, "_pag_block_wrapped", False):
+        if getattr(block.forward, "_anima_pag_owner", None) is not _PATCH_OWNER:
             try:
-                block._pag_orig_block_forward = block.forward
+                if not hasattr(block, "_pag_orig_block_forward"):
+                    block._pag_orig_block_forward = block.forward
                 block.forward = _make_block_wrapper(idx, block._pag_orig_block_forward)
                 block._pag_block_wrapped = True
                 wrapped_bl += 1
@@ -338,9 +381,11 @@ def _ensure_patched(diffusion_model) -> int:
                 _log(f"failed to wrap block {idx} forward: {type(e).__name__}: {e}")
         # PAG/SEG: wrap the self_attn forward.
         sa = getattr(block, "self_attn", None)
-        if sa is not None and not getattr(sa, "_pag_wrapped", False):
+        if (sa is not None
+                and getattr(sa.forward, "_anima_pag_owner", None) is not _PATCH_OWNER):
             try:
-                sa._pag_orig_forward = sa.forward
+                if not hasattr(sa, "_pag_orig_forward"):
+                    sa._pag_orig_forward = sa.forward
                 sa.forward = _make_selfattn_wrapper(idx, sa._pag_orig_forward)
                 sa._pag_wrapped = True
                 wrapped_sa += 1
@@ -420,46 +465,63 @@ def _clear_markers():
 
 
 def _model_wrapper(apply_model, w):
-    """model_function_wrapper: run ONE enlarged ``apply_model`` that also
+    """model_function_wrapper: run an enlarged cond ``apply_model`` that also
     produces the weak predictions (attention-perturbed for PAG/SEG and/or
-    layer-skipped for SLG) by appending copies of the cond rows to the batch.
-    No separate forward — every weak prediction rides the same kernel launch.
+    layer-skipped for SLG) by appending copies of the cond rows. This supports
+    both Forge's combined cond+uncond call and its low-VRAM split calls. No
+    separate forward — every weak prediction rides the cond kernel launch.
     """
     x = w.get("input")
     ts = w.get("timestep")
     c = w.get("c") or {}
     cou = w.get("cond_or_uncond")
 
-    _STATE["attn_raw"] = None
-    _STATE["slg_raw"] = None
     if not (_STATE["on"] or _ADG["on"]) or torch is None:
         return apply_model(x, ts, **c)
 
-    _STATE["step"] += 1
     try:
-        if cou is None or len(cou) != 2:
-            return apply_model(x, ts, **c)
-        if c.get("control") is not None:
+        _STATE["wrapper_calls"] += 1
+        if cou is None or len(cou) == 0:
             return apply_model(x, ts, **c)
 
         batch = x.shape[0]
+        if batch % len(cou) != 0:
+            return apply_model(x, ts, **c)
+
+        # Forge may call the wrapper once with [cond, uncond], or separately
+        # with [uncond] then [cond] when the combined Anima batch does not fit
+        # in VRAM. Treat all wrapper calls before post_cfg as one denoise step.
+        if not _STATE["step_open"]:
+            _STATE["step_open"] = True
+            _STATE["step"] += 1
+            _STATE["attn_raw"] = None
+            _STATE["slg_raw"] = None
+
         chunk = batch // len(cou)
         cond_idx, uncond_idx = [], []
         for i, marker in enumerate(cou):
             rng = list(range(i * chunk, (i + 1) * chunk))
             (cond_idx if int(marker) == 0 else uncond_idx).extend(rng)
-        if not cond_idx or not uncond_idx:
+
+        idx = torch.tensor(cond_idx, device=x.device, dtype=torch.long) \
+            if cond_idx else None
+        uidx = torch.tensor(uncond_idx, device=x.device, dtype=torch.long) \
+            if uncond_idx else None
+
+        # A split uncond-only call cannot carry a perturbation copy. Forge's
+        # post-CFG args already supply the aggregated denoised predictions, so
+        # there is nothing else to cache from this half.
+        if idx is None:
             return apply_model(x, ts, **c)
 
-        idx = torch.tensor(cond_idx, device=x.device, dtype=torch.long)
-        uidx = torch.tensor(uncond_idx, device=x.device, dtype=torch.long)
         n = len(cond_idx)
 
         # --- Adaptive Guidance: in the late steps, run cond-only and set the
         # uncond output = cond → CFG collapses to cond (guidance neutralized),
         # saving the uncond half of the batch. Takes precedence over the
         # (adds-work) perturbation path in those steps. ---
-        if _adg_should_skip():
+        if (_adg_should_skip() and uidx is not None
+                and len(cond_idx) == len(uncond_idx)):
             x_c = x.index_select(0, idx)
             ts_c = ts.index_select(0, idx)
             c_c = _select_c(c, idx, batch)
@@ -472,7 +534,7 @@ def _model_wrapper(apply_model, w):
             out_full.index_copy_(0, uidx, out_c)  # uncond := cond
             return out_full
 
-        if not _STATE["on"] or not _percent_in_range():
+        if not _STATE["on"] or not _percent_in_range() or c.get("control") is not None:
             return apply_model(x, ts, **c)
 
         attn_on = bool(_STATE["attn_method"]) and float(_STATE["attn_scale"]) > 0 \
@@ -511,8 +573,7 @@ def _model_wrapper(apply_model, w):
             _STATE["attn_raw"] = out_ext[a0:a1].detach().float()
         if s0 is not None:
             _STATE["slg_raw"] = out_ext[s0:s1].detach().float()
-        _STATE["cond_raw"] = out.index_select(0, idx).detach().float()
-        _STATE["uncond_raw"] = out.index_select(0, uidx).detach().float()
+        _STATE["weak_steps"] += 1
         return out
     except Exception as e:
         _clear_markers()
@@ -579,60 +640,60 @@ def _apply_apg(args, cond_scale):
 def _apply_perturbation(args, base):
     """Add the perturbation-guidance term(s) onto ``base`` (denoised space):
     ``scale·(cond_denoised − weak_denoised)`` for each active weak prediction
-    (attention-perturbed for PAG/SEG, and/or layer-skipped for SLG). Uses the
-    empirically-recovered ``c_out`` so it holds for eps/v/flow alike. When more
-    than one is active AND ``auto_decay`` is on, each scale is divided by the
-    active count. Returns ``base`` unchanged on any problem."""
+    (attention-perturbed for PAG/SEG, and/or layer-skipped for SLG). Forge's
+    ``model.apply_model`` has already converted every prediction to denoised
+    x0, so no eps/v/flow conversion is needed here. When more than one term is
+    active AND ``auto_decay`` is on, each scale is divided by the active count.
+    Returns ``base`` unchanged on any problem."""
     cd = args["cond_denoised"].float()
-    ud = args["uncond_denoised"].float()
-    cond_raw = _STATE["cond_raw"]
-    uncond_raw = _STATE["uncond_raw"]
     attn_raw = _STATE["attn_raw"]
     slg_raw = _STATE["slg_raw"]
-    if cond_raw is None or uncond_raw is None:
-        return base
-    if cd.shape != cond_raw.shape:
-        return base
-
-    # (cd-ud) = c_out*(cond_raw-uncond_raw). Recover c_out by least squares.
-    do = cond_raw - uncond_raw
-    dd = cd - ud
-    denom = (do * do).sum()
-    if float(denom) <= 1e-8:
-        return base
-    c_out = (dd * do).sum() / denom
 
     terms = []
-    if attn_raw is not None and attn_raw.shape == cond_raw.shape:
+    if attn_raw is not None and attn_raw.shape == cd.shape:
         terms.append((float(_STATE["attn_scale"]), attn_raw))
-    if slg_raw is not None and slg_raw.shape == cond_raw.shape:
+    if slg_raw is not None and slg_raw.shape == cd.shape:
         terms.append((float(_STATE["slg_scale"]), slg_raw))
     if not terms:
         return base
 
     decay = 1.0 / len(terms) if (_STATE["auto_decay"] and len(terms) > 1) else 1.0
-    result = base
+    guidance = torch.zeros_like(base, dtype=torch.float32)
     for scale, weak in terms:
-        # cond_denoised - weak_denoised = c_out*(cond_raw - weak_raw)
-        result = result + (scale * decay) * c_out * (cond_raw - weak)
+        guidance = guidance + (scale * decay) * (cd - weak)
 
-    # Rescale — auto-skipped while APG governs magnitude (toggleable).
+    if not _STATE["delta_logged"]:
+        _STATE["delta_logged"] = True
+        delta = float((cd - terms[0][1]).detach().abs().mean())
+        _log(
+            "first active-step mean |cond - weak|="
+            f"{delta:.8f}; terms={len(terms)}"
+        )
+
+    # Match the original Safe-PAG rescale: derive the factor from the full
+    # guided prediction, but scale ONLY the new guidance term. Scaling the
+    # entire CFG base every denoise step drains image energy and produces the
+    # near-black silhouettes seen with the old implementation.
     r = float(_STATE["rescale"])
     apg_governs = _APG["on"] and _STATE.get("apg_autooff_rescale", True)
     if r > 0 and not apg_governs:
-        dims = list(range(1, result.ndim))
+        guided = base.float() + guidance
+        dims = list(range(1, guided.ndim))
         std_c = cd.std(dim=dims, keepdim=True).clamp_min(1e-6)
-        std_r = result.std(dim=dims, keepdim=True).clamp_min(1e-6)
+        std_r = guided.std(dim=dims, keepdim=True).clamp_min(1e-6)
         factor = r * (std_c / std_r) + (1.0 - r)
-        result = result * factor
+        guidance = guidance * factor
+
+    result = base.float() + guidance
+    _STATE["applied_steps"] += 1
     return result
 
 
 def _post_cfg(args):
     """post_cfg orchestrator. Order: APG recomputes the CFG-combine base (if on),
     then perturbation guidance (PAG/SEG/SLG) is layered on top. Because the
-    perturbation term is added via a recovered ``c_out``, it composes on top of
-    ANY base — standard CFG, APG, or a built-in like MaHiRo/RescaleCFG.
+    perturbation term is an x0-space correction, it composes on top of ANY
+    base — standard CFG, APG, or a built-in like MaHiRo/RescaleCFG.
     """
     denoised = args["denoised"]
     if torch is None:
@@ -641,6 +702,7 @@ def _post_cfg(args):
     # without the float() round-trip / two latent-sized allocations per step.
     has_pert = _STATE["on"] and (_STATE["attn_raw"] is not None or _STATE["slg_raw"] is not None)
     if not _APG["on"] and not has_pert:
+        _STATE["step_open"] = False
         _STATE["attn_raw"] = None
         _STATE["slg_raw"] = None
         return denoised
@@ -660,6 +722,7 @@ def _post_cfg(args):
         _log(f"post_cfg fallback → unmodified cfg: {type(e).__name__}: {e}")
         return denoised
     finally:
+        _STATE["step_open"] = False
         _STATE["attn_raw"] = None
         _STATE["slg_raw"] = None
 
@@ -670,11 +733,17 @@ def _post_cfg(args):
 
 
 def _parse_blocks(spec: str, n: int) -> set:
-    """Parse "18", "14-27", "14,16,18" → a set of valid indices. Empty spec →
-    auto: the later half (node recommends >14 on a 28-block Anima)."""
+    """Parse "18", "14-27", "14,16,18" → valid block indices.
+
+    The upstream Anima Safe PAG default is one balanced late block (18 on the
+    common 28-block model). The old port treated an empty field as *every*
+    block in the later half (14-27), which multiplied a soft perturbation into
+    a destructive one. Keep the safe single-block default and clamp it for
+    smaller compatible models.
+    """
     spec = (spec or "").strip()
     if not spec:
-        return set(range(n // 2, n))
+        return {min(18, n - 1)} if n > 0 else set()
     out: set = set()
     for part in spec.replace(" ", "").split(","):
         if not part:
@@ -799,6 +868,31 @@ def _as_bool(value, default: bool) -> bool:
     return str(value).strip().lower() in {"true", "1", "yes", "on"}
 
 
+def _finite_clamp(value, low: float, high: float, default: float) -> float:
+    """Clamp UI/XYZ numeric input and reject NaN/Inf safely."""
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        number = float(default)
+    if not math.isfinite(number):
+        number = float(default)
+    return min(high, max(low, number))
+
+
+def _clear_extra_generation_params(p) -> None:
+    """Remove per-cell guidance metadata before applying XYZ overrides.
+
+    ``p`` is reused across XYZ cells. Without this cleanup, a False cell keeps
+    the preceding True cell's "Anima Perturbation Guidance" infotext even
+    though the hook is disabled.
+    """
+    params = getattr(p, "extra_generation_params", None)
+    if not isinstance(params, dict):
+        return
+    for key in _EXTRA_GENERATION_PARAM_KEYS:
+        params.pop(key, None)
+
+
 # ---------------------------------------------------------------------------
 # The extension script
 # ---------------------------------------------------------------------------
@@ -850,8 +944,8 @@ class AnimaSafePAG(scripts.Script):
                 elem_id="anima_safe_pag_strength",
             )
             block_indices = gr.Textbox(
-                label="Attention block indices (빈칸=후반 절반 자동, 예: 18 / 14-27)",
-                value="",
+                label="Attention block indices (권장·빈칸 기본=18, 예: 18 / 18-20)",
+                value="18",
                 elem_id="anima_safe_pag_blocks",
             )
 
@@ -867,8 +961,8 @@ class AnimaSafePAG(scripts.Script):
                 elem_id="anima_safe_pag_slg_scale",
             )
             slg_blocks = gr.Textbox(
-                label="SLG skip block indices (빈칸=후반 절반 자동)",
-                value="",
+                label="SLG skip block indices (빈칸 기본=18)",
+                value="18",
                 elem_id="anima_safe_pag_slg_blocks",
             )
 
@@ -975,11 +1069,17 @@ class AnimaSafePAG(scripts.Script):
 
         # XYZ-plot overrides (set per grid cell by the AxisOption apply fns).
         xyz = getattr(p, "_anima_safe_pag_xyz", {}) or {}
+        _clear_extra_generation_params(p)
+        _STATE.update(
+            wrapper_calls=0, weak_steps=0, applied_steps=0,
+            delta_logged=False,
+        )
 
         def _xyz_num(key, cur):
             if key in xyz:
                 try:
-                    return float(xyz[key])
+                    value = float(xyz[key])
+                    return value if math.isfinite(value) else cur
                 except (TypeError, ValueError):
                     return cur
             return cur
@@ -1023,11 +1123,11 @@ class AnimaSafePAG(scripts.Script):
             attn_method = method_str if method_str in ("pag", "seg") else None
             scale = _xyz_num("scale", float(_arg(2, 4.0)))
             strength = _xyz_num("strength", float(_arg(3, 0.75)))
-            block_spec = str(xyz["blocks"]) if "blocks" in xyz else str(_arg(4, ""))
+            block_spec = str(xyz["blocks"]) if "blocks" in xyz else str(_arg(4, "18"))
             slg_on = _as_bool(xyz["slg_enabled"], _as_bool(_arg(5, False), False)) \
                 if "slg_enabled" in xyz else _as_bool(_arg(5, False), False)
             slg_scale = _xyz_num("slg_scale", float(_arg(6, 3.0)))
-            slg_block_spec = str(xyz["slg_blocks"]) if "slg_blocks" in xyz else str(_arg(7, ""))
+            slg_block_spec = str(xyz["slg_blocks"]) if "slg_blocks" in xyz else str(_arg(7, "18"))
             start = _xyz_num("start", float(_arg(8, 0.0)))
             end = _xyz_num("end", float(_arg(9, 0.7)))
             rescale = _xyz_num("rescale", float(_arg(10, 0.20)))
@@ -1037,13 +1137,28 @@ class AnimaSafePAG(scripts.Script):
             apg_momentum = _xyz_num("apg_momentum", float(_arg(15, 0.0)))
             apg_autooff = _as_bool(_arg(16, True), True)
             adg_start = _xyz_num("adg_start", float(_arg(18, 0.5)))
-            adg_interval = int(_xyz_num("adg_interval", float(_arg(19, 0))))
+            adg_interval = _xyz_num("adg_interval", float(_arg(19, 0)))
         except Exception as e:
             _STATE["on"] = False
             _APG["on"] = False
             _ADG["on"] = False
             _log(f"bad args, disabling: {type(e).__name__}: {e}")
             return
+
+        # Gradio sliders constrain interactive values, but XYZ axes accept
+        # arbitrary strings (including NaN/Inf). Keep the same safe domains
+        # when values arrive through XYZ or an API client.
+        scale = _finite_clamp(scale, 0.0, 15.0, 4.0)
+        strength = _finite_clamp(strength, 0.0, 1.0, 0.75)
+        slg_scale = _finite_clamp(slg_scale, 0.0, 15.0, 3.0)
+        start = _finite_clamp(start, 0.0, 1.0, 0.0)
+        end = _finite_clamp(end, 0.0, 1.0, 0.7)
+        rescale = _finite_clamp(rescale, 0.0, 1.0, 0.20)
+        apg_eta = _finite_clamp(apg_eta, -10.0, 10.0, 0.0)
+        apg_norm = _finite_clamp(apg_norm, 0.0, 50.0, 15.0)
+        apg_momentum = _finite_clamp(apg_momentum, -1.0, 1.0, 0.0)
+        adg_start = _finite_clamp(adg_start, 0.0, 1.0, 0.5)
+        adg_interval = int(_finite_clamp(adg_interval, 0.0, 10.0, 0.0))
 
         sd_model = getattr(p, "sd_model", None)
         engine = type(sd_model).__name__ if sd_model is not None else "?"
@@ -1104,6 +1219,7 @@ class AnimaSafePAG(scripts.Script):
                 slg_targets=slg_targets, auto_decay=auto_decay, rescale=rescale,
                 start=min(start, end), end=max(start, end),
                 active=0, attn_raw=None, slg_raw=None,
+                step_open=False,
             )
             _clear_markers()
         else:
@@ -1115,6 +1231,7 @@ class AnimaSafePAG(scripts.Script):
         # Step counter / total drive both perturbation range and AG gating.
         _STATE["total"] = int(getattr(p, "steps", 20) or 20)
         _STATE["step"] = 0
+        _STATE["step_open"] = False
 
         # ---- Attach hooks (clone so Forge core / other gens are untouched) ----
         try:
@@ -1169,13 +1286,23 @@ class AnimaSafePAG(scripts.Script):
     def postprocess(self, p, processed, *args):
         # Belt-and-suspenders: make sure guidance doesn't leak into a later
         # generation if forge_objects reuse ever changed.
+        if _STATE["wrapper_calls"]:
+            _log(
+                "generation summary: "
+                f"wrapper_calls={_STATE['wrapper_calls']} "
+                f"weak_steps={_STATE['weak_steps']} "
+                f"applied_steps={_STATE['applied_steps']}"
+            )
         _STATE["on"] = False
         _APG["on"] = False
         _ADG["on"] = False
         # Drop the stashed latent-sized tensors so they don't sit in VRAM
         # between generations (they'd otherwise linger until the next gen).
-        _STATE["cond_raw"] = None
-        _STATE["uncond_raw"] = None
         _STATE["attn_raw"] = None
         _STATE["slg_raw"] = None
+        _STATE["step_open"] = False
+        _STATE["wrapper_calls"] = 0
+        _STATE["weak_steps"] = 0
+        _STATE["applied_steps"] = 0
+        _STATE["delta_logged"] = False
         _APG["avg"] = None

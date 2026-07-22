@@ -5,9 +5,8 @@ SAM3 워크플로와 완전히 분리돼 있고(`sam3ext`를 전혀 import하지
 파일을 건드리지 않으며**, 전 구간 try/except로 어떤 오류에도 일반 생성으로 폴백합니다 —
 켜 둬도 생성이 깨지지 않습니다.
 
-> ⚠️ **실험 기능 — 런타임 검증 미완.** Forge Neo `neo` 브랜치 소스(`sampling_function.py` /
-> `patcher/base.py` / `nn/anima.py`)와 정적으로 일치하도록 작성했고 각 기능의 수학은
-> 독립 검증했으나, 실제 Anima 체크포인트로 end-to-end 확인이 1회 필요합니다. webui 콘솔의
+> ⚠️ **실험 기능.** PAG는 Forge Neo 2.27 + `anima_baseV10`에서 True/False
+> end-to-end 생성을 검증했습니다. 다른 파생 모델/정밀 조합은 webui 콘솔의
 > `[AnimaSafePAG]` / `[AnimaDetailDaemon]` 로그로 훅 부착·동작을 확인하세요.
 
 ## 구성 파일
@@ -47,10 +46,10 @@ Forge Neo 실제 샘플링 경로(`backend/sampling/sampling_function.py`)는 Co
 1. **`model_function_wrapper`** — `apply_model`이 보는 cond/uncond 배치를 감쌉니다.
    Perturbation은 여기서 **cond 행을 복제해 배치에 붙여** 약한 예측을 *같은 forward*로
    계산하고(별도 호출 없음), Adaptive Guidance는 반대로 **uncond 행을 제거**합니다.
-2. **`post_cfg_function`** — CFG 합성 결과 위에서 guidance를 조정합니다. cond/uncond의
-   denoise 스케일 `c_out`을 **실측 복원**해 약한 예측을 denoised(x0) 공간으로 정확히
-   (eps/v/flow-matching 무관) 변환하므로, 베이스가 표준 CFG·APG·MaHiRo 무엇이든 그 위에
-   안전하게 얹힙니다.
+2. **`post_cfg_function`** — Forge의 `model.apply_model` 결과는 이미 predictor가 변환한
+   denoised(x0) 예측입니다. 따라서 `cond_x0 − weak_x0`를 직접 guidance로 더하며,
+   eps/v/flow-matching 종류와 무관하게 표준 CFG·APG·MaHiRo 등의 결과 위에 안전하게
+   얹힙니다. Rescale은 **CFG 전체가 아닌 PAG 보정량만** 조정합니다.
 
 어텐션 perturbation은 `backend/nn/anima.py`의 모듈 전역 `scaled_dot_product_attention`을
 감싸 **약한 예측 행에만** 적용합니다(value는 RoPE가 없어 rotary-safe, grouped-query로 head
@@ -85,10 +84,10 @@ forward로 계산합니다(활성 수만큼 배치 행만 증가).
 | Attention perturbation | PAG | `PAG` / `SEG` / `None`(=SLG만) |
 | Attention guidance scale | 4.0 | PAG/SEG guidance 세기 |
 | Perturbation strength | 0.75 | PAG: →value / SEG: →uniform 블렌드 비율 |
-| Attention block indices | 빈칸(=후반 절반 자동) | `18` / `14-27` (28블록은 >14 권장) |
+| Attention block indices | `18` | 빈칸도 안전 기본 `18`로 처리. 필요 시 `18-20` 형식 |
 | Enable SLG | off | 레이어 스킵 약한 예측 병용 |
 | SLG guidance scale | 3.0 | SLG guidance 세기 |
-| SLG skip block indices | 빈칸(=후반 절반 자동) | 스킵할 블록 |
+| SLG skip block indices | `18` | 빈칸도 `18`로 처리. 스킵할 블록 |
 | Start ~ End percent | 0.0 ~ 0.7 | 적용 샘플링 구간(나머지 스텝은 원가) |
 | Rescale | 0.20 | 대비/채도 과다 억제 (APG 켜지면 자동 off) |
 | **동시 사용 시 scale 자동 감쇠** *(토글)* | on | 활성 수로 각 scale ÷ (과대 guidance 방지). 끄면 원 scale |
