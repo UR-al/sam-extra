@@ -111,9 +111,10 @@ _STATE: dict = {
     # mutually exclusive; None → no attention perturbation (SLG only).
     "attn_method": "pag",
     "attn_scale": 4.0,    # guidance strength for the attention-perturbation term
-    "strength": 0.75,     # legacy-only blend (pag: →value; seg: →uniform/mean)
-    "legacy_attn": False, # False=official hard PAG / Gaussian-query SEG
+    "strength": 0.75,     # perturbation blend (1=full official target)
+    "legacy_attn": False, # False=official PAG value / Gaussian-query SEG
     "seg_sigma": 100.0,   # official SEG query-blur sigma (>9999=infinite)
+    "head_spec": "",      # empty=all attention heads; supports 0,2,4-7
     "attn_targets": set(),  # block indices for attention perturbation
     # SLG (Skip Layer Guidance): skip whole blocks on a separate weak prediction.
     "slg_on": False,
@@ -121,6 +122,7 @@ _STATE: dict = {
     "slg_targets": set(),  # block indices to skip
     "auto_decay": True,   # halve each scale when >1 perturbation is active (toggle)
     "rescale": 0.20,      # std-matching rescale factor
+    "rescale_mode": "full",  # full=CFG+guidance, partial=cond+guidance std source
     "start": 0.0,         # start percent of sampling
     "end": 0.7,           # end percent of sampling
     "total": 20,          # total steps this pass
@@ -310,12 +312,41 @@ def _gaussian_blur_2d(img, sigma: float):
     return F.conv2d(img, kernel_2d, groups=img.shape[-3])
 
 
+def _parse_attention_heads(spec: str, n: int) -> set:
+    """Parse an optional attention-head list; an empty value selects all."""
+    if n <= 0:
+        return set()
+    spec = (spec or "").strip()
+    if not spec:
+        return set(range(n))
+    out: set = set()
+    for part in spec.replace(" ", "").split(","):
+        if not part:
+            continue
+        if "-" in part:
+            a, _, b = part.partition("-")
+            try:
+                start, end = int(a), int(b)
+                if start <= end:
+                    out.update(range(start, end + 1))
+            except ValueError:
+                pass
+        else:
+            try:
+                out.add(int(part))
+            except ValueError:
+                pass
+    return {i for i in out if 0 <= i < n}
+
+
 def _official_seg_query(
     query,
     a0: int,
     a1: int,
     sigma: float,
     spatial_shape=None,
+    strength: float = 1.0,
+    head_spec: str = "",
 ):
     """Blur only appended weak-row queries over Anima's real spatial axes.
 
@@ -332,7 +363,7 @@ def _official_seg_query(
             spatial = spatial.mean(dim=(-2, -1), keepdim=True).expand_as(spatial)
         else:
             spatial = _gaussian_blur_2d(spatial, sigma)
-        weak = spatial.reshape(b, t, n, d, h, w).permute(0, 1, 4, 5, 2, 3)
+        perturbed = spatial.reshape(b, t, n, d, h, w).permute(0, 1, 4, 5, 2, 3)
     elif weak.ndim == 4:  # B,S,N,D (current Forge Neo)
         if not spatial_shape or len(spatial_shape) != 3:
             raise ValueError("official SEG needs the surrounding block's T/H/W shape")
@@ -350,15 +381,25 @@ def _official_seg_query(
             spatial = spatial.mean(dim=(-2, -1), keepdim=True).expand_as(spatial)
         else:
             spatial = _gaussian_blur_2d(spatial, sigma)
-        weak = (
+        perturbed = (
             spatial.reshape(b, t, n, d, h, w)
             .permute(0, 1, 4, 5, 2, 3)
             .reshape(b, seq, n, d)
         )
     else:
         raise ValueError(f"unsupported query layout {tuple(query.shape)}")
+    heads = sorted(_parse_attention_heads(head_spec, int(weak.shape[-2])))
+    if not heads:
+        return query
+    strength = min(1.0, max(0.0, float(strength)))
+    blended = weak.clone()
+    blended[..., heads, :] = torch.lerp(
+        weak[..., heads, :],
+        perturbed[..., heads, :],
+        strength,
+    )
     result = query.clone()
-    result[a0:a1] = weak
+    result[a0:a1] = blended
     return result
 
 
@@ -390,6 +431,8 @@ def _patched_anima_attention_op(query, key, value, *args, **kwargs):
                 a1,
                 float(_STATE["seg_sigma"]),
                 _STATE.get("attn_spatial_shape"),
+                float(_STATE["strength"]),
+                str(_STATE.get("head_spec", "")),
             )
         out = original(query, key, value, *args, **kwargs)
         if a1 > out.shape[0]:
@@ -412,19 +455,34 @@ def _patched_anima_attention_op(query, key, value, *args, **kwargs):
                 )
             return out
 
-        strength = float(_STATE["strength"]) if legacy else 1.0
-        result = out.clone()
+        heads = sorted(
+            _parse_attention_heads(
+                str(_STATE.get("head_spec", "")),
+                int(value.shape[-2]),
+            )
+        )
+        if not heads:
+            return out
+        strength = float(_STATE["strength"])
+        out_heads = out.reshape_as(value)
+        result_heads = out_heads.clone()
         if method == "pag":
-            target = value_path[a0:a1]
+            target = value[a0:a1]
         elif method == "seg":
             # Uniform attention is the sequence-wise mean of values.
-            target = value_path[a0:a1].mean(dim=1, keepdim=True).expand_as(out[a0:a1])
+            target = value[a0:a1].mean(dim=1, keepdim=True).expand_as(value[a0:a1])
         else:
             return out
-        result[a0:a1] = torch.lerp(out[a0:a1], target, strength)
+        weak = result_heads[a0:a1]
+        weak[..., heads, :] = torch.lerp(
+            out_heads[a0:a1, :, heads, :],
+            target[..., heads, :],
+            strength,
+        )
+        result_heads[a0:a1] = weak
         _STATE["attn_hook_hits"] += 1
         _STATE["attn_hook_hits_total"] += 1
-        return result
+        return result_heads.reshape_as(out)
     except Exception as e:  # never let the patch break sampling
         _log(f"attention perturb skipped: {type(e).__name__}: {e}")
         if out is not None:
@@ -1197,14 +1255,18 @@ def _apply_perturbation(args, base):
             f"{delta:.8f}; terms={len(terms)}"
         )
 
-    # Match the original Safe-PAG rescale: derive the factor from the full
-    # guided prediction, but scale ONLY the new guidance term. Scaling the
-    # entire CFG base every denoise step drains image energy and produces the
-    # near-black silhouettes seen with the old implementation.
+    # Match the original Safe-PAG rescale. ``full`` derives the factor from the
+    # incoming CFG result plus PAG/SEG guidance; ``partial`` uses the conditional
+    # prediction plus guidance. In both modes only the new guidance term is
+    # scaled. Scaling the entire CFG base every denoise step drains image energy.
     r = float(_STATE["rescale"])
     apg_governs = _APG["on"] and _STATE.get("apg_autooff_rescale", True)
     if r > 0 and not apg_governs:
-        guided = base.float() + guidance
+        guided = (
+            cd + guidance
+            if _STATE.get("rescale_mode", "full") == "partial"
+            else base.float() + guidance
+        )
         dims = list(range(1, guided.ndim))
         std_c = cd.std(dim=dims, keepdim=True).clamp_min(1e-6)
         std_r = guided.std(dim=dims, keepdim=True).clamp_min(1e-6)
@@ -1362,12 +1424,20 @@ def _make_pag_xyz_axis() -> None:
             partial(_pag_xyz_set, field="legacy_attn"), choices=bool_choices,
         ),
         xyz_grid.AxisOption(
+            "[Anima Pert] Legacy Perturbation Strength", float,
+            partial(_pag_xyz_set, field="legacy_strength"),
+        ),
+        xyz_grid.AxisOption(
             "[Anima Pert] SEG Blur Sigma", float,
             partial(_pag_xyz_set, field="seg_sigma"),
         ),
         xyz_grid.AxisOption(
             "[Anima Pert] Attn Block Indices", str,
             partial(_pag_xyz_set, field="blocks"),
+        ),
+        xyz_grid.AxisOption(
+            "[Anima Pert] Attn Head Indices", str,
+            partial(_pag_xyz_set, field="heads"),
         ),
         xyz_grid.AxisOption(
             "[Anima Pert] SLG Enable", str,
@@ -1381,6 +1451,11 @@ def _make_pag_xyz_axis() -> None:
         xyz_grid.AxisOption("[Anima Pert] Start Percent", float, partial(_pag_xyz_set, field="start")),
         xyz_grid.AxisOption("[Anima Pert] End Percent", float, partial(_pag_xyz_set, field="end")),
         xyz_grid.AxisOption("[Anima Pert] Rescale", float, partial(_pag_xyz_set, field="rescale")),
+        xyz_grid.AxisOption(
+            "[Anima Pert] Rescale Mode", str,
+            partial(_pag_xyz_set, field="rescale_mode"),
+            choices=lambda: ["full", "partial"],
+        ),
         # APG axes (ON/OFF + the three knobs) for the same style of comparison.
         xyz_grid.AxisOption(
             "[Anima APG] Enable", str,
@@ -1557,23 +1632,34 @@ class AnimaSafePAG(scripts.Script):
             )
             gr.Markdown(
                 "#### PAG / SEG — Attention perturbation\n"
-                "기본은 **공식 방식**입니다: PAG는 hard value-only, SEG는 실제 H·W query에 "
-                "Gaussian blur를 적용합니다. `None`은 SLG만 사용할 때 선택하세요."
+                "기본은 **공식 경로**입니다: PAG는 value-only, SEG는 실제 H·W query에 "
+                "Gaussian blur를 적용합니다. Strength=1이면 원 기법의 전체 perturbation, "
+                "기본 0.75는 Anima Safe PAG의 부드러운 권장값입니다. `None`은 SLG만 "
+                "사용할 때 선택하세요."
             )
             attn_method = gr.Radio(
                 label="Attention perturbation method",
                 choices=["PAG", "SEG", "None"],
                 value="PAG",
+                info="PAG와 SEG는 둘 중 하나만 선택합니다. SLG만 쓸 때는 None을 선택하세요.",
                 elem_id="anima_safe_pag_method",
             )
             scale = gr.Slider(
-                label="PAG / SEG guidance scale",
+                label="Attn Scale — PAG / SEG guidance scale (cond−weak 배율)",
                 minimum=0.0, maximum=15.0, step=0.1, value=4.0,
+                info="이미지가 찢어지거나 배경·구도가 과하게 변하면 이 값을 먼저 낮추세요.",
                 elem_id="anima_safe_pag_scale",
+            )
+            official_strength = gr.Slider(
+                label="Perturbation strength (PAG→value · SEG→blurred query · 1=전체)",
+                minimum=0.0, maximum=1.0, step=0.01, value=0.75,
+                info="윤곽·질감이 깨지거나 노이즈가 늘면 낮추세요. 1.0이 가장 강합니다.",
+                elem_id="anima_safe_pag_official_strength",
             )
             seg_sigma = gr.Slider(
                 label="SEG Gaussian query blur sigma (공식 · >9999=uniform query)",
                 minimum=0.0, maximum=10000.0, step=1.0, value=100.0,
+                info="SEG 전용입니다. 형태가 뭉개지거나 영향이 과하면 낮추세요.",
                 elem_id="anima_safe_pag_seg_sigma",
             )
             with gr.Accordion("Legacy Soft/Approx 호환", open=False):
@@ -1582,15 +1668,23 @@ class AnimaSafePAG(scripts.Script):
                     value=False,
                     elem_id="anima_safe_pag_legacy_attn",
                 )
-                strength = gr.Slider(
+                legacy_strength = gr.Slider(
                     label="Legacy perturbation strength (PAG→value · SEG→uniform value)",
                     minimum=0.0, maximum=1.0, step=0.01, value=0.75,
+                    info="Legacy 모드 전용입니다. 이미지가 깨지거나 검게 무너지면 낮추세요.",
                     elem_id="anima_safe_pag_strength",
                 )
             block_indices = gr.Textbox(
                 label="Attention block indices (권장·빈칸 기본=18, 예: 18 / 18-20)",
                 value="18",
+                info="여러 블록은 효과와 위험을 함께 키웁니다. 이상하면 18 하나로 되돌리세요.",
                 elem_id="anima_safe_pag_blocks",
+            )
+            head_indices = gr.Textbox(
+                label="Attention head indices (빈칸=전체, 예: 0,2,4-7)",
+                value="",
+                info="실험용 세부 선택입니다. 띠·분할 무늬가 생기면 빈칸으로 복귀한 뒤 Scale/Strength부터 낮추세요.",
+                elem_id="anima_safe_pag_heads",
             )
 
             gr.Markdown(
@@ -1602,17 +1696,27 @@ class AnimaSafePAG(scripts.Script):
                 start_percent = gr.Slider(
                     label="Start percent (공통 · 0=샘플링 시작)",
                     minimum=0.0, maximum=1.0, step=0.01, value=0.0,
+                    info="초반 구도·인물 배치가 무너지면 값을 올려 더 늦게 시작하세요.",
                     elem_id="anima_safe_pag_start",
                 )
                 end_percent = gr.Slider(
                     label="End percent (공통 · 1=샘플링 끝)",
                     minimum=0.0, maximum=1.0, step=0.01, value=0.7,
+                    info="후반 윤곽·세부가 깨지면 값을 낮춰 더 일찍 끝내세요.",
                     elem_id="anima_safe_pag_end",
                 )
             rescale = gr.Slider(
                 label="Rescale (공통 · 대비/채도 과다 억제)",
                 minimum=0.0, maximum=1.0, step=0.01, value=0.20,
+                info="과채도·과대비면 올리고, 색이 탁하거나 대비가 눌리면 낮추거나 0으로 비교하세요.",
                 elem_id="anima_safe_pag_rescale",
+            )
+            rescale_mode = gr.Radio(
+                label="Rescale mode (full=CFG 결과 기준 · partial=cond 기준)",
+                choices=["full", "partial"],
+                value="full",
+                info="대부분 full을 권장합니다. partial에서 결과가 불안정하면 full로 되돌리세요.",
+                elem_id="anima_safe_pag_rescale_mode",
             )
 
             gr.Markdown(
@@ -1628,17 +1732,20 @@ class AnimaSafePAG(scripts.Script):
             slg_scale = gr.Slider(
                 label="SLG guidance scale",
                 minimum=0.0, maximum=15.0, step=0.1, value=3.0,
+                info="인물·배경이 갈라지거나 형태가 깨지면 낮추세요.",
                 elem_id="anima_safe_pag_slg_scale",
             )
             slg_blocks = gr.Textbox(
                 label="SLG skip block indices (빈칸 기본=18)",
                 value="18",
+                info="여러 블록을 건너뛸수록 불안정해질 수 있습니다. 이상하면 18 하나만 쓰세요.",
                 elem_id="anima_safe_pag_slg_blocks",
             )
 
             auto_decay = gr.Checkbox(
                 label="PAG/SEG + SLG 병용 시 각 scale 자동 감쇠 (÷활성 수)",
                 value=True,
+                info="병용 시 과도한 보정을 막는 안전장치입니다. 개별 scale을 직접 맞출 때만 끄세요.",
                 elem_id="anima_safe_pag_auto_decay",
             )
 
@@ -1669,16 +1776,19 @@ class AnimaSafePAG(scripts.Script):
                 apg_eta = gr.Slider(
                     label="APG eta (평행 성분 비중 · 낮을수록 과채도↓)",
                     minimum=-10.0, maximum=10.0, step=0.05, value=0.0,
+                    info="과채도·번짐은 낮추고, 스타일이나 구조가 너무 약해지면 1 쪽으로 올리세요.",
                     elem_id="anima_safe_pag_apg_eta",
                 )
                 apg_norm = gr.Slider(
                     label="APG norm threshold (guidance 크기 상한 · 0=off)",
                     minimum=0.0, maximum=50.0, step=0.5, value=15.0,
+                    info="강한 CFG 아티팩트에는 낮추고, 결과가 지나치게 눌리면 올리거나 0으로 끄세요.",
                     elem_id="anima_safe_pag_apg_norm",
                 )
                 apg_momentum = gr.Slider(
                     label="APG momentum (스텝 간 running-average · 음수 권장 · 0=off)",
                     minimum=-1.0, maximum=1.0, step=0.05, value=0.0,
+                    info="잔상·고스팅이나 스텝 간 불안정이 보이면 0 쪽으로 되돌리세요.",
                     elem_id="anima_safe_pag_apg_momentum",
                 )
 
@@ -1697,6 +1807,7 @@ class AnimaSafePAG(scripts.Script):
             adg_start = gr.Slider(
                 label="Skip after (이 지점 이후 uncond 생략)",
                 minimum=0.0, maximum=1.0, step=0.01, value=0.5,
+                info="품질 손실이 보이면 올려 더 늦게 생략하고, 속도 우선이면 낮추세요.",
                 elem_id="anima_safe_pag_adg_start",
             )
             with gr.Accordion("Adaptive Guidance Advanced (세부값)", open=False):
@@ -1707,6 +1818,7 @@ class AnimaSafePAG(scripts.Script):
                 adg_interval = gr.Slider(
                     label="Keep every N steps (0 = 항상 생략)",
                     minimum=0, maximum=10, step=1, value=0,
+                    info="품질 손실 시 1~2로 두고, 속도 우선이면 값을 키우거나 0(항상 생략)을 쓰세요.",
                     elem_id="anima_safe_pag_adg_interval",
                 )
 
@@ -1726,22 +1838,26 @@ class AnimaSafePAG(scripts.Script):
                     "SMC + CWM",
                 ],
                 value="Preserve incoming",
+                info="호환 문제나 이미지 붕괴가 생기면 Preserve incoming으로 되돌리세요.",
                 elem_id="anima_guidance_cfg_mode",
             )
             experimental_stack = gr.Checkbox(
                 label="Experimental stack: SMC → APG → CWM (고급 실험)",
                 value=False,
+                info="효과가 겹쳐 불안정할 수 있습니다. 깨짐이 생기면 끄고 한 모드씩 비교하세요.",
                 elem_id="anima_guidance_experimental_stack",
             )
             with gr.Accordion("CWM / SMC Advanced", open=False):
                 cwm_alpha_low = gr.Slider(
                     label="CWM alpha low (초반 저주파 CFG)",
                     minimum=-1.0, maximum=1.0, step=0.01, value=0.30,
+                    info="전체 구도·큰 색면이 과하게 변하면 0 쪽으로 줄이세요.",
                     elem_id="anima_guidance_cwm_alpha_low",
                 )
                 cwm_alpha_high = gr.Slider(
                     label="CWM alpha high (후반 고주파 CFG)",
                     minimum=-1.0, maximum=1.0, step=0.01, value=0.15,
+                    info="인물 복제·윤곽 링·세부 노이즈가 생기면 0 쪽으로 줄이세요.",
                     elem_id="anima_guidance_cwm_alpha_high",
                 )
                 alpha_high_warning = gr.Markdown(
@@ -1762,85 +1878,95 @@ class AnimaSafePAG(scripts.Script):
                 smc_lambda = gr.Slider(
                     label="SMC lambda (Anima/Cosmos 보수값 6.0)",
                     minimum=0.0, maximum=10.0, step=0.1, value=6.0,
+                    info="스텝 간 흔들림이나 과보정이 보이면 낮추세요. 0이면 SMC가 꺼집니다.",
                     elem_id="anima_guidance_smc_lambda",
                 )
                 smc_k = gr.Slider(
                     label="SMC k (Anima/Cosmos 보수값 0.20)",
                     minimum=0.0, maximum=1.0, step=0.01, value=0.20,
+                    info="보정이 튀거나 디테일이 깨지면 낮추세요. 0이면 SMC가 꺼집니다.",
                     elem_id="anima_guidance_smc_k",
                 )
 
-            with gr.Accordion("DCW (post-CFG wavelet correction)", open=False):
-                dcw_enabled = gr.Checkbox(
-                    label="Enable DCW",
-                    value=False,
-                    elem_id="anima_guidance_dcw_enable",
+            gr.Markdown("#### DCW — post-CFG wavelet correction")
+            dcw_enabled = gr.Checkbox(
+                label="Enable DCW",
+                value=False,
+                elem_id="anima_guidance_dcw_enable",
+            )
+            with gr.Row():
+                dcw_lambda_low = gr.Slider(
+                    label="DCW lambda low",
+                    minimum=-0.5, maximum=0.5, step=0.005, value=0.10,
+                    info="구도·밝기·큰 색면이 어색해지면 0 쪽으로 줄이세요.",
+                    elem_id="anima_guidance_dcw_lambda_low",
                 )
-                with gr.Row():
-                    dcw_lambda_low = gr.Slider(
-                        label="DCW lambda low",
-                        minimum=-0.5, maximum=0.5, step=0.005, value=0.10,
-                        elem_id="anima_guidance_dcw_lambda_low",
-                    )
-                    dcw_lambda_high = gr.Slider(
-                        label="DCW lambda high",
-                        minimum=-0.5, maximum=0.5, step=0.005, value=0.02,
-                        elem_id="anima_guidance_dcw_lambda_high",
-                    )
-
-            with gr.Accordion("DAVE (Anima diversity · block DC attenuation)", open=False):
-                dave_enabled = gr.Checkbox(
-                    label="Enable DAVE",
-                    value=False,
-                    elem_id="anima_guidance_dave_enable",
-                )
-                dave_strength = gr.Slider(
-                    label="DAVE strength",
-                    minimum=0.0, maximum=1.0, step=0.01, value=0.30,
-                    elem_id="anima_guidance_dave_strength",
-                )
-                dave_tau = gr.Slider(
-                    label="DAVE early-step tau (0=전 구간, 권장 0.10)",
-                    minimum=0.0, maximum=1.0, step=0.01, value=0.10,
-                    elem_id="anima_guidance_dave_tau",
-                )
-                dave_blocks = gr.Textbox(
-                    label="DAVE block indices (기본 8-18)",
-                    value="8-18",
-                    elem_id="anima_guidance_dave_blocks",
+                dcw_lambda_high = gr.Slider(
+                    label="DCW lambda high",
+                    minimum=-0.5, maximum=0.5, step=0.005, value=0.02,
+                    info="윤곽 링·미세 노이즈가 생기면 0 쪽으로 줄이세요.",
+                    elem_id="anima_guidance_dcw_lambda_high",
                 )
 
-            with gr.Accordion("CNS-inspired Wavelet Noise (ancestral/SDE)", open=False):
-                gr.Markdown(
-                    "기존 seeded/Brownian noise를 새로 만들지 않고 **재색칠**합니다. "
-                    "noise_sampler를 쓰지 않는 결정론적 sampler에서는 자동으로 무효입니다."
-                )
-                cns_enabled = gr.Checkbox(
-                    label="Enable CNS-inspired Wavelet Noise",
-                    value=False,
-                    elem_id="anima_guidance_cns_enable",
-                )
-                cns_strength = gr.Slider(
-                    label="CNS strength",
-                    minimum=0.0, maximum=1.0, step=0.01, value=1.0,
-                    elem_id="anima_guidance_cns_strength",
-                )
-                cns_gamma_power = gr.Slider(
-                    label="CNS gamma power",
-                    minimum=0.05, maximum=2.0, step=0.05, value=0.5,
-                    elem_id="anima_guidance_cns_gamma_power",
-                )
-                cns_gamma_scale = gr.Slider(
-                    label="CNS gamma scale (Anima 시작값 3.0)",
-                    minimum=0.25, maximum=25.0, step=0.25, value=3.0,
-                    elem_id="anima_guidance_cns_gamma_scale",
-                )
-                gr.Markdown(
-                    "Adaptive Guidance와 병용할 때는 `Skip after ≥ 0.65`부터 시작하는 "
-                    "편이 안전합니다. TeaCache는 이 Suite에 포함하지 않습니다."
-                )
+            gr.Markdown("#### DAVE — Anima diversity · block DC attenuation")
+            dave_enabled = gr.Checkbox(
+                label="Enable DAVE",
+                value=False,
+                elem_id="anima_guidance_dave_enable",
+            )
+            dave_strength = gr.Slider(
+                label="DAVE strength",
+                minimum=0.0, maximum=1.0, step=0.01, value=0.30,
+                info="구조가 사라지거나 결과가 지나치게 달라지면 낮추세요.",
+                elem_id="anima_guidance_dave_strength",
+            )
+            dave_tau = gr.Slider(
+                label="DAVE early-step tau (0=전 구간, 권장 0.10)",
+                minimum=0.0, maximum=1.0, step=0.01, value=0.10,
+                info="영향 시간이 길면 0을 피하고 0.05~0.10처럼 낮은 양수로 줄이세요.",
+                elem_id="anima_guidance_dave_tau",
+            )
+            dave_blocks = gr.Textbox(
+                label="DAVE block indices (기본 8-18)",
+                value="8-18",
+                info="형태가 불안정하면 대상 블록 수를 줄여 한두 블록부터 비교하세요.",
+                elem_id="anima_guidance_dave_blocks",
+            )
+
+            gr.Markdown("#### CNS-inspired Wavelet Noise — ancestral/SDE")
+            gr.Markdown(
+                "기존 seeded/Brownian noise를 새로 만들지 않고 **재색칠**합니다. "
+                "noise_sampler를 쓰지 않는 결정론적 sampler에서는 자동으로 무효입니다."
+            )
+            cns_enabled = gr.Checkbox(
+                label="Enable CNS-inspired Wavelet Noise",
+                value=False,
+                elem_id="anima_guidance_cns_enable",
+            )
+            cns_strength = gr.Slider(
+                label="CNS strength",
+                minimum=0.0, maximum=1.0, step=0.01, value=1.0,
+                info="색 노이즈·거친 입자·구조 변형이 과하면 먼저 낮추세요.",
+                elem_id="anima_guidance_cns_strength",
+            )
+            cns_gamma_power = gr.Slider(
+                label="CNS gamma power",
+                minimum=0.05, maximum=2.0, step=0.05, value=0.5,
+                info="주파수별 색 노이즈가 어색하면 기본값 0.5로 되돌린 뒤 Strength를 낮추세요.",
+                elem_id="anima_guidance_cns_gamma_power",
+            )
+            cns_gamma_scale = gr.Slider(
+                label="CNS gamma scale (Anima 시작값 3.0)",
+                minimum=0.25, maximum=25.0, step=0.25, value=3.0,
+                info="노이즈 분포가 과장되면 기본값 3.0으로 되돌린 뒤 Strength를 낮추세요.",
+                elem_id="anima_guidance_cns_gamma_scale",
+            )
+            gr.Markdown(
+                "Adaptive Guidance와 병용할 때는 `Skip after ≥ 0.65`부터 시작하는 "
+                "편이 안전합니다. TeaCache는 이 Suite에 포함하지 않습니다."
+            )
         return [
-            enabled, attn_method, scale, strength, block_indices,
+            enabled, attn_method, scale, legacy_strength, block_indices,
             slg_on, slg_scale, slg_blocks,
             start_percent, end_percent, rescale, auto_decay,
             apg_enabled, apg_eta, apg_norm, apg_momentum, apg_autooff,
@@ -1851,6 +1977,8 @@ class AnimaSafePAG(scripts.Script):
             dcw_enabled, dcw_lambda_low, dcw_lambda_high,
             dave_enabled, dave_strength, dave_tau, dave_blocks,
             cns_enabled, cns_strength, cns_gamma_power, cns_gamma_scale,
+            # Appended to preserve every pre-v0.13 script-argument index.
+            official_strength, head_indices, rescale_mode,
         ]
 
     def process_before_every_sampling(self, p, *args, **kwargs):
@@ -1872,7 +2000,8 @@ class AnimaSafePAG(scripts.Script):
         _DAVE.update(on=False, targets=set(), steps=0)
         _CNS.update(on=False, warned=False)
         _STATE.update(
-            on=False, attn_method=None, attn_targets=set(),
+            on=False, attn_method=None, attn_targets=set(), head_spec="",
+            strength=0.75, rescale_mode="full",
             slg_on=False, slg_targets=set(), active=0,
             wrapper_calls=0, weak_steps=0, applied_steps=0, apg_steps=0,
             adg_skipped_steps=0, combined_calls=0, split_cond_calls=0,
@@ -1994,8 +2123,22 @@ class AnimaSafePAG(scripts.Script):
             attn_method = method_str if method_str in ("pag", "seg") else None
             _STATE["requested_method"] = attn_method
             scale = _xyz_num("scale", float(_arg(2, 4.0)))
-            strength = _xyz_num("strength", float(_arg(3, 0.75)))
+            legacy_strength = _xyz_num(
+                "legacy_strength", float(_arg(3, 0.75))
+            )
+            official_strength = _xyz_num(
+                "strength", float(_arg(39, 0.75))
+            )
+            # Before the dedicated Legacy axis existed, the generic
+            # Perturbation Strength axis was the only strength control. Keep it
+            # effective in either mode for saved XYZ presets.
+            if "strength" in xyz and "legacy_strength" not in xyz:
+                legacy_strength = official_strength
             block_spec = str(xyz["blocks"]) if "blocks" in xyz else str(_arg(4, "18"))
+            head_spec = (
+                str(xyz["heads"])
+                if "heads" in xyz else str(_arg(40, ""))
+            )
             slg_on = _as_bool(xyz["slg_enabled"], _as_bool(_arg(5, False), False)) \
                 if "slg_enabled" in xyz else _as_bool(_arg(5, False), False)
             slg_scale = _xyz_num("slg_scale", float(_arg(6, 3.0)))
@@ -2003,6 +2146,10 @@ class AnimaSafePAG(scripts.Script):
             start = _xyz_num("start", float(_arg(8, 0.0)))
             end = _xyz_num("end", float(_arg(9, 0.7)))
             rescale = _xyz_num("rescale", float(_arg(10, 0.20)))
+            rescale_mode = str(
+                xyz["rescale_mode"]
+                if "rescale_mode" in xyz else _arg(41, "full")
+            ).strip().lower()
             auto_decay = _as_bool(_arg(11, True), True)
             apg_eta = _xyz_num("apg_eta", float(_arg(13, 0.0)))
             apg_norm = _xyz_num("apg_norm", float(_arg(14, 15.0)))
@@ -2051,11 +2198,20 @@ class AnimaSafePAG(scripts.Script):
         # arbitrary strings (including NaN/Inf). Keep the same safe domains
         # when values arrive through XYZ or an API client.
         scale = _finite_clamp(scale, 0.0, 15.0, 4.0)
-        strength = _finite_clamp(strength, 0.0, 1.0, 0.75)
+        legacy_strength = _finite_clamp(
+            legacy_strength, 0.0, 1.0, 0.75
+        )
+        official_strength = _finite_clamp(
+            official_strength, 0.0, 1.0, 0.75
+        )
+        strength = legacy_strength if legacy_attn else official_strength
         slg_scale = _finite_clamp(slg_scale, 0.0, 15.0, 3.0)
         start = _finite_clamp(start, 0.0, 1.0, 0.0)
         end = _finite_clamp(end, 0.0, 1.0, 0.7)
         rescale = _finite_clamp(rescale, 0.0, 1.0, 0.20)
+        rescale_mode = (
+            rescale_mode if rescale_mode in {"full", "partial"} else "full"
+        )
         apg_eta = _finite_clamp(apg_eta, -10.0, 10.0, 0.0)
         apg_norm = _finite_clamp(apg_norm, 0.0, 50.0, 15.0)
         apg_momentum = _finite_clamp(apg_momentum, -1.0, 1.0, 0.0)
@@ -2202,9 +2358,11 @@ class AnimaSafePAG(scripts.Script):
             _STATE.update(
                 on=True, attn_method=(attn_method if attn_targets else None),
                 attn_scale=scale, strength=strength, legacy_attn=legacy_attn,
-                seg_sigma=seg_sigma, attn_targets=attn_targets,
+                seg_sigma=seg_sigma, head_spec=head_spec,
+                attn_targets=attn_targets,
                 slg_on=bool(slg_on and slg_targets), slg_scale=slg_scale,
                 slg_targets=slg_targets, auto_decay=auto_decay, rescale=rescale,
+                rescale_mode=rescale_mode,
                 start=requested_start, end=effective_end,
                 requested_start=requested_start, requested_end=requested_end,
                 range_mode=range_mode,
@@ -2253,11 +2411,13 @@ class AnimaSafePAG(scripts.Script):
                 parts = []
                 if _STATE["attn_method"]:
                     mode = "legacy-soft/approx" if legacy_attn else "official"
-                    detail = f"strength={strength}" if legacy_attn else (
-                        f"sigma={seg_sigma}" if attn_method == "seg" else "hard-value-only"
+                    detail = (
+                        f"strength={strength}"
+                        + (f" sigma={seg_sigma}" if attn_method == "seg" else "")
                     )
+                    heads = head_spec.strip() or "all"
                     parts.append(f"{_STATE['attn_method'].upper()} mode={mode} scale={scale} "
-                                 f"{detail} blocks={sorted(attn_targets)}")
+                                 f"{detail} blocks={sorted(attn_targets)} heads={heads}")
                 if _STATE["slg_on"]:
                     parts.append(f"SLG scale={slg_scale} skip={sorted(slg_targets)}")
                 p.extra_generation_params["Anima Perturbation Guidance"] = (
@@ -2266,6 +2426,7 @@ class AnimaSafePAG(scripts.Script):
                       f"{_STATE['requested_end']:.2f}"
                     + f"; effective_range={_STATE['start']:.2f}-{_STATE['end']:.2f}"
                     + f"; range_mode={_STATE['range_mode']}"
+                    + f"; rescale={rescale}({rescale_mode})"
                     + f"; auto_decay={auto_decay}"
                 )
             if _APG["on"]:
@@ -2305,13 +2466,15 @@ class AnimaSafePAG(scripts.Script):
                 f"pert={'on' if _STATE['on'] else 'off'} "
                 f"(attn={_STATE['attn_method']}:{sorted(attn_targets)} scale={scale} "
                 f"mode={'legacy' if legacy_attn else 'official'} "
+                f"strength={strength} heads={head_spec.strip() or 'all'} "
                 f"seg_sigma={seg_sigma} "
                 f"slg={_STATE['slg_on']}:{sorted(slg_targets)} scale={slg_scale} "
                 f"range={_STATE['requested_start']:.2f}-{_STATE['requested_end']:.2f}"
                 f"→{_STATE['start']:.2f}-{_STATE['end']:.2f}"
                 f"({_STATE['range_mode']}) "
                 f"auto_decay={auto_decay} "
-                f"rescale={'auto-off' if (_APG['on'] and apg_autooff) else rescale}) "
+                f"rescale={'auto-off' if (_APG['on'] and apg_autooff) else rescale}"
+                f"({rescale_mode})) "
                 f"APG={'on' if _APG['on'] else 'off'} "
                 f"(eta={apg_eta} norm={apg_norm} mom={apg_momentum}) "
                 f"AdaptiveG={'on' if _ADG['on'] else 'off'} "

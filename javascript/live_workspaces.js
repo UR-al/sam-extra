@@ -7,6 +7,7 @@
 
     var query = new URLSearchParams(window.location.search);
     var frameSlot = query.get("__sam3_live_workspace");
+    var nativeWorkspaceTab = !!frameSlot && window.parent === window;
     var liveDisabled = query.get("sam3_live") === "off";
     var standaloneShell = document.documentElement.hasAttribute(
         "data-sam3-standalone-live-shell"
@@ -16,6 +17,7 @@
     var READY_MESSAGE = "sam3-live-workspace-ready-v1";
     var CONTROL_MESSAGE = "sam3-live-workspace-control-v1";
     var CONTROL_REPLY = "sam3-live-workspace-control-reply-v1";
+    var STATUS_MESSAGE = "sam3-live-workspace-status-v1";
     var MAX_IMPORT_BYTES = 4 * 1024 * 1024;
 
     var standaloneRedirect = null;
@@ -93,7 +95,55 @@
             : new URL(window.location.href);
         if (standaloneShell) url.search = window.location.search;
         url.searchParams.delete("sam3_live");
+        url.searchParams.delete("__sam3_native_tab");
         url.searchParams.set("__sam3_live_workspace", slot);
+        url.hash = "";
+        return url.toString();
+    }
+
+    function nativeTabUrl(slot) {
+        var url = new URL("/", window.location.origin);
+        url.search = window.location.search;
+        url.searchParams.delete("sam3_live");
+        url.searchParams.set("__sam3_live_workspace", slot);
+        url.searchParams.set("__sam3_native_tab", "1");
+        url.hash = "";
+        return url.toString();
+    }
+
+    function nativeTabTarget(slot) {
+        var originKey = window.location.host.replace(/[^A-Za-z0-9_-]/g, "_");
+        var slotKey = String(slot || "").replace(/[^A-Za-z0-9_-]/g, "_");
+        return "sam3-workspace-" + originKey + "-" + slotKey;
+    }
+
+    function nativeWorkspaceName(slot) {
+        try {
+            var manager = window.__sam3WorkspaceManager;
+            var listing = manager && manager.storage && manager.storage.list();
+            return listing && listing.names && listing.names[slot]
+                ? String(listing.names[slot]) : String(slot);
+        } catch (e) {
+            return String(slot);
+        }
+    }
+
+    function syncNativeTabIdentity() {
+        if (!nativeWorkspaceTab) return;
+        var name = nativeWorkspaceName(frameSlot);
+        window.name = nativeTabTarget(frameSlot);
+        document.title = name + " · Forge Neo";
+        document.documentElement.setAttribute("data-sam3-native-workspace", frameSlot);
+        var label = document.querySelector("[data-sam3-native-name]");
+        if (label) label.textContent = name;
+    }
+
+    function liveShellUrl() {
+        var url = new URL("/sam3-live", window.location.origin);
+        url.search = window.location.search;
+        url.searchParams.delete("__sam3_live_workspace");
+        url.searchParams.delete("__sam3_native_tab");
+        url.searchParams.delete("sam3_live");
         url.hash = "";
         return url.toString();
     }
@@ -181,6 +231,8 @@
             '        <input type="file" accept="application/json,.json" data-sam3-live-import></label>',
             '    </div>',
             '  </details>',
+            '  <button type="button" data-sam3-live-native-tabs ',
+            '    title="iframe을 닫고 각 Workspace를 실제 브라우저 탭으로 엽니다">실제 탭으로 열기</button>',
             '  <button type="button" data-sam3-live-legacy title="기존 값 복원 Workspace UI로 전환">기본 UI</button>',
             '</header>',
             '<div class="sam3-live-frames">',
@@ -202,6 +254,7 @@
         var loadQueue = [];
         var loadingSlot = null;
         var readySlots = Object.create(null);
+        var childStatuses = Object.create(null);
         var pendingRequests = Object.create(null);
         var requestCounter = 0;
 
@@ -300,6 +353,9 @@
             }
             if (loadingSlot === slot) loadingSlot = null;
             refreshLoading();
+            if (state.active === slot && !childStatuses[slot]) {
+                setShellStatus((state.names[slot] || slot) + " 준비됨", "saved");
+            }
             // Build one full Forge document at a time. This avoids three-way
             // CPU/DOM/API contention while still preparing every default
             // Workspace automatically in the background.
@@ -317,11 +373,19 @@
             });
             Array.prototype.forEach.call(frames.querySelectorAll("iframe[data-slot]"), function (iframe) {
                 var active = iframe.getAttribute("data-slot") === slot;
-                iframe.hidden = !active;
+                iframe.setAttribute("data-active", active ? "true" : "false");
+                iframe.setAttribute("aria-hidden", active ? "false" : "true");
                 iframe.toggleAttribute("inert", !active);
-                iframe.style.pointerEvents = active ? "auto" : "none";
             });
             syncNameEditor();
+            var childStatus = childStatuses[slot];
+            if (childStatus) {
+                setShellStatus(childStatus.message, childStatus.tone);
+            } else if (readySlots[slot]) {
+                setShellStatus((state.names[slot] || slot) + " 준비됨", "saved");
+            } else {
+                setShellStatus((state.names[slot] || slot) + " 준비 중…", "pending");
+            }
             queueLoad(slot, true);
             refreshLoading();
         }
@@ -339,6 +403,10 @@
             if (iframe) iframe.title = "Workspace " + result.name;
             writeShellState(state);
             syncNameEditor();
+            childStatuses[slot] = {
+                message: result.name + " 이름 저장됨",
+                tone: "saved"
+            };
             setShellStatus(result.name + " 이름 저장됨", "saved");
             return true;
         }
@@ -366,9 +434,9 @@
             iframe.setAttribute("title", "Workspace " + state.names[slot]);
             iframe.setAttribute("loading", "eager");
             iframe.setAttribute("data-src", childUrl(slot));
-            iframe.hidden = true;
+            iframe.setAttribute("data-active", "false");
+            iframe.setAttribute("aria-hidden", "true");
             iframe.toggleAttribute("inert", true);
-            iframe.style.pointerEvents = "none";
             frames.appendChild(iframe);
         }
 
@@ -403,6 +471,90 @@
                 var result = await requestChild(slot, "flush");
                 if (!result.ok) throw new Error(result.error || "Workspace 저장 실패");
             }
+        }
+
+        function prepareNativePlaceholder(handle, slot) {
+            var created = false;
+            try {
+                if (handle.location.href === "about:blank") {
+                    created = true;
+                    handle.document.title = (state.names[slot] || slot) + " 준비 중";
+                    handle.document.body.textContent =
+                        (state.names[slot] || slot) + " Workspace를 준비하고 있습니다…";
+                    handle.document.body.style.cssText =
+                        "margin:0;display:grid;place-items:center;min-height:100vh;"
+                        + "color:#e7eaf0;background:#080d17;font:16px system-ui,sans-serif";
+                }
+            } catch (e) {}
+            return created;
+        }
+
+        async function openNativeWorkspaceTabs() {
+            if (!readySlots[state.active]) {
+                setShellStatus("현재 Workspace 준비가 끝난 뒤 실제 탭으로 열어 주세요", "warning");
+                return;
+            }
+            if (slotIds.length > 8 && !window.confirm(
+                slotIds.length + "개 Workspace를 실제 브라우저 탭으로 모두 열까요?"
+            )) return;
+
+            // Start the iframe flush before opening placeholders, but do not
+            // await yet: window.open must remain inside the original click
+            // activation or browsers will block every new tab.
+            var flushPromise = flushLoadedChildren();
+            var opened = [];
+            var blocked = [];
+            slotIds.forEach(function (slot) {
+                if (slot === state.active) return;
+                var handle = window.open("", nativeTabTarget(slot));
+                if (!handle) {
+                    blocked.push(slot);
+                    return;
+                }
+                opened.push({
+                    slot: slot,
+                    handle: handle,
+                    placeholder: prepareNativePlaceholder(handle, slot)
+                });
+            });
+            setShellStatus("Workspace 저장 후 실제 탭 여는 중…", "pending");
+
+            try {
+                await flushPromise;
+            } catch (e) {
+                opened.forEach(function (entry) {
+                    if (!entry.placeholder) return;
+                    try { entry.handle.close(); } catch (closeError) {}
+                });
+                setShellStatus(
+                    String(e && e.message ? e.message : "Workspace 저장 실패"),
+                    "error"
+                );
+                return;
+            }
+
+            opened.forEach(function (entry) {
+                try {
+                    entry.handle.location.replace(nativeTabUrl(entry.slot));
+                } catch (e) {
+                    entry.handle.location.href = nativeTabUrl(entry.slot);
+                }
+            });
+
+            if (blocked.length) {
+                setShellStatus(
+                    opened.length + "개 탭 열림 · " + blocked.length
+                        + "개 차단됨 — 주소창에서 팝업을 허용하고 다시 눌러 주세요",
+                    "warning"
+                );
+                return;
+            }
+
+            // Reuse this shell tab for the active Workspace. Once it leaves,
+            // all iframe documents are destroyed, so the browser is left with
+            // only genuine top-level Workspace tabs.
+            window.name = nativeTabTarget(state.active);
+            window.location.assign(nativeTabUrl(state.active));
         }
 
         async function createWorkspace() {
@@ -472,6 +624,7 @@
             loadQueue = loadQueue.filter(function (slot) { return slot !== deletedSlot; });
             if (loadingSlot === deletedSlot) loadingSlot = null;
             delete readySlots[deletedSlot];
+            delete childStatuses[deletedSlot];
             var deletedButton = buttonFor(deletedSlot);
             var deletedFrame = frameFor(deletedSlot);
             if (deletedButton) deletedButton.remove();
@@ -588,6 +741,23 @@
                 markReady(readySlot, detail);
                 return;
             }
+            if (detail.type === STATUS_MESSAGE) {
+                var statusSlot = String(detail.slot || "");
+                if (slotIds.indexOf(statusSlot) < 0) return;
+                var statusFrame = frameFor(statusSlot);
+                if (!statusFrame || statusFrame.contentWindow !== event.source) return;
+                childStatuses[statusSlot] = {
+                    message: String(detail.message || "").slice(0, 160),
+                    tone: String(detail.tone || "normal").slice(0, 24)
+                };
+                if (state.active === statusSlot) {
+                    setShellStatus(
+                        childStatuses[statusSlot].message,
+                        childStatuses[statusSlot].tone
+                    );
+                }
+                return;
+            }
             if (detail.type !== CONTROL_REPLY) return;
             var pending = pendingRequests[String(detail.requestId || "")];
             if (!pending) return;
@@ -622,6 +792,10 @@
             importWorkspaceFile(input.files && input.files[0]);
             input.value = "";
         });
+        shell.querySelector("[data-sam3-live-native-tabs]").addEventListener(
+            "click",
+            openNativeWorkspaceTabs
+        );
         shell.querySelector("[data-sam3-live-legacy]").addEventListener("click", function () {
             var url = standaloneShell
                 ? new URL("/", window.location.origin)
@@ -702,25 +876,13 @@
         return scriptCore;
     }
 
-    function isolateLayoutBranch(host, stop) {
-        for (var node = host; node && node !== stop; node = node.parentElement) {
-            var parent = node.parentElement;
-            if (!parent) break;
-            Array.prototype.forEach.call(parent.children, function (sibling) {
-                if (sibling === node) return;
-                // Toasts are useful while generating and do not occupy layout.
-                if (sibling.classList && sibling.classList.contains("toast-wrap")) return;
-                if (sibling.classList) sibling.classList.add("sam3-live-original-branch");
-            });
-        }
-    }
-
     async function mountChildLayout() {
         document.documentElement.classList.add("sam3-live-frame-active");
         var ready = await waitFor(function () {
             var txt2imgScripts = app().querySelector("#txt2img_script_container");
             return app().querySelector("#txt2img_toprow")
                 && app().querySelector("#txt2img_settings")
+                && app().querySelector("#tab_txt2img")
                 && txt2imgScripts
                 && txt2imgScripts.querySelector("#script_list")
                 && app().querySelector("#txt2img_gallery");
@@ -757,6 +919,20 @@
             ' <div class="sam3-live-column" data-column="gallery"><h2>Gallery</h2><div></div></div>',
             '</section>'
         ].join("");
+        if (nativeWorkspaceTab) {
+            var nativeBar = document.createElement("section");
+            nativeBar.className = "sam3-native-workspace-bar";
+            nativeBar.innerHTML = [
+                '<strong data-sam3-native-name></strong>',
+                '<span>실제 브라우저 탭 · 독립 Workspace</span>',
+                '<span class="sam3-native-workspace-status" ',
+                '  data-sam3-native-status aria-live="polite"></span>',
+                '<a data-sam3-native-manage>Live 관리로 돌아가기</a>'
+            ].join("");
+            nativeBar.querySelector("[data-sam3-native-manage]").href = liveShellUrl();
+            layout.insertBefore(nativeBar, layout.firstChild);
+            syncNativeTabIdentity();
+        }
         // Keep the controls inside the original txt2img tab. Forge and several
         // extensions scope their layout CSS to #tab_txt2img; moving controls
         // outside that branch makes prompt helpers, dropdowns, and sliders
@@ -767,7 +943,6 @@
             Array.prototype.forEach.call(layoutHost.children, function (child) {
                 if (child.classList) child.classList.add("sam3-live-original-root");
             });
-            isolateLayoutBranch(layoutHost, sourceRoot);
             layoutHost.appendChild(layout);
         } else if (sourceRoot && sourceRoot.appendChild) {
             sourceRoot.classList.add("sam3-live-source-root");
@@ -809,6 +984,10 @@
                 && !diagnostics.restoring
                 && !diagnostics.switching;
         }, 60000);
+        if (nativeWorkspaceTab) {
+            syncNativeTabIdentity();
+            return;
+        }
         try {
             window.parent.postMessage({
                 type: READY_MESSAGE,
@@ -821,7 +1000,7 @@
     }
 
     function installChildControlBridge() {
-        if (!frameSlot || window.__sam3LiveControlBridgeInstalled) return;
+        if (!frameSlot || nativeWorkspaceTab || window.__sam3LiveControlBridgeInstalled) return;
         window.__sam3LiveControlBridgeInstalled = true;
         window.addEventListener("message", async function (event) {
             var detail = event && event.data;
@@ -860,6 +1039,11 @@
         if (frameSlot) {
             installChildControlBridge();
             mountChildFrame();
+            if (nativeWorkspaceTab) {
+                window.addEventListener("storage", function () {
+                    setTimeout(syncNativeTabIdentity, 0);
+                });
+            }
         }
         else if (!liveDisabled) {
             if (standaloneRedirect) {

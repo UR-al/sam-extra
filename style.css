@@ -416,10 +416,23 @@ html.sam3-live-shell-active body > :not(#sam3_live_workspace_shell) {
 
 .sam3-live-frames {
     position: relative;
+    display: grid;
+    overflow: hidden;
 }
 
-.sam3-live-frames iframe[hidden] {
-    display: none !important;
+.sam3-live-frames iframe {
+    grid-area: 1 / 1;
+    z-index: 0;
+    visibility: hidden;
+    opacity: 0;
+    pointer-events: none;
+}
+
+.sam3-live-frames iframe[data-active="true"] {
+    z-index: 1;
+    visibility: visible;
+    opacity: 1;
+    pointer-events: auto;
 }
 
 .sam3-live-loading {
@@ -459,8 +472,7 @@ html.sam3-live-frame-active body {
     overflow: auto !important;
 }
 
-html.sam3-live-frame-active .sam3-live-original-root,
-html.sam3-live-frame-active .sam3-live-original-branch {
+html.sam3-live-frame-active .sam3-live-original-root {
     display: none !important;
 }
 
@@ -471,6 +483,59 @@ html.sam3-live-frame-active .sam3-live-original-branch {
     padding: .55rem;
     color: var(--body-text-color, #e7eaf0);
     background: var(--body-background-fill, #080d17);
+}
+
+.sam3-native-workspace-bar {
+    display: flex;
+    align-items: center;
+    gap: .65rem;
+    min-width: 0;
+    margin-bottom: .55rem;
+    padding: .4rem .6rem;
+    border: 1px solid var(--border-color-primary, #334155);
+    border-radius: .5rem;
+    color: var(--body-text-color, #e7eaf0);
+    background: var(--background-fill-secondary, #101827);
+}
+
+.sam3-native-workspace-bar > strong {
+    flex: 0 0 auto;
+    color: var(--color-accent, #fb923c);
+}
+
+.sam3-native-workspace-bar > span:not(.sam3-native-workspace-status) {
+    flex: 0 0 auto;
+    color: var(--body-text-color-subdued, #94a3b8);
+    font-size: .8rem;
+}
+
+.sam3-native-workspace-status {
+    flex: 1 1 auto;
+    min-width: 0;
+    overflow: hidden;
+    color: var(--body-text-color-subdued, #94a3b8);
+    font-size: .78rem;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.sam3-native-workspace-status[data-tone="saved"] {
+    color: var(--color-accent, #fb923c);
+}
+
+.sam3-native-workspace-status[data-tone="warning"],
+.sam3-native-workspace-status[data-tone="error"] {
+    color: var(--error-text-color, #f87171);
+}
+
+.sam3-native-workspace-bar > a {
+    flex: 0 0 auto;
+    padding: .3rem .55rem;
+    border: 1px solid var(--border-color-primary, #475569);
+    border-radius: .4rem;
+    color: inherit;
+    background: var(--button-secondary-background-fill, #1e293b);
+    text-decoration: none;
 }
 
 .sam3-live-prompt {
@@ -515,7 +580,25 @@ html.sam3-live-frame-active .sam3-live-original-branch {
     opacity: .78;
 }
 
+/*
+ * Keep Forge's Gallery node stable at Generate time so progressbar.js can
+ * attach its absolute-positioned .livePreview to it. The old thumbnails retain
+ * the Gallery height but stay invisible until the final result replaces them.
+ */
+#txt2img_gallery.sam3-workspace-generation-pending > :not(.livePreview) {
+    visibility: hidden !important;
+    pointer-events: none !important;
+}
+
+#txt2img_gallery.sam3-workspace-generation-pending > .livePreview {
+    visibility: visible !important;
+    pointer-events: auto !important;
+}
+
 @media (max-width: 1100px) {
     .sam3-live-note { display: none; }
+    .sam3-native-workspace-bar > span:not(.sam3-native-workspace-status) {
+        display: none;
+    }
     .sam3-live-columns { grid-template-columns: 1fr; }
 }

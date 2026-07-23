@@ -1,5 +1,5 @@
 /*
- * SAM3 extension — txt2img Workspaces (v0.12.x)
+ * SAM3 extension — txt2img Workspaces (v0.13.x)
  *
  * Browser-local txt2img workspaces in one Forge tab.  The manager is
  * deliberately front-end only: it does not patch Forge or touch global
@@ -25,6 +25,7 @@
     if (LIVE_FRAME_SLOT && !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,79}$/.test(LIVE_FRAME_SLOT)) {
         LIVE_FRAME_SLOT = null;
     }
+    var NATIVE_WORKSPACE_TAB = !!LIVE_FRAME_SLOT && window.parent === window;
     var LIVE_SHELL_PAGE = !LIVE_FRAME_SLOT && _sam3Query.get("sam3_live") !== "off";
     // Load the Live shell from this already-registered extension script too.
     // This makes upgrades work after a normal page reload even when Forge has
@@ -36,7 +37,7 @@
             if (ownScript) {
                 var liveScript = document.createElement("script");
                 liveScript.src = ownScript.replace(/workspace_manager\.js(?:\?.*)?$/, "live_workspaces.js")
-                    + "?v=10";
+                    + "?v=11";
                 document.head.appendChild(liveScript);
             }
         } catch (e) {
@@ -47,10 +48,11 @@
     // It still initializes the storage facade below so add/rename/export/
     // import use exactly the same schema and validation as child frames.
 
-    var VERSION = "0.12.0";
+    var VERSION = "0.13.0";
     var SCHEMA = 1;
     var STORAGE_KEY = "sam-extra.workspace-manager.v1";
     var ACTIVE_KEY = "sam-extra.workspace-manager.active.v1";
+    var LIVE_STATUS_MESSAGE = "sam3-live-workspace-status-v1";
     var SAVE_DELAY_MS = 750;
     var MAX_STORAGE_BYTES = 4 * 1024 * 1024;
     var MAX_WORKSPACES = 20;
@@ -90,6 +92,9 @@
     var outputSaveTimer = null;
     var outputDbPromise = null;
     var outputDbWarned = false;
+    var galleryPendingTimer = null;
+    var galleryPendingSawRunning = false;
+    var galleryPendingStartedAt = 0;
     var activeSlot = LIVE_FRAME_SLOT || readActiveSlot();
     var tabId = readTabId();
     var knownSlotRevision = 0;
@@ -496,11 +501,32 @@
     }
 
     function setStatus(message, tone) {
+        message = message || "";
+        tone = tone || "normal";
+        if (LIVE_FRAME_SLOT && window.parent !== window) {
+            try {
+                window.parent.postMessage({
+                    type: LIVE_STATUS_MESSAGE,
+                    slot: LIVE_FRAME_SLOT,
+                    message: message,
+                    tone: tone
+                }, window.location.origin);
+            } catch (e) {
+                console.warn("[SAM3 Workspaces] live status signal failed:", e);
+            }
+        }
+        if (NATIVE_WORKSPACE_TAB) {
+            var nativeStatus = document.querySelector("[data-sam3-native-status]");
+            if (nativeStatus) {
+                nativeStatus.textContent = message;
+                nativeStatus.setAttribute("data-tone", tone);
+            }
+        }
         if (!toolbar) return;
         var el = toolbar.querySelector("[data-workspace-status]");
         if (!el) return;
-        el.textContent = message || "";
-        el.setAttribute("data-tone", tone || "normal");
+        el.textContent = message;
+        el.setAttribute("data-tone", tone);
     }
 
     function stableId(id) {
@@ -1031,6 +1057,44 @@
         }
     }
 
+    function applyGalleryGenerationPending(pending) {
+        var gallery = app().querySelector("#txt2img_gallery");
+        if (!gallery || !gallery.classList) return;
+        gallery.classList.toggle(
+            "sam3-workspace-generation-pending",
+            !!pending
+        );
+    }
+
+    function endGalleryGenerationPending() {
+        if (galleryPendingTimer) {
+            clearInterval(galleryPendingTimer);
+            galleryPendingTimer = null;
+        }
+        galleryPendingSawRunning = false;
+        galleryPendingStartedAt = 0;
+        applyGalleryGenerationPending(false);
+    }
+
+    function beginGalleryGenerationPending() {
+        endGalleryGenerationPending();
+        galleryPendingStartedAt = Date.now();
+        applyGalleryGenerationPending(true);
+        galleryPendingTimer = setInterval(function () {
+            // Keep the class on the current Gallery root if Gradio happens to
+            // rebuild it for an unrelated UI update while generation runs.
+            applyGalleryGenerationPending(true);
+            if (generationRunning()) galleryPendingSawRunning = true;
+            else if (galleryPendingSawRunning
+                    || Date.now() - galleryPendingStartedAt > 15000) {
+                // Covers normal completion, interrupt/error, and a click that
+                // never reached Forge. A successful gallery prop_change also
+                // ends this immediately below.
+                endGalleryGenerationPending();
+            }
+        }, 100);
+    }
+
     function captureWorkspaceOutputChange(detail) {
         if (!detail || detail.prop !== "value") return false;
         var id = Number(detail.id);
@@ -1041,6 +1105,7 @@
             var gallery = sanitizeGalleryItems(value);
             outputState.items = gallery.items;
             outputState.truncated = gallery.truncated;
+            endGalleryGenerationPending();
             if (!restoring && !switching && gallery.items.length) {
                 setStatus(
                     activeWorkspaceName() + " 마지막 생성 결과 · 갤러리 "
@@ -1078,16 +1143,23 @@
     function clearVisibleWorkspaceOutputs(slot, reason) {
         slot = sanitizeSlotId(slot || activeSlot);
         outputState = emptyWorkspaceOutputs();
-        // Clear the visible Gradio values synchronously in the capture phase,
-        // before Forge handles the Generate click. The next generation's
-        // prop_change events then become the only result stored for this slot.
-        restoring++;
-        try {
-            dispatchOutputValue(outputComponentIds.gallery, []);
-            dispatchOutputValue(outputComponentIds.generationInfo, "");
-            dispatchOutputValue(outputComponentIds.htmlInfo, "");
-        } finally {
-            restoring--;
+        // Do not prop_change *any* Gradio output in the Generate click's
+        // capture phase. A nested prop_change here can re-enter Gradio before
+        // Forge's submit() returns its generated task id, leaving
+        // requestProgress() on "Waiting..." while the backend is already
+        // sampling. Hide the previous thumbnails without changing component
+        // values; the final output replaces gallery/info values normally.
+        if (reason === "generate") {
+            beginGalleryGenerationPending();
+        } else {
+            restoring++;
+            try {
+                dispatchOutputValue(outputComponentIds.gallery, []);
+                dispatchOutputValue(outputComponentIds.generationInfo, "");
+                dispatchOutputValue(outputComponentIds.htmlInfo, "");
+            } finally {
+                restoring--;
+            }
         }
         if (outputSaveTimer) { clearTimeout(outputSaveTimer); outputSaveTimer = null; }
         deleteWorkspaceOutputs(slot);

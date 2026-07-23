@@ -50,7 +50,12 @@ class LiveWorkspaceAssetTests(unittest.TestCase):
             ".sam3-live-original-root",
             css,
         )
-        self.assertIn(".sam3-live-original-branch", css)
+        self.assertNotIn(".sam3-live-original-branch", css)
+        self.assertNotIn("isolateLayoutBranch", script)
+        self.assertIn('iframe.setAttribute("data-active"', script)
+        self.assertNotIn("iframe.hidden =", script)
+        self.assertIn('.sam3-live-frames iframe[data-active="true"]', css)
+        self.assertNotIn(".sam3-live-frames iframe[hidden]", css)
         self.assertIn(".sam3-live-loading", css)
         self.assertIn("@keyframes sam3-live-spin", css)
         self.assertNotIn(
@@ -120,6 +125,51 @@ class LiveWorkspaceAssetTests(unittest.TestCase):
         self.assertIn(".sam3-live-brand", css)
         self.assertIn(".sam3-live-delete", css)
         self.assertIn(".sam3-live-status", css)
+        self.assertIn(
+            'var STATUS_MESSAGE = "sam3-live-workspace-status-v1"',
+            live,
+        )
+        self.assertIn(
+            'var LIVE_STATUS_MESSAGE = "sam3-live-workspace-status-v1"',
+            manager,
+        )
+        self.assertIn("childStatuses[statusSlot]", live)
+        self.assertIn("window.parent.postMessage", manager)
+
+    def test_live_shell_can_handoff_to_real_browser_tabs(self):
+        live = (ROOT / "javascript" / "live_workspaces.js").read_text(
+            encoding="utf-8"
+        )
+        manager = (ROOT / "javascript" / "workspace_manager.js").read_text(
+            encoding="utf-8"
+        )
+        css = (ROOT / "style.css").read_text(encoding="utf-8")
+
+        self.assertIn("data-sam3-live-native-tabs", live)
+        self.assertIn("async function openNativeWorkspaceTabs()", live)
+        self.assertIn("var flushPromise = flushLoadedChildren()", live)
+        self.assertIn('var handle = window.open("", nativeTabTarget(slot))', live)
+        self.assertIn("handle.location.replace(nativeTabUrl(entry.slot))", live)
+        self.assertIn("window.location.assign(nativeTabUrl(state.active))", live)
+        self.assertIn('url.searchParams.set("__sam3_native_tab", "1")', live)
+        self.assertIn(
+            "var nativeWorkspaceTab = !!frameSlot && window.parent === window",
+            live,
+        )
+        self.assertIn('document.title = name + " · Forge Neo"', live)
+        self.assertIn("data-sam3-native-status", live)
+        self.assertIn("Live 관리로 돌아가기", live)
+        self.assertIn(
+            "var NATIVE_WORKSPACE_TAB = !!LIVE_FRAME_SLOT "
+            "&& window.parent === window",
+            manager,
+        )
+        self.assertIn(
+            'document.querySelector("[data-sam3-native-status]")',
+            manager,
+        )
+        self.assertIn(".sam3-native-workspace-bar", css)
+        self.assertIn(".sam3-native-workspace-status", css)
 
     def test_xyz_plot_drivers_and_values_are_captured_and_restored(self):
         manager = (ROOT / "javascript" / "workspace_manager.js").read_text(
@@ -144,6 +194,54 @@ class LiveWorkspaceAssetTests(unittest.TestCase):
         self.assertIn("stageDriverValue(driver, driverRecord)", manager)
         self.assertIn("triggerDriverDependency(dependencyDriver", manager)
         self.assertIn("waitForXyzChoiceOptions(snapshot, catalog)", manager)
+
+    def test_generate_keeps_gallery_root_for_forge_live_preview(self):
+        manager = (ROOT / "javascript" / "workspace_manager.js").read_text(
+            encoding="utf-8"
+        )
+        css = (ROOT / "style.css").read_text(encoding="utf-8")
+
+        clear_start = manager.index("function clearVisibleWorkspaceOutputs")
+        clear_end = manager.index("function dispatchGradioChange", clear_start)
+        clear_body = manager[clear_start:clear_end]
+
+        self.assertIn("beginGalleryGenerationPending()", clear_body)
+        generate_start = clear_body.index('if (reason === "generate")')
+        generate_end = clear_body.index("} else {", generate_start)
+        generate_branch = clear_body[generate_start:generate_end]
+        non_generate_end = clear_body.index(
+            "if (outputSaveTimer)",
+            generate_end,
+        )
+        non_generate_branch = clear_body[generate_end:non_generate_end]
+        self.assertNotIn(
+            "dispatchOutputValue(",
+            generate_branch,
+        )
+        self.assertIn(
+            "dispatchOutputValue(outputComponentIds.gallery, [])",
+            non_generate_branch,
+        )
+        self.assertIn(
+            'dispatchOutputValue(outputComponentIds.generationInfo, "")',
+            non_generate_branch,
+        )
+        self.assertIn(
+            'dispatchOutputValue(outputComponentIds.htmlInfo, "")',
+            non_generate_branch,
+        )
+        self.assertIn("endGalleryGenerationPending()", manager)
+        self.assertIn("sam3-workspace-generation-pending", manager)
+        self.assertIn(
+            "#txt2img_gallery.sam3-workspace-generation-pending "
+            "> :not(.livePreview)",
+            css,
+        )
+        self.assertIn(
+            "#txt2img_gallery.sam3-workspace-generation-pending "
+            "> .livePreview",
+            css,
+        )
 
 
 if __name__ == "__main__":

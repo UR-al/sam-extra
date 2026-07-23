@@ -64,12 +64,14 @@ class AnimaSafePagTests(unittest.TestCase):
             strength=0.75,
             legacy_attn=False,
             seg_sigma=100.0,
+            head_spec="",
             attn_targets={0},
             slg_on=False,
             slg_scale=3.0,
             slg_targets=set(),
             auto_decay=False,
             rescale=0.0,
+            rescale_mode="full",
             active=0,
             attn_raw=None,
             slg_raw=None,
@@ -215,7 +217,7 @@ class AnimaSafePagTests(unittest.TestCase):
         self.assertEqual(p._STATE["weak_steps"], 1)
         self.assertEqual(self._post_cfg().item(), -0.5)
 
-    def test_official_pag_is_hard_value_only_and_changes_only_weak_rows(self):
+    def test_pag_strength_blends_value_path_and_changes_only_weak_rows(self):
         p = self.pag
         p._ORIG_ANIMA_ATTN_OP = lambda q, k, v, *args, **kwargs: torch.zeros(
             q.shape[0], q.shape[1], q.shape[2] * q.shape[3]
@@ -234,10 +236,15 @@ class AnimaSafePagTests(unittest.TestCase):
         out = p._patched_anima_attention_op(q, q, value)
 
         self.assertEqual(torch.count_nonzero(out[0]).item(), 0)
-        torch.testing.assert_close(out[1], value.reshape(2, 4, 6)[1])
+        torch.testing.assert_close(out[1], value.reshape(2, 4, 6)[1] * 0.5)
         self.assertEqual(p._STATE["attn_hook_hits"], 1)
 
+        p._STATE["strength"] = 1.0
+        out = p._patched_anima_attention_op(q, q, value)
+        torch.testing.assert_close(out[1], value.reshape(2, 4, 6)[1])
+
         p._STATE["legacy_attn"] = True
+        p._STATE["strength"] = 0.5
         p._STATE["attn_hook_hits"] = 0
         out = p._patched_anima_attention_op(q, q, value)
         torch.testing.assert_close(out[1], value.reshape(2, 4, 6)[1] * 0.5)
@@ -249,6 +256,29 @@ class AnimaSafePagTests(unittest.TestCase):
         out = p._patched_anima_attention_op(q, q, value)
         expected = value.reshape(2, 4, 6)[1].mean(0, keepdim=True).expand(4, 6)
         torch.testing.assert_close(out[1], expected)
+
+    def test_pag_head_filter_changes_only_selected_attention_head(self):
+        p = self.pag
+        p._ORIG_ANIMA_ATTN_OP = lambda q, k, v, *args, **kwargs: torch.zeros(
+            q.shape[0], q.shape[1], q.shape[2] * q.shape[3]
+        )
+        p._STATE.update(
+            active=1,
+            attn_b0=1,
+            attn_b1=2,
+            attn_method="pag",
+            strength=1.0,
+            legacy_attn=False,
+            head_spec="1",
+        )
+        q = torch.zeros(2, 4, 2, 3)
+        value = torch.ones_like(q)
+
+        out = p._patched_anima_attention_op(q, q, value).reshape_as(value)
+
+        self.assertEqual(torch.count_nonzero(out[0]).item(), 0)
+        self.assertEqual(torch.count_nonzero(out[1, :, 0, :]).item(), 0)
+        torch.testing.assert_close(out[1, :, 1, :], value[1, :, 1, :])
 
     def test_official_seg_blurs_query_on_real_anima_hw_axes(self):
         p = self.pag
@@ -266,6 +296,8 @@ class AnimaSafePagTests(unittest.TestCase):
             attn_method="seg",
             legacy_attn=False,
             seg_sigma=1.0,
+            strength=1.0,
+            head_spec="",
             attn_spatial_shape=(1, 5, 7),
             attn_hook_hits=0,
         )
@@ -295,6 +327,29 @@ class AnimaSafePagTests(unittest.TestCase):
         expected = query[1].mean(dim=0, keepdim=True).expand_as(query[1])
         torch.testing.assert_close(result[1], expected)
 
+    def test_official_seg_strength_and_head_filter_are_applied(self):
+        p = self.pag
+        query = torch.zeros(2, 15, 2, 1)
+        query[1, 7, :, 0] = 1.0
+
+        result = p._official_seg_query(
+            query,
+            1,
+            2,
+            10000.0,
+            spatial_shape=(1, 3, 5),
+            strength=0.5,
+            head_spec="1",
+        )
+
+        self.assertTrue(torch.equal(result[1, :, 0], query[1, :, 0]))
+        expected = torch.lerp(
+            query[1, :, 1],
+            query[1, :, 1].mean(dim=0, keepdim=True).expand_as(query[1, :, 1]),
+            0.5,
+        )
+        torch.testing.assert_close(result[1, :, 1], expected)
+
     def test_zero_correction_with_rescale_keeps_cfg_base_bit_identical(self):
         p = self.pag
         cond = torch.tensor([[1.0, -2.0, 0.5, 3.0]])
@@ -303,6 +358,7 @@ class AnimaSafePagTests(unittest.TestCase):
             attn_raw=cond.clone(),
             slg_raw=None,
             rescale=0.2,
+            rescale_mode="full",
         )
 
         out = p._apply_perturbation({"cond_denoised": cond}, base)
@@ -479,6 +535,7 @@ class AnimaSafePagTests(unittest.TestCase):
             attn_raw=weak,
             slg_raw=None,
             rescale=rescale,
+            rescale_mode="full",
         )
 
         raw_guidance = scale * (cond - weak)
@@ -493,6 +550,88 @@ class AnimaSafePagTests(unittest.TestCase):
 
         torch.testing.assert_close(out, expected)
         self.assertFalse(torch.equal(out, guided * factor))
+
+    def test_partial_rescale_uses_conditional_prediction_for_std_source(self):
+        p = self.pag
+        cond = torch.tensor([[1.0, -1.0, 2.0, -2.0]])
+        weak = torch.tensor([[0.5, -0.5, 1.0, -1.5]])
+        base = torch.tensor([[2.0, -1.0, 0.5, 3.0]])
+        scale = 2.0
+        rescale = 0.2
+        raw_guidance = scale * (cond - weak)
+        guided = cond + raw_guidance
+        dims = list(range(1, guided.ndim))
+        factor = rescale * (
+            cond.std(dim=dims, keepdim=True).clamp_min(1e-6)
+            / guided.std(dim=dims, keepdim=True).clamp_min(1e-6)
+        ) + (1.0 - rescale)
+        p._STATE.update(
+            attn_scale=scale,
+            attn_raw=weak,
+            slg_raw=None,
+            rescale=rescale,
+            rescale_mode="partial",
+        )
+
+        out = p._apply_perturbation({"cond_denoised": cond}, base)
+
+        torch.testing.assert_close(out, base + raw_guidance * factor)
+
+    def test_head_parser_empty_means_all_and_supports_ranges(self):
+        self.assertEqual(self.pag._parse_attention_heads("", 4), {0, 1, 2, 3})
+        self.assertEqual(self.pag._parse_attention_heads("0,2-4,99", 5), {0, 2, 3, 4})
+
+    def test_guidance_ui_exposes_upstream_pag_controls_and_primary_sections(self):
+        source = (ROOT / "scripts" / "anima_safe_pag.py").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn("anima_safe_pag_official_strength", source)
+        self.assertIn("anima_safe_pag_heads", source)
+        self.assertIn("anima_safe_pag_rescale_mode", source)
+        self.assertIn(
+            "official_strength, head_indices, rescale_mode",
+            source,
+        )
+        self.assertNotIn(
+            'with gr.Accordion("DCW (post-CFG wavelet correction)"',
+            source,
+        )
+        self.assertNotIn(
+            'with gr.Accordion("DAVE (Anima diversity',
+            source,
+        )
+        self.assertNotIn(
+            'with gr.Accordion("CNS-inspired Wavelet Noise',
+            source,
+        )
+
+    def test_guidance_ui_exposes_per_control_adjustment_hints(self):
+        source = (ROOT / "scripts" / "anima_safe_pag.py").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn(
+            "이미지가 찢어지거나 배경·구도가 과하게 변하면 이 값을 먼저 낮추세요.",
+            source,
+        )
+        self.assertIn(
+            "초반 구도·인물 배치가 무너지면 값을 올려 더 늦게 시작하세요.",
+            source,
+        )
+        self.assertIn(
+            "과채도·과대비면 올리고, 색이 탁하거나 대비가 눌리면 낮추거나 0으로 비교하세요.",
+            source,
+        )
+        self.assertIn(
+            "품질 손실이 보이면 올려 더 늦게 생략하고, 속도 우선이면 낮추세요.",
+            source,
+        )
+        self.assertIn(
+            "색 노이즈·거친 입자·구조 변형이 과하면 먼저 낮추세요.",
+            source,
+        )
+        self.assertGreaterEqual(source.count("info="), 30)
 
     def test_empty_block_spec_uses_upstream_safe_default(self):
         self.assertEqual(self.pag._parse_blocks("", 28), {18})
