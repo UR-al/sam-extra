@@ -7,16 +7,12 @@ same way the user is already used to.
 from __future__ import annotations
 
 import json
-import os
-import re
 import sys
 import traceback
 from dataclasses import dataclass, field
 from typing import Any
 
 import gradio as gr
-import numpy as np
-from PIL import Image
 
 from .anima_core import (
     AnimaTileRepairArgs,

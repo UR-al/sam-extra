@@ -3,6 +3,36 @@
 버전 태그는 GitHub Releases에도 발행됩니다. 아래는 요약이며, guidance/속도 기능의
 상세는 [docs/GUIDANCE.md](docs/GUIDANCE.md)를 참고하세요.
 
+## v0.11.0 — Anima Guidance Suite 공식 모드 + Live Workspaces
+
+Forge Neo 코어 파일을 수정하지 않고 Anima guidance 실행 경로와 단일 탭 다중 작업공간 UI를
+확장 내부에서 완성한 릴리즈.
+
+- **공식 PAG/SEG + SLG**: PAG는 appended weak row의 hard value-only attention, SEG는 실제
+  Anima T/H/W 중 H/W query Gaussian blur로 동작. 기존 soft PAG / SEG-approx는
+  `Legacy Soft/Approx` 호환 토글로 분리.
+- **Guidance 오케스트레이터**: Preserve/APG/CWM/SMC/SMC+CWM CFG base, DCW, DAVE,
+  CNS-inspired wavelet noise, Adaptive Guidance를 고정된 순서와 generation 단위 상태 정리로
+  통합. 모든 기능은 기본 OFF이며 중립 설정은 기존 Forge 결과를 보존.
+- **최신 Anima attention hook 복구**: `SelfCrossAttention.torch_attention_op`의 실제
+  value/output 레이아웃과 staticmethod binding을 보존하면서 weak row에만 perturbation 적용.
+  훅 미도달·shape 불일치는 원본 결과로 안전하게 폴백.
+- **검증 로그**: 확장 하단의 debug/안전 아코디언에 opt-in Guidance verification summary를
+  추가. PAG/SEG/SLG 적용 스텝, APG/Adaptive, DCW/DAVE/CNS 실행 여부를 생성 종료 시 요약.
+- **Live Workspaces**: 같은 탭 안에 독립된 txt2img 문서 3개를 유지하여 값 바꿔치기 없이
+  즉시 전환. prompt/negative, 생성 설정, Script/XYZ 상태, 마지막 생성 갤러리를 작업공간별
+  보존하며 Generate는 현재 화면 하나에서만 실행.
+- **Workspace UI 수정**: Prompt/Negative/Generate와 Parameters/Scripts/Gallery 3열 배치를
+  원래 `#tab_txt2img` CSS 범위 안에 유지해 찌그러짐과 겹침을 제거. 모든 확장 UI는
+  Parameters 아래에 두고 중앙 Scripts에는 Forge 기본 Script 선택기와 기본 패널만 표시.
+- **갤러리 수명주기**: Generate 직전에 이전 결과를 비우고 이번 생성 결과만 유지. 페이지/WebUI
+  재시작 시 갤러리를 비우며 서버 재시작 복구 시 세 iframe을 자동 재연결.
+- **기타 안정성**: ForgeCanvas가 없는 Refine 배선에서 prompt 입력이 canvas 값으로 밀리던
+  인덱스 오류 수정, `sam3ext.guidance` import가 SAM3 모델 의존성을 초기화하지 않도록
+  package import를 지연 로딩으로 변경.
+- **검증**: Forge Neo 2.27 + `anima_baseV10` 실제 경로 확인, Python 회귀 테스트 38개와
+  JavaScript 문법·실제 브라우저 DOM/레이아웃 검증 통과.
+
 ## v0.10.0 — txt2img Workspaces (단일 탭 작업공간 3개)
 
 여러 브라우저 탭을 다시 열고 설정을 복사하던 흐름을 대체하는 확장 전용 작업공간 관리자를 추가.

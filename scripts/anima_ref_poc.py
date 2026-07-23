@@ -40,6 +40,11 @@ import sys
 import gradio as gr
 
 from modules import scripts
+try:
+    from guidance_diagnostics import set_guidance_diagnostics
+except ImportError:  # standalone/unit-test loader without extension root on sys.path
+    def set_guidance_diagnostics(enabled: bool) -> None:
+        return None
 
 try:
     import torch
@@ -64,10 +69,21 @@ class AnimaRefPoC(scripts.Script):
     def ui(self, is_img2img):
         with gr.Accordion("Anima Reference-Latent PoC (debug / 안전)", open=False):
             gr.Markdown(
-                "Cosmos/Anima reference-latent를 Forge에서 코어 수정 없이 주입 가능한지 "
-                "확인하는 **안전한 계측**입니다. 켜고 **Anima로 img2img 한 번** 생성한 뒤 "
-                "webui 콘솔의 `[AnimaRefPoC]` 줄을 복사해 주세요. 오류 시 항상 일반 "
-                "생성으로 폴백하므로 결과물에는 영향이 없습니다."
+                "결과물에는 영향을 주지 않는 **검증·가드 로그** 모음입니다. 필요한 항목만 "
+                "잠시 켜서 webui 콘솔을 확인하세요. 모두 기본 OFF입니다."
+            )
+            guidance_diagnostics = gr.Checkbox(
+                label=(
+                    "Log Guidance verification summary "
+                    "(PAG/SEG/SLG·APG 적용 스텝, Adaptive 실제 생략/배치 방식)"
+                ),
+                value=False,
+                elem_id="anima_guidance_diagnostics",
+            )
+            gr.Markdown(
+                "아래 Reference-Latent PoC는 Cosmos/Anima reference latent를 Forge 코어 "
+                "수정 없이 주입 가능한지 확인하는 별도 계측입니다. 켜고 **Anima img2img**를 "
+                "한 번 실행한 뒤 `[AnimaRefPoC]` 줄을 확인하세요."
             )
             enabled = gr.Checkbox(
                 label="Enable PoC (log apply_model input shape)",
@@ -79,15 +95,21 @@ class AnimaRefPoC(scripts.Script):
                 value=True,
                 elem_id="anima_ref_poc_concat",
             )
-        return [enabled, do_concat]
+        return [enabled, do_concat, guidance_diagnostics]
 
     def process_before_every_sampling(self, p, *args, **kwargs):
-        if torch is None:
-            return
         try:
             enabled = bool(args[0]) if len(args) > 0 else False
             do_concat = bool(args[1]) if len(args) > 1 else False
+            guidance_diagnostics = bool(args[2]) if len(args) > 2 else False
         except Exception:
+            set_guidance_diagnostics(False)
+            return
+        # This script runs before sampling begins; the Guidance hooks consult
+        # the shared flag during sampling/postprocess, so no Forge core option
+        # or persistent global setting is required.
+        set_guidance_diagnostics(guidance_diagnostics)
+        if torch is None:
             return
         if not enabled:
             return

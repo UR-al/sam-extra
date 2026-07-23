@@ -1,9 +1,10 @@
 /*
- * SAM3 extension — txt2img Workspaces (v0.10.0)
+ * SAM3 extension — txt2img Workspaces (v0.11.x)
  *
- * Three browser-local txt2img workspaces in one Forge tab.  The manager is
- * deliberately front-end only: it does not patch Forge, does not persist
- * images/files/results, and does not touch global checkpoint/VAE quicksettings.
+ * Browser-local txt2img workspaces in one Forge tab.  The manager is
+ * deliberately front-end only: it does not patch Forge or touch global
+ * checkpoint/VAE quicksettings. Gallery entries are stored as Forge/Gradio
+ * file references (never duplicated image bytes) in browser IndexedDB.
  *
  * Gradio 4.40 notes:
  *   - The DOM is the source of truth for current values.  /config is fetched
@@ -18,12 +19,44 @@
 (function () {
     "use strict";
 
-    var VERSION = "0.10.0";
+    var _sam3Query = new URLSearchParams(window.location.search);
+    var LIVE_FRAME_SLOT = _sam3Query.get("__sam3_live_workspace");
+    if (LIVE_FRAME_SLOT && !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,79}$/.test(LIVE_FRAME_SLOT)) {
+        LIVE_FRAME_SLOT = null;
+    }
+    // Load the Live shell from this already-registered extension script too.
+    // This makes upgrades work after a normal page reload even when Forge has
+    // not yet rebuilt its startup-time list of extension JavaScript files.
+    if (!window.__sam3LiveWorkspacesLoading) {
+        window.__sam3LiveWorkspacesLoading = true;
+        try {
+            var ownScript = document.currentScript && document.currentScript.src;
+            if (ownScript) {
+                var liveScript = document.createElement("script");
+                liveScript.src = ownScript.replace(/workspace_manager\.js(?:\?.*)?$/, "live_workspaces.js")
+                    + "?v=2";
+                document.head.appendChild(liveScript);
+            }
+        } catch (e) {
+            console.warn("[SAM3 Live Workspaces] loader failed:", e);
+        }
+    }
+    // The top-level page is a lightweight Live Workspace shell by default.
+    // Its child frames still use this serializer, pinned to one slot each.
+    if (!LIVE_FRAME_SLOT && _sam3Query.get("sam3_live") !== "off") return;
+
+    var VERSION = "0.11.0";
     var SCHEMA = 1;
     var STORAGE_KEY = "sam-extra.workspace-manager.v1";
     var ACTIVE_KEY = "sam-extra.workspace-manager.active.v1";
     var SAVE_DELAY_MS = 750;
     var MAX_STORAGE_BYTES = 4 * 1024 * 1024;
+    var MAX_WORKSPACES = 20;
+    var MAX_WORKSPACE_NAME = 40;
+    var MAX_GALLERY_ITEMS = 500;
+    var OUTPUT_DB_NAME = "sam-extra.workspace-outputs.v1";
+    var OUTPUT_DB_STORE = "workspaceOutputs";
+    var LEGACY_SLOT_IDS = ["1", "2", "3"];
     var ALLOWED_TYPES = {
         textbox: true,
         number: true,
@@ -50,7 +83,12 @@
     var restoreBusyRoots = [];
     var capturedComponentIds = new Set();
     var lastCatalogStats = { captured: 0, skipped: 0, collisions: 0 };
-    var activeSlot = readActiveSlot();
+    var outputComponentIds = { gallery: null, generationInfo: null, htmlInfo: null };
+    var outputState = emptyWorkspaceOutputs();
+    var outputSaveTimer = null;
+    var outputDbPromise = null;
+    var outputDbWarned = false;
+    var activeSlot = LIVE_FRAME_SLOT || readActiveSlot();
     var tabId = readTabId();
     var knownSlotRevision = 0;
 
@@ -83,9 +121,192 @@
         try { window.sessionStorage.setItem(key, value); } catch (e) {}
     }
 
+    function boundedText(value, maxLength) {
+        return String(value === null || value === undefined ? "" : value).slice(0, maxLength);
+    }
+
+    function emptyWorkspaceOutputs() {
+        return { items: [], generationInfo: "", htmlInfo: "", truncated: false };
+    }
+
+    function sanitizeFileData(raw) {
+        if (raw && isPlainObject(raw.image)) raw = raw.image;
+        if (typeof raw === "string") raw = { path: raw, url: raw };
+        if (!isPlainObject(raw)) return null;
+        var path = boundedText(raw.path || raw.name || raw.url, 4096);
+        var url = boundedText(raw.url || "", 8192);
+        // Never put embedded image bytes into IndexedDB. Forge gallery outputs
+        // normally use /file= references; data URLs can be unexpectedly huge.
+        if ((!path && !url) || /^data:/i.test(path) || /^data:/i.test(url)) return null;
+        var file = {
+            path: path || url,
+            url: url || null,
+            size: Number.isFinite(Number(raw.size)) ? Number(raw.size) : null,
+            orig_name: boundedText(raw.orig_name || raw.name || "", 512) || null,
+            mime_type: boundedText(raw.mime_type || "", 128) || null,
+            is_stream: !!raw.is_stream,
+            meta: { _type: "gradio.FileData" }
+        };
+        return file;
+    }
+
+    function sanitizeGalleryItems(value) {
+        if (isPlainObject(value) && Array.isArray(value.value)) value = value.value;
+        var source = Array.isArray(value) ? value : [];
+        var start = Math.max(0, source.length - MAX_GALLERY_ITEMS);
+        var items = [];
+        for (var i = start; i < source.length; i++) {
+            var raw = source[i];
+            var image = raw;
+            var caption = null;
+            if (Array.isArray(raw)) {
+                image = raw[0];
+                caption = raw.length > 1 ? raw[1] : null;
+            } else if (isPlainObject(raw) && Object.prototype.hasOwnProperty.call(raw, "image")) {
+                image = raw.image;
+                caption = raw.caption;
+            }
+            var file = sanitizeFileData(image);
+            if (!file) continue;
+            items.push({
+                image: file,
+                caption: caption === null || caption === undefined
+                    ? null : boundedText(caption, 2048)
+            });
+        }
+        return { items: items, truncated: source.length > MAX_GALLERY_ITEMS };
+    }
+
+    function sanitizeWorkspaceOutputs(value) {
+        var gallery = sanitizeGalleryItems(value && value.items);
+        return {
+            items: gallery.items,
+            generationInfo: boundedText(value && value.generationInfo, 2 * 1024 * 1024),
+            htmlInfo: boundedText(value && value.htmlInfo, 512 * 1024),
+            truncated: !!(value && value.truncated) || gallery.truncated
+        };
+    }
+
+    function warnOutputDb(error) {
+        if (outputDbWarned) return;
+        outputDbWarned = true;
+        console.warn("[SAM3 Workspaces] gallery IndexedDB unavailable:", error);
+    }
+
+    function openOutputDb() {
+        if (outputDbPromise) return outputDbPromise;
+        outputDbPromise = new Promise(function (resolve, reject) {
+            if (!window.indexedDB) {
+                reject(new Error("IndexedDB unavailable"));
+                return;
+            }
+            var request = window.indexedDB.open(OUTPUT_DB_NAME, 1);
+            request.onupgradeneeded = function () {
+                var db = request.result;
+                if (!db.objectStoreNames.contains(OUTPUT_DB_STORE)) {
+                    db.createObjectStore(OUTPUT_DB_STORE, { keyPath: "slot" });
+                }
+            };
+            request.onsuccess = function () { resolve(request.result); };
+            request.onerror = function () { reject(request.error || new Error("IndexedDB open failed")); };
+        }).catch(function (error) {
+            warnOutputDb(error);
+            return null;
+        });
+        return outputDbPromise;
+    }
+
+    function outputDbRequest(mode, action) {
+        return openOutputDb().then(function (db) {
+            if (!db) return null;
+            return new Promise(function (resolve, reject) {
+                var transaction;
+                try {
+                    transaction = db.transaction(OUTPUT_DB_STORE, mode);
+                    var request = action(transaction.objectStore(OUTPUT_DB_STORE));
+                    var result = null;
+                    if (request) request.onsuccess = function () { result = request.result; };
+                    transaction.oncomplete = function () { resolve(result); };
+                    transaction.onerror = function () {
+                        reject(transaction.error || new Error("IndexedDB transaction failed"));
+                    };
+                    transaction.onabort = transaction.onerror;
+                } catch (error) {
+                    reject(error);
+                }
+            });
+        }).catch(function (error) {
+            warnOutputDb(error);
+            return null;
+        });
+    }
+
+    function persistWorkspaceOutputs(slot) {
+        slot = sanitizeSlotId(slot);
+        if (!slot) return Promise.resolve(false);
+        var clean = sanitizeWorkspaceOutputs(outputState);
+        var record = {
+            slot: slot,
+            schema: 1,
+            updatedAt: new Date().toISOString(),
+            writer: tabId,
+            items: clean.items,
+            generationInfo: clean.generationInfo,
+            htmlInfo: clean.htmlInfo,
+            truncated: clean.truncated
+        };
+        return outputDbRequest("readwrite", function (store) { return store.put(record); })
+            .then(function () { return true; });
+    }
+
+    function loadWorkspaceOutputs(slot) {
+        slot = sanitizeSlotId(slot);
+        if (!slot) return Promise.resolve(emptyWorkspaceOutputs());
+        return outputDbRequest("readonly", function (store) { return store.get(slot); })
+            .then(function (record) { return sanitizeWorkspaceOutputs(record || emptyWorkspaceOutputs()); });
+    }
+
+    function deleteWorkspaceOutputs(slot) {
+        slot = sanitizeSlotId(slot);
+        if (!slot) return Promise.resolve();
+        return outputDbRequest("readwrite", function (store) { return store.delete(slot); });
+    }
+
+    function clearWorkspaceOutputs() {
+        return outputDbRequest("readwrite", function (store) { return store.clear(); });
+    }
+
+    function scheduleOutputSave() {
+        if (!initialized || bootstrapping || restoring || switching || resetting) return;
+        if (outputSaveTimer) clearTimeout(outputSaveTimer);
+        outputSaveTimer = setTimeout(function () {
+            outputSaveTimer = null;
+            persistWorkspaceOutputs(activeSlot);
+        }, 250);
+    }
+
+    function flushWorkspaceOutputs(slot) {
+        if (outputSaveTimer) { clearTimeout(outputSaveTimer); outputSaveTimer = null; }
+        return persistWorkspaceOutputs(slot);
+    }
+
+    function sanitizeSlotId(value) {
+        var id = String(value || "");
+        return /^[A-Za-z0-9][A-Za-z0-9._:-]{0,79}$/.test(id) ? id : null;
+    }
+
+    function sanitizeWorkspaceName(value, fallback) {
+        var text = String(value === null || value === undefined ? "" : value)
+            .replace(/[\u0000-\u001f\u007f]/g, " ")
+            .replace(/\s+/g, " ")
+            .trim()
+            .slice(0, MAX_WORKSPACE_NAME);
+        return text || String(fallback || "Workspace");
+    }
+
     function readActiveSlot() {
-        var raw = safeSessionGet(ACTIVE_KEY);
-        return (raw === "1" || raw === "2" || raw === "3") ? raw : "1";
+        if (LIVE_FRAME_SLOT) return LIVE_FRAME_SLOT;
+        return sanitizeSlotId(safeSessionGet(ACTIVE_KEY)) || "1";
     }
 
     function readTabId() {
@@ -108,6 +329,8 @@
             revision: 0,
             updatedAt: null,
             updatedBy: null,
+            slotOrder: LEGACY_SLOT_IDS.slice(),
+            slotNames: { "1": "1", "2": "2", "3": "3" },
             slotRevisions: { "1": 0, "2": 0, "3": 0 },
             slots: { "1": null, "2": null, "3": null }
         };
@@ -137,20 +360,75 @@
     }
 
     function normalizeStore(raw) {
-        var result = emptyStore();
-        if (!isPlainObject(raw) || Number(raw.schema) !== SCHEMA) return result;
+        if (!isPlainObject(raw) || Number(raw.schema) !== SCHEMA) return emptyStore();
+        var result = {
+            schema: SCHEMA,
+            revision: 0,
+            updatedAt: null,
+            updatedBy: null,
+            slotOrder: [],
+            slotNames: Object.create(null),
+            slotRevisions: Object.create(null),
+            slots: Object.create(null)
+        };
         result.revision = Number(raw.revision) || 0;
         result.updatedAt = typeof raw.updatedAt === "string" ? raw.updatedAt : null;
         result.updatedBy = typeof raw.updatedBy === "string" ? raw.updatedBy : null;
-        if (isPlainObject(raw.slots)) {
-            ["1", "2", "3"].forEach(function (slot) {
-                result.slots[slot] = sanitizeSnapshot(raw.slots[slot]);
-                var storedClock = isPlainObject(raw.slotRevisions) ? Number(raw.slotRevisions[slot]) || 0 : 0;
-                var snapshotClock = result.slots[slot] ? Number(result.slots[slot].revision) || 0 : 0;
-                result.slotRevisions[slot] = Math.max(storedClock, snapshotClock);
+
+        // Preserve revision tombstones for workspaces removed by another tab.
+        // They prevent a stale tab from silently recreating a deleted slot.
+        if (isPlainObject(raw.slotRevisions)) {
+            Object.keys(raw.slotRevisions).forEach(function (key) {
+                var slot = sanitizeSlotId(key);
+                if (slot) result.slotRevisions[slot] = Number(raw.slotRevisions[key]) || 0;
             });
         }
+
+        var candidates = [];
+        function addCandidate(value) {
+            var slot = sanitizeSlotId(value);
+            if (!slot || candidates.indexOf(slot) !== -1 || candidates.length >= MAX_WORKSPACES) return;
+            candidates.push(slot);
+        }
+        if (Array.isArray(raw.slotOrder)) raw.slotOrder.forEach(addCandidate);
+        // v0.10.0 stores and exports did not have slotOrder; retain their 1/2/3 order.
+        if (!candidates.length && !Array.isArray(raw.slotOrder)) LEGACY_SLOT_IDS.forEach(addCandidate);
+        if (isPlainObject(raw.slots)) Object.keys(raw.slots).forEach(addCandidate);
+        if (!candidates.length) addCandidate("1");
+
+        candidates.forEach(function (slot, index) {
+            result.slotOrder.push(slot);
+            var fallbackName = /^\d+$/.test(slot) ? slot : String(index + 1);
+            var rawName = isPlainObject(raw.slotNames) ? raw.slotNames[slot] : null;
+            result.slotNames[slot] = sanitizeWorkspaceName(rawName, fallbackName);
+            result.slots[slot] = isPlainObject(raw.slots) ? sanitizeSnapshot(raw.slots[slot]) : null;
+            var storedClock = Number(result.slotRevisions[slot]) || 0;
+            var snapshotClock = result.slots[slot] ? Number(result.slots[slot].revision) || 0 : 0;
+            result.slotRevisions[slot] = Math.max(storedClock, snapshotClock);
+        });
         return result;
+    }
+
+    function workspaceIds(store) {
+        return store && Array.isArray(store.slotOrder) ? store.slotOrder.slice() : LEGACY_SLOT_IDS.slice();
+    }
+
+    function workspaceName(store, slot) {
+        var fallback = /^\d+$/.test(String(slot)) ? String(slot) : "Workspace";
+        return sanitizeWorkspaceName(store && store.slotNames ? store.slotNames[slot] : null, fallback);
+    }
+
+    function activeWorkspaceName(store) {
+        return workspaceName(store || readStore(), activeSlot);
+    }
+
+    function ensureActiveSlot(store) {
+        var ids = workspaceIds(store);
+        if (ids.indexOf(activeSlot) === -1) {
+            activeSlot = ids[0] || "1";
+            safeSessionSet(ACTIVE_KEY, activeSlot);
+        }
+        return activeSlot;
     }
 
     function slotRevision(store, slot) {
@@ -223,6 +501,15 @@
             configComponents.forEach(function (component) {
                 if (component && component.id !== undefined) configById[String(component.id)] = component;
             });
+            function idForElemId(elemId) {
+                var found = configComponents.find(function (component) {
+                    return component && component.props && component.props.elem_id === elemId;
+                });
+                return found && found.id !== undefined ? Number(found.id) : null;
+            }
+            outputComponentIds.gallery = idForElemId("txt2img_gallery");
+            outputComponentIds.generationInfo = idForElemId("generation_info_txt2img");
+            outputComponentIds.htmlInfo = idForElemId("html_info_txt2img");
             return configComponents;
         }).catch(function (e) {
             console.warn("[SAM3 Workspaces] /config unavailable; using DOM fallback:", e);
@@ -234,6 +521,11 @@
     }
 
     function findGenerationPane() {
+        if (LIVE_FRAME_SLOT) {
+            var liveLayout = document.querySelector("#sam3_live_child_layout")
+                || app().querySelector("#sam3_live_child_layout");
+            if (liveLayout) return liveLayout;
+        }
         var container = app().querySelector("#txt2img_extra_tabs");
         if (!container) return null;
         var panes = Array.prototype.slice.call(container.querySelectorAll(":scope > .tabitem"));
@@ -245,6 +537,11 @@
 
     function captureRoots() {
         var roots = [];
+        if (LIVE_FRAME_SLOT) {
+            var liveLayout = document.querySelector("#sam3_live_child_layout")
+                || app().querySelector("#sam3_live_child_layout");
+            if (liveLayout) return [liveLayout];
+        }
         var top = app().querySelector("#txt2img_toprow");
         var pane = generationPane || findGenerationPane();
         if (top) roots.push(top);
@@ -368,6 +665,8 @@
 
                 var axis = xyzChoiceAxis(el);
                 var accordionKey = generatedAccordionKey(el, meta);
+                var label = componentLabel(el, meta);
+                var ancestor = nearestStableAncestor(el);
                 var baseKey = null;
                 if (axis) {
                     baseKey = "dropdown|xyz:" + axis + "-values-choice";
@@ -375,6 +674,12 @@
                     baseKey = accordionKey;
                 } else if (stableId(el.id)) {
                     baseKey = type + "|id:" + encodeURIComponent(el.id);
+                } else if (label) {
+                    // Many third-party extensions omit elem_id and receive a
+                    // generated component-N id that can shift after updates.
+                    // Use a semantic key only when label + stable ancestor is
+                    // unique; the collision pass below drops ambiguous peers.
+                    baseKey = type + "|semantic:" + encodeURIComponent(label);
                 }
                 if (!baseKey) { skipped++; return; }
 
@@ -385,8 +690,8 @@
                     componentId: meta && meta.id !== undefined ? Number(meta.id) : null,
                     baseKey: baseKey,
                     key: baseKey,
-                    label: componentLabel(el, meta),
-                    ancestor: nearestStableAncestor(el),
+                    label: label,
+                    ancestor: ancestor,
                     xyzAxis: axis
                 });
             });
@@ -536,17 +841,30 @@
     function updateButtons() {
         if (!toolbar) return;
         var store = readStore();
-        ["1", "2", "3"].forEach(function (slot) {
-            var button = toolbar.querySelector('[data-workspace-slot="' + slot + '"]');
-            if (!button) return;
+        var container = toolbar.querySelector(".sam3-workspace-slots");
+        if (!container) return;
+        var oldScroll = container.scrollLeft;
+        container.textContent = "";
+        workspaceIds(store).forEach(function (slot) {
             var snapshot = store.slots[slot];
+            var name = workspaceName(store, slot);
+            var button = document.createElement("button");
+            var label = document.createElement("span");
+            button.type = "button";
+            button.setAttribute("data-workspace-slot", slot);
             button.classList.toggle("active", slot === activeSlot);
             button.setAttribute("aria-pressed", slot === activeSlot ? "true" : "false");
             button.setAttribute("data-has-snapshot", snapshot ? "true" : "false");
+            button.setAttribute("aria-label", name + (slot === activeSlot ? " · 현재 Workspace" : " · Workspace로 전환"));
             button.title = snapshot && snapshot.savedAt
-                ? "Workspace " + slot + " · " + new Date(snapshot.savedAt).toLocaleString()
-                : "Workspace " + slot + " · 비어 있음";
+                ? name + " · " + new Date(snapshot.savedAt).toLocaleString()
+                : name + " · 비어 있음";
+            label.textContent = name;
+            button.appendChild(label);
+            container.appendChild(button);
         });
+        container.scrollLeft = oldScroll;
+        syncWorkspaceNameEditor(store);
     }
 
     function saveNow(reason, force) {
@@ -555,11 +873,12 @@
         // not suppress this explicit flush.
         if (!initialized || restoring || resetting) return null;
         var before = readStore();
+        var currentName = activeWorkspaceName(before);
         var beforeClock = slotRevision(before, activeSlot);
         if (beforeClock > knownSlotRevision) {
             externalConflict = true;
             if (dirty || force) {
-                setStatus("다른 탭에서 W" + activeSlot + "이 변경됨 · 새로고침 필요", "warning");
+                setStatus("다른 탭에서 '" + currentName + "'이 변경됨 · 새로고침 필요", "warning");
                 return null;
             }
             // Clean tabs can leave the slot without overwriting the newer
@@ -573,7 +892,7 @@
             dirty = false;
             externalConflict = false;
             knownSlotRevision = beforeClock;
-            setStatus("W" + activeSlot + " 준비됨", "saved");
+            setStatus(currentName + " 준비됨", "saved");
             return before.slots[activeSlot];
         }
 
@@ -584,7 +903,7 @@
         var latestClock = slotRevision(latest, activeSlot);
         if (latestClock > beforeClock) {
             externalConflict = true;
-            setStatus("다른 탭에서 W" + activeSlot + "이 변경됨 · 새로고침 필요", "warning");
+            setStatus("다른 탭에서 '" + currentName + "'이 변경됨 · 새로고침 필요", "warning");
             return null;
         }
         var nextClock = latestClock + 1;
@@ -599,14 +918,14 @@
         externalConflict = false;
         knownSlotRevision = nextClock;
         updateButtons();
-        setStatus("W" + activeSlot + " 자동 저장됨", "saved");
+        setStatus(currentName + " 자동 저장됨", "saved");
         return snapshot;
     }
 
     function scheduleSave() {
         if (!initialized || bootstrapping || restoring || switching || resetting) return;
         dirty = true;
-        setStatus("W" + activeSlot + " 저장 대기…", "pending");
+        setStatus(activeWorkspaceName() + " 저장 대기…", "pending");
         if (saveTimer) clearTimeout(saveTimer);
         saveTimer = setTimeout(function () { saveNow("autosave", false); }, SAVE_DELAY_MS);
     }
@@ -632,6 +951,87 @@
         } catch (e) {
             console.warn("[SAM3 Workspaces] prop_change failed for", adapter.key, e);
             return false;
+        }
+    }
+
+    function dispatchOutputValue(componentId, value) {
+        if (componentId === null || componentId === undefined) return false;
+        var container = gradioContainer();
+        if (!container || typeof CustomEvent !== "function") return false;
+        try {
+            container.dispatchEvent(new CustomEvent("prop_change", {
+                bubbles: true,
+                detail: { id: componentId, prop: "value", value: value }
+            }));
+            return true;
+        } catch (error) {
+            console.warn("[SAM3 Workspaces] output restore failed for component", componentId, error);
+            return false;
+        }
+    }
+
+    function captureWorkspaceOutputChange(detail) {
+        if (!detail || detail.prop !== "value") return false;
+        var id = Number(detail.id);
+        var value = isPlainObject(detail.value)
+            && Object.prototype.hasOwnProperty.call(detail.value, "value")
+            ? detail.value.value : detail.value;
+        if (id === outputComponentIds.gallery) {
+            var gallery = sanitizeGalleryItems(value);
+            outputState.items = gallery.items;
+            outputState.truncated = gallery.truncated;
+            if (!restoring && !switching && gallery.items.length) {
+                setStatus(
+                    activeWorkspaceName() + " 마지막 생성 결과 · 갤러리 "
+                        + gallery.items.length + "장",
+                    "saved"
+                );
+            }
+        } else if (id === outputComponentIds.generationInfo) {
+            outputState.generationInfo = boundedText(value, 2 * 1024 * 1024);
+        } else if (id === outputComponentIds.htmlInfo) {
+            outputState.htmlInfo = boundedText(value, 512 * 1024);
+        } else {
+            return false;
+        }
+        scheduleOutputSave();
+        return true;
+    }
+
+    async function restoreWorkspaceOutputs(slot) {
+        var restored = await loadWorkspaceOutputs(slot);
+        outputState = restored || emptyWorkspaceOutputs();
+        dispatchOutputValue(outputComponentIds.gallery, outputState.items);
+        dispatchOutputValue(outputComponentIds.generationInfo, outputState.generationInfo);
+        dispatchOutputValue(outputComponentIds.htmlInfo, outputState.htmlInfo);
+        await delay(80);
+        if (outputState.truncated) {
+            console.warn(
+                "[SAM3 Workspaces] gallery was capped at the newest "
+                + MAX_GALLERY_ITEMS + " items for", slot
+            );
+        }
+        return outputState.items.length;
+    }
+
+    function clearVisibleWorkspaceOutputs(slot, reason) {
+        slot = sanitizeSlotId(slot || activeSlot);
+        outputState = emptyWorkspaceOutputs();
+        // Clear the visible Gradio values synchronously in the capture phase,
+        // before Forge handles the Generate click. The next generation's
+        // prop_change events then become the only result stored for this slot.
+        restoring++;
+        try {
+            dispatchOutputValue(outputComponentIds.gallery, []);
+            dispatchOutputValue(outputComponentIds.generationInfo, "");
+            dispatchOutputValue(outputComponentIds.htmlInfo, "");
+        } finally {
+            restoring--;
+        }
+        if (outputSaveTimer) { clearTimeout(outputSaveTimer); outputSaveTimer = null; }
+        deleteWorkspaceOutputs(slot);
+        if (reason === "generate") {
+            setStatus(activeWorkspaceName() + " 생성 시작 · 이전 갤러리 비움", "pending");
         }
     }
 
@@ -944,9 +1344,10 @@
         if (restoring === 1) setRestoreBusy(true);
         dirty = false;
         if (saveTimer) { clearTimeout(saveTimer); saveTimer = null; }
-        setStatus("W" + activeSlot + " 복원 중…", "pending");
+        setStatus(activeWorkspaceName() + " 복원 중…", "pending");
         var applied = 0;
         var missing = 0;
+        var galleryCount = 0;
         try {
             await loadConfig();
             var catalog = buildCatalog();
@@ -1004,16 +1405,18 @@
                     fallbackCount++;
                 }
             }
+            galleryCount = await restoreWorkspaceOutputs(activeSlot);
             knownSlotRevision = Number(snapshot.revision) || 0;
             setStatus(
-                "W" + activeSlot + " 복원됨 · " + applied + "개 적용",
+                activeWorkspaceName() + " 복원됨 · 설정 " + applied + "개 · 갤러리 "
+                    + galleryCount + "장",
                 missing || xyzNotReady ? "warning" : "saved"
             );
             if (xyzNotReady) console.warn("[SAM3 Workspaces] XYZ choice controls not ready:", xyzNotReady);
             if (fallbackCount) console.debug("[SAM3 Workspaces] DOM fallback count:", fallbackCount);
         } catch (e) {
             console.error("[SAM3 Workspaces] restore failed:", e);
-            setStatus("W" + activeSlot + " 복원 오류", "error");
+            setStatus(activeWorkspaceName() + " 복원 오류", "error");
         } finally {
             restoring--;
             if (restoring === 0) setRestoreBusy(false);
@@ -1030,19 +1433,21 @@
     }
 
     async function switchWorkspace(target) {
-        target = String(target);
+        target = sanitizeSlotId(target);
         if (target === activeSlot || switching || restoring) return;
-        if (target !== "1" && target !== "2" && target !== "3") return;
+        var available = readStore();
+        if (!target || workspaceIds(available).indexOf(target) === -1) return;
         if (generationRunning()) {
             setStatus("생성 중에는 전환할 수 없습니다", "warning");
             return;
         }
         switching = true;
         try {
+            await flushWorkspaceOutputs(activeSlot);
             var hadDirtyChanges = dirty;
             var sourceSnapshot = saveNow("switch", false);
             if (hadDirtyChanges && !sourceSnapshot) {
-                setStatus("W" + activeSlot + " 저장 실패 · 전환 취소", "error");
+                setStatus(activeWorkspaceName() + " 저장 실패 · 전환 취소", "error");
                 return;
             }
             var store = readStore();
@@ -1063,7 +1468,7 @@
                     store.updatedAt = clone.savedAt;
                     store.updatedBy = tabId;
                     if (!writeStore(store)) {
-                        setStatus("Workspace " + target + " 생성 실패 · 전환 취소", "error");
+                        setStatus(workspaceName(store, target) + " 생성 실패 · 전환 취소", "error");
                         return;
                     }
                 }
@@ -1076,6 +1481,222 @@
             updateButtons();
             switching = false;
             await restoreSnapshot(store.slots[activeSlot], "switch");
+        } finally {
+            switching = false;
+        }
+    }
+
+    function nextWorkspaceName(store) {
+        var used = Object.create(null);
+        workspaceIds(store).forEach(function (slot) {
+            used[workspaceName(store, slot).toLocaleLowerCase()] = true;
+        });
+        var number = workspaceIds(store).length + 1;
+        while (used[String(number).toLocaleLowerCase()]) number++;
+        return String(number);
+    }
+
+    function createWorkspaceId(store) {
+        var id;
+        do {
+            id = "ws-" + Date.now().toString(36) + "-" + Math.random().toString(36).slice(2, 9);
+        } while (workspaceIds(store).indexOf(id) !== -1 || Object.prototype.hasOwnProperty.call(store.slotRevisions, id));
+        return id;
+    }
+
+    function syncWorkspaceNameEditor(store) {
+        if (!toolbar) return;
+        var input = toolbar.querySelector("[data-workspace-name]");
+        if (!input) return;
+        input.setAttribute("data-workspace-name-slot", activeSlot);
+        if (document.activeElement !== input) input.value = workspaceName(store || readStore(), activeSlot);
+    }
+
+    function openWorkspaceNameEditor() {
+        if (!toolbar) return;
+        var details = toolbar.querySelector(".sam3-workspace-menu");
+        var input = toolbar.querySelector("[data-workspace-name]");
+        if (!details || !input) return;
+        details.open = true;
+        syncWorkspaceNameEditor(readStore());
+        setTimeout(function () {
+            try { input.focus(); input.select(); } catch (e) {}
+        }, 0);
+    }
+
+    function renameCurrentWorkspace() {
+        if (!toolbar || switching || restoring || resetting) return;
+        var input = toolbar.querySelector("[data-workspace-name]");
+        if (!input) return;
+        var store = readStore();
+        if (workspaceIds(store).indexOf(activeSlot) === -1) {
+            setStatus("이름을 바꿀 Workspace를 찾지 못했습니다", "error");
+            return;
+        }
+        var currentName = workspaceName(store, activeSlot);
+        var nextName = sanitizeWorkspaceName(input.value, currentName);
+        input.value = nextName;
+        if (nextName === currentName) {
+            setStatus(currentName + " 이름 유지", "saved");
+            return;
+        }
+        store.slotNames[activeSlot] = nextName;
+        store.revision = (Number(store.revision) || 0) + 1;
+        store.updatedAt = new Date().toISOString();
+        store.updatedBy = tabId;
+        if (!writeStore(store)) return;
+        updateButtons();
+        setStatus(nextName + " 이름 저장됨", "saved");
+    }
+
+    async function createWorkspace() {
+        if (switching || restoring || resetting) return;
+        if (generationRunning()) {
+            setStatus("생성 중에는 Workspace를 추가할 수 없습니다", "warning");
+            return;
+        }
+        var initialStore = readStore();
+        if (workspaceIds(initialStore).length >= MAX_WORKSPACES) {
+            setStatus("Workspace는 최대 " + MAX_WORKSPACES + "개까지 만들 수 있습니다", "warning");
+            return;
+        }
+        switching = true;
+        try {
+            await flushWorkspaceOutputs(activeSlot);
+            var hadDirtyChanges = dirty;
+            var sourceSnapshot = saveNow("create", false);
+            if (hadDirtyChanges && !sourceSnapshot) {
+                setStatus(activeWorkspaceName() + " 저장 실패 · 생성 취소", "error");
+                return;
+            }
+            var store = readStore();
+            if (workspaceIds(store).length >= MAX_WORKSPACES) {
+                setStatus("Workspace는 최대 " + MAX_WORKSPACES + "개까지 만들 수 있습니다", "warning");
+                return;
+            }
+            var slot = createWorkspaceId(store);
+            var name = nextWorkspaceName(store);
+            var snapshot = sourceSnapshot ? cloneJson(sourceSnapshot) : captureSnapshot(null);
+            var now = new Date().toISOString();
+            var clock = slotRevision(store, slot) + 1;
+            snapshot.revision = clock;
+            snapshot.createdAt = now;
+            snapshot.savedAt = now;
+            snapshot.writer = tabId;
+            store.slotOrder.push(slot);
+            store.slotNames[slot] = name;
+            store.slotRevisions[slot] = clock;
+            store.slots[slot] = snapshot;
+            store.revision = (Number(store.revision) || 0) + 1;
+            store.updatedAt = now;
+            store.updatedBy = tabId;
+            if (!writeStore(store)) return;
+
+            activeSlot = slot;
+            safeSessionSet(ACTIVE_KEY, activeSlot);
+            knownSlotRevision = clock;
+            externalConflict = false;
+            dirty = false;
+            updateButtons();
+            // A new workspace forks the settings, but starts with an empty
+            // result history so later generations remain workspace-specific.
+            await deleteWorkspaceOutputs(slot);
+            await restoreWorkspaceOutputs(slot);
+            setStatus(name + " 생성됨 · 현재 설정 복사 · 갤러리 비움", "saved");
+            openWorkspaceNameEditor();
+        } finally {
+            switching = false;
+        }
+    }
+
+    async function deleteCurrentWorkspace() {
+        if (switching || restoring || resetting) return;
+        if (generationRunning()) {
+            setStatus("생성 중에는 Workspace를 삭제할 수 없습니다", "warning");
+            return;
+        }
+
+        var store = readStore();
+        var ids = workspaceIds(store);
+        var currentIndex = ids.indexOf(activeSlot);
+        if (currentIndex === -1) {
+            setStatus("삭제할 Workspace를 찾지 못했습니다 · 새로고침 필요", "error");
+            return;
+        }
+        if (ids.length <= 1) {
+            setStatus("마지막 Workspace는 삭제할 수 없습니다", "warning");
+            return;
+        }
+
+        var deletedSlot = activeSlot;
+        var deletedName = workspaceName(store, deletedSlot);
+        var deleteButton = toolbar && toolbar.querySelector("[data-workspace-delete]");
+        if (deleteButton && deleteButton.getAttribute("data-delete-armed") !== deletedSlot) {
+            deleteButton.setAttribute("data-delete-armed", deletedSlot);
+            deleteButton.textContent = "한 번 더 눌러 삭제";
+            setStatus("'" + deletedName + "' 삭제 확인 · 5초 안에 한 번 더 누르세요", "warning");
+            setTimeout(function () {
+                if (deleteButton.getAttribute("data-delete-armed") === deletedSlot) {
+                    deleteButton.removeAttribute("data-delete-armed");
+                    deleteButton.textContent = "현재 Workspace 삭제";
+                }
+            }, 5000);
+            return;
+        }
+        if (deleteButton) {
+            deleteButton.removeAttribute("data-delete-armed");
+            deleteButton.textContent = "현재 Workspace 삭제";
+        }
+
+        switching = true;
+        dirty = false;
+        externalConflict = false;
+        if (saveTimer) { clearTimeout(saveTimer); saveTimer = null; }
+        try {
+            // Re-read after confirmation so a concurrent tab update is not
+            // overwritten by the pre-confirmation copy of the store.
+            store = readStore();
+            ids = workspaceIds(store);
+            currentIndex = ids.indexOf(deletedSlot);
+            if (currentIndex === -1 || ids.length <= 1) {
+                setStatus("Workspace 구성이 다른 탭에서 변경됨 · 새로고침 필요", "warning");
+                return;
+            }
+
+            var remaining = ids.filter(function (slot) { return slot !== deletedSlot; });
+            var target = remaining[Math.min(currentIndex, remaining.length - 1)];
+            if (!store.slots[target]) {
+                var populated = remaining.find(function (slot) { return !!store.slots[slot]; });
+                if (populated) target = populated;
+            }
+
+            // Keep a revision tombstone so a stale tab cannot silently write
+            // the removed workspace back into localStorage.
+            store.slotRevisions[deletedSlot] = slotRevision(store, deletedSlot) + 1;
+            store.slotOrder = remaining;
+            delete store.slotNames[deletedSlot];
+            delete store.slots[deletedSlot];
+            store.revision = (Number(store.revision) || 0) + 1;
+            store.updatedAt = new Date().toISOString();
+            store.updatedBy = tabId;
+            if (!writeStore(store)) return;
+            await deleteWorkspaceOutputs(deletedSlot);
+
+            activeSlot = target;
+            safeSessionSet(ACTIVE_KEY, activeSlot);
+            knownSlotRevision = slotRevision(store, activeSlot);
+            updateButtons();
+            switching = false;
+
+            if (store.slots[activeSlot]) {
+                await restoreSnapshot(store.slots[activeSlot], "delete");
+                setStatus("'" + deletedName + "' 삭제됨 · " + activeWorkspaceName(store) + "로 전환", "saved");
+            } else {
+                // An untouched legacy slot has no snapshot to restore. A full
+                // reload lets Forge rebuild its real defaults before the slot
+                // is initialized, instead of copying the deleted workspace.
+                window.location.reload();
+            }
         } finally {
             switching = false;
         }
@@ -1097,6 +1718,8 @@
             revision: store.revision,
             updatedAt: store.updatedAt,
             updatedBy: store.updatedBy,
+            slotOrder: store.slotOrder,
+            slotNames: store.slotNames,
             slotRevisions: store.slotRevisions,
             slots: store.slots
         };
@@ -1127,15 +1750,20 @@
             try {
                 var parsed = JSON.parse(String(reader.result || ""));
                 var imported = normalizeStore(parsed);
-                var hasAny = imported.slots["1"] || imported.slots["2"] || imported.slots["3"];
+                var importedIds = workspaceIds(imported);
+                var hasAny = importedIds.some(function (slot) { return !!imported.slots[slot]; });
                 if (!hasAny) throw new Error("no workspace snapshots");
-                if (!window.confirm("현재 3개 작업공간을 가져온 파일로 교체할까요?")) return;
+                if (!window.confirm(
+                    "현재 Workspace를 가져온 파일의 " + importedIds.length
+                        + "개 Workspace로 교체할까요? 로컬 txt2img 갤러리 기록도 비워집니다."
+                )) return;
                 switching = true;
                 dirty = false;
                 if (saveTimer) { clearTimeout(saveTimer); saveTimer = null; }
                 var current = readStore();
+                var currentIds = workspaceIds(current);
                 var importedAt = new Date().toISOString();
-                ["1", "2", "3"].forEach(function (slot) {
+                importedIds.forEach(function (slot) {
                     var clock = Math.max(
                         slotRevision(current, slot),
                         slotRevision(imported, slot),
@@ -1148,6 +1776,14 @@
                         imported.slots[slot].savedAt = importedAt;
                     }
                 });
+                // Keep revision tombstones for slots removed by the import so
+                // another open tab cannot silently recreate stale data.
+                currentIds.forEach(function (slot) {
+                    if (importedIds.indexOf(slot) !== -1) return;
+                    imported.slotRevisions[slot] = Math.max(
+                        slotRevision(current, slot), slotRevision(imported, slot)
+                    ) + 1;
+                });
                 imported.revision = Math.max(Number(current.revision) || 0, Number(imported.revision) || 0) + 1;
                 imported.updatedAt = importedAt;
                 imported.updatedBy = tabId;
@@ -1155,9 +1791,13 @@
                     switching = false;
                     return;
                 }
-                var restoreSlot = imported.slots[activeSlot]
+                // Gallery records are intentionally local-only and are not
+                // present in exported JSON. Avoid attaching stale records to
+                // imported workspace ids that happen to match local ids.
+                await clearWorkspaceOutputs();
+                var restoreSlot = importedIds.indexOf(activeSlot) !== -1 && imported.slots[activeSlot]
                     ? activeSlot
-                    : (["1", "2", "3"].find(function (slot) { return !!imported.slots[slot]; }) || "1");
+                    : (importedIds.find(function (slot) { return !!imported.slots[slot]; }) || importedIds[0]);
                 activeSlot = restoreSlot;
                 safeSessionSet(ACTIVE_KEY, activeSlot);
                 knownSlotRevision = slotRevision(imported, activeSlot);
@@ -1175,12 +1815,15 @@
         reader.readAsText(file);
     }
 
-    function resetCurrentWorkspace() {
-        if (!window.confirm("Workspace " + activeSlot + " 저장본을 지우고 페이지를 새로 고칠까요?")) return;
+    async function resetCurrentWorkspace() {
+        var store = readStore();
+        var name = workspaceName(store, activeSlot);
+        if (!window.confirm(
+            "'" + name + "' 설정과 txt2img 갤러리 기록을 지우고 페이지를 새로 고칠까요?"
+        )) return;
         resetting = true;
         dirty = false;
         if (saveTimer) { clearTimeout(saveTimer); saveTimer = null; }
-        var store = readStore();
         var nextClock = slotRevision(store, activeSlot) + 1;
         store.slots[activeSlot] = null;
         store.slotRevisions[activeSlot] = nextClock;
@@ -1189,6 +1832,7 @@
         store.updatedBy = tabId;
         if (writeStore(store)) {
             knownSlotRevision = nextClock;
+            await deleteWorkspaceOutputs(activeSlot);
             window.location.reload();
         } else {
             resetting = false;
@@ -1201,25 +1845,57 @@
         bar.className = "sam3-workspace-bar";
         bar.setAttribute("data-sam3-workspaces", "1");
         bar.innerHTML = [
-            '<span class="sam3-workspace-title">Workspaces</span>',
+            '<button type="button" class="sam3-workspace-title" data-workspace-create ',
+            '  aria-label="새 Workspace 만들기" title="새 Workspace 만들기">',
+            '  <span>Workspaces</span><span aria-hidden="true">＋</span>',
+            '</button>',
             '<div class="sam3-workspace-slots" role="group" aria-label="txt2img workspaces">',
-            '  <button type="button" data-workspace-slot="1" aria-pressed="false"><span>1</span></button>',
-            '  <button type="button" data-workspace-slot="2" aria-pressed="false"><span>2</span></button>',
-            '  <button type="button" data-workspace-slot="3" aria-pressed="false"><span>3</span></button>',
             '</div>',
             '<span class="sam3-workspace-status" data-workspace-status aria-live="polite"></span>',
             '<details class="sam3-workspace-menu">',
             '  <summary aria-label="Workspace 메뉴" title="Workspace 메뉴">⋯</summary>',
             '  <div class="sam3-workspace-menu-panel">',
+            '    <label class="sam3-workspace-name-editor">',
+            '      <span>현재 Workspace 이름</span>',
+            '      <input type="text" maxlength="' + MAX_WORKSPACE_NAME + '" data-workspace-name ',
+            '        aria-label="현재 Workspace 이름">',
+            '    </label>',
+            '    <button type="button" data-workspace-rename>이름 저장</button>',
             '    <button type="button" data-workspace-export>내보내기</button>',
             '    <label>가져오기<input type="file" accept="application/json,.json" data-workspace-import></label>',
-            '    <button type="button" class="danger" data-workspace-reset>이 슬롯 새로 시작</button>',
+            '    <button type="button" data-workspace-live>Live Workspaces로 전환</button>',
+            '    <button type="button" class="danger" data-workspace-reset>현재 Workspace 새로 시작</button>',
+            '    <button type="button" class="danger" data-workspace-delete>현재 Workspace 삭제</button>',
             '  </div>',
             '</details>'
         ].join("");
 
-        Array.prototype.forEach.call(bar.querySelectorAll("[data-workspace-slot]"), function (button) {
-            button.addEventListener("click", function () { switchWorkspace(button.getAttribute("data-workspace-slot")); });
+        bar.querySelector("[data-workspace-create]").addEventListener("click", function () {
+            createWorkspace();
+        });
+        bar.querySelector(".sam3-workspace-slots").addEventListener("click", function (event) {
+            var button = event.target && event.target.closest
+                ? event.target.closest("[data-workspace-slot]")
+                : null;
+            if (button && this.contains(button)) switchWorkspace(button.getAttribute("data-workspace-slot"));
+        });
+        bar.querySelector("[data-workspace-rename]").addEventListener("click", function () {
+            renameCurrentWorkspace();
+            bar.querySelector("details").open = false;
+        });
+        bar.querySelector("[data-workspace-name]").addEventListener("keydown", function (event) {
+            if (event.key === "Enter") {
+                event.preventDefault();
+                renameCurrentWorkspace();
+                bar.querySelector("details").open = false;
+            } else if (event.key === "Escape") {
+                event.preventDefault();
+                syncWorkspaceNameEditor(readStore());
+                bar.querySelector("details").open = false;
+            }
+        });
+        bar.querySelector("details").addEventListener("toggle", function () {
+            if (this.open) syncWorkspaceNameEditor(readStore());
         });
         bar.querySelector("[data-workspace-export]").addEventListener("click", function () {
             downloadExport();
@@ -1230,7 +1906,13 @@
             event.target.value = "";
             bar.querySelector("details").open = false;
         });
+        bar.querySelector("[data-workspace-live]").addEventListener("click", function () {
+            var url = new URL(window.location.href);
+            url.searchParams.delete("sam3_live");
+            window.location.href = url.toString();
+        });
         bar.querySelector("[data-workspace-reset]").addEventListener("click", resetCurrentWorkspace);
+        bar.querySelector("[data-workspace-delete]").addEventListener("click", deleteCurrentWorkspace);
         return bar;
     }
 
@@ -1238,6 +1920,7 @@
         var pane = findGenerationPane();
         if (!pane) return false;
         generationPane = pane;
+        if (LIVE_FRAME_SLOT) return true;
         var existing = app().querySelector("#sam3_workspace_bar");
         if (existing && existing.isConnected) {
             toolbar = existing;
@@ -1281,10 +1964,18 @@
         document.addEventListener("prop_change", function (event) {
             var detail = event && event.detail;
             if (!detail || detail.prop !== "value") return;
+            if (captureWorkspaceOutputChange(detail)) return;
             if (capturedComponentIds.has(Number(detail.id))) scheduleSave();
         }, true);
         document.addEventListener("click", function (event) {
             if (!initialized || restoring || switching) return;
+            var generateButton = event.target && event.target.closest
+                ? event.target.closest("#txt2img_generate")
+                : null;
+            if (generateButton) {
+                clearVisibleWorkspaceOutputs(activeSlot, "generate");
+                return;
+            }
             var target = event.target && event.target.closest
                 ? event.target.closest('[role="option"],.token-remove,.input-accordion-checkbox')
                 : null;
@@ -1292,14 +1983,21 @@
         }, true);
         window.addEventListener("pagehide", function () {
             if (dirty && !bootstrapping && !restoring && !switching && !resetting) saveNow("pagehide", true);
+            if (!restoring && !switching && !resetting) flushWorkspaceOutputs(activeSlot);
         });
         window.addEventListener("storage", function (event) {
             if (event.key !== STORAGE_KEY) return;
-            updateButtons();
             var store = readStore();
+            if (workspaceIds(store).indexOf(activeSlot) === -1) {
+                externalConflict = true;
+                updateButtons();
+                setStatus("현재 Workspace가 다른 탭에서 삭제됨 · 새로고침 필요", "warning");
+                return;
+            }
+            updateButtons();
             if (slotRevision(store, activeSlot) > knownSlotRevision) {
                 externalConflict = true;
-                setStatus("다른 탭에서 W" + activeSlot + "이 변경됨", "warning");
+                setStatus("다른 탭에서 '" + activeWorkspaceName(store) + "'이 변경됨", "warning");
             }
         });
     }
@@ -1313,8 +2011,14 @@
         setStatus("작업공간 준비 중…", "pending");
         try {
             await loadConfig();
+            // Galleries are comparison scratchpads, not history. A page/WebUI
+            // restart begins a fresh comparison session for every workspace.
+            if (LIVE_FRAME_SLOT) await deleteWorkspaceOutputs(activeSlot);
+            else await clearWorkspaceOutputs();
+            outputState = emptyWorkspaceOutputs();
             await delay(250);
             var store = readStore();
+            ensureActiveSlot(store);
             var snapshot = store.slots[activeSlot];
             knownSlotRevision = slotRevision(store, activeSlot);
             externalConflict = false;
@@ -1323,7 +2027,14 @@
             } else {
                 dirty = true;
                 var created = saveNow("initial", true);
-                if (created) setStatus("W" + activeSlot + "을 현재 설정으로 만들었습니다", "saved");
+                var initialGalleryCount = await restoreWorkspaceOutputs(activeSlot);
+                if (created) {
+                    setStatus(
+                        activeWorkspaceName() + "을 현재 설정으로 만들었습니다 · 갤러리 "
+                            + initialGalleryCount + "장",
+                        "saved"
+                    );
+                }
             }
         } finally {
             bootstrapping = false;
@@ -1363,10 +2074,19 @@
             dirty: dirty,
             knownSlotRevision: knownSlotRevision,
             catalog: lastCatalogStats,
-            slots: ["1", "2", "3"].map(function (slot) {
+            outputs: {
+                componentIds: cloneJson(outputComponentIds),
+                galleryItems: outputState.items.length,
+                generationInfoLength: outputState.generationInfo.length,
+                htmlInfoLength: outputState.htmlInfo.length,
+                truncated: outputState.truncated,
+                indexedDbAvailable: !!window.indexedDB
+            },
+            slots: workspaceIds(store).map(function (slot) {
                 var snapshot = store.slots[slot];
                 return {
-                    slot: Number(slot),
+                    slot: slot,
+                    name: workspaceName(store, slot),
                     exists: !!snapshot,
                     revision: snapshot ? snapshot.revision : 0,
                     controlCount: snapshot ? Object.keys(snapshot.controls).length : 0,

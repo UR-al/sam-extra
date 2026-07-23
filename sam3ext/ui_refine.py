@@ -10,7 +10,6 @@ import re
 import sys
 import traceback
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Any
 
 import gradio as gr
@@ -217,6 +216,26 @@ REFINE_ARG_KEYS = (
     "canvas_background",
     "canvas_foreground",
 )
+
+_REFINE_CANVAS_KEY_COUNT = 2
+_REFINE_EXTRA_INPUT_COUNT = 3  # main prompt, negative prompt, generation info
+
+
+def _refine_widget_count(total_values: int) -> int | None:
+    """Return the widget prefix length for a wired Refine click.
+
+    ForgeCanvas is optional. When it is unavailable ``all_widgets()`` omits
+    the final two canvas components, but the three standard txt2img extras are
+    still appended by ``scripts/!sam3.py``. A fixed 42-value slice therefore
+    consumed the prompt extras as canvas values on canvas-less builds.
+    """
+    full = len(REFINE_ARG_KEYS)
+    base = full - _REFINE_CANVAS_KEY_COUNT
+    if total_values >= full + _REFINE_EXTRA_INPUT_COUNT:
+        return full
+    if total_values >= base + _REFINE_EXTRA_INPUT_COUNT:
+        return base
+    return None
 
 
 def build_refine_panel(
@@ -1020,8 +1039,8 @@ def handle_refine_click(
     Out-of-scope behaviors are returned as HTML status messages rather than
     raised exceptions so the panel stays responsive.
     """
-    expected_widget_count = len(REFINE_ARG_KEYS)
-    if len(all_values) < expected_widget_count:
+    expected_widget_count = _refine_widget_count(len(all_values))
+    if expected_widget_count is None:
         return _refine_error_return(
             gallery_value,
             "<span style='color:#c33'>SAM3 Refine: missing widget values.</span>",

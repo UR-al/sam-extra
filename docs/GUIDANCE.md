@@ -1,221 +1,263 @@
-# Anima Guidance & Speed Suite
+# Anima Guidance Suite
 
-Anima(및 Cosmos/Predict2 계열 DiT) 생성 품질·속도를 높이는 **독립 기능 모음**입니다.
-SAM3 워크플로와 완전히 분리돼 있고(`sam3ext`를 전혀 import하지 않음), **Forge Neo 코어
-파일을 건드리지 않으며**, 전 구간 try/except로 어떤 오류에도 일반 생성으로 폴백합니다 —
-켜 둬도 생성이 깨지지 않습니다.
+Anima/Cosmos/Predict2 계열 DiT의 guidance를 Forge Neo 코어 수정 없이 확장하는 독립 기능입니다.
+SAM3 처리 모듈은 초기화하지 않고 `sam3ext.guidance`의 경량 수학 모듈만 사용합니다. 모든 기능은
+기본 OFF이며, 전부 끄면 들어온 Forge 결과를 그대로 반환합니다.
 
-> ⚠️ **실험 기능.** PAG는 Forge Neo 2.27 + `anima_baseV10`에서 True/False
-> end-to-end 생성을 검증했습니다. 다른 파생 모델/정밀 조합은 webui 콘솔의
-> `[AnimaSafePAG]` / `[AnimaDetailDaemon]` 로그로 훅 부착·동작을 확인하세요.
+> [!IMPORTANT]
+> 2026-07-23, Forge Neo 2.27 + `anima_baseV10`에서 PAG·SEG·SLG·APG·Adaptive
+> Guidance 분리 실행과 CWM+DCW+DAVE+CNS 최소 활성 조합의 실제 checkpoint 실행
+> 경로를 확인했습니다.
+> 이는 **훅과 수식이 실행된다는 검증**이며, 모든 sampler·attention backend에서 화질이
+> 더 좋아진다는 보장은 아닙니다.
 
-## 구성 파일
+## 구성
 
-| 스크립트 | 담는 기능 |
+| 파일 | 역할 |
 |---|---|
-| `scripts/anima_safe_pag.py` | Perturbation Guidance(PAG/SEG/SLG) · APG · Adaptive Guidance |
-| `scripts/anima_detail_daemon.py` | Detail Daemon |
+| `scripts/anima_safe_pag.py` | 단일 오케스트레이터, UI, Forge hook, XYZ 축 |
+| `sam3ext/guidance/runtime.py` | generation/pass 단위 APG·SMC·CNS 상태 정리 |
+| `sam3ext/guidance/haar.py` | 4D/5D·홀수 크기 공용 Haar DWT/IDWT |
+| `sam3ext/guidance/cwm_smc.py` | CWM·SMC CFG base |
+| `sam3ext/guidance/dcw.py` | post-CFG wavelet correction |
+| `sam3ext/guidance/dave.py` | Anima block DC attenuation |
+| `sam3ext/guidance/cns.py` | 기존 sampler noise의 wavelet 재색칠 |
+| `scripts/anima_detail_daemon.py` | 별도 Detail Daemon 기능 |
 
-설치는 확장에 포함돼 별도 작업이 없습니다. t2i/img2img 패널에 **"Anima Perturbation
-Guidance (PAG / SEG / SLG)"** 와 **"Anima Detail Daemon"** 아코디언이 보이면 정상입니다.
+## 실제 처리 순서
 
----
-
-## 한눈 요약
-
-| 기능 | 효과(느낌) | 추가 forward | 대상 모델 |
-|---|---|---|---|
-| **PAG** | 선·구조 또렷, 디테일↑ | 있음(배치 접기) | Anima DiT |
-| **SEG** | PAG보다 부드럽게 구조 잡기 | 있음(배치 접기) | Anima DiT |
-| **SLG** | 해부/구도 붕괴 방지 | 있음(배치 접기) | Anima DiT |
-| **APG** | 높은 CFG의 과채도·번짐 억제 | **없음** | 모든 모델 |
-| **Detail Daemon** | 질감·잔디테일↑, 배경 뽀샤시↓ | **없음** | 모든 모델 |
-| **Adaptive Guidance** | 무손실에 가까운 **속도↑** | **음수(생략)** | 모든 모델 |
-
-**설계 원칙**: 모든 자동동작은 **토글**로 끌 수 있고, 값은 기본은 쉽게(메인 슬라이더) +
-필요 시 깊게(**Advanced 아코디언**) 조절합니다.
-
----
-
-## Forge Neo 연동 원리 (코어 수정 없음)
-
-Forge Neo 실제 샘플링 경로(`backend/sampling/sampling_function.py`)는 ComfyUI 노드가 쓰는
-`sampler_calc_cond_batch_function`을 **호출하지 않으므로**(패처에 setter만 존재), 실제로
-호출되는 훅만 사용합니다.
-
-1. **`model_function_wrapper`** — `apply_model`이 보는 cond/uncond 배치를 감쌉니다.
-   Perturbation은 여기서 **cond 행을 복제해 배치에 붙여** 약한 예측을 *같은 forward*로
-   계산하고(별도 호출 없음), Adaptive Guidance는 반대로 **uncond 행을 제거**합니다.
-2. **`post_cfg_function`** — Forge의 `model.apply_model` 결과는 이미 predictor가 변환한
-   denoised(x0) 예측입니다. 따라서 `cond_x0 − weak_x0`를 직접 guidance로 더하며,
-   eps/v/flow-matching 종류와 무관하게 표준 CFG·APG·MaHiRo 등의 결과 위에 안전하게
-   얹힙니다. Rescale은 **CFG 전체가 아닌 PAG 보정량만** 조정합니다.
-
-어텐션 perturbation은 `backend/nn/anima.py`의 모듈 전역 `scaled_dot_product_attention`을
-감싸 **약한 예측 행에만** 적용합니다(value는 RoPE가 없어 rotary-safe, grouped-query로 head
-수가 다르면 훼손 없이 자동 스킵). SLG는 `TransformerBlock.forward`를 감싸 지정 블록을 해당
-행에서만 통째로 스킵합니다.
-
-기능은 매 생성마다 `p.sd_model.forge_objects.unet.clone()`에만 훅을 답니다 → Forge 기본
-동작·다른 생성에 영향 없음, 끄면 완전 no-op.
-
----
-
-## 1. Perturbation Guidance (PAG / SEG / SLG)
-
-후반 블록에 *약한 예측*을 만들어 CFG를 그 반대로 밀어 구조·디테일을 강화합니다.
-**Anima 엔진에서만** 동작합니다. 여러 방식을 켜도 약한 예측을 **같은 배치에 접어** 단일
-forward로 계산합니다(활성 수만큼 배치 행만 증가).
-
-| 방식 | 느낌 | perturbation |
-|---|---|---|
-| **PAG** | 선/구조 또렷 | 어텐션 → value-only(identity). `lerp(정상, value, strength)` |
-| **SEG** | 더 부드럽게 구조 잡기 | 어텐션 → uniform(seq 평균). `lerp(정상, mean(value), strength)` |
-| **SLG** | 해부/구도 붕괴 방지 | 지정 블록을 통째로 스킵(출력=입력)한 약한 예측 |
-
-- **PAG ↔ SEG** 는 성격이 겹쳐 **택1**(Attention perturbation 라디오).
-- **SLG** 는 PAG/SEG와 **병용 가능**.
-- SEG는 원논문의 가우시안 블러 대신 "uniform(∞-blur 극한=값 평균)으로 보간"하는
-  shape-agnostic 근사입니다(H·W 재구성 불필요, 안전). SLG는 SD3.5/Wan에서 정평난 방식.
-
-| 필드 | 기본값 | 설명 |
-|---|---|---|
-| Enable Perturbation Guidance | off | Anima 생성에만 적용(다른 모델 자동 스킵) |
-| Attention perturbation | PAG | `PAG` / `SEG` / `None`(=SLG만) |
-| Attention guidance scale | 4.0 | PAG/SEG guidance 세기 |
-| Perturbation strength | 0.75 | PAG: →value / SEG: →uniform 블렌드 비율 |
-| Attention block indices | `18` | 빈칸도 안전 기본 `18`로 처리. 필요 시 `18-20` 형식 |
-| Enable SLG | off | 레이어 스킵 약한 예측 병용 |
-| SLG guidance scale | 3.0 | SLG guidance 세기 |
-| SLG skip block indices | `18` | 빈칸도 `18`로 처리. 스킵할 블록 |
-| Start ~ End percent | 0.0 ~ 0.7 | 적용 샘플링 구간(나머지 스텝은 원가) |
-| Rescale | 0.20 | 대비/채도 과다 억제 (APG 켜지면 자동 off) |
-| **동시 사용 시 scale 자동 감쇠** *(토글)* | on | 활성 수로 각 scale ÷ (과대 guidance 방지). 끄면 원 scale |
-
----
-
-## 2. APG (Adaptive Projected Guidance)
-
-높은 CFG가 만드는 **과채도·번짐 성분(cond 평행)만 골라 억제**해, guidance를 세게 밀어도
-자연스럽게 유지합니다(RescaleCFG의 상위호환). **추가 forward 없이** post-CFG에서 계산만
-바꾸며 **모든 모델에서 동작**합니다. `eta=1·norm=0·momentum=0`이면 **표준 CFG로 정확히
-환원**되어 안전합니다.
-
-| 필드 | 기본값 | 설명 |
-|---|---|---|
-| Enable APG | off | 켜면 CFG 합성을 APG로 대체 |
-| APG 켜지면 PAG rescale 자동 끄기 *(토글)* | on | 이중 크기보정 방지. 끄면 둘 다 적용 |
-| eta *(Advanced)* | 0.0 | 평행(과채도) 성분 비중. 1.0=표준 CFG 환원, 0=최대 억제 |
-| norm threshold *(Advanced)* | 15.0 | guidance L2 크기 상한(0=off) |
-| momentum *(Advanced)* | 0.0 | 스텝 간 running-average(음수 권장, 0=off) |
-
-guidance 세기는 메인 **CFG Scale** 슬라이더를 그대로 씁니다.
-
----
-
-## 3. Adaptive Guidance (속도)
-
-샘플링 **후반부에는 uncond(네거티브) 예측 기여가 미미**하므로, 지정 지점 이후 **uncond
-forward를 생략**해 그 스텝 배치를 절반으로 줄입니다. 추가 계산이 아니라 **빼는** 쪽이라
-무손실에 가까운 속도↑(예: 20스텝·skip 0.5 → forward 시간 약 **−27%**)이며 모든 모델에서
-동작합니다. 생략 스텝에선 uncond=cond로 두어 CFG가 cond로 붕괴하고, perturbation도 함께
-쉽니다(그 지점은 이득이 거의 없음).
-
-| 필드 | 기본값 | 설명 |
-|---|---|---|
-| Enable Adaptive Guidance | off | 켜면 후반 uncond 생략 |
-| Skip after | 0.5 | 이 지점(스텝 비율) 이후 생략 시작 |
-| Keep every N *(Advanced)* | 0 | 생략 구간에서도 N스텝마다 uncond 유지(0=항상 생략, 보수적 품질용) |
-
----
-
-## 4. Detail Daemon
-
-매 스텝 **제거하는 노이즈량을 줄여** 디테일·질감을 늘립니다(배경 뽀샤시↓). 추가 forward
-없이 sampler sigma만 조정하므로 **모든 모델(Anima RF 포함)에서 동작**합니다. muerrilla의
-원본을 재구현해 직관적 UX로 재설계했습니다.
-
-`sigma *= 1 − schedule[step] · amount · (cfg_scale if couple else 1)` — 양수 amount는 sigma를
-낮춰(=노이즈 덜 제거) 디테일↑, 음수는 매끈, 0/끄면 완전 무효.
-
-| 필드 | 기본값 | 설명 |
-|---|---|---|
-| Enable Detail Daemon | off | |
-| Preset | Medium | Custom이면 아래 Amount 사용 (Subtle 0.05 / Medium 0.10 / Strong 0.25) |
-| Detail amount | 0.10 | 음수=매끈, 양수=디테일↑ |
-| start / end / bias *(Adv)* | 0.2 / 0.8 / 0.5 | 적용 구간과 피크 위치 |
-| exponent / offsets / fade *(Adv)* | 1.0 / 0 / 0 | 곡률·구간밖 기본값·전체 감쇠 |
-| smooth / multiplier *(Adv)* | on / 1.0 | 코사인 스무딩 · 스케줄 위 전역 강도 |
-| couple to CFG scale *(Adv, 토글)* | on | 효과를 CFG scale에 비례(원본 both). 끄면 CFG 무관 |
-
----
-
-## 조합 규칙 (중요)
-
-기능을 **카테고리**로 나누면 충돌 여부가 명확합니다. **각 카테고리에서 하나씩** 고르면
-서로 다른 지점이라 안전하게 겹칩니다.
-
-| 카테고리 | 후보 | 규칙 |
-|---|---|---|
-| Perturbation | PAG / SEG / SLG | PAG↔SEG 택1, SLG 병용 가능 |
-| 크기보정 | APG / Rescale | 하나만. **APG 켜면 rescale 자동 off**(토글로 해제) |
-| 스케줄 | Detail Daemon | 독립 — 무엇과도 겹침 |
-| 속도 | Adaptive Guidance | 독립 — 무엇과도 겹침 |
-| (내장) 프롬프트 재믹스 | MaHiRo | post-CFG 위에 우리 guidance가 얹힘 → 병용 OK |
-
-**권장 스택 예시**: PAG(구조) + APG(과채도 억제) + Detail Daemon(질감) + Adaptive
-Guidance(속도).
-
-⚠️ **피할 조합**: PAG+SEG 동시(중복·속도 2배 손해), APG+Rescale 이중 크기보정(밋밋).
-여러 perturbation을 굳이 함께 쓸 땐 `scale 자동 감쇠` 토글을 켜 두세요.
-
-> 참고: RescaleCFG/Epsilon Scaling은 v-pred/eps 모델용이라 RF인 Anima에선 효용이 적습니다.
-> 그래서 Anima에선 rescale을 낮게 두거나 APG로 대체하는 것을 권장합니다.
-
----
-
-## XYZ Plot 비교
-
-축군 `[Anima Pert] …` · `[Anima APG] …` · `[Anima AdaptiveG] …` · `[Detail Daemon] …` 가
-추가됩니다. **`… Enable`** 축을 `True, False`로 두면 **ON/OFF 비교 그리드**를 바로 뽑습니다
-(UI 체크박스와 무관하게 축 값이 우선).
-
-- `[Anima Pert]` — Enable · Attn Method · Attn Scale · Perturbation Strength · Attn Block
-  Indices · SLG Enable · SLG Scale · SLG Block Indices · Start/End Percent · Rescale
-- `[Anima APG]` — Enable · Eta · Norm Threshold · Momentum
-- `[Anima AdaptiveG]` — Enable · Skip After · Keep Every
-- `[Detail Daemon]` — Enable · Amount · Start · End · Bias
-
----
-
-## 메타데이터 / 로그
-
-각 기능은 결과 PNG의 `parameters`에 마커를 남깁니다: `Anima Perturbation Guidance: …`,
-`Anima APG: …`, `Anima Adaptive Guidance: …`, `Anima Detail Daemon: …`.
-
-콘솔 로그로 실제 부착·동작을 확인할 수 있습니다:
-
-```
-[AnimaSafePAG] patched backend.nn.anima.scaled_dot_product_attention ✅
-[AnimaSafePAG] wrapped N self_attn + N block forward(s)
-[AnimaSafePAG] attached ✅ engine=Anima pert=on (...) APG=on (...) AdaptiveG=on (...)
-[AnimaDetailDaemon] active ✅ amount=... range=... couple=... cfg=...
+```text
+shared.state.sampling_step / sampling_steps
+  → model wrapper: ADG cond-only 또는 PAG/SEG/SLG weak-row 확장
+  → Anima block: original forward → DAVE → SLG weak-row restore
+  → attention: weak row에만 hard PAG 또는 Gaussian-query SEG
+  → 단일 post-CFG:
+      1. CNS용 live x_t 저장
+      2. ADG skip이면 APG/SMC state reset 후 incoming 유지
+      3. CFG base 라디오(Preserve/APG/CWM/SMC/SMC+CWM)
+      4. PAG/SEG/SLG delta 가산
+      5. DCW
+  → ancestral/SDE noise sampler: CNS 재색칠
 ```
 
-`engine=... (not 'Anima')` 나 `head layout differ (grouped-query?)` 같은 로그가 보이면 해당
-지점만 조정이 필요합니다.
+- `sampler_cfg_function` 슬롯은 사용하지 않습니다.
+- `model_function_wrapper`와 `post_cfg_function`은 현재 `forge_objects.unet.clone()`에만 붙습니다.
+- step 비율은 wrapper 호출 횟수가 아니라 Forge의 공식 sampling step을 읽습니다. low-VRAM 분할,
+  regional conditioning, 2차 sampler가 범위 계산을 오염시키지 않습니다.
+- CFG base를 바꾸는 모드는 Forge의 incoming 결과에서 `w_eff`를 최소제곱으로 복원하므로
+  `edit_strength`가 소실되지 않습니다. custom/nonlinear CFG의 fit 오차가 크면 경고합니다.
 
----
+## 1. PAG / SEG / SLG
+
+후반 블록의 약한 예측을 만들고 `scale × (cond − weak)`를 incoming CFG 결과에 더합니다.
+Anima 엔진 전용이며 ControlNet이 전달된 호출에서는 충돌 방지를 위해 쉬어 갑니다.
+
+| 방식 | 현재 기본 동작 | 상태 |
+|---|---|---|
+| PAG | 타깃 self-attention weak row를 hard value-only 경로로 교체 | 실제 Anima E2E 검증 |
+| SEG | 타깃 weak query를 실제 T/H/W 중 H/W 축으로 Gaussian blur | 실제 Anima E2E 검증 |
+| SLG | 타깃 block의 weak-row 출력을 block 입력으로 복원 | 실제 Anima E2E 검증 |
+
+PAG와 SEG는 라디오에서 하나만 선택합니다. SLG는 둘 중 하나와 병용할 수 있습니다. 과거 결과를
+재현할 때만 `Legacy Soft/Approx`를 켜세요. Legacy PAG는 value 경로로 보간하고 Legacy SEG는
+uniform-value 근사를 사용합니다.
+
+| 필드 | 기본값 | 설명 |
+|---|---:|---|
+| Enable Perturbation Guidance | off | 전체 perturbation 토글 |
+| Attention method | PAG | PAG / SEG / None |
+| PAG / SEG scale | 4.0 | `cond − weak` guidance 배율 |
+| SEG Gaussian sigma | 100 | `>9999`는 spatially uniform query |
+| Legacy strength | 0.75 | Legacy 모드에서만 사용 |
+| Attention blocks | `18` | 빈칸도 안전 기본 `18` |
+| SLG enable / scale / blocks | off / 3.0 / `18` | layer-skip weak 예측 |
+| Start / End | 0.0 / 0.7 | 공통 적용 구간 |
+| Rescale | 0.20 | PAG 보정량만 std 보정 |
+| 동시 사용 scale 자동 감쇠 | on | 활성 weak term 수로 각 scale 나눔 |
+
+PAG 자체를 A/B 할 때는 `Rescale=0`, SLG/APG/ADG off로 두어야 원인을 분리할 수 있습니다.
+
+## 2. CFG base 오케스트레이터
+
+`Preserve incoming`이 기본입니다. 다른 모드는 incoming CFG를 의도적으로 교체하므로
+MaHiRo/RescaleCFG/custom CFG를 쓰는 경우 먼저 Preserve로 비교하세요.
+
+| 모드 | 동작 |
+|---|---|
+| Preserve incoming | Forge 및 다른 CFG 확장의 결과를 그대로 유지 |
+| APG | guidance를 cond 평행/직교 성분으로 분해해 과포화 성분 억제 |
+| CWM | Haar 대역별 CFG 배율 적용 |
+| SMC | step 간 guidance error에 unit-L2 switching control 적용 |
+| SMC + CWM | SMC로 error를 보정한 뒤 CWM 대역 배율 적용 |
+
+고급 `Experimental stack`은 라디오와 별개로 `SMC → APG → CWM`을 명시적으로 실행합니다.
+기본 사용에는 권장하지 않습니다.
+
+### APG
+
+- 빠른 `Enable APG` 체크박스는 CFG base가 Preserve일 때 APG로 바꾸는 호환 토글입니다.
+- `eta=1`, `norm=0`, `momentum=0`이면 표준 선형 CFG로 환원됩니다.
+- APG는 이 확장에서는 post-CFG denoised 공간 구현입니다. reference 구현과 픽셀 동일하지 않습니다.
+- Forge의 CFG=1 positive-only 경로에서는 uncond가 없을 수 있으므로 **CFG > 1에서 사용**하세요.
+- ADG가 uncond를 생략하는 순간 APG momentum과 SMC state를 즉시 비웁니다.
+
+### CWM / SMC
+
+| 필드 | 기본값 | 주의 |
+|---|---:|---|
+| CWM alpha low | 0.30 | 초반 LL 대역 CFG 변화 |
+| CWM alpha high | 0.15 | 후반 HH 대역 CFG 변화 |
+| SMC lambda | 6.0 | Anima/Cosmos 보수적 시작값, 벤치마크 최적값 아님 |
+| SMC k | 0.20 | element-wise sign이 아닌 전체 unit-L2 방향 사용 |
+
+Anima 16채널 latent에서 `alpha high > +0.15`는 한 인물이 여러 인물로 갈라질 수 있습니다.
+UI는 동적 경고만 표시하며 값을 강제로 자르지 않습니다.
+SMC/CWM 입력의 NaN·양/음의 Inf는 reference 구현처럼 0으로 정리해 비정상 값이 latent 전체로
+증폭되지 않게 합니다.
+
+## 3. DCW
+
+CFG·perturbation 뒤 마지막에 live `x_t`와 denoised 예측의 Haar 대역 차이를 보정합니다.
+
+```text
+band_out = band_x0 + lambda_band(sigma) × channel_weight × (band_xt − band_x0)
+```
+
+기본은 off, `lambda low=0.10`, `lambda high=0.02`입니다. 둘 다 0이면 bitwise identity
+fast-path입니다. 4D/5D latent와 홀수 H/W를 지원하며 dtype을 보존합니다. Anima flow sigma는
+`sigma/(sigma+1)` 최대치가 낮으므로 다른 EDM 예제와 수치 체감이 다를 수 있습니다.
+
+## 4. DAVE
+
+Anima block 출력의 token/spatial 평균(DC)을 초반에 약하게 감쇠해 지배적인 구조 성분을 줄입니다.
+
+```text
+out = x − strength × mean(x, token/spatial axes)
+```
+
+- 기본 off, `strength=0.30`, `tau=0.10`, blocks `8-18`
+- `tau=0`은 전 구간, 양수 tau는 초반 비율까지만 적용
+- cond/uncond/PAG weak 행 모두 같은 선형 변환을 받습니다.
+- forward hook을 사용하지 않고 기존 block wrapper 안에서 `original → DAVE → SLG restore` 순서를
+  보장합니다.
+
+실행 경로는 실제 Anima에서 확인했지만, “다양성 향상” 정도와 안전 block 범위는 고정 시드 여러
+seed로 직접 비교해야 합니다.
+
+## 5. CNS-inspired Wavelet Noise
+
+Euler a, ancestral, SDE처럼 sampler가 원본 noise sampler를 호출할 때만 동작합니다. 새 난수를
+생성하지 않고 **기존 seeded/Brownian 출력**을 live `x_t` Haar 에너지에 맞춰 재색칠하므로 RNG
+경로를 보존합니다. 최종 표준편차도 원본 noise와 맞춥니다.
+
+| 필드 | 기본값 |
+|---|---:|
+| Enable CNS-inspired Wavelet Noise | off |
+| Strength | 1.0 |
+| Gamma power | 0.5 |
+| Gamma scale | 3.0 |
+
+결정론적 sampler가 noise sampler를 호출하지 않으면 자동 inert이며 검증 로그에
+`INERT(no ancestral/SDE noise call)`이 표시됩니다. Adaptive Guidance와 병용할 때는
+`Skip after >= 0.65`부터 시작하는 편이 안전합니다.
+
+## 6. Adaptive Guidance (속도)
+
+고정 `Skip after` 이후 cond/uncond가 한 batch로 합쳐진 호출에서 uncond 행을 생략합니다.
+논문의 cosine-similarity 판정이 아닌 단순 threshold 구현입니다.
+
+- 기본 off, `Skip after=0.5`
+- low-VRAM이 cond/uncond를 따로 호출하면 생략할 수 없어 속도 차이가 없습니다.
+- 생략 스텝에서는 perturbation도 쉬고 APG/SMC state를 비웁니다.
+- `Keep every N`은 생략 구간에서도 N번째 스텝마다 uncond를 유지합니다.
+- 특정 속도 향상률은 보장하지 않습니다. 검증 로그의 `SKIPPED-UNCOND`로 실제 생략을 확인하세요.
+
+## 7. Detail Daemon
+
+별도 `Anima Detail Daemon` 아코디언의 sigma schedule 기능입니다. Guidance Suite의 CFG base와는
+별도이며, 모든 모델에서 동작합니다. 자세한 필드는 UI 설명을 따르세요.
+
+## 조합 원칙
+
+- 처음에는 기능 하나씩, 같은 seed로 비교합니다.
+- PAG/SEG는 택1. SLG는 병용 가능하지만 scale 자동 감쇠를 유지합니다.
+- CFG base는 라디오 하나만 사용합니다. Experimental stack은 별도 고급 실험입니다.
+- DCW는 Suite 내부 마지막입니다. 다른 확장의 post-CFG callback과의 전역 순서는 보장할 수 없습니다.
+- CNS는 ancestral/SDE에서만 의미가 있습니다.
+- TeaCache는 이 Suite에 포함하지 않습니다. ADG `keep_every`의 batch 크기 진동 및 stateful guidance와
+  캐시가 충돌할 수 있습니다.
+
+## XYZ Plot
+
+기존 축에 새 Suite 축도 등록됩니다. `Enable=True,False`로 즉시 A/B할 수 있습니다.
+
+- `[Anima Pert]`: Enable, Method, Scale, Legacy, SEG sigma, Blocks, SLG, Start/End, Rescale
+- `[Anima APG]`, `[Anima AdaptiveG]`
+- `[Anima CFG]`: Base Mode, Experimental Stack
+- `[Anima CWM]`, `[Anima SMC]`
+- `[Anima DCW]`, `[Anima DAVE]`, `[Anima CNS]`
+- `[Detail Daemon]`
+
+WebUI의 Reload scripts 뒤에도 기존 label은 중복하지 않고 새 label만 추가합니다.
+
+## 메타데이터와 검증 로그
+
+활성 기능은 PNG infotext/API `info`에 다음 키를 기록합니다.
+
+```text
+Anima Perturbation Guidance
+Anima APG
+Anima Adaptive Guidance
+Anima CFG Orchestrator
+Anima DCW
+Anima DAVE
+Anima CNS Wavelet Noise
+```
+
+확장 목록 아래 `Anima Reference-Latent PoC (debug / 안전)`에서
+`Log Guidance verification summary`를 잠시 켜면 다음을 확인할 수 있습니다.
+
+```text
+[AnimaSafePAG] patched SelfCrossAttention.torch_attention_op (staticmethod) ✅
+[AnimaSafePAG] attention perturb active ✅ hits=... relative_raw_delta=...
+[AnimaSafePAG] [VERIFY] verdict: perturb=..., APG=..., Adaptive=...
+[AnimaSafePAG] [VERIFY] suite: attention=..., CFG=... (w_eff=..., fit=...),
+                               DCW=..., DAVE=..., CNS=...
+```
+
+2026-07-23 실제 최소 검증(256×256, 3 steps):
+
+- 공식 PAG block 18: 3/3 steps, 첫 weak `relative_raw_delta=2.326e-01`
+- 공식 SEG sigma 1.0 block 18: 3/3 steps, 첫 weak `relative_raw_delta=2.879e-02`
+- SLG block 18: 3/3 steps, 첫 `mean|cond-weak|=9.751e-02`
+- APG: 3/3 evals, `w_eff=4`, `fit_error=0`
+- Adaptive Guidance `skip_after=0`: combined batch의 uncond 3/3 steps 생략
+- CWM+DCW+DAVE+CNS, Euler a: CFG 3 evals, DCW 3 evals, DAVE 3 block hits,
+  CNS 2 noise calls, `w_eff=4`, `fit_error=0`
+
+## 테스트
+
+```bash
+python -m unittest discover -s tests -v
+```
+
+검증 범위는 attention staticmethod binding/weak-row 한정 변경, official SEG 실제 H/W,
+Haar 4D/5D·홀수 크기 round-trip, CWM/SMC/DCW/DAVE 중립값, APG 표준 CFG 환원,
+SMC/CWM 비정상 수치 정리, ADG state flush, CNS 결정성·RNG 비소비·표준편차 보존,
+pass 종료 tensor 해제와 Live Workspaces 자산 구조를 포함합니다.
 
 ## 크레딧
 
-| 기능 | 원본 | 라이선스 |
+| 기능 | 참고 프로젝트/논문 | 구현 형태 |
 |---|---|---|
-| Perturbation Guidance (PAG) | [iljung1106/comfyui-anima-safe-pag](https://github.com/iljung1106/comfyui-anima-safe-pag) | 원 저장소 참고 |
-| SEG | [SusungHong/SEG-SDXL](https://github.com/SusungHong/SEG-SDXL) (NeurIPS'24) | 원 저장소 참고 |
-| SLG (Skip Layer Guidance) | SD3.5 / Wan 계열 커뮤니티 구현 | — |
-| APG | [MythicalChu/ComfyUI-APG_ImYourCFGNow](https://github.com/MythicalChu/ComfyUI-APG_ImYourCFGNow) · [논문](https://huggingface.co/papers/2410.02416) | 원 저장소 참고 |
-| Detail Daemon | [muerrilla/sd-webui-detail-daemon](https://github.com/muerrilla/sd-webui-detail-daemon) | 원 저장소 참고 |
+| PAG | [iljung1106/comfyui-anima-safe-pag](https://github.com/iljung1106/comfyui-anima-safe-pag), [PAG 논문](https://arxiv.org/abs/2403.17377) | Forge 이식 + 공식 hard mode |
+| SEG | [SusungHong/SEG-SDXL](https://github.com/SusungHong/SEG-SDXL), [SEG 논문](https://arxiv.org/abs/2408.00760) | Anima H/W용 재구현 |
+| SLG | Stability AI SD3.5 / Wan 커뮤니티 구현 | Forge block wrapper |
+| APG | [MythicalChu/ComfyUI-APG_ImYourCFGNow](https://github.com/MythicalChu/ComfyUI-APG_ImYourCFGNow), [APG 논문](https://arxiv.org/abs/2410.02416) | post-CFG 재구현 |
+| DCW/CWM/SMC | [namemechan/ComfyUI-DCW](https://github.com/namemechan/ComfyUI-DCW) (GPL-3.0) | 공개 수식 기반 Forge 재작성, vendor 아님 |
+| DAVE | [daheekwon/DAVE](https://github.com/daheekwon/DAVE) (MIT), [ComfyUI-Anima-DAVE](https://github.com/sorryhyun/ComfyUI-Anima-DAVE) (MIT), [논문](https://arxiv.org/abs/2606.06813) | block 수식 재구현 |
+| CNS | [namemechan/comfyui-cns_sampler_patch](https://github.com/namemechan/comfyui-cns_sampler_patch) (GPL-3.0), [논문](https://arxiv.org/abs/2605.30332) | CNS-inspired 재작성, vendor 아님 |
+| Detail Daemon | [muerrilla/sd-webui-detail-daemon](https://github.com/muerrilla/sd-webui-detail-daemon) | Forge 재구현 |
 
-각 알고리즘은 Forge Neo용으로 **이식/재구현**한 것이며(vendor 아님), 저작권은 각 원저자에게
-있습니다.
+원본 저장소를 통째로 포함하지 않았으며, Forge 연결과 상태 관리는 이 확장에서 별도로 작성했습니다.
+각 기법과 참조 코드의 저작권·라이선스는 원저자/원 저장소에 따릅니다.

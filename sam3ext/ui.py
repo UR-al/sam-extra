@@ -33,7 +33,6 @@ def _scan_sam3_dir_for_cn_models() -> dict[str, str]:
     SAM3 detection checkpoints themselves are excluded by name pattern — they
     live in the SAM3 Checkpoint dropdown, not the CN model dropdown.
     """
-    import os as _os
     from pathlib import Path as _Path
 
     try:

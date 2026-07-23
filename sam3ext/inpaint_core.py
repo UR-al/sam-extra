@@ -736,7 +736,7 @@ def run_sam3_refine(
 
     Returns ``[]`` when SAM3 finds nothing or every pass is interrupted.
     """
-    from .core import Sam3Result, run_sam3_on_pil, unload_sam3
+    from .core import run_sam3_on_pil, unload_sam3
 
     # Standalone refine always overrides the t2i sampler/steps/scheduler/seed
     # — there's no parent process to inherit from. Set the use_* flags so
