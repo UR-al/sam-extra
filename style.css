@@ -227,7 +227,7 @@
     }
 }
 /* -------------------------------------------------------------------------
- * Live Workspaces — three real, continuously mounted WebUI documents.
+ * Live Workspaces — up to 20 persistent WebUI documents, loaded on demand.
  * ---------------------------------------------------------------------- */
 
 html.sam3-live-shell-active,
@@ -261,17 +261,44 @@ html.sam3-live-shell-active body > :not(#sam3_live_workspace_shell) {
 
 .sam3-live-tabs {
     display: flex;
+    flex: 1 1 auto;
+    min-width: 0;
     gap: .35rem;
+    overflow-x: auto;
+    scrollbar-width: thin;
 }
 
 .sam3-live-tabs button,
-.sam3-live-header > button {
+.sam3-live-header > button,
+.sam3-live-menu > summary,
+.sam3-live-menu-panel button,
+.sam3-live-menu-panel > label.sam3-live-import {
     min-width: 2.6rem;
     padding: .35rem .7rem;
     border: 1px solid var(--border-color-primary, #475569);
     border-radius: .45rem;
     color: inherit;
     background: var(--button-secondary-background-fill, #1e293b);
+    cursor: pointer;
+}
+
+.sam3-live-brand {
+    display: inline-flex;
+    align-items: center;
+    gap: .45rem;
+    white-space: nowrap;
+}
+
+.sam3-live-brand > span {
+    color: var(--color-accent, #fb923c);
+    font-size: 1rem;
+    font-weight: 800;
+    line-height: 1;
+}
+
+.sam3-live-brand:hover,
+.sam3-live-brand:focus-visible {
+    border-color: var(--color-accent, #f97316);
 }
 
 .sam3-live-tabs button.active {
@@ -280,9 +307,101 @@ html.sam3-live-shell-active body > :not(#sam3_live_workspace_shell) {
 }
 
 .sam3-live-note {
-    margin-left: auto;
+    flex: 0 0 auto;
     opacity: .72;
     font-size: .82rem;
+    white-space: nowrap;
+}
+
+.sam3-live-status {
+    flex: 0 1 18rem;
+    min-width: 0;
+    overflow: hidden;
+    color: var(--body-text-color-subdued, #94a3b8);
+    font-size: .78rem;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.sam3-live-status[data-tone="saved"] {
+    color: var(--color-accent, #fb923c);
+}
+
+.sam3-live-status[data-tone="warning"],
+.sam3-live-status[data-tone="error"] {
+    color: var(--error-text-color, #f87171);
+}
+
+.sam3-live-menu {
+    position: relative;
+    flex: 0 0 auto;
+}
+
+.sam3-live-menu > summary {
+    display: grid;
+    place-items: center;
+    min-width: 2.6rem;
+    list-style: none;
+    user-select: none;
+}
+
+.sam3-live-menu > summary::-webkit-details-marker {
+    display: none;
+}
+
+.sam3-live-menu[open] > summary {
+    border-color: var(--color-accent, #f97316);
+}
+
+.sam3-live-menu-panel {
+    position: absolute;
+    top: calc(100% + .45rem);
+    right: 0;
+    z-index: 10;
+    display: grid;
+    width: min(19rem, 80vw);
+    gap: .45rem;
+    padding: .65rem;
+    border: 1px solid var(--border-color-primary, #475569);
+    border-radius: .55rem;
+    background: var(--background-fill-secondary, #101827);
+    box-shadow: 0 .7rem 2rem rgba(0, 0, 0, .35);
+}
+
+.sam3-live-menu-panel > label:not(.sam3-live-import) {
+    display: grid;
+    gap: .3rem;
+    font-size: .78rem;
+}
+
+.sam3-live-menu-panel input[type="text"] {
+    box-sizing: border-box;
+    width: 100%;
+    min-width: 0;
+    padding: .4rem .5rem;
+    border: 1px solid var(--border-color-primary, #475569);
+    border-radius: .4rem;
+    color: inherit;
+    background: var(--input-background-fill, #0f172a);
+}
+
+.sam3-live-menu-panel > label.sam3-live-import {
+    display: block;
+    text-align: center;
+}
+
+.sam3-live-menu-panel button.sam3-live-delete {
+    border-color: color-mix(in srgb, var(--error-text-color, #f87171) 65%, transparent);
+    color: var(--error-text-color, #f87171);
+}
+
+.sam3-live-menu-panel button.sam3-live-delete:hover,
+.sam3-live-menu-panel button.sam3-live-delete:focus-visible {
+    background: color-mix(in srgb, var(--error-background-fill, #7f1d1d) 55%, transparent);
+}
+
+.sam3-live-menu-panel input[type="file"] {
+    display: none;
 }
 
 .sam3-live-frames,
@@ -295,8 +414,44 @@ html.sam3-live-shell-active body > :not(#sam3_live_workspace_shell) {
     background: var(--body-background-fill, #080d17);
 }
 
+.sam3-live-frames {
+    position: relative;
+}
+
 .sam3-live-frames iframe[hidden] {
     display: none !important;
+}
+
+.sam3-live-loading {
+    position: absolute;
+    inset: 0;
+    z-index: 2;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: .75rem;
+    padding: 1rem;
+    color: var(--body-text-color, #e7eaf0);
+    background: var(--body-background-fill, #080d17);
+    font-size: .95rem;
+    pointer-events: none;
+}
+
+.sam3-live-loading[hidden] {
+    display: none !important;
+}
+
+.sam3-live-spinner {
+    width: 1.15rem;
+    height: 1.15rem;
+    border: 2px solid color-mix(in srgb, currentColor 25%, transparent);
+    border-top-color: var(--color-accent, #f97316);
+    border-radius: 50%;
+    animation: sam3-live-spin .8s linear infinite;
+}
+
+@keyframes sam3-live-spin {
+    to { transform: rotate(360deg); }
 }
 
 html.sam3-live-frame-active body {

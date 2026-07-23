@@ -1,5 +1,5 @@
 /*
- * SAM3 extension — txt2img Workspaces (v0.11.x)
+ * SAM3 extension — txt2img Workspaces (v0.12.x)
  *
  * Browser-local txt2img workspaces in one Forge tab.  The manager is
  * deliberately front-end only: it does not patch Forge or touch global
@@ -7,8 +7,9 @@
  * file references (never duplicated image bytes) in browser IndexedDB.
  *
  * Gradio 4.40 notes:
- *   - The DOM is the source of truth for current values.  /config is fetched
- *     only for component ids, raw types and choice metadata.
+ *   - The DOM is the source of truth for current values. Forge's already
+ *     parsed `window.gradio_config` is reused for component ids, raw types and
+ *     choice metadata; /config is only a compatibility fallback.
  *   - Values are restored through Gradio's typed `prop_change` event.  This is
  *     important for dropdowns (including XYZ's anonymous multiselects), where
  *     assigning input.value only changes the search box.
@@ -24,6 +25,7 @@
     if (LIVE_FRAME_SLOT && !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,79}$/.test(LIVE_FRAME_SLOT)) {
         LIVE_FRAME_SLOT = null;
     }
+    var LIVE_SHELL_PAGE = !LIVE_FRAME_SLOT && _sam3Query.get("sam3_live") !== "off";
     // Load the Live shell from this already-registered extension script too.
     // This makes upgrades work after a normal page reload even when Forge has
     // not yet rebuilt its startup-time list of extension JavaScript files.
@@ -34,7 +36,7 @@
             if (ownScript) {
                 var liveScript = document.createElement("script");
                 liveScript.src = ownScript.replace(/workspace_manager\.js(?:\?.*)?$/, "live_workspaces.js")
-                    + "?v=2";
+                    + "?v=10";
                 document.head.appendChild(liveScript);
             }
         } catch (e) {
@@ -42,10 +44,10 @@
         }
     }
     // The top-level page is a lightweight Live Workspace shell by default.
-    // Its child frames still use this serializer, pinned to one slot each.
-    if (!LIVE_FRAME_SLOT && _sam3Query.get("sam3_live") !== "off") return;
+    // It still initializes the storage facade below so add/rename/export/
+    // import use exactly the same schema and validation as child frames.
 
-    var VERSION = "0.11.0";
+    var VERSION = "0.12.0";
     var SCHEMA = 1;
     var STORAGE_KEY = "sam-extra.workspace-manager.v1";
     var ACTIVE_KEY = "sam-extra.workspace-manager.active.v1";
@@ -91,6 +93,38 @@
     var activeSlot = LIVE_FRAME_SLOT || readActiveSlot();
     var tabId = readTabId();
     var knownSlotRevision = 0;
+    var livePhaseStartedAt = Date.now();
+    var livePhaseHistory = [];
+
+    function setLivePhase(phase, detail) {
+        if (!LIVE_FRAME_SLOT || !document.documentElement) return;
+        var elapsed = Math.max(0, Date.now() - livePhaseStartedAt);
+        livePhaseHistory.push({
+            phase: String(phase || ""),
+            elapsedMs: elapsed,
+            detail: detail === undefined || detail === null ? "" : String(detail).slice(0, 120)
+        });
+        if (livePhaseHistory.length > 24) livePhaseHistory.shift();
+        document.documentElement.setAttribute("data-sam3-workspace-phase", String(phase || ""));
+        document.documentElement.setAttribute(
+            "data-sam3-workspace-elapsed-ms",
+            String(elapsed)
+        );
+        document.documentElement.setAttribute(
+            "data-sam3-workspace-phase-history",
+            JSON.stringify(livePhaseHistory)
+        );
+        if (detail === undefined || detail === null) {
+            document.documentElement.removeAttribute("data-sam3-workspace-phase-detail");
+        } else {
+            document.documentElement.setAttribute(
+                "data-sam3-workspace-phase-detail",
+                String(detail).slice(0, 240)
+            );
+        }
+    }
+
+    setLivePhase("script-loaded");
 
     function app() {
         return (typeof gradioApp === "function") ? gradioApp() : document;
@@ -486,16 +520,7 @@
         }
     }
 
-    function loadConfig() {
-        if (configPromise) return configPromise;
-        configPromise = fetch(configUrl(), {
-            method: "GET",
-            credentials: "same-origin",
-            cache: "no-store"
-        }).then(function (response) {
-            if (!response.ok) throw new Error("HTTP " + response.status);
-            return response.json();
-        }).then(function (cfg) {
+    function acceptConfig(cfg) {
             configComponents = Array.isArray(cfg && cfg.components) ? cfg.components : [];
             configById = Object.create(null);
             configComponents.forEach(function (component) {
@@ -511,7 +536,31 @@
             outputComponentIds.generationInfo = idForElemId("generation_info_txt2img");
             outputComponentIds.htmlInfo = idForElemId("html_info_txt2img");
             return configComponents;
-        }).catch(function (e) {
+    }
+
+    function loadConfig() {
+        if (configPromise) return configPromise;
+        // Gradio has already downloaded and parsed this multi-megabyte object
+        // before it calls onUiLoaded. Re-fetching /config in every Live iframe
+        // doubled the largest startup cost and made three Workspaces feel much
+        // slower than three manually opened tabs.
+        if (window.gradio_config && Array.isArray(window.gradio_config.components)) {
+            try {
+                configPromise = Promise.resolve(acceptConfig(window.gradio_config));
+                return configPromise;
+            } catch (e) {
+                configPromise = null;
+                console.warn("[SAM3 Workspaces] loaded Gradio config was unusable:", e);
+            }
+        }
+        configPromise = fetch(configUrl(), {
+            method: "GET",
+            credentials: "same-origin",
+            cache: "default"
+        }).then(function (response) {
+            if (!response.ok) throw new Error("HTTP " + response.status);
+            return response.json();
+        }).then(acceptConfig).catch(function (e) {
             console.warn("[SAM3 Workspaces] /config unavailable; using DOM fallback:", e);
             configComponents = [];
             configById = Object.create(null);
@@ -623,6 +672,19 @@
             if (values && values.parentElement && values.parentElement.contains(el)) return axes[i];
         }
         return null;
+    }
+
+    function logicallyVisibleInWorkspace(el) {
+        // offsetParent becomes null for every control when the containing Live
+        // Workspace iframe is hidden. Inspect only this document's own style
+        // tree so background autosave/export preserves the active XYZ value UI.
+        for (var node = el; node && node.nodeType === 1; node = node.parentElement) {
+            if (node.hidden) return false;
+            var style = window.getComputedStyle(node);
+            if (style.display === "none" || style.visibility === "hidden") return false;
+            if (node === document.documentElement) break;
+        }
+        return true;
     }
 
     function generatedAccordionKey(el, meta) {
@@ -822,8 +884,7 @@
             if (value !== undefined) {
                 var record = { kind: adapter.kind, value: value };
                 if (adapter.xyzAxis) {
-                    record.active = adapter.el.offsetParent !== null
-                        && window.getComputedStyle(adapter.el).display !== "none";
+                    record.active = logicallyVisibleInWorkspace(adapter.el);
                 }
                 controls[adapter.key] = record;
             }
@@ -1342,6 +1403,7 @@
         if (!snapshot || !isPlainObject(snapshot.controls)) return;
         restoring++;
         if (restoring === 1) setRestoreBusy(true);
+        setLivePhase("restore-start", reason || "");
         dirty = false;
         if (saveTimer) { clearTimeout(saveTimer); saveTimer = null; }
         setStatus(activeWorkspaceName() + " 복원 중…", "pending");
@@ -1350,11 +1412,13 @@
         var galleryCount = 0;
         try {
             await loadConfig();
+            setLivePhase("restore-config-ready");
             var catalog = buildCatalog();
             var driverAdapters = catalog.adapters.filter(isDriver).sort(function (a, b) {
                 return driverPriority(a) - driverPriority(b);
             });
             var driverKeys = driverAdapters.map(function (adapter) { return adapter.key; });
+            var stagedDriverKeys = new Set();
 
             // Phase 1: commit every driver value before starting any Gradio
             // dependency. XYZ axis callbacks also read CSV mode and sibling
@@ -1363,22 +1427,42 @@
             for (var i = 0; i < driverAdapters.length; i++) {
                 var driver = driverAdapters[i];
                 var driverRecord = snapshot.controls[driver.key];
-                if (driverRecord && await stageDriverValue(driver, driverRecord)) applied++;
+                if (driverRecord && await stageDriverValue(driver, driverRecord)) {
+                    stagedDriverKeys.add(driver.key);
+                    applied++;
+                }
             }
-            await delay(60);
+            setLivePhase(
+                "restore-drivers-staged",
+                stagedDriverKeys.size + "/" + driverAdapters.length
+            );
+            if (stagedDriverKeys.size) await delay(60);
 
             // Phase 2: all callbacks now observe the same final driver state.
-            // Trigger even for values that already matched so stale dependent
-            // panels from the previous workspace are rebuilt deterministically.
-            for (var d = 0; d < driverAdapters.length; d++) {
-                var dependencyDriver = driverAdapters[d];
+            // A Live child starts as a fresh Forge document, so matching driver
+            // values already have matching dependent panels. Re-triggering all
+            // five Script/XYZ callbacks caused seconds of redundant Gradio
+            // rerenders on every iframe. Legacy in-place switches still rebuild
+            // every dependency because the previous Workspace may have left a
+            // stale panel behind.
+            var dependencyDrivers = reason === "startup"
+                ? driverAdapters.filter(function (adapter) {
+                    return stagedDriverKeys.has(adapter.key);
+                })
+                : driverAdapters;
+            for (var d = 0; d < dependencyDrivers.length; d++) {
+                var dependencyDriver = dependencyDrivers[d];
                 var dependencyRecord = snapshot.controls[dependencyDriver.key];
                 if (dependencyRecord && await triggerDriverDependency(dependencyDriver, dependencyRecord)) applied++;
             }
+            setLivePhase("restore-driver-dependencies", dependencyDrivers.length);
 
-            if (driverKeys.length) await delay(120);
+            if (dependencyDrivers.length) await delay(120);
             catalog = buildCatalog();
-            var xyzNotReady = await waitForXyzChoiceOptions(snapshot, catalog);
+            var xyzNotReady = dependencyDrivers.length
+                ? await waitForXyzChoiceOptions(snapshot, catalog)
+                : 0;
+            setLivePhase("restore-xyz-ready", xyzNotReady);
             catalog = buildCatalog();
             var keys = Object.keys(snapshot.controls);
             for (var j = 0; j < keys.length; j++) {
@@ -1390,13 +1474,35 @@
                 if (adapter.xyzAxis && record.active === false) continue;
                 if (await applyOne(adapter, record, false)) applied++;
             }
+            setLivePhase("restore-controls-applied", applied);
 
-            await delay(160);
             catalog = buildCatalog();
+            function mismatchedControlKeys(currentCatalog) {
+                return keys.filter(function (candidateKey) {
+                    var candidateAdapter = currentCatalog.map[candidateKey];
+                    var candidateRecord = snapshot.controls[candidateKey];
+                    if (!candidateAdapter || !candidateRecord
+                            || candidateAdapter.kind !== candidateRecord.kind) return false;
+                    if (candidateAdapter.xyzAxis && candidateRecord.active === false) return false;
+                    var candidateValue = readValue(candidateAdapter);
+                    return candidateValue === undefined
+                        || !valuesEqual(candidateValue, candidateRecord.value);
+                });
+            }
+            var mismatchedKeys = mismatchedControlKeys(catalog);
+            // prop_change is synchronous for ordinary controls. Only yield to
+            // Gradio when something is still mismatched; an unconditional
+            // 160 ms timer could be delayed by several seconds while the large
+            // Forge page finished mounting, even when every value already fit.
+            if (mismatchedKeys.length) {
+                await delay(160);
+                catalog = buildCatalog();
+                mismatchedKeys = mismatchedControlKeys(catalog);
+            }
             var fallbackCount = 0;
-            for (var k = 0; k < keys.length; k++) {
-                var verifyAdapter = catalog.map[keys[k]];
-                var verifyRecord = snapshot.controls[keys[k]];
+            for (var k = 0; k < mismatchedKeys.length; k++) {
+                var verifyAdapter = catalog.map[mismatchedKeys[k]];
+                var verifyRecord = snapshot.controls[mismatchedKeys[k]];
                 if (!verifyAdapter || !verifyRecord || verifyAdapter.kind !== verifyRecord.kind) continue;
                 if (verifyAdapter.xyzAxis && verifyRecord.active === false) continue;
                 var actual = readValue(verifyAdapter);
@@ -1405,7 +1511,20 @@
                     fallbackCount++;
                 }
             }
-            galleryCount = await restoreWorkspaceOutputs(activeSlot);
+            setLivePhase("restore-controls-verified", fallbackCount);
+            if (reason === "startup") {
+                // A WebUI/page restart intentionally begins with an empty
+                // comparison gallery. The IndexedDB delete was queued before
+                // restore started, so do not block settings on opening that DB
+                // and then read the just-deleted empty record back again.
+                outputState = emptyWorkspaceOutputs();
+                dispatchOutputValue(outputComponentIds.gallery, []);
+                dispatchOutputValue(outputComponentIds.generationInfo, "");
+                dispatchOutputValue(outputComponentIds.htmlInfo, "");
+                galleryCount = 0;
+            } else {
+                galleryCount = await restoreWorkspaceOutputs(activeSlot);
+            }
             knownSlotRevision = Number(snapshot.revision) || 0;
             setStatus(
                 activeWorkspaceName() + " 복원됨 · 설정 " + applied + "개 · 갤러리 "
@@ -1422,6 +1541,7 @@
             if (restoring === 0) setRestoreBusy(false);
             dirty = false;
             updateButtons();
+            setLivePhase("restore-complete");
         }
     }
 
@@ -1502,6 +1622,139 @@
             id = "ws-" + Date.now().toString(36) + "-" + Math.random().toString(36).slice(2, 9);
         } while (workspaceIds(store).indexOf(id) !== -1 || Object.prototype.hasOwnProperty.call(store.slotRevisions, id));
         return id;
+    }
+
+    function storedWorkspaceList() {
+        var store = readStore();
+        var names = Object.create(null);
+        workspaceIds(store).forEach(function (slot) {
+            names[slot] = workspaceName(store, slot);
+        });
+        return {
+            ids: workspaceIds(store),
+            names: names,
+            max: MAX_WORKSPACES
+        };
+    }
+
+    function renameStoredWorkspace(slot, requestedName) {
+        slot = sanitizeSlotId(slot);
+        var store = readStore();
+        if (!slot || workspaceIds(store).indexOf(slot) === -1) {
+            return { ok: false, error: "Workspace를 찾지 못했습니다" };
+        }
+        var currentName = workspaceName(store, slot);
+        var nextName = sanitizeWorkspaceName(requestedName, currentName);
+        if (nextName === currentName) {
+            return { ok: true, slot: slot, name: currentName, unchanged: true };
+        }
+        store.slotNames[slot] = nextName;
+        store.revision = (Number(store.revision) || 0) + 1;
+        store.updatedAt = new Date().toISOString();
+        store.updatedBy = tabId;
+        if (!writeStore(store)) return { ok: false, error: "이름을 저장하지 못했습니다" };
+        return { ok: true, slot: slot, name: nextName };
+    }
+
+    function createStoredWorkspace(sourceSlot) {
+        sourceSlot = sanitizeSlotId(sourceSlot);
+        var store = readStore();
+        var ids = workspaceIds(store);
+        if (ids.length >= MAX_WORKSPACES) {
+            return {
+                ok: false,
+                error: "Workspace는 최대 " + MAX_WORKSPACES + "개까지 만들 수 있습니다"
+            };
+        }
+        if (!sourceSlot || ids.indexOf(sourceSlot) === -1 || !store.slots[sourceSlot]) {
+            return { ok: false, error: "현재 Workspace 설정을 먼저 준비해 주세요" };
+        }
+
+        var slot = createWorkspaceId(store);
+        var name = nextWorkspaceName(store);
+        var snapshot = cloneJson(store.slots[sourceSlot]);
+        var now = new Date().toISOString();
+        var clock = slotRevision(store, slot) + 1;
+        snapshot.revision = clock;
+        snapshot.createdAt = now;
+        snapshot.savedAt = now;
+        snapshot.writer = tabId;
+        store.slotOrder.push(slot);
+        store.slotNames[slot] = name;
+        store.slotRevisions[slot] = clock;
+        store.slots[slot] = snapshot;
+        store.revision = (Number(store.revision) || 0) + 1;
+        store.updatedAt = now;
+        store.updatedBy = tabId;
+        if (!writeStore(store)) return { ok: false, error: "Workspace를 저장하지 못했습니다" };
+        return { ok: true, slot: slot, name: name };
+    }
+
+    async function deleteStoredWorkspace(slot) {
+        slot = sanitizeSlotId(slot);
+        var store = readStore();
+        var ids = workspaceIds(store);
+        var currentIndex = ids.indexOf(slot);
+        if (!slot || currentIndex === -1) {
+            return { ok: false, error: "삭제할 Workspace를 찾지 못했습니다" };
+        }
+        if (ids.length <= 1) {
+            return { ok: false, error: "마지막 Workspace는 삭제할 수 없습니다" };
+        }
+
+        var deletedName = workspaceName(store, slot);
+        var remaining = ids.filter(function (candidate) { return candidate !== slot; });
+        var target = remaining[Math.min(currentIndex, remaining.length - 1)];
+        if (!store.slots[target]) {
+            var populated = remaining.find(function (candidate) {
+                return !!store.slots[candidate];
+            });
+            if (populated) target = populated;
+        }
+
+        // Retain a revision tombstone so a stale browser tab cannot recreate
+        // the removed Workspace during its next autosave.
+        store.slotRevisions[slot] = slotRevision(store, slot) + 1;
+        store.slotOrder = remaining;
+        delete store.slotNames[slot];
+        delete store.slots[slot];
+        store.revision = (Number(store.revision) || 0) + 1;
+        store.updatedAt = new Date().toISOString();
+        store.updatedBy = tabId;
+        if (!writeStore(store)) {
+            return { ok: false, error: "Workspace를 삭제하지 못했습니다" };
+        }
+        await deleteWorkspaceOutputs(slot);
+
+        var names = Object.create(null);
+        remaining.forEach(function (candidate) {
+            names[candidate] = workspaceName(store, candidate);
+        });
+        return {
+            ok: true,
+            deletedSlot: slot,
+            deletedName: deletedName,
+            activeSlot: target,
+            ids: remaining,
+            names: names
+        };
+    }
+
+    function workspaceExportPayload() {
+        var store = readStore();
+        return {
+            schema: SCHEMA,
+            format: "sam-extra-workspaces",
+            extensionVersion: VERSION,
+            exportedAt: new Date().toISOString(),
+            revision: store.revision,
+            updatedAt: store.updatedAt,
+            updatedBy: store.updatedBy,
+            slotOrder: store.slotOrder,
+            slotNames: store.slotNames,
+            slotRevisions: store.slotRevisions,
+            slots: store.slots
+        };
     }
 
     function syncWorkspaceNameEditor(store) {
@@ -1709,20 +1962,7 @@
             setStatus("현재 작업공간 저장 실패 · 내보내기 취소", "error");
             return;
         }
-        var store = readStore();
-        var payload = {
-            schema: SCHEMA,
-            format: "sam-extra-workspaces",
-            extensionVersion: VERSION,
-            exportedAt: new Date().toISOString(),
-            revision: store.revision,
-            updatedAt: store.updatedAt,
-            updatedBy: store.updatedBy,
-            slotOrder: store.slotOrder,
-            slotNames: store.slotNames,
-            slotRevisions: store.slotRevisions,
-            slots: store.slots
-        };
+        var payload = workspaceExportPayload();
         try {
             var blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" });
             var url = URL.createObjectURL(blob);
@@ -1739,6 +1979,76 @@
         }
     }
 
+    function previewWorkspaceImport(parsed) {
+        var imported = normalizeStore(parsed);
+        var importedIds = workspaceIds(imported);
+        var hasAny = importedIds.some(function (slot) { return !!imported.slots[slot]; });
+        if (!hasAny) throw new Error("no workspace snapshots");
+        var names = Object.create(null);
+        importedIds.forEach(function (slot) {
+            names[slot] = workspaceName(imported, slot);
+        });
+        return {
+            store: imported,
+            ids: importedIds,
+            names: names
+        };
+    }
+
+    async function replaceWorkspaceStore(parsed, preferredSlot) {
+        var preview = previewWorkspaceImport(parsed);
+        var imported = preview.store;
+        var importedIds = preview.ids;
+        var current = readStore();
+        var currentIds = workspaceIds(current);
+        var importedAt = new Date().toISOString();
+        importedIds.forEach(function (slot) {
+            var clock = Math.max(
+                slotRevision(current, slot),
+                slotRevision(imported, slot),
+                imported.slots[slot] ? Number(imported.slots[slot].revision) || 0 : 0
+            ) + 1;
+            imported.slotRevisions[slot] = clock;
+            if (imported.slots[slot]) {
+                imported.slots[slot].revision = clock;
+                imported.slots[slot].writer = tabId;
+                imported.slots[slot].savedAt = importedAt;
+            }
+        });
+        // Keep revision tombstones for slots removed by the import so another
+        // open tab cannot silently recreate stale data.
+        currentIds.forEach(function (slot) {
+            if (importedIds.indexOf(slot) !== -1) return;
+            imported.slotRevisions[slot] = Math.max(
+                slotRevision(current, slot), slotRevision(imported, slot)
+            ) + 1;
+        });
+        imported.revision = Math.max(
+            Number(current.revision) || 0,
+            Number(imported.revision) || 0
+        ) + 1;
+        imported.updatedAt = importedAt;
+        imported.updatedBy = tabId;
+        if (!writeStore(imported)) throw new Error("workspace store write failed");
+
+        // Gallery records are intentionally local-only and are not present in
+        // exported JSON. Avoid attaching stale records to imported ids.
+        await clearWorkspaceOutputs();
+        preferredSlot = sanitizeSlotId(preferredSlot);
+        var restoreSlot = preferredSlot
+                && importedIds.indexOf(preferredSlot) !== -1
+                && imported.slots[preferredSlot]
+            ? preferredSlot
+            : (importedIds.find(function (slot) { return !!imported.slots[slot]; })
+                || importedIds[0]);
+        return {
+            ok: true,
+            activeSlot: restoreSlot,
+            ids: importedIds,
+            names: preview.names
+        };
+    }
+
     function importFile(file) {
         if (!file) return;
         if (file.size > MAX_STORAGE_BYTES) {
@@ -1749,57 +2059,18 @@
         reader.onload = async function () {
             try {
                 var parsed = JSON.parse(String(reader.result || ""));
-                var imported = normalizeStore(parsed);
-                var importedIds = workspaceIds(imported);
-                var hasAny = importedIds.some(function (slot) { return !!imported.slots[slot]; });
-                if (!hasAny) throw new Error("no workspace snapshots");
+                var preview = previewWorkspaceImport(parsed);
                 if (!window.confirm(
-                    "현재 Workspace를 가져온 파일의 " + importedIds.length
+                    "현재 Workspace를 가져온 파일의 " + preview.ids.length
                         + "개 Workspace로 교체할까요? 로컬 txt2img 갤러리 기록도 비워집니다."
                 )) return;
                 switching = true;
                 dirty = false;
                 if (saveTimer) { clearTimeout(saveTimer); saveTimer = null; }
-                var current = readStore();
-                var currentIds = workspaceIds(current);
-                var importedAt = new Date().toISOString();
-                importedIds.forEach(function (slot) {
-                    var clock = Math.max(
-                        slotRevision(current, slot),
-                        slotRevision(imported, slot),
-                        imported.slots[slot] ? Number(imported.slots[slot].revision) || 0 : 0
-                    ) + 1;
-                    imported.slotRevisions[slot] = clock;
-                    if (imported.slots[slot]) {
-                        imported.slots[slot].revision = clock;
-                        imported.slots[slot].writer = tabId;
-                        imported.slots[slot].savedAt = importedAt;
-                    }
-                });
-                // Keep revision tombstones for slots removed by the import so
-                // another open tab cannot silently recreate stale data.
-                currentIds.forEach(function (slot) {
-                    if (importedIds.indexOf(slot) !== -1) return;
-                    imported.slotRevisions[slot] = Math.max(
-                        slotRevision(current, slot), slotRevision(imported, slot)
-                    ) + 1;
-                });
-                imported.revision = Math.max(Number(current.revision) || 0, Number(imported.revision) || 0) + 1;
-                imported.updatedAt = importedAt;
-                imported.updatedBy = tabId;
-                if (!writeStore(imported)) {
-                    switching = false;
-                    return;
-                }
-                // Gallery records are intentionally local-only and are not
-                // present in exported JSON. Avoid attaching stale records to
-                // imported workspace ids that happen to match local ids.
-                await clearWorkspaceOutputs();
-                var restoreSlot = importedIds.indexOf(activeSlot) !== -1 && imported.slots[activeSlot]
-                    ? activeSlot
-                    : (importedIds.find(function (slot) { return !!imported.slots[slot]; }) || importedIds[0]);
-                activeSlot = restoreSlot;
+                var result = await replaceWorkspaceStore(parsed, activeSlot);
+                activeSlot = result.activeSlot;
                 safeSessionSet(ACTIVE_KEY, activeSlot);
+                var imported = readStore();
                 knownSlotRevision = slotRevision(imported, activeSlot);
                 externalConflict = false;
                 updateButtons();
@@ -2008,15 +2279,28 @@
         if (!app().querySelector("#txt2img_prompt textarea") || !app().querySelector("#txt2img_steps input")) return;
         initialized = true;
         bootstrapping = true;
+        setLivePhase("initialize-start");
         setStatus("작업공간 준비 중…", "pending");
         try {
+            if (LIVE_FRAME_SLOT) {
+                // The Live layout moves Forge's selectable Script controls
+                // into its middle column. Restoring XYZ while those nodes are
+                // being moved can let a late Gradio dependency repaint the
+                // old axis value over the saved one.
+                await waitFor(function () {
+                    return window.__sam3LiveChildLayoutSettled === true;
+                }, 20000);
+                setLivePhase("layout-ready");
+            }
             await loadConfig();
+            setLivePhase("config-ready");
             // Galleries are comparison scratchpads, not history. A page/WebUI
             // restart begins a fresh comparison session for every workspace.
-            if (LIVE_FRAME_SLOT) await deleteWorkspaceOutputs(activeSlot);
-            else await clearWorkspaceOutputs();
+            if (LIVE_FRAME_SLOT) deleteWorkspaceOutputs(activeSlot);
+            else clearWorkspaceOutputs();
+            setLivePhase("outputs-clear-queued");
             outputState = emptyWorkspaceOutputs();
-            await delay(250);
+            if (!LIVE_FRAME_SLOT) await delay(250);
             var store = readStore();
             ensureActiveSlot(store);
             var snapshot = store.slots[activeSlot];
@@ -2040,6 +2324,7 @@
             bootstrapping = false;
             attachAutosave();
             updateButtons();
+            setLivePhase("initialize-complete");
         }
     }
 
@@ -2058,6 +2343,43 @@
                 if (snapshot) restoreSnapshot(snapshot, "remount");
             }, 300);
         }
+    }
+
+    async function flushForLiveShell() {
+        var settled = await waitFor(function () {
+            return initialized
+                && !bootstrapping
+                && !restoring
+                && !switching
+                && !resetting;
+        }, 60000);
+        if (!settled) return { ok: false, error: "Workspace가 아직 준비 중입니다" };
+        var snapshot = saveNow("live-shell-flush", true);
+        if (!snapshot) return { ok: false, error: "Workspace 설정을 저장하지 못했습니다" };
+        await flushWorkspaceOutputs(activeSlot);
+        return {
+            ok: true,
+            slot: activeSlot,
+            revision: Number(snapshot.revision) || 0
+        };
+    }
+
+    function prepareForLiveImport() {
+        resetting = true;
+        switching = false;
+        dirty = false;
+        externalConflict = false;
+        if (saveTimer) { clearTimeout(saveTimer); saveTimer = null; }
+        if (outputSaveTimer) { clearTimeout(outputSaveTimer); outputSaveTimer = null; }
+        return { ok: true, slot: activeSlot };
+    }
+
+    function cancelLiveImport() {
+        // If validation or the shared-store write fails after the parent
+        // paused its child frames, resume autosave without a manual reload.
+        resetting = false;
+        updateButtons();
+        return { ok: true, slot: activeSlot };
     }
 
     function diagnostics() {
@@ -2098,7 +2420,22 @@
 
     window.__sam3WorkspaceManager = {
         version: VERSION,
-        diagnostics: diagnostics
+        diagnostics: diagnostics,
+        flushForLiveShell: flushForLiveShell,
+        prepareForLiveImport: prepareForLiveImport,
+        cancelLiveImport: cancelLiveImport,
+        storage: {
+            list: storedWorkspaceList,
+            rename: renameStoredWorkspace,
+            createFrom: createStoredWorkspace,
+            remove: deleteStoredWorkspace,
+            exportPayload: workspaceExportPayload,
+            previewImport: function (parsed) {
+                var preview = previewWorkspaceImport(parsed);
+                return { ids: preview.ids, names: preview.names };
+            },
+            importStore: replaceWorkspaceStore
+        }
     };
 
     function start() {
@@ -2113,9 +2450,11 @@
         if (typeof onAfterUiUpdate === "function") onAfterUiUpdate(ensureMounted);
     }
 
-    if (typeof onUiLoaded === "function") {
-        onUiLoaded(function () { setTimeout(start, 400); });
-    } else {
-        document.addEventListener("DOMContentLoaded", function () { setTimeout(start, 1200); });
+    if (!LIVE_SHELL_PAGE) {
+        if (typeof onUiLoaded === "function") {
+            onUiLoaded(function () { setTimeout(start, 400); });
+        } else {
+            document.addEventListener("DOMContentLoaded", function () { setTimeout(start, 1200); });
+        }
     }
 })();
