@@ -3,6 +3,31 @@
 버전 태그는 GitHub Releases에도 발행됩니다. 아래는 요약이며, guidance/속도 기능의
 상세는 [docs/GUIDANCE.md](docs/GUIDANCE.md)를 참고하세요.
 
+## v0.13.0 — 실제 Workspace 탭 + Guidance 제어·UI 완성
+
+Live Workspaces의 iframe 전환이 무거운 환경을 위해 같은 WebUI 포트의 실제 브라우저 탭으로
+전환하는 경로를 추가하고, PAG/SEG 공식 구현의 전체 제어값과 안전 힌트를 UI에 노출한 릴리즈.
+
+- **실제 브라우저 탭 모드**: Live 헤더의 `실제 탭으로 열기`가 로드된 Workspace를 먼저
+  강제 저장한 뒤 현재 셸을 활성 Workspace로 바꾸고 나머지를 최상위 브라우저 탭으로 엶.
+  탭마다 고정 slot·이름·자동 저장 상태를 표시하며 iframe은 0개가 되어 브라우저 기본 탭
+  전환과 같은 경로를 사용. 팝업 차단은 감지해 열린 수와 허용 안내를 표시.
+- **Live Workspace 안정성·UX**: 세 iframe을 모두 한 번 준비하되 비활성 화면은 표시만
+  전환하고, 자동 저장 상태를 Live 헤더에 전달. Forge 상단 txt2img/img2img/PNG Info/
+  Settings/Extensions 탭을 유지하고 확장 패널은 Parameters 아래, Forge 기본 Script/XYZ만
+  중앙 Scripts에 배치.
+- **Forge 갤러리 동작 보존**: Generate 시 이전 결과만 숨기고 Gallery 루트를 유지하여
+  Waiting/Queue/진행률/중간 미리보기가 Forge 기본 경로로 표시된 뒤 이번 최종 결과만 남김.
+- **공식 PAG/SEG 전체 제어**: Attn Scale, 공식 perturbation strength, block/head indices,
+  Start/End, Rescale, full/partial rescale mode를 UI와 XYZ에 일치시킴. Legacy Soft PAG/
+  SEG-Approx strength는 호환 아코디언으로 분리.
+- **Guidance UI 정리**: DCW/DAVE/CNS를 중첩 탭 밖의 주 패널로 이동하고 SLG/APG/
+  Adaptive/CWM/SMC를 포함한 각 수치 항목에 깨짐·과채도·구도 변화가 보일 때의 조절 방향을
+  설명하는 맞춤 힌트를 추가.
+- **검증**: Python 회귀 테스트 54개와 JavaScript 문법 검사 통과. 실제 `7860` Forge에서
+  Workspace 1/2/3이 각각 별도 최상위 탭, 고정 slot, 개별 제목·저장 상태, iframe 0개로
+  열리는 것을 확인. Forge 상단 탭 유지 및 새 `Traceback`/`KeyError` 0개 확인.
+
 ## v0.12.0 — 동적 Live Workspaces + RK/TDE Gradio 가드
 
 Live Workspaces를 고정된 iframe 3개에서 동적으로 관리 가능한 작업공간 셸로 확장하고,

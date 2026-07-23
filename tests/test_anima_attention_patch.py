@@ -23,6 +23,7 @@ class AnimaAttentionPatchTests(unittest.TestCase):
             strength=1.0,
             legacy_attn=False,
             seg_sigma=1.0,
+            head_spec="",
             attn_spatial_shape=(1, 2, 2),
             attn_hook_hits=0,
             attn_shape_warned=False,
