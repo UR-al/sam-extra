@@ -308,7 +308,7 @@ def _resolve_vae_path(name: str) -> str | None:
 
 
 class AnimaVAE2x(scripts.Script):
-    sorting_priority = 1  # just under SAM3 / guidance block
+    sorting_priority = 3  # just under SAM3 / guidance block
 
     def title(self):
         return "Anima VAE 2x (spacepxl decoder)"

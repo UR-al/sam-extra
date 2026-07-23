@@ -3,6 +3,30 @@
 버전 태그는 GitHub Releases에도 발행됩니다. 아래는 요약이며, guidance/속도 기능의
 상세는 [docs/GUIDANCE.md](docs/GUIDANCE.md)를 참고하세요.
 
+## v0.14.0 — 독립 CFG base 토글 + Skimmed CFG
+
+상호배타였던 CFG base 라디오를 독립 토글로 분해해 SMC·APG·CWM을 자유롭게 조합할 수 있게
+하고, anti-burn 기능인 Skimmed CFG를 별도 아코디언으로 추가한 릴리즈.
+
+- **SMC·APG·CWM을 독립 토글로 분리**: 상호배타였던 `CFG base mode` 라디오를 대신해
+  `Enable SMC` / `Enable CWM` 체크박스를 추가하고, 기존 `Enable APG`와 함께 원하는 조합을
+  동시에 켤 수 있게 함. 켜진 것들은 항상 `SMC → APG → CWM` 순서로 적용되며, 셋 다 끄면
+  incoming CFG를 그대로 보존. `Experimental stack` 없이도 APG+CWM, APG+SMC 조합 가능.
+- **파라미터 재배치**: `CWM / SMC Advanced` 아코디언을 해체해 SMC lambda/k는 SMC 토글
+  아래, CWM alpha low/high는 CWM 토글 아래로 이동.
+- **하위 호환 유지**: 라디오와 `Experimental stack`은 `Legacy CFG base mode` 아코디언에
+  남겨 새 토글과 OR로 합침. 스크립트 인자는 뒤에 append해 저장된 infotext·API 호출·
+  기존 XYZ 그리드가 그대로 동작. XYZ에 `[Anima SMC] Enable`·`[Anima CWM] Enable` 추가.
+- **Skimmed CFG 추가**: [Extraltodeus/Skimmed_CFG](https://github.com/Extraltodeus/Skimmed_CFG)의
+  공개 수식을 Forge용으로 재작성한 anti-burn 기능을 `Anima Detail Daemon` 바로 아래
+  독립 아코디언으로 추가. upstream은 ComfyUI pre-CFG 노드지만 Forge의 pre-CFG 계약이
+  달라 post-CFG에서 동일 수식을 재구성. skim 결과를 Forge의 예측 tensor에 다시 써서
+  **SMC/APG/CWM·PAG delta·DCW와 동시에 사용 가능**(ComfyUI에서 pre-CFG 노드를 물린 것과
+  같은 조합). 정렬 우선순위로 Safe PAG보다 먼저 실행되도록 보장.
+- **검증**: 회귀 테스트 71개 전부 통과(신규 Skimmed CFG 12개는 상단 수식 transcription과
+  tensor 단위 일치 및 downstream 전파를 확인, 신규 CFG base 토글 5개 포함). 실제 생성
+  E2E는 아직 확인하지 않았습니다.
+
 ## v0.13.0 — 실제 Workspace 탭 + Guidance 제어·UI 완성
 
 Live Workspaces의 iframe 전환이 무거운 환경을 위해 같은 WebUI 포트의 실제 브라우저 탭으로

@@ -103,6 +103,9 @@ class AnimaSafePagTests(unittest.TestCase):
         p._APG["on"] = False
         p._ADG["on"] = False
         p._CFG.update(
+            smc_on=False,
+            apg_on=False,
+            cwm_on=False,
             mode="preserve",
             experimental_stack=False,
             steps=0,
@@ -442,6 +445,105 @@ class AnimaSafePagTests(unittest.TestCase):
         )
 
         torch.testing.assert_close(out, incoming)
+
+    def _cfg_base_args(self, cond, uncond):
+        return {
+            "cond_denoised": cond,
+            "uncond_denoised": uncond,
+            "sigma": torch.tensor([1.0]),
+            "model_options": {},
+        }
+
+    def _cfg_base_fixture(self):
+        """CWM runs a Haar transform, so these need real 4-D latent shapes."""
+        p = self.pag
+        cond = (torch.arange(64, dtype=torch.float32) / 10.0 - 3.0).reshape(
+            1, 4, 4, 4
+        )
+        uncond = torch.flip(cond, dims=[-1]) * 0.5
+        p._CFG.update(
+            alpha_low=0.30, alpha_high=0.15, smc_lambda=6.0, smc_k=0.20,
+        )
+        return cond, uncond, uncond + 4.0 * (cond - uncond)
+
+    def test_no_base_toggle_preserves_incoming(self):
+        p = self.pag
+        cond, uncond, incoming = self._cfg_base_fixture()
+
+        out = p._apply_cfg_base(self._cfg_base_args(cond, uncond), incoming)
+
+        torch.testing.assert_close(out, incoming)
+
+    def test_legacy_radio_resolves_to_the_same_flags(self):
+        p = self.pag
+        p._CFG.update(mode="smc+cwm")
+        self.assertEqual(p._cfg_base_flags(), (True, False, True))
+        p._CFG.update(mode="preserve", experimental_stack=True)
+        self.assertEqual(p._cfg_base_flags(), (True, True, True))
+        p._CFG.update(experimental_stack=False, smc_on=True, cwm_on=True)
+        self.assertEqual(p._cfg_base_flags(), (True, False, True))
+
+    def test_smc_cwm_toggles_match_legacy_combined_mode(self):
+        p = self.pag
+        cond, uncond, incoming = self._cfg_base_fixture()
+        args = self._cfg_base_args(cond, uncond)
+
+        p._CFG.update(mode="smc+cwm")
+        p.reset_cfg_state()
+        legacy = p._apply_cfg_base(args, incoming)
+
+        p._CFG.update(mode="preserve", smc_on=True, cwm_on=True)
+        p.reset_cfg_state()
+        toggled = p._apply_cfg_base(args, incoming)
+
+        self.assertFalse(torch.allclose(toggled, incoming))
+        torch.testing.assert_close(toggled, legacy)
+
+    def test_three_toggles_match_the_experimental_stack(self):
+        p = self.pag
+        cond, uncond, incoming = self._cfg_base_fixture()
+        args = self._cfg_base_args(cond, uncond)
+        apg_neutral = dict(
+            on=True, eta=1.0, norm_threshold=0.0, momentum=0.0,
+            avg=None, last_sigma=None,
+        )
+
+        p._APG.update(**apg_neutral)
+        p._CFG.update(experimental_stack=True)
+        p.reset_cfg_state()
+        stacked = p._apply_cfg_base(args, incoming)
+
+        p._APG.update(**apg_neutral)
+        p._CFG.update(
+            experimental_stack=False, smc_on=True, apg_on=True, cwm_on=True,
+        )
+        p.reset_cfg_state()
+        toggled = p._apply_cfg_base(args, incoming)
+
+        torch.testing.assert_close(toggled, stacked)
+
+    def test_apg_and_cwm_combine_without_the_legacy_stack(self):
+        """The old radio could not express APG + CWM at once."""
+        p = self.pag
+        cond, uncond, incoming = self._cfg_base_fixture()
+        args = self._cfg_base_args(cond, uncond)
+        p._APG.update(
+            on=True, eta=1.0, norm_threshold=0.0, momentum=0.0,
+            avg=None, last_sigma=None,
+        )
+
+        p._CFG.update(apg_on=True)
+        p.reset_cfg_state()
+        apg_only = p._apply_cfg_base(args, incoming)
+
+        p._APG.update(avg=None, last_sigma=None)
+        p._CFG.update(apg_on=True, cwm_on=True)
+        p.reset_cfg_state()
+        apg_and_cwm = p._apply_cfg_base(args, incoming)
+
+        # Neutral APG reduces to standard CFG; CWM must then reshape it.
+        torch.testing.assert_close(apg_only, incoming)
+        self.assertFalse(torch.allclose(apg_and_cwm, apg_only))
 
     def test_adaptive_skip_flushes_apg_and_smc_state(self):
         p = self.pag

@@ -228,6 +228,13 @@ _ADG: dict = {
 # ---------------------------------------------------------------------------
 
 _CFG: dict = {
+    # Independent toggles, always applied in the order SMC -> APG -> CWM.
+    "smc_on": False,
+    "apg_on": False,
+    "cwm_on": False,
+    # Legacy mutually-exclusive radio + stack checkbox, kept so saved infotext,
+    # API calls and XYZ grids from before the split still resolve. Both are
+    # OR-ed into the toggles above by _cfg_base_flags().
     "mode": "preserve",  # preserve | apg | cwm | smc | smc+cwm
     "experimental_stack": False,
     "alpha_low": 0.30,
@@ -1144,11 +1151,29 @@ def _recover_effective_cfg(args, incoming):
     return effective, fit_error
 
 
-def _apply_cfg_base(args, incoming):
-    """Return the selected CFG base before PAG/SEG/SLG and DCW."""
+def _cfg_base_flags() -> tuple[bool, bool, bool]:
+    """Resolve ``(smc, apg, cwm)`` from the independent toggles.
+
+    The pre-split mutually-exclusive ``mode`` radio and the experimental stack
+    checkbox are folded in with OR, so an old preset selecting ``SMC + CWM``
+    behaves exactly like ticking both new toggles."""
     mode = str(_CFG["mode"])
     stacked = bool(_CFG["experimental_stack"])
-    if mode == "preserve" and not stacked:
+    smc_on = bool(_CFG["smc_on"]) or stacked or mode in {"smc", "smc+cwm"}
+    apg_on = bool(_CFG["apg_on"]) or stacked or mode == "apg"
+    cwm_on = bool(_CFG["cwm_on"]) or stacked or mode in {"cwm", "smc+cwm"}
+    return smc_on, apg_on, cwm_on
+
+
+def _apply_cfg_base(args, incoming):
+    """Return the selected CFG base before PAG/SEG/SLG and DCW.
+
+    SMC, APG and CWM are independent; whichever are on run in the fixed order
+    SMC (smooth the CFG error across steps) -> APG (reproject it) -> CWM
+    (reweight it per Haar band). With none on, the incoming CFG result from
+    Forge/MaHiRo/other extensions is preserved untouched."""
+    smc_on, apg_on, cwm_on = _cfg_base_flags()
+    if not (smc_on or apg_on or cwm_on):
         return incoming.float()
 
     effective_scale, fit_error = _recover_effective_cfg(args, incoming)
@@ -1169,57 +1194,54 @@ def _apply_cfg_base(args, incoming):
     uncond = args["uncond_denoised"].float()
     sigma = args.get("sigma")
 
-    if stacked:
+    if apg_on:
+        # SMC -> APG -> CWM. APG consumes the (optionally SMC-smoothed) error
+        # and already applies the CFG scale, so CWM runs on its output at 1.0.
         raw_error = cond - uncond
-        smc_error, _RUNTIME.smc_prev = apply_smc_error(
-            raw_error,
-            _RUNTIME.smc_prev,
-            float(_CFG["smc_lambda"]),
-            float(_CFG["smc_k"]),
+        if smc_on:
+            raw_error, _RUNTIME.smc_prev = apply_smc_error(
+                raw_error,
+                _RUNTIME.smc_prev,
+                float(_CFG["smc_lambda"]),
+                float(_CFG["smc_k"]),
+            )
+        apg_result = _apply_apg(
+            args, effective_scale, raw_error if smc_on else None
         )
-        apg_result = _apply_apg(args, effective_scale, smc_error)
         if apg_result is None:
-            apg_result = uncond + effective_scale * smc_error
+            if not (smc_on or cwm_on):
+                return incoming.float()  # APG alone failed: keep incoming CFG
+            apg_result = uncond + effective_scale * raw_error
         else:
             _STATE["apg_steps"] += 1
-        apg_error = apg_result - uncond
-        mixed_error = apply_cwm_error(
-            apg_error,
+        _CFG["steps"] += 1
+        if not cwm_on:
+            return apg_result
+        return uncond + apply_cwm_error(
+            apg_result - uncond,
             sigma,
             1.0,
             float(_CFG["alpha_low"]),
             float(_CFG["alpha_high"]),
         )
-        _CFG["steps"] += 1
-        return uncond + mixed_error
 
-    if mode == "apg":
-        result = _apply_apg(args, effective_scale)
-        if result is not None:
-            _STATE["apg_steps"] += 1
-            _CFG["steps"] += 1
-            return result
-        return incoming.float()
-
-    if mode in {"cwm", "smc", "smc+cwm"}:
-        result, next_previous = compose_cfg(
-            cond=cond,
-            uncond=uncond,
-            sigma=sigma,
-            effective_scale=effective_scale,
-            mode=mode,
-            alpha_low=float(_CFG["alpha_low"]),
-            alpha_high=float(_CFG["alpha_high"]),
-            smc_lambda=float(_CFG["smc_lambda"]),
-            smc_k=float(_CFG["smc_k"]),
-            smc_previous=_RUNTIME.smc_prev,
-        )
-        if mode in {"smc", "smc+cwm"}:
-            _RUNTIME.smc_prev = next_previous
-        _CFG["steps"] += 1
-        return result
-
-    return incoming.float()
+    # No APG: compose_cfg covers SMC only, CWM only, and SMC + CWM.
+    result, next_previous = compose_cfg(
+        cond=cond,
+        uncond=uncond,
+        sigma=sigma,
+        effective_scale=effective_scale,
+        mode="smc+cwm" if smc_on and cwm_on else ("smc" if smc_on else "cwm"),
+        alpha_low=float(_CFG["alpha_low"]),
+        alpha_high=float(_CFG["alpha_high"]),
+        smc_lambda=float(_CFG["smc_lambda"]),
+        smc_k=float(_CFG["smc_k"]),
+        smc_previous=_RUNTIME.smc_prev,
+    )
+    if smc_on:
+        _RUNTIME.smc_prev = next_previous
+    _CFG["steps"] += 1
+    return result
 
 
 def _apply_perturbation(args, base):
@@ -1297,7 +1319,7 @@ def _post_cfg(args):
         _RUNTIME.close_step()
         return denoised
 
-    has_base_override = _CFG["mode"] != "preserve" or _CFG["experimental_stack"]
+    has_base_override = any(_cfg_base_flags())
     has_pert = _STATE["on"] and (
         _STATE["attn_raw"] is not None or _STATE["slg_raw"] is not None
     )
@@ -1484,12 +1506,20 @@ def _make_pag_xyz_axis() -> None:
             partial(_pag_xyz_set, field="cfg_stack"), choices=bool_choices,
         ),
         xyz_grid.AxisOption(
+            "[Anima CWM] Enable", str,
+            partial(_pag_xyz_set, field="cwm_enabled"), choices=bool_choices,
+        ),
+        xyz_grid.AxisOption(
             "[Anima CWM] Alpha Low", float,
             partial(_pag_xyz_set, field="cwm_alpha_low"),
         ),
         xyz_grid.AxisOption(
             "[Anima CWM] Alpha High", float,
             partial(_pag_xyz_set, field="cwm_alpha_high"),
+        ),
+        xyz_grid.AxisOption(
+            "[Anima SMC] Enable", str,
+            partial(_pag_xyz_set, field="smc_enabled"), choices=bool_choices,
         ),
         xyz_grid.AxisOption(
             "[Anima SMC] Lambda", float,
@@ -1603,11 +1633,12 @@ def _clear_extra_generation_params(p) -> None:
 
 class AnimaSafePAG(scripts.Script):
     # sorting_priority governs BOTH the accordion position and the
-    # process order (lower = higher up / earlier). 0 keeps this panel in the
-    # SAM3 extension block right under the SAM3 accordion. We still clone from
-    # the CURRENT forge_objects.unet, so other unet-patching scripts compose
-    # regardless of order.
-    sorting_priority = 0
+    # process order (lower = higher up / earlier). This panel sits in the SAM3
+    # extension block under Detail Daemon (0) and Skimmed CFG (1); running
+    # after Skimmed CFG also means its post-CFG hook receives the skimmed
+    # result as "incoming". We still clone from the CURRENT
+    # forge_objects.unet, so other unet-patching scripts compose regardless.
+    sorting_priority = 2
 
     def title(self):
         return "Anima Perturbation Guidance"
@@ -1824,30 +1855,41 @@ class AnimaSafePAG(scripts.Script):
 
             gr.Markdown("---\n### Guidance Orchestrator (CFG / Wavelet / Control)")
             gr.Markdown(
-                "기본 **Preserve incoming**은 Forge·MaHiRo·다른 CFG 확장의 결과를 그대로 "
-                "보존합니다. 다른 모드는 그 CFG base를 명시적으로 교체합니다. 기존 APG "
-                "체크박스는 빠른 호환 토글이며, 아래 라디오가 Preserve일 때 APG로 해석됩니다."
+                "**SMC · APG · CWM은 서로 독립 토글**입니다. 원하는 만큼 함께 켤 수 "
+                "있고, 여러 개가 켜지면 항상 **SMC → APG → CWM** 순서로 적용됩니다. "
+                "APG 토글은 위 APG 섹션에 있습니다. 셋 다 끄면 Forge·MaHiRo·다른 CFG "
+                "확장의 결과를 그대로 보존합니다."
             )
-            cfg_mode = gr.Radio(
-                label="CFG base mode (상호배타)",
-                choices=[
-                    "Preserve incoming",
-                    "APG",
-                    "CWM",
-                    "SMC",
-                    "SMC + CWM",
-                ],
-                value="Preserve incoming",
-                info="호환 문제나 이미지 붕괴가 생기면 Preserve incoming으로 되돌리세요.",
-                elem_id="anima_guidance_cfg_mode",
-            )
-            experimental_stack = gr.Checkbox(
-                label="Experimental stack: SMC → APG → CWM (고급 실험)",
+
+            gr.Markdown("#### SMC — sliding-mode control (스텝 간 CFG error 안정화)")
+            smc_enabled = gr.Checkbox(
+                label="Enable SMC",
                 value=False,
-                info="효과가 겹쳐 불안정할 수 있습니다. 깨짐이 생기면 끄고 한 모드씩 비교하세요.",
-                elem_id="anima_guidance_experimental_stack",
+                info="lambda 또는 k가 0이면 켜도 효과가 없습니다.",
+                elem_id="anima_guidance_smc_enable",
             )
-            with gr.Accordion("CWM / SMC Advanced", open=False):
+            with gr.Row():
+                smc_lambda = gr.Slider(
+                    label="SMC lambda (Anima/Cosmos 보수값 6.0)",
+                    minimum=0.0, maximum=10.0, step=0.1, value=6.0,
+                    info="스텝 간 흔들림이나 과보정이 보이면 낮추세요. 0이면 SMC가 꺼집니다.",
+                    elem_id="anima_guidance_smc_lambda",
+                )
+                smc_k = gr.Slider(
+                    label="SMC k (Anima/Cosmos 보수값 0.20)",
+                    minimum=0.0, maximum=1.0, step=0.01, value=0.20,
+                    info="보정이 튀거나 디테일이 깨지면 낮추세요. 0이면 SMC가 꺼집니다.",
+                    elem_id="anima_guidance_smc_k",
+                )
+
+            gr.Markdown("#### CWM — CFG wavelet mixing (주파수 대역별 CFG 재가중)")
+            cwm_enabled = gr.Checkbox(
+                label="Enable CWM",
+                value=False,
+                info="alpha low·high가 모두 0이면 켜도 표준 CFG와 같습니다.",
+                elem_id="anima_guidance_cwm_enable",
+            )
+            with gr.Row():
                 cwm_alpha_low = gr.Slider(
                     label="CWM alpha low (초반 저주파 CFG)",
                     minimum=-1.0, maximum=1.0, step=0.01, value=0.30,
@@ -1860,32 +1902,46 @@ class AnimaSafePAG(scripts.Script):
                     info="인물 복제·윤곽 링·세부 노이즈가 생기면 0 쪽으로 줄이세요.",
                     elem_id="anima_guidance_cwm_alpha_high",
                 )
-                alpha_high_warning = gr.Markdown(
-                    "⚠️ **Anima 주의:** `alpha high > +0.15`는 16채널 HH 대역에서 "
-                    "한 인물이 여러 인물로 갈라지는 현상을 만들 수 있습니다.",
-                    visible=False,
-                )
+            alpha_high_warning = gr.Markdown(
+                "⚠️ **Anima 주의:** `alpha high > +0.15`는 16채널 HH 대역에서 "
+                "한 인물이 여러 인물로 갈라지는 현상을 만들 수 있습니다.",
+                visible=False,
+            )
 
-                def _show_alpha_high_warning(value):
-                    return gr.update(visible=float(value) > 0.15)
+            def _show_alpha_high_warning(value):
+                return gr.update(visible=float(value) > 0.15)
 
-                cwm_alpha_high.change(
-                    fn=_show_alpha_high_warning,
-                    inputs=[cwm_alpha_high],
-                    outputs=[alpha_high_warning],
-                    show_progress=False,
+            cwm_alpha_high.change(
+                fn=_show_alpha_high_warning,
+                inputs=[cwm_alpha_high],
+                outputs=[alpha_high_warning],
+                show_progress=False,
+            )
+
+            with gr.Accordion("Legacy CFG base mode (구버전 호환)", open=False):
+                gr.Markdown(
+                    "예전의 상호배타 라디오입니다. 저장된 infotext·API 호출·XYZ 그리드가 "
+                    "그대로 동작하도록 남겨 두었으며, 위 토글들과 **OR**로 합쳐집니다. "
+                    "새로 설정할 때는 건드릴 필요가 없습니다."
                 )
-                smc_lambda = gr.Slider(
-                    label="SMC lambda (Anima/Cosmos 보수값 6.0)",
-                    minimum=0.0, maximum=10.0, step=0.1, value=6.0,
-                    info="스텝 간 흔들림이나 과보정이 보이면 낮추세요. 0이면 SMC가 꺼집니다.",
-                    elem_id="anima_guidance_smc_lambda",
+                cfg_mode = gr.Radio(
+                    label="CFG base mode (legacy · 상호배타)",
+                    choices=[
+                        "Preserve incoming",
+                        "APG",
+                        "CWM",
+                        "SMC",
+                        "SMC + CWM",
+                    ],
+                    value="Preserve incoming",
+                    info="호환 문제나 이미지 붕괴가 생기면 Preserve incoming으로 되돌리세요.",
+                    elem_id="anima_guidance_cfg_mode",
                 )
-                smc_k = gr.Slider(
-                    label="SMC k (Anima/Cosmos 보수값 0.20)",
-                    minimum=0.0, maximum=1.0, step=0.01, value=0.20,
-                    info="보정이 튀거나 디테일이 깨지면 낮추세요. 0이면 SMC가 꺼집니다.",
-                    elem_id="anima_guidance_smc_k",
+                experimental_stack = gr.Checkbox(
+                    label="Experimental stack: SMC → APG → CWM (legacy 단축)",
+                    value=False,
+                    info="세 토글을 모두 켜는 것과 같습니다. 새 토글을 쓰면 필요 없습니다.",
+                    elem_id="anima_guidance_experimental_stack",
                 )
 
             gr.Markdown("#### DCW — post-CFG wavelet correction")
@@ -1979,6 +2035,9 @@ class AnimaSafePAG(scripts.Script):
             cns_enabled, cns_strength, cns_gamma_power, cns_gamma_scale,
             # Appended to preserve every pre-v0.13 script-argument index.
             official_strength, head_indices, rescale_mode,
+            # Appended for the same reason when SMC/CWM became independent
+            # toggles instead of entries in the cfg_mode radio.
+            smc_enabled, cwm_enabled,
         ]
 
     def process_before_every_sampling(self, p, *args, **kwargs):
@@ -1992,6 +2051,7 @@ class AnimaSafePAG(scripts.Script):
         _APG.update(on=False, avg=None, last_sigma=None)
         _ADG["on"] = False
         _CFG.update(
+            smc_on=False, apg_on=False, cwm_on=False,
             mode="preserve", experimental_stack=False, steps=0,
             fit_error=None, effective_scale=None,
             external_cfg_detected=False, warned=False,
@@ -2008,7 +2068,8 @@ class AnimaSafePAG(scripts.Script):
             split_uncond_calls=0, control_blocked_calls=0,
             wrapper_fallbacks=0, requested_pert=False, requested_apg=False,
             requested_adg=False, requested_cfg_mode="preserve",
-            requested_cfg_stack=False, requested_dcw=False,
+            requested_cfg_stack=False, requested_smc=False,
+            requested_cwm=False, requested_dcw=False,
             requested_dave=False, requested_cns=False,
             requested_method=None, engine="?",
             diag_started_at=time.perf_counter(), delta_logged=False,
@@ -2078,6 +2139,16 @@ class AnimaSafePAG(scripts.Script):
         )
         if cfg_mode == "preserve" and apg_enabled:
             cfg_mode = "apg"  # backwards-compatible quick checkbox
+        smc_enabled = (
+            _as_bool(xyz["smc_enabled"], _as_bool(_arg(42, False), False))
+            if "smc_enabled" in xyz
+            else _as_bool(_arg(42, False), False)
+        )
+        cwm_enabled = (
+            _as_bool(xyz["cwm_enabled"], _as_bool(_arg(43, False), False))
+            if "cwm_enabled" in xyz
+            else _as_bool(_arg(43, False), False)
+        )
         dcw_enabled = (
             _as_bool(xyz["dcw_enabled"], _as_bool(_arg(28, False), False))
             if "dcw_enabled" in xyz
@@ -2093,7 +2164,13 @@ class AnimaSafePAG(scripts.Script):
             if "cns_enabled" in xyz
             else _as_bool(_arg(35, False), False)
         )
-        resolved_apg = cfg_mode == "apg" or experimental_stack
+        resolved_apg = apg_enabled or cfg_mode == "apg" or experimental_stack
+        resolved_smc = (
+            smc_enabled or experimental_stack or cfg_mode in {"smc", "smc+cwm"}
+        )
+        resolved_cwm = (
+            cwm_enabled or experimental_stack or cfg_mode in {"cwm", "smc+cwm"}
+        )
 
         _STATE.update(
             requested_pert=pert_enabled,
@@ -2101,6 +2178,8 @@ class AnimaSafePAG(scripts.Script):
             requested_adg=adg_enabled,
             requested_cfg_mode=cfg_mode,
             requested_cfg_stack=experimental_stack,
+            requested_smc=resolved_smc,
+            requested_cwm=resolved_cwm,
             requested_dcw=dcw_enabled,
             requested_dave=dave_enabled,
             requested_cns=cns_enabled,
@@ -2111,6 +2190,8 @@ class AnimaSafePAG(scripts.Script):
             adg_enabled,
             cfg_mode != "preserve",
             experimental_stack,
+            resolved_smc,
+            resolved_cwm,
             dcw_enabled,
             dave_enabled,
             cns_enabled,
@@ -2241,6 +2322,9 @@ class AnimaSafePAG(scripts.Script):
             range_mode = f"pulsed-keep-every-{adg_interval}"
 
         _CFG.update(
+            smc_on=resolved_smc,
+            apg_on=resolved_apg,
+            cwm_on=resolved_cwm,
             mode=cfg_mode,
             experimental_stack=experimental_stack,
             alpha_low=cwm_alpha_low,
@@ -2259,9 +2343,7 @@ class AnimaSafePAG(scripts.Script):
             gamma_power=cns_gamma_power,
             gamma_scale=cns_gamma_scale,
         )
-        if cwm_alpha_high > 0.15 and (
-            cfg_mode in {"cwm", "smc+cwm"} or experimental_stack
-        ):
+        if cwm_alpha_high > 0.15 and resolved_cwm:
             _log(
                 "CWM alpha_high > +0.15 on Anima can split one character "
                 "into multiple subjects; this is a warning, not a clamp."
@@ -2380,8 +2462,7 @@ class AnimaSafePAG(scripts.Script):
             _STATE["on"],
             _APG["on"],
             _ADG["on"],
-            _CFG["mode"] != "preserve",
-            _CFG["experimental_stack"],
+            *_cfg_base_flags(),
             _DCW["on"],
             _DAVE["on"],
             _CNS["on"],
@@ -2433,14 +2514,16 @@ class AnimaSafePAG(scripts.Script):
                 p.extra_generation_params["Anima APG"] = (
                     f"eta={apg_eta}, norm={apg_norm}, momentum={apg_momentum}"
                 )
-            if _CFG["mode"] != "preserve" or _CFG["experimental_stack"]:
+            smc_on, apg_on, cwm_on = _cfg_base_flags()
+            if smc_on or apg_on or cwm_on:
+                active = [
+                    name for name, on in
+                    (("SMC", smc_on), ("APG", apg_on), ("CWM", cwm_on)) if on
+                ]
                 p.extra_generation_params["Anima CFG Orchestrator"] = (
-                    "SMC→APG→CWM"
-                    if _CFG["experimental_stack"]
-                    else _CFG["mode"].upper()
-                ) + (
-                    f", alpha=({cwm_alpha_low},{cwm_alpha_high}), "
-                    f"smc=({smc_lambda},{smc_k})"
+                    "→".join(active)
+                    + (f", alpha=({cwm_alpha_low},{cwm_alpha_high})" if cwm_on else "")
+                    + (f", smc=({smc_lambda},{smc_k})" if smc_on else "")
                 )
             if _DCW["on"]:
                 p.extra_generation_params["Anima DCW"] = (
