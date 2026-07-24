@@ -64,6 +64,7 @@ import importlib
 import sys
 import time
 import traceback
+import weakref
 from functools import partial
 
 import gradio as gr
@@ -285,6 +286,17 @@ _ORIG_ANIMA_ATTN_OP = None
 _ORIG_CNS_DEFAULT_FACTORY = None
 _ORIG_CNS_BROWNIAN_CALL = None
 _PATCH_OWNER = object()
+
+# What we patched, tracked so _teardown_global_patches() can restore the
+# originals cleanly (e.g. on extension reload). The attention op is a
+# class-level global and the CNS sources are k-diffusion module globals — those
+# outlive the model and are the real cross-extension/model leak surface. Block /
+# self_attn wraps live on the model instance (recreated on reload), tracked
+# weakly so we never keep a dead model alive.
+_PATCHED_ATTN_OWNER = None
+_PATCHED_BLOCKS: "weakref.WeakSet" = weakref.WeakSet()
+_PATCHED_SELFATTN: "weakref.WeakSet" = weakref.WeakSet()
+_PATCHED_CNS_TARGETS: list = []  # [(sampling_module, brownian_cls_or_None)]
 
 
 # ---------------------------------------------------------------------------
@@ -602,7 +614,7 @@ def _ensure_patched(diffusion_model) -> int:
         _log("SelfCrossAttention.torch_attention_op is unavailable.")
         return 0
 
-    global _ORIG_ANIMA_ATTN_OP
+    global _ORIG_ANIMA_ATTN_OP, _PATCHED_ATTN_OWNER
     original = (
         getattr(owner_cls, "_pag_orig_torch_attention_op", None)
         or getattr(owner_cls, "_pag_orig_attention_op", None)
@@ -633,6 +645,7 @@ def _ensure_patched(diffusion_model) -> int:
             f"patched {owner_cls.__name__}.torch_attention_op "
             "(staticmethod) ✅"
         )
+    _PATCHED_ATTN_OWNER = owner_cls
 
     wrapped_sa = wrapped_bl = 0
     for idx, block in enumerate(blocks):
@@ -643,6 +656,7 @@ def _ensure_patched(diffusion_model) -> int:
                     block._pag_orig_block_forward = block.forward
                 block.forward = _make_block_wrapper(idx, block._pag_orig_block_forward)
                 block._pag_block_wrapped = True
+                _PATCHED_BLOCKS.add(block)
                 wrapped_bl += 1
             except Exception as e:
                 _log(f"failed to wrap block {idx} forward: {type(e).__name__}: {e}")
@@ -655,6 +669,7 @@ def _ensure_patched(diffusion_model) -> int:
                     sa._pag_orig_forward = sa.forward
                 sa.forward = _make_selfattn_wrapper(idx, sa._pag_orig_forward)
                 sa._pag_wrapped = True
+                _PATCHED_SELFATTN.add(sa)
                 wrapped_sa += 1
             except Exception as e:
                 _log(f"failed to wrap block {idx} self_attn: {type(e).__name__}: {e}")
@@ -800,6 +815,10 @@ def _ensure_cns_noise_patched() -> bool:
                         brownian_cls.__call__ = _patched_brownian_call
                         installed = True
         if found:
+            # Record the module we touched so _teardown_global_patches() can
+            # restore it. Dedup by module identity.
+            if not any(existing is sampling for existing, _ in _PATCHED_CNS_TARGETS):
+                _PATCHED_CNS_TARGETS.append((sampling, brownian_cls))
             # The second name is only a fallback import path. Patching two
             # independently-loaded copies would make one global original
             # ambiguous across WebUI script reloads.
@@ -810,6 +829,90 @@ def _ensure_cns_noise_patched() -> bool:
     elif not found:
         _log("CNS could not find k-diffusion noise sources; feature stays inert.")
     return found
+
+
+def _teardown_global_patches() -> None:
+    """Restore every global monkey-patch this script installed to its original.
+
+    Covers the class-level Anima ``torch_attention_op``, the wrapped
+    block/self_attn forwards, and the k-diffusion ``default_noise_sampler`` /
+    ``BrownianTreeNoiseSampler.__call__``. Idempotent and safe to call when
+    nothing was patched. Registered on script unload so a Forge "reload scripts"
+    (or extension update) doesn't leave stale patches — and the sam-extra
+    markers are cleared so a later reload re-patches from a clean base.
+    """
+    global _PATCHED_ATTN_OWNER
+
+    owner = _PATCHED_ATTN_OWNER
+    if owner is not None:
+        try:
+            original = getattr(owner, "_pag_orig_torch_attention_op", None)
+            if callable(original):
+                owner.torch_attention_op = staticmethod(original)
+            for attr in (
+                "_pag_attention_op_patched",
+                "_pag_orig_torch_attention_op",
+                "_pag_orig_attention_op",
+            ):
+                if hasattr(owner, attr):
+                    try:
+                        delattr(owner, attr)
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+        _PATCHED_ATTN_OWNER = None
+
+    for block in list(_PATCHED_BLOCKS):
+        try:
+            original = getattr(block, "_pag_orig_block_forward", None)
+            if original is not None:
+                block.forward = original
+            for attr in ("_pag_orig_block_forward", "_pag_block_wrapped"):
+                if hasattr(block, attr):
+                    delattr(block, attr)
+        except Exception:
+            pass
+    _PATCHED_BLOCKS.clear()
+
+    for sa in list(_PATCHED_SELFATTN):
+        try:
+            original = getattr(sa, "_pag_orig_forward", None)
+            if original is not None:
+                sa.forward = original
+            for attr in ("_pag_orig_forward", "_pag_wrapped"):
+                if hasattr(sa, attr):
+                    delattr(sa, attr)
+        except Exception:
+            pass
+    _PATCHED_SELFATTN.clear()
+
+    for sampling, brownian_cls in _PATCHED_CNS_TARGETS:
+        try:
+            orig_factory = getattr(
+                sampling, "_sam_extra_cns_orig_default_noise_sampler", None
+            )
+            if callable(orig_factory):
+                sampling.default_noise_sampler = orig_factory
+                delattr(sampling, "_sam_extra_cns_orig_default_noise_sampler")
+        except Exception:
+            pass
+        if brownian_cls is not None:
+            try:
+                orig_call = getattr(brownian_cls, "_sam_extra_cns_orig_call", None)
+                if callable(orig_call):
+                    brownian_cls.__call__ = orig_call
+                    delattr(brownian_cls, "_sam_extra_cns_orig_call")
+            except Exception:
+                pass
+    _PATCHED_CNS_TARGETS.clear()
+
+
+try:
+    script_callbacks.on_script_unloaded(_teardown_global_patches)
+except Exception:
+    # Older WebUI without this callback: patches simply persist as before.
+    pass
 
 
 # ---------------------------------------------------------------------------

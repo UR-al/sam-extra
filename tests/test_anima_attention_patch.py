@@ -110,6 +110,72 @@ class AnimaAttentionPatchTests(unittest.TestCase):
         self.assertTrue(torch.equal(out, baseline))
         self.assertEqual(pag._STATE["attn_hook_hits"], 0)
 
+    def test_teardown_restores_all_global_patches(self):
+        pag = self.pag
+        pag._teardown_global_patches()  # start from a clean base (test-order safe)
+
+        class DummyAttention:
+            @staticmethod
+            def torch_attention_op(query, key, value):
+                return torch.zeros(
+                    value.shape[0], value.shape[1], value.shape[2] * value.shape[3]
+                )
+
+            def forward(self, x):
+                return x
+
+        class DummyBlock:
+            def __init__(self):
+                self.self_attn = DummyAttention()
+
+            def forward(self, x):
+                return x
+
+        block = DummyBlock()
+        model = type("DummyModel", (), {"blocks": [block]})()
+        orig_attn_op = DummyAttention.torch_attention_op
+
+        self.assertEqual(pag._ensure_patched(model), 1)
+        # Patched: class attention op swapped, forwards carry our owner marker.
+        self.assertIsNot(DummyAttention.torch_attention_op, orig_attn_op)
+        self.assertIs(getattr(block.forward, "_anima_pag_owner", None), pag._PATCH_OWNER)
+        self.assertIs(
+            getattr(block.self_attn.forward, "_anima_pag_owner", None), pag._PATCH_OWNER
+        )
+
+        # A fake CNS target proves that restoration path too, without needing a
+        # real k-diffusion install. The stored original is a callable, as the
+        # real patch records (teardown only restores callables).
+        def _orig_factory(x):
+            return None
+
+        fake_sampling = type("FakeSampling", (), {})()
+        fake_sampling.default_noise_sampler = "PATCHED"
+        fake_sampling._sam_extra_cns_orig_default_noise_sampler = _orig_factory
+        pag._PATCHED_CNS_TARGETS.append((fake_sampling, None))
+
+        pag._teardown_global_patches()
+
+        # Attention op restored to the exact original; markers cleared.
+        self.assertIs(DummyAttention.torch_attention_op, orig_attn_op)
+        self.assertFalse(hasattr(DummyAttention, "_pag_orig_torch_attention_op"))
+        # Forwards unwrapped (no owner marker) and behave like the original.
+        self.assertIsNone(getattr(block.forward, "_anima_pag_owner", None))
+        self.assertEqual(block.forward(5), 5)
+        self.assertIsNone(getattr(block.self_attn.forward, "_anima_pag_owner", None))
+        # CNS module restored and tracking cleared.
+        self.assertIs(fake_sampling.default_noise_sampler, _orig_factory)
+        self.assertFalse(
+            hasattr(fake_sampling, "_sam_extra_cns_orig_default_noise_sampler")
+        )
+        self.assertEqual(len(pag._PATCHED_CNS_TARGETS), 0)
+
+        # Re-patching from the cleaned base works (install → teardown idempotent).
+        self.assertEqual(pag._ensure_patched(model), 1)
+        self.assertIsNot(DummyAttention.torch_attention_op, orig_attn_op)
+        pag._teardown_global_patches()
+        self.assertIs(DummyAttention.torch_attention_op, orig_attn_op)
+
 
 if __name__ == "__main__":
     unittest.main()
