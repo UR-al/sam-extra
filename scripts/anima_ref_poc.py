@@ -200,8 +200,23 @@ class AnimaRefPoC(scripts.Script):
 
         try:
             unet = unet.clone()
-            unet.set_model_unet_function_wrapper(_wrapper)
-            p.sd_model.forge_objects.unet = unet
-            _log("wrapper attached to unet ✅ (run a sampling step to see shapes)")
+            # The unet function-wrapper slot holds a single callable. If another
+            # script (e.g. the Anima Guidance suite) already installed one that
+            # manipulates the cond/uncond batch, overwriting it here would
+            # silently break that feature. This is a read-only diagnostic PoC,
+            # so yield instead: leave the existing wrapper in place.
+            existing = (getattr(unet, "model_options", None) or {}).get(
+                "model_function_wrapper"
+            )
+            if existing is not None and existing is not _wrapper:
+                _log(
+                    "another unet model_function_wrapper is already installed "
+                    f"({getattr(existing, '__qualname__', existing)!r}); "
+                    "Ref PoC yields and does not attach its diagnostic wrapper."
+                )
+            else:
+                unet.set_model_unet_function_wrapper(_wrapper)
+                p.sd_model.forge_objects.unet = unet
+                _log("wrapper attached to unet ✅ (run a sampling step to see shapes)")
         except Exception as e:
             _log(f"failed to attach wrapper: {type(e).__name__}: {e}")

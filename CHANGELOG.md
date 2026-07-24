@@ -3,6 +3,34 @@
 버전 태그는 GitHub Releases에도 발행됩니다. 아래는 요약이며, guidance/속도 기능의
 상세는 [docs/GUIDANCE.md](docs/GUIDANCE.md)를 참고하세요.
 
+## v0.15.0 — Workspace 토글·갤러리 타이밍, 충돌 정리 + 리뷰 버그 수정
+
+코드 리뷰에서 나온 런타임 충돌·버그를 정리하고, txt2img Workspaces(기능 5)의 제어를
+개선한 릴리즈.
+
+- **Workspaces 설정 토글**: Settings → `SAM3 Workspaces`에 `txt2img Workspaces 활성화`
+  옵션(`sam3_workspaces_enable`)을 추가. 끄면 `workspace_manager.js`가 `window.opts`를
+  읽어 툴바/탭 마운트를 통째로 건너뜀(페이지 새로고침 후 적용).
+- **갤러리 비움 타이밍 변경**: 생성 버튼을 누르는 즉시 이전 갤러리를 감추던 동작을 제거.
+  이제 이전 결과를 그대로 두고 Forge live preview가 위에 겹쳐지며, **새 이미지가 완성될
+  때** 최종 결과로 교체됨. 사용하지 않게 된 hide-on-generate 로직(JS·CSS)도 제거.
+- **PAG 자동 감쇠(안전 브레이크) 제거**: PAG/SEG + SLG 병용 시 각 scale을 활성 항 수로
+  나누던 `auto_decay` 토글을 삭제. perturbation은 항상 설정된 full scale로 적용됨. 스크립트
+  인자 index는 inert placeholder로 보존해 append-only 계약 유지.
+- **guidance 스택 충돌 점검**: PAG·DCW·CWM·SMC·Skimmed CFG 동시 사용이 서로를 무력화하지
+  않음을 확인하고 회귀 테스트로 고정(Skimmed→Safe PAG 순서 불변식, 각 단계 기여 검증).
+- **런타임 충돌 수정**: (1) unet `model_function_wrapper` 단일 슬롯을 두 스크립트가 덮어쓰던
+  문제 — Safe PAG가 우선권을 갖고 경고 로그를 남기며, Ref PoC는 기존 wrapper가 있으면
+  yield. (2) CNS 노이즈 패치의 `continue`가 `break`를 건너뛰어 두 k-diffusion 사본을 이중
+  패치하던 버그 수정. (3) Anima VAE 2x wrapper 이중 wrap 방지(원본 VAE 재-wrap).
+- **리뷰 버그 수정**: inpaint noise multiplier의 `0.0`→`1.0` falsy 강제 제거; Refine
+  `inherit_main_neg_prompt` 폴백이 위젯 기본값과 반대로 뒤집히던 문제; Anima 랜덤 시드(-1)
+  재현성(명시적 시드 선택); `write_artifacts`가 개별 마스크를 덮어쓰던 free-slot 탐색;
+  `unload_sam3`의 명시적 CPU 이동; LoRA Manager 이중 spawn·health false-positive·로그 핸들
+  누수; ControlNet `global_state` 등록 idempotent화; 중단된 vendor clone 자가복구.
+- **검증**: 회귀 테스트 74개 전부 통과(guidance 조합 3개 신규). 실제 생성 E2E는 아직
+  확인하지 않았습니다.
+
 ## v0.14.0 — 독립 CFG base 토글 + Skimmed CFG
 
 상호배타였던 CFG base 라디오를 독립 토글로 분해해 SMC·APG·CWM을 자유롭게 조합할 수 있게

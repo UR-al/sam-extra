@@ -764,36 +764,41 @@ def _ensure_cns_noise_patched() -> bool:
                     installed = True
 
         brownian_cls = getattr(sampling, "BrownianTreeNoiseSampler", None)
-        if brownian_cls is None:
-            continue
-        descriptor = brownian_cls.__dict__.get("__call__")
-        current_call = descriptor
-        if not callable(current_call):
-            continue
-        found = True
-        original_call = getattr(
-            brownian_cls, "_sam_extra_cns_orig_call", None
-        )
-        if original_call is None:
-            if (
-                getattr(current_call, "_anima_pag_owner", None) is not None
-                or getattr(current_call, "__name__", "")
-                == "_patched_brownian_call"
-            ):
-                original_call = getattr(current_call, "__globals__", {}).get(
-                    "_ORIG_CNS_BROWNIAN_CALL"
+        # NOTE: do not `continue` from here on a missing/non-callable Brownian
+        # class. If this module already yielded default_noise_sampler
+        # (found=True) we must still hit the `break` below — otherwise the loop
+        # falls through to the second k-diffusion copy and patches *its*
+        # default_noise_sampler too, leaving one module's slot pointing at our
+        # wrapper while _ORIG_CNS_DEFAULT_FACTORY holds the *other* module's
+        # original (cross-wired). Guard the Brownian work inline instead.
+        if brownian_cls is not None:
+            descriptor = brownian_cls.__dict__.get("__call__")
+            current_call = descriptor
+            if callable(current_call):
+                found = True
+                original_call = getattr(
+                    brownian_cls, "_sam_extra_cns_orig_call", None
                 )
-            else:
-                original_call = current_call
-        if callable(original_call):
-            brownian_cls._sam_extra_cns_orig_call = original_call
-            _ORIG_CNS_BROWNIAN_CALL = original_call
-            if (
-                getattr(current_call, "_anima_pag_owner", None)
-                is not _PATCH_OWNER
-            ):
-                brownian_cls.__call__ = _patched_brownian_call
-                installed = True
+                if original_call is None:
+                    if (
+                        getattr(current_call, "_anima_pag_owner", None) is not None
+                        or getattr(current_call, "__name__", "")
+                        == "_patched_brownian_call"
+                    ):
+                        original_call = getattr(
+                            current_call, "__globals__", {}
+                        ).get("_ORIG_CNS_BROWNIAN_CALL")
+                    else:
+                        original_call = current_call
+                if callable(original_call):
+                    brownian_cls._sam_extra_cns_orig_call = original_call
+                    _ORIG_CNS_BROWNIAN_CALL = original_call
+                    if (
+                        getattr(current_call, "_anima_pag_owner", None)
+                        is not _PATCH_OWNER
+                    ):
+                        brownian_cls.__call__ = _patched_brownian_call
+                        installed = True
         if found:
             # The second name is only a fallback import path. Patching two
             # independently-loaded copies would make one global original
@@ -1067,6 +1072,38 @@ def _model_wrapper(apply_model, w):
         _STATE["slg_raw"] = None
         _log(f"wrapper fallback → normal apply_model: {type(e).__name__}: {e}")
         return apply_model(x, ts, **c)
+
+
+# Owner tag so a co-loaded script (e.g. anima_ref_poc) can recognise our unet
+# function wrapper in ``model_options`` and step aside instead of silently
+# clobbering it — the single wrapper slot can't hold two batch-manipulating
+# wrappers at once.
+_model_wrapper._anima_pag_owner = _PATCH_OWNER
+
+
+def _existing_unet_wrapper(unet):
+    """Return the unet ``model_function_wrapper`` already installed on ``unet``
+    (its clone carries the model_options of whatever ran earlier), or None."""
+    try:
+        return (getattr(unet, "model_options", None) or {}).get(
+            "model_function_wrapper"
+        )
+    except Exception:
+        return None
+
+
+def _warn_foreign_unet_wrapper(unet) -> None:
+    existing = _existing_unet_wrapper(unet)
+    if (
+        existing is not None
+        and getattr(existing, "_anima_pag_owner", None) is not _PATCH_OWNER
+    ):
+        _log(
+            "another extension already installed a unet model_function_wrapper "
+            f"({getattr(existing, '__qualname__', existing)!r}); the Anima "
+            "Guidance suite needs exclusive control of the cond/uncond batch, "
+            "so it takes precedence and overrides that wrapper this generation."
+        )
 
 
 def _project(v0, v1):
@@ -2483,6 +2520,7 @@ class AnimaSafePAG(scripts.Script):
             # The wrapper is needed for perturbation AND for Adaptive Guidance
             # (both manipulate the cond/uncond batch before apply_model).
             if _STATE["on"] or _ADG["on"]:
+                _warn_foreign_unet_wrapper(unet)
                 unet.set_model_unet_function_wrapper(_model_wrapper)
             unet.set_model_sampler_post_cfg_function(_post_cfg)
             p.sd_model.forge_objects.unet = unet

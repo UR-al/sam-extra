@@ -387,6 +387,13 @@ class AnimaVAE2x(scripts.Script):
             _log("no forge_objects.vae — cannot attach.")
             return
 
+        # Idempotency guard: if forge_objects.vae is already our wrapper (e.g. a
+        # hires/second pass re-entered without Forge resetting forge_objects),
+        # re-wrap the ORIGINAL stock VAE rather than the wrapper. Wrapping a
+        # wrapper would apply the 2x pixel-shuffle twice and corrupt the decode.
+        if isinstance(orig_vae, _VAE2xWrapper):
+            orig_vae = getattr(orig_vae, "_orig", orig_vae)
+
         try:
             device = next(orig_vae.first_stage_model.parameters()).device
             dtype = getattr(orig_vae, "vae_dtype", None) or torch.bfloat16
