@@ -530,8 +530,9 @@ anima_wired: bool = False
 # JS shim: replace the placeholder selected_index slot (index 1 in the inputs
 # array) with the current gallery selection from the DOM. This sidesteps
 # Gradio 5.x's check_all_files_in_cache validation of SelectData event_data
-# that we'd otherwise hit by subscribing to gallery.select.
-_REFINE_JS = (
+# that we'd otherwise hit by subscribing to gallery.select. Shared by every
+# Refine/Anima handler and seed/canvas button that needs the live selection.
+_SELECTED_INDEX_JS = (
     "(...args) => {"
     "  try { args[1] = selected_gallery_index(); } catch (e) { args[1] = -1; }"
     "  return args;"
@@ -547,7 +548,7 @@ def _wire_refine_panel(
     html_info,
     generation_info,
 ):
-    """Wire the Refine button. Index is injected client-side via ``_REFINE_JS``
+    """Wire the Refine button. Index is injected client-side via ``_SELECTED_INDEX_JS``
     so we don't need a ``gallery.select`` handler (which would otherwise
     trigger Gradio's file-cache validation on the selected image's path).
 
@@ -571,7 +572,7 @@ def _wire_refine_panel(
     )
     refine_run = refine_show_stop.then(
         fn=handle_refine_click,
-        _js=_REFINE_JS,
+        _js=_SELECTED_INDEX_JS,
         inputs=[
             gallery,
             panel.selected_index_state,
@@ -614,7 +615,7 @@ def _wire_refine_panel(
     )
     panel.seed_pull_button.click(
         fn=_pull_seed_from_gallery_item,
-        _js="(...args) => { try { args[1] = selected_gallery_index(); } catch (e) { args[1] = -1; } return args; }",
+        _js=_SELECTED_INDEX_JS,
         inputs=[gallery, panel.selected_index_state, generation_info],
         outputs=[panel.seed],
         queue=False,
@@ -677,7 +678,7 @@ def _wire_refine_panel(
 
         panel.canvas_load_button.click(
             fn=_load_to_canvas,
-            _js="(...args) => { try { args[1] = selected_gallery_index(); } catch (e) { args[1] = -1; } return args; }",
+            _js=_SELECTED_INDEX_JS,
             inputs=[gallery, panel.selected_index_state],
             outputs=[panel.canvas_bg],
             queue=False,
@@ -706,16 +707,6 @@ def _wire_refine_panel(
     )
 
 
-# JS shim identical to Refine's — replaces selected_index in args slot 1
-# with the live frontend selection.
-_ANIMA_JS = (
-    "(...args) => {"
-    "  try { args[1] = selected_gallery_index(); } catch (e) { args[1] = -1; }"
-    "  return args;"
-    "}"
-)
-
-
 def _wire_anima_panel(
     panel: AnimaPanel,
     gallery,
@@ -736,7 +727,7 @@ def _wire_anima_panel(
     )
     run = show_stop.then(
         fn=handle_anima_click,
-        _js=_ANIMA_JS,
+        _js=_SELECTED_INDEX_JS,
         inputs=[
             gallery,
             panel.selected_index_state,
@@ -774,7 +765,7 @@ def _wire_anima_panel(
     )
     panel.seed_pull_button.click(
         fn=_pull_seed_from_gallery_item,
-        _js=_ANIMA_JS,
+        _js=_SELECTED_INDEX_JS,
         inputs=[gallery, panel.selected_index_state, generation_info],
         outputs=[panel.seed],
         queue=False,

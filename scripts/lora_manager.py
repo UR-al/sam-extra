@@ -1,4 +1,4 @@
-"""LoRA Manager bridge (v0.9.0).
+"""LoRA Manager bridge (introduced in v0.9.0).
 
 Registers two things:
 

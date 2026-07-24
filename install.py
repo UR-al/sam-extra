@@ -76,6 +76,12 @@ check_environment()
 
 _ANIMA_REPO = "https://github.com/kohya-ss/sd-scripts.git"
 _ANIMA_BRANCH = "main"
+# Optional pin: set to a verified upstream tag/branch to stop the vendor tree
+# floating with upstream main (which can silently break the source-patch
+# anchors in lora_manager_core.py and the Anima import surface). None tracks
+# _ANIMA_BRANCH — the historical behaviour. A shallow clone can pin a tag or
+# branch name, not an arbitrary commit SHA.
+_ANIMA_PIN: str | None = None
 _ANIMA_ROOT = Path(__file__).resolve().parent / "anima_vendor"
 # Sentinel = the actual entrypoint upstream ships. If the clone was
 # interrupted partway through, this file will be missing and the next run
@@ -155,7 +161,7 @@ def ensure_anima_vendor() -> bool:
                 "1",
                 "--single-branch",
                 "--branch",
-                _ANIMA_BRANCH,
+                _ANIMA_PIN or _ANIMA_BRANCH,
                 _ANIMA_REPO,
                 str(_ANIMA_ROOT),
             ],
@@ -222,6 +228,12 @@ check_anima_environment()
 
 _LM_REPO = "https://github.com/willmiao/ComfyUI-Lora-Manager.git"
 _LM_BRANCH = "main"
+# Optional pin (see _ANIMA_PIN). lora_manager_core.py already assumes the
+# vendored manager is version 1.1.4 (its update-check patch anchors + the
+# "vendor pinned (1.1.4)" comment), so pinning the clone to that upstream tag
+# would make the tree actually match those assumptions. Left None until a
+# maintainer verifies the exact tag name (e.g. "1.1.4" vs "v1.1.4").
+_LM_PIN: str | None = None
 _LM_ROOT = Path(__file__).resolve().parent / "lora_manager_vendor"
 _LM_SENTINEL = _LM_ROOT / "standalone.py"
 
@@ -280,7 +292,7 @@ def ensure_lora_manager_vendor() -> bool:
                 "1",
                 "--single-branch",
                 "--branch",
-                _LM_BRANCH,
+                _LM_PIN or _LM_BRANCH,
                 _LM_REPO,
                 str(_LM_ROOT),
             ],

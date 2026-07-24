@@ -1,8 +1,8 @@
 """LoRA Manager integration core — lazy-spawns willmiao/ComfyUI-Lora-Manager's
 standalone aiohttp server and points Forge's UI at it via an iframe.
 
-Design (v0.9.0)
----------------
+Design (introduced in v0.9.0)
+-----------------------------
 - The manager is vendored (shallow clone) at ``lora_manager_vendor/`` by
   install.py. We never modify the vendor tree.
 - We write ``lora_manager_vendor/settings.json`` with ``use_portable_settings:
