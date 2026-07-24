@@ -14,6 +14,7 @@ from typing import Any
 
 import gradio as gr
 
+from .coerce import as_float, as_int
 from .anima_core import (
     AnimaTileRepairArgs,
     anima_available,
@@ -147,27 +148,9 @@ ANIMA_ARG_KEYS: tuple[str, ...] = (
 )
 
 
-# ---------------------------------------------------------------------------
-# Numeric coercion helpers — same defensive layer Refine uses
-# ---------------------------------------------------------------------------
-
-
-def _as_float(value: Any, default: float) -> float:
-    if value is None or (isinstance(value, str) and value.strip() == ""):
-        return default
-    try:
-        return float(value)
-    except (TypeError, ValueError):
-        return default
-
-
-def _as_int(value: Any, default: int) -> int:
-    if value is None or (isinstance(value, str) and value.strip() == ""):
-        return default
-    try:
-        return int(float(value))
-    except (TypeError, ValueError):
-        return default
+# Numeric coercion helpers — same defensive layer Refine uses (sam3ext.coerce).
+_as_float = as_float
+_as_int = as_int
 
 
 # ---------------------------------------------------------------------------
@@ -207,7 +190,7 @@ def build_anima_panel() -> AnimaPanel:
             "The vendor's Anima DiT runs with the ControlNet-LLLite you select; the "
             "source image is fed as the LLLite control signal (same mechanism as the "
             "ComfyUI `AnimaLLLiteApply` node). Result inserts next to the selected "
-            "image. **First Refine click can take ~20-40 s** because the Anima DiT/VAE/TE "
+            "image. **First Tile-Repair click can take ~20-40 s** because the Anima DiT/VAE/TE "
             "weights load from disk."
         )
 

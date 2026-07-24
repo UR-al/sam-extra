@@ -195,7 +195,9 @@ class LiveWorkspaceAssetTests(unittest.TestCase):
         self.assertIn("triggerDriverDependency(dependencyDriver", manager)
         self.assertIn("waitForXyzChoiceOptions(snapshot, catalog)", manager)
 
-    def test_generate_keeps_gallery_root_for_forge_live_preview(self):
+    def test_generate_keeps_previous_gallery_until_completion(self):
+        """On Generate the previous gallery stays visible until the new image
+        actually completes; only non-generate (switch/reset) paths clear it."""
         manager = (ROOT / "javascript" / "workspace_manager.js").read_text(
             encoding="utf-8"
         )
@@ -205,19 +207,18 @@ class LiveWorkspaceAssetTests(unittest.TestCase):
         clear_end = manager.index("function dispatchGradioChange", clear_start)
         clear_body = manager[clear_start:clear_end]
 
-        self.assertIn("beginGalleryGenerationPending()", clear_body)
-        generate_start = clear_body.index('if (reason === "generate")')
-        generate_end = clear_body.index("} else {", generate_start)
-        generate_branch = clear_body[generate_start:generate_end]
-        non_generate_end = clear_body.index(
-            "if (outputSaveTimer)",
-            generate_end,
-        )
-        non_generate_branch = clear_body[generate_end:non_generate_end]
-        self.assertNotIn(
-            "dispatchOutputValue(",
-            generate_branch,
-        )
+        split = clear_body.index("// Non-generate paths")
+        generate_branch = clear_body[:split]
+        non_generate_branch = clear_body[split:]
+
+        # Generate: no hide, no output mutation, early return — the previous
+        # result is left on screen and the final image replaces it normally.
+        self.assertIn('if (reason === "generate")', generate_branch)
+        self.assertIn("return;", generate_branch)
+        self.assertNotIn("dispatchOutputValue(", generate_branch)
+        self.assertNotIn("emptyWorkspaceOutputs()", generate_branch)
+
+        # Non-generate: clear gallery/info/html immediately.
         self.assertIn(
             "dispatchOutputValue(outputComponentIds.gallery, [])",
             non_generate_branch,
@@ -230,18 +231,67 @@ class LiveWorkspaceAssetTests(unittest.TestCase):
             'dispatchOutputValue(outputComponentIds.htmlInfo, "")',
             non_generate_branch,
         )
-        self.assertIn("endGalleryGenerationPending()", manager)
-        self.assertIn("sam3-workspace-generation-pending", manager)
-        self.assertIn(
-            "#txt2img_gallery.sam3-workspace-generation-pending "
-            "> :not(.livePreview)",
-            css,
+
+        # The old hide-on-generate machinery is fully removed.
+        self.assertNotIn("GalleryGenerationPending", manager)
+        self.assertNotIn("sam3-workspace-generation-pending", manager)
+        self.assertNotIn("sam3-workspace-generation-pending", css)
+
+
+    def test_mode_gate_and_smoother_switching(self):
+        live = (ROOT / "javascript" / "live_workspaces.js").read_text(
+            encoding="utf-8"
         )
-        self.assertIn(
-            "#txt2img_gallery.sam3-workspace-generation-pending "
-            "> .livePreview",
-            css,
+        manager = (ROOT / "javascript" / "workspace_manager.js").read_text(
+            encoding="utf-8"
         )
+
+        # Redirect to the Live shell is gated on the server mode probe, and the
+        # plain-Forge choice cancels it.
+        self.assertIn('new URL("/sam3-live/enabled", window.location.origin)', live)
+        self.assertIn("cfg.live === false", live)
+        # The in-shell mode-switch button was removed (choice lives in Settings).
+        self.assertNotIn("data-sam3-live-legacy", live)
+
+        # Hidden child frames pause their background watch via a visibility msg.
+        self.assertIn(
+            'var VISIBILITY_MESSAGE = "sam3-live-workspace-visibility-v1"', live
+        )
+        self.assertIn("function notifyChildVisibility(slot, active)", live)
+        self.assertIn("installChildVisibilityBridge()", live)
+        self.assertIn(
+            'var LIVE_VISIBILITY_MESSAGE = "sam3-live-workspace-visibility-v1"',
+            manager,
+        )
+        self.assertIn("setBackgroundActive: setBackgroundActive", manager)
+        self.assertIn("function stopBackgroundWatch()", manager)
+
+        # activate() only re-attributes the changed frames (inert reflow cut).
+        self.assertIn("var previous = state.active;", live)
+
+        # The legacy in-page toolbar builder is gone; the child-frame early
+        # return (asserted elsewhere) is all that remains of mountToolbar.
+        self.assertNotIn("function createToolbar()", manager)
+        self.assertNotIn('bar.id = "sam3_workspace_bar"', manager)
+
+
+    def test_shell_hosts_shared_lora_manager_routed_to_active_workspace(self):
+        live = (ROOT / "javascript" / "live_workspaces.js").read_text(encoding="utf-8")
+        lora = (ROOT / "javascript" / "lora_manager.js").read_text(encoding="utf-8")
+        css = (ROOT / "style.css").read_text(encoding="utf-8")
+
+        # Shell has a single LoRA overlay driven by the HTTP endpoints.
+        self.assertIn("data-sam3-live-lora-overlay", live)
+        self.assertIn('window.fetch("/sam3-lora/spawn"', live)
+        self.assertIn('window.fetch("/sam3-lora/config"', live)
+        # "Add LoRA" is forwarded to the ACTIVE workspace's prompt.
+        self.assertIn('d.type !== "sam3-add-lora"', live)
+        self.assertIn("frameFor(state.active)", live)
+        self.assertIn(".sam3-live-lora-overlay", css)
+
+        # A Live child iframe must NOT inject its own (nested) manager tab.
+        self.assertIn("inLiveChildFrame", lora)
+        self.assertIn('params.has("__sam3_live_workspace") && window.parent !== window', lora)
 
 
 if __name__ == "__main__":

@@ -53,6 +53,7 @@
     var STORAGE_KEY = "sam-extra.workspace-manager.v1";
     var ACTIVE_KEY = "sam-extra.workspace-manager.active.v1";
     var LIVE_STATUS_MESSAGE = "sam3-live-workspace-status-v1";
+    var LIVE_VISIBILITY_MESSAGE = "sam3-live-workspace-visibility-v1";
     var SAVE_DELAY_MS = 750;
     var MAX_STORAGE_BYTES = 4 * 1024 * 1024;
     var MAX_WORKSPACES = 20;
@@ -92,9 +93,6 @@
     var outputSaveTimer = null;
     var outputDbPromise = null;
     var outputDbWarned = false;
-    var galleryPendingTimer = null;
-    var galleryPendingSawRunning = false;
-    var galleryPendingStartedAt = 0;
     var activeSlot = LIVE_FRAME_SLOT || readActiveSlot();
     var tabId = readTabId();
     var knownSlotRevision = 0;
@@ -1057,44 +1055,6 @@
         }
     }
 
-    function applyGalleryGenerationPending(pending) {
-        var gallery = app().querySelector("#txt2img_gallery");
-        if (!gallery || !gallery.classList) return;
-        gallery.classList.toggle(
-            "sam3-workspace-generation-pending",
-            !!pending
-        );
-    }
-
-    function endGalleryGenerationPending() {
-        if (galleryPendingTimer) {
-            clearInterval(galleryPendingTimer);
-            galleryPendingTimer = null;
-        }
-        galleryPendingSawRunning = false;
-        galleryPendingStartedAt = 0;
-        applyGalleryGenerationPending(false);
-    }
-
-    function beginGalleryGenerationPending() {
-        endGalleryGenerationPending();
-        galleryPendingStartedAt = Date.now();
-        applyGalleryGenerationPending(true);
-        galleryPendingTimer = setInterval(function () {
-            // Keep the class on the current Gallery root if Gradio happens to
-            // rebuild it for an unrelated UI update while generation runs.
-            applyGalleryGenerationPending(true);
-            if (generationRunning()) galleryPendingSawRunning = true;
-            else if (galleryPendingSawRunning
-                    || Date.now() - galleryPendingStartedAt > 15000) {
-                // Covers normal completion, interrupt/error, and a click that
-                // never reached Forge. A successful gallery prop_change also
-                // ends this immediately below.
-                endGalleryGenerationPending();
-            }
-        }, 100);
-    }
-
     function captureWorkspaceOutputChange(detail) {
         if (!detail || detail.prop !== "value") return false;
         var id = Number(detail.id);
@@ -1105,7 +1065,6 @@
             var gallery = sanitizeGalleryItems(value);
             outputState.items = gallery.items;
             outputState.truncated = gallery.truncated;
-            endGalleryGenerationPending();
             if (!restoring && !switching && gallery.items.length) {
                 setStatus(
                     activeWorkspaceName() + " 마지막 생성 결과 · 갤러리 "
@@ -1142,30 +1101,34 @@
 
     function clearVisibleWorkspaceOutputs(slot, reason) {
         slot = sanitizeSlotId(slot || activeSlot);
-        outputState = emptyWorkspaceOutputs();
-        // Do not prop_change *any* Gradio output in the Generate click's
-        // capture phase. A nested prop_change here can re-enter Gradio before
-        // Forge's submit() returns its generated task id, leaving
-        // requestProgress() on "Waiting..." while the backend is already
-        // sampling. Hide the previous thumbnails without changing component
-        // values; the final output replaces gallery/info values normally.
         if (reason === "generate") {
-            beginGalleryGenerationPending();
-        } else {
-            restoring++;
-            try {
-                dispatchOutputValue(outputComponentIds.gallery, []);
-                dispatchOutputValue(outputComponentIds.generationInfo, "");
-                dispatchOutputValue(outputComponentIds.htmlInfo, "");
-            } finally {
-                restoring--;
-            }
+            // Keep the previous gallery visible while generation runs. Forge's
+            // progressbar livePreview overlays it, and the final result replaces
+            // the old thumbnails on completion (captureWorkspaceOutputChange
+            // updates outputState + saves). We used to hide the previous result
+            // the instant Generate was clicked; users preferred keeping it on
+            // screen until the new image is actually finished. We deliberately
+            // do NOT clear outputState or the stored record here either, so a
+            // mid-generation workspace switch/reload still shows the last
+            // result rather than a blank gallery.
+            setStatus(
+                activeWorkspaceName() + " 생성 중 · 완료되면 새 결과로 교체",
+                "pending"
+            );
+            return;
+        }
+        // Non-generate paths (workspace switch / reset): clear immediately.
+        outputState = emptyWorkspaceOutputs();
+        restoring++;
+        try {
+            dispatchOutputValue(outputComponentIds.gallery, []);
+            dispatchOutputValue(outputComponentIds.generationInfo, "");
+            dispatchOutputValue(outputComponentIds.htmlInfo, "");
+        } finally {
+            restoring--;
         }
         if (outputSaveTimer) { clearTimeout(outputSaveTimer); outputSaveTimer = null; }
         deleteWorkspaceOutputs(slot);
-        if (reason === "generate") {
-            setStatus(activeWorkspaceName() + " 생성 시작 · 이전 갤러리 비움", "pending");
-        }
     }
 
     function dispatchGradioChange(adapter) {
@@ -1624,60 +1587,6 @@
         return style.display !== "none" && style.visibility !== "hidden" && interrupt.offsetParent !== null;
     }
 
-    async function switchWorkspace(target) {
-        target = sanitizeSlotId(target);
-        if (target === activeSlot || switching || restoring) return;
-        var available = readStore();
-        if (!target || workspaceIds(available).indexOf(target) === -1) return;
-        if (generationRunning()) {
-            setStatus("생성 중에는 전환할 수 없습니다", "warning");
-            return;
-        }
-        switching = true;
-        try {
-            await flushWorkspaceOutputs(activeSlot);
-            var hadDirtyChanges = dirty;
-            var sourceSnapshot = saveNow("switch", false);
-            if (hadDirtyChanges && !sourceSnapshot) {
-                setStatus(activeWorkspaceName() + " 저장 실패 · 전환 취소", "error");
-                return;
-            }
-            var store = readStore();
-            if (!store.slots[target]) {
-                var clone = sourceSnapshot ? cloneJson(sourceSnapshot) : captureSnapshot(null);
-                clone.createdAt = new Date().toISOString();
-                clone.savedAt = clone.createdAt;
-                clone.writer = tabId;
-                // Merge into the latest store and honor a target created by a
-                // different tab while the source was being flushed.
-                store = readStore();
-                if (!store.slots[target]) {
-                    var targetClock = slotRevision(store, target) + 1;
-                    clone.revision = targetClock;
-                    store.slotRevisions[target] = targetClock;
-                    store.slots[target] = clone;
-                    store.revision = (Number(store.revision) || 0) + 1;
-                    store.updatedAt = clone.savedAt;
-                    store.updatedBy = tabId;
-                    if (!writeStore(store)) {
-                        setStatus(workspaceName(store, target) + " 생성 실패 · 전환 취소", "error");
-                        return;
-                    }
-                }
-            }
-            activeSlot = target;
-            safeSessionSet(ACTIVE_KEY, activeSlot);
-            store = readStore();
-            knownSlotRevision = slotRevision(store, activeSlot);
-            externalConflict = false;
-            updateButtons();
-            switching = false;
-            await restoreSnapshot(store.slots[activeSlot], "switch");
-        } finally {
-            switching = false;
-        }
-    }
-
     function nextWorkspaceName(store) {
         var used = Object.create(null);
         workspaceIds(store).forEach(function (slot) {
@@ -1837,220 +1746,6 @@
         if (document.activeElement !== input) input.value = workspaceName(store || readStore(), activeSlot);
     }
 
-    function openWorkspaceNameEditor() {
-        if (!toolbar) return;
-        var details = toolbar.querySelector(".sam3-workspace-menu");
-        var input = toolbar.querySelector("[data-workspace-name]");
-        if (!details || !input) return;
-        details.open = true;
-        syncWorkspaceNameEditor(readStore());
-        setTimeout(function () {
-            try { input.focus(); input.select(); } catch (e) {}
-        }, 0);
-    }
-
-    function renameCurrentWorkspace() {
-        if (!toolbar || switching || restoring || resetting) return;
-        var input = toolbar.querySelector("[data-workspace-name]");
-        if (!input) return;
-        var store = readStore();
-        if (workspaceIds(store).indexOf(activeSlot) === -1) {
-            setStatus("이름을 바꿀 Workspace를 찾지 못했습니다", "error");
-            return;
-        }
-        var currentName = workspaceName(store, activeSlot);
-        var nextName = sanitizeWorkspaceName(input.value, currentName);
-        input.value = nextName;
-        if (nextName === currentName) {
-            setStatus(currentName + " 이름 유지", "saved");
-            return;
-        }
-        store.slotNames[activeSlot] = nextName;
-        store.revision = (Number(store.revision) || 0) + 1;
-        store.updatedAt = new Date().toISOString();
-        store.updatedBy = tabId;
-        if (!writeStore(store)) return;
-        updateButtons();
-        setStatus(nextName + " 이름 저장됨", "saved");
-    }
-
-    async function createWorkspace() {
-        if (switching || restoring || resetting) return;
-        if (generationRunning()) {
-            setStatus("생성 중에는 Workspace를 추가할 수 없습니다", "warning");
-            return;
-        }
-        var initialStore = readStore();
-        if (workspaceIds(initialStore).length >= MAX_WORKSPACES) {
-            setStatus("Workspace는 최대 " + MAX_WORKSPACES + "개까지 만들 수 있습니다", "warning");
-            return;
-        }
-        switching = true;
-        try {
-            await flushWorkspaceOutputs(activeSlot);
-            var hadDirtyChanges = dirty;
-            var sourceSnapshot = saveNow("create", false);
-            if (hadDirtyChanges && !sourceSnapshot) {
-                setStatus(activeWorkspaceName() + " 저장 실패 · 생성 취소", "error");
-                return;
-            }
-            var store = readStore();
-            if (workspaceIds(store).length >= MAX_WORKSPACES) {
-                setStatus("Workspace는 최대 " + MAX_WORKSPACES + "개까지 만들 수 있습니다", "warning");
-                return;
-            }
-            var slot = createWorkspaceId(store);
-            var name = nextWorkspaceName(store);
-            var snapshot = sourceSnapshot ? cloneJson(sourceSnapshot) : captureSnapshot(null);
-            var now = new Date().toISOString();
-            var clock = slotRevision(store, slot) + 1;
-            snapshot.revision = clock;
-            snapshot.createdAt = now;
-            snapshot.savedAt = now;
-            snapshot.writer = tabId;
-            store.slotOrder.push(slot);
-            store.slotNames[slot] = name;
-            store.slotRevisions[slot] = clock;
-            store.slots[slot] = snapshot;
-            store.revision = (Number(store.revision) || 0) + 1;
-            store.updatedAt = now;
-            store.updatedBy = tabId;
-            if (!writeStore(store)) return;
-
-            activeSlot = slot;
-            safeSessionSet(ACTIVE_KEY, activeSlot);
-            knownSlotRevision = clock;
-            externalConflict = false;
-            dirty = false;
-            updateButtons();
-            // A new workspace forks the settings, but starts with an empty
-            // result history so later generations remain workspace-specific.
-            await deleteWorkspaceOutputs(slot);
-            await restoreWorkspaceOutputs(slot);
-            setStatus(name + " 생성됨 · 현재 설정 복사 · 갤러리 비움", "saved");
-            openWorkspaceNameEditor();
-        } finally {
-            switching = false;
-        }
-    }
-
-    async function deleteCurrentWorkspace() {
-        if (switching || restoring || resetting) return;
-        if (generationRunning()) {
-            setStatus("생성 중에는 Workspace를 삭제할 수 없습니다", "warning");
-            return;
-        }
-
-        var store = readStore();
-        var ids = workspaceIds(store);
-        var currentIndex = ids.indexOf(activeSlot);
-        if (currentIndex === -1) {
-            setStatus("삭제할 Workspace를 찾지 못했습니다 · 새로고침 필요", "error");
-            return;
-        }
-        if (ids.length <= 1) {
-            setStatus("마지막 Workspace는 삭제할 수 없습니다", "warning");
-            return;
-        }
-
-        var deletedSlot = activeSlot;
-        var deletedName = workspaceName(store, deletedSlot);
-        var deleteButton = toolbar && toolbar.querySelector("[data-workspace-delete]");
-        if (deleteButton && deleteButton.getAttribute("data-delete-armed") !== deletedSlot) {
-            deleteButton.setAttribute("data-delete-armed", deletedSlot);
-            deleteButton.textContent = "한 번 더 눌러 삭제";
-            setStatus("'" + deletedName + "' 삭제 확인 · 5초 안에 한 번 더 누르세요", "warning");
-            setTimeout(function () {
-                if (deleteButton.getAttribute("data-delete-armed") === deletedSlot) {
-                    deleteButton.removeAttribute("data-delete-armed");
-                    deleteButton.textContent = "현재 Workspace 삭제";
-                }
-            }, 5000);
-            return;
-        }
-        if (deleteButton) {
-            deleteButton.removeAttribute("data-delete-armed");
-            deleteButton.textContent = "현재 Workspace 삭제";
-        }
-
-        switching = true;
-        dirty = false;
-        externalConflict = false;
-        if (saveTimer) { clearTimeout(saveTimer); saveTimer = null; }
-        try {
-            // Re-read after confirmation so a concurrent tab update is not
-            // overwritten by the pre-confirmation copy of the store.
-            store = readStore();
-            ids = workspaceIds(store);
-            currentIndex = ids.indexOf(deletedSlot);
-            if (currentIndex === -1 || ids.length <= 1) {
-                setStatus("Workspace 구성이 다른 탭에서 변경됨 · 새로고침 필요", "warning");
-                return;
-            }
-
-            var remaining = ids.filter(function (slot) { return slot !== deletedSlot; });
-            var target = remaining[Math.min(currentIndex, remaining.length - 1)];
-            if (!store.slots[target]) {
-                var populated = remaining.find(function (slot) { return !!store.slots[slot]; });
-                if (populated) target = populated;
-            }
-
-            // Keep a revision tombstone so a stale tab cannot silently write
-            // the removed workspace back into localStorage.
-            store.slotRevisions[deletedSlot] = slotRevision(store, deletedSlot) + 1;
-            store.slotOrder = remaining;
-            delete store.slotNames[deletedSlot];
-            delete store.slots[deletedSlot];
-            store.revision = (Number(store.revision) || 0) + 1;
-            store.updatedAt = new Date().toISOString();
-            store.updatedBy = tabId;
-            if (!writeStore(store)) return;
-            await deleteWorkspaceOutputs(deletedSlot);
-
-            activeSlot = target;
-            safeSessionSet(ACTIVE_KEY, activeSlot);
-            knownSlotRevision = slotRevision(store, activeSlot);
-            updateButtons();
-            switching = false;
-
-            if (store.slots[activeSlot]) {
-                await restoreSnapshot(store.slots[activeSlot], "delete");
-                setStatus("'" + deletedName + "' 삭제됨 · " + activeWorkspaceName(store) + "로 전환", "saved");
-            } else {
-                // An untouched legacy slot has no snapshot to restore. A full
-                // reload lets Forge rebuild its real defaults before the slot
-                // is initialized, instead of copying the deleted workspace.
-                window.location.reload();
-            }
-        } finally {
-            switching = false;
-        }
-    }
-
-    function downloadExport() {
-        var hadDirtyChanges = dirty;
-        var saved = saveNow("export", false);
-        if (hadDirtyChanges && !saved) {
-            setStatus("현재 작업공간 저장 실패 · 내보내기 취소", "error");
-            return;
-        }
-        var payload = workspaceExportPayload();
-        try {
-            var blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" });
-            var url = URL.createObjectURL(blob);
-            var anchor = document.createElement("a");
-            anchor.href = url;
-            anchor.download = "sam-extra-workspaces-" + new Date().toISOString().replace(/[:.]/g, "-") + ".json";
-            document.body.appendChild(anchor);
-            anchor.click();
-            anchor.remove();
-            setTimeout(function () { URL.revokeObjectURL(url); }, 1000);
-            setStatus("작업공간을 내보냈습니다", "saved");
-        } catch (e) {
-            setStatus("내보내기에 실패했습니다", "error");
-        }
-    }
-
     function previewWorkspaceImport(parsed) {
         var imported = normalizeStore(parsed);
         var importedIds = workspaceIds(imported);
@@ -2121,167 +1816,18 @@
         };
     }
 
-    function importFile(file) {
-        if (!file) return;
-        if (file.size > MAX_STORAGE_BYTES) {
-            setStatus("가져올 파일이 너무 큽니다", "error");
-            return;
-        }
-        var reader = new FileReader();
-        reader.onload = async function () {
-            try {
-                var parsed = JSON.parse(String(reader.result || ""));
-                var preview = previewWorkspaceImport(parsed);
-                if (!window.confirm(
-                    "현재 Workspace를 가져온 파일의 " + preview.ids.length
-                        + "개 Workspace로 교체할까요? 로컬 txt2img 갤러리 기록도 비워집니다."
-                )) return;
-                switching = true;
-                dirty = false;
-                if (saveTimer) { clearTimeout(saveTimer); saveTimer = null; }
-                var result = await replaceWorkspaceStore(parsed, activeSlot);
-                activeSlot = result.activeSlot;
-                safeSessionSet(ACTIVE_KEY, activeSlot);
-                var imported = readStore();
-                knownSlotRevision = slotRevision(imported, activeSlot);
-                externalConflict = false;
-                updateButtons();
-                switching = false;
-                await restoreSnapshot(imported.slots[activeSlot], "import");
-                setStatus("작업공간을 가져왔습니다", "saved");
-            } catch (e) {
-                switching = false;
-                console.warn("[SAM3 Workspaces] import failed:", e);
-                setStatus("올바른 작업공간 파일이 아닙니다", "error");
-            }
-        };
-        reader.readAsText(file);
-    }
-
-    async function resetCurrentWorkspace() {
-        var store = readStore();
-        var name = workspaceName(store, activeSlot);
-        if (!window.confirm(
-            "'" + name + "' 설정과 txt2img 갤러리 기록을 지우고 페이지를 새로 고칠까요?"
-        )) return;
-        resetting = true;
-        dirty = false;
-        if (saveTimer) { clearTimeout(saveTimer); saveTimer = null; }
-        var nextClock = slotRevision(store, activeSlot) + 1;
-        store.slots[activeSlot] = null;
-        store.slotRevisions[activeSlot] = nextClock;
-        store.revision = (Number(store.revision) || 0) + 1;
-        store.updatedAt = new Date().toISOString();
-        store.updatedBy = tabId;
-        if (writeStore(store)) {
-            knownSlotRevision = nextClock;
-            await deleteWorkspaceOutputs(activeSlot);
-            window.location.reload();
-        } else {
-            resetting = false;
-        }
-    }
-
-    function createToolbar() {
-        var bar = document.createElement("div");
-        bar.id = "sam3_workspace_bar";
-        bar.className = "sam3-workspace-bar";
-        bar.setAttribute("data-sam3-workspaces", "1");
-        bar.innerHTML = [
-            '<button type="button" class="sam3-workspace-title" data-workspace-create ',
-            '  aria-label="새 Workspace 만들기" title="새 Workspace 만들기">',
-            '  <span>Workspaces</span><span aria-hidden="true">＋</span>',
-            '</button>',
-            '<div class="sam3-workspace-slots" role="group" aria-label="txt2img workspaces">',
-            '</div>',
-            '<span class="sam3-workspace-status" data-workspace-status aria-live="polite"></span>',
-            '<details class="sam3-workspace-menu">',
-            '  <summary aria-label="Workspace 메뉴" title="Workspace 메뉴">⋯</summary>',
-            '  <div class="sam3-workspace-menu-panel">',
-            '    <label class="sam3-workspace-name-editor">',
-            '      <span>현재 Workspace 이름</span>',
-            '      <input type="text" maxlength="' + MAX_WORKSPACE_NAME + '" data-workspace-name ',
-            '        aria-label="현재 Workspace 이름">',
-            '    </label>',
-            '    <button type="button" data-workspace-rename>이름 저장</button>',
-            '    <button type="button" data-workspace-export>내보내기</button>',
-            '    <label>가져오기<input type="file" accept="application/json,.json" data-workspace-import></label>',
-            '    <button type="button" data-workspace-live>Live Workspaces로 전환</button>',
-            '    <button type="button" class="danger" data-workspace-reset>현재 Workspace 새로 시작</button>',
-            '    <button type="button" class="danger" data-workspace-delete>현재 Workspace 삭제</button>',
-            '  </div>',
-            '</details>'
-        ].join("");
-
-        bar.querySelector("[data-workspace-create]").addEventListener("click", function () {
-            createWorkspace();
-        });
-        bar.querySelector(".sam3-workspace-slots").addEventListener("click", function (event) {
-            var button = event.target && event.target.closest
-                ? event.target.closest("[data-workspace-slot]")
-                : null;
-            if (button && this.contains(button)) switchWorkspace(button.getAttribute("data-workspace-slot"));
-        });
-        bar.querySelector("[data-workspace-rename]").addEventListener("click", function () {
-            renameCurrentWorkspace();
-            bar.querySelector("details").open = false;
-        });
-        bar.querySelector("[data-workspace-name]").addEventListener("keydown", function (event) {
-            if (event.key === "Enter") {
-                event.preventDefault();
-                renameCurrentWorkspace();
-                bar.querySelector("details").open = false;
-            } else if (event.key === "Escape") {
-                event.preventDefault();
-                syncWorkspaceNameEditor(readStore());
-                bar.querySelector("details").open = false;
-            }
-        });
-        bar.querySelector("details").addEventListener("toggle", function () {
-            if (this.open) syncWorkspaceNameEditor(readStore());
-        });
-        bar.querySelector("[data-workspace-export]").addEventListener("click", function () {
-            downloadExport();
-            bar.querySelector("details").open = false;
-        });
-        bar.querySelector("[data-workspace-import]").addEventListener("change", function (event) {
-            importFile(event.target.files && event.target.files[0]);
-            event.target.value = "";
-            bar.querySelector("details").open = false;
-        });
-        bar.querySelector("[data-workspace-live]").addEventListener("click", function () {
-            var url = new URL(window.location.href);
-            url.searchParams.delete("sam3_live");
-            window.location.href = url.toString();
-        });
-        bar.querySelector("[data-workspace-reset]").addEventListener("click", resetCurrentWorkspace);
-        bar.querySelector("[data-workspace-delete]").addEventListener("click", deleteCurrentWorkspace);
-        return bar;
-    }
-
     function mountToolbar() {
+        // The standalone in-page workspace toolbar (legacy "기본 UI" / Mode D)
+        // has been removed: workspace switching lives entirely in the Live
+        // shell now. When Live Workspace mode is off the user gets plain,
+        // untouched Forge with nothing injected. The only case that proceeds
+        // past here is a Live child frame, which restores this slot's values
+        // into the full Forge document without any nested toolbar.
         var pane = findGenerationPane();
         if (!pane) return false;
         generationPane = pane;
         if (LIVE_FRAME_SLOT) return true;
-        var existing = app().querySelector("#sam3_workspace_bar");
-        if (existing && existing.isConnected) {
-            toolbar = existing;
-            updateButtons();
-            return true;
-        }
-        toolbar = createToolbar();
-        // #txt2img_settings is one column of Forge's resize row.  Adding the
-        // toolbar *inside that row* creates a third flex column and crushes the
-        // controls.  Insert it immediately above the whole row: full width,
-        // and still visible when Forge wraps settings in a closed accordion.
-        var settings = pane.querySelector("#txt2img_settings");
-        var layoutRow = settings && settings.closest(".resize-handle-row");
-        if (layoutRow && layoutRow.parentNode) layoutRow.parentNode.insertBefore(toolbar, layoutRow);
-        else if (settings) settings.insertBefore(toolbar, settings.firstChild);
-        else pane.insertBefore(toolbar, pane.firstChild);
-        updateButtons();
-        return true;
+        return false;
     }
 
     function eventInsideCaptureRoots(target) {
@@ -2401,6 +1947,11 @@
     }
 
     function ensureMounted() {
+        // Live vs plain Forge is decided server-side by the /sam3-live redirect
+        // gate (Settings → SAM3 Workspaces mode), so there is no separate
+        // frontend kill switch here. Only Live child frames reach mountToolbar's
+        // "return true" path; on a plain page mountToolbar returns false and
+        // initialize() bails, leaving Forge untouched.
         var pane = findGenerationPane();
         if (!pane) return;
         var replaced = generationPane && pane !== generationPane;
@@ -2496,6 +2047,7 @@
         flushForLiveShell: flushForLiveShell,
         prepareForLiveImport: prepareForLiveImport,
         cancelLiveImport: cancelLiveImport,
+        setBackgroundActive: setBackgroundActive,
         storage: {
             list: storedWorkspaceList,
             rename: renameStoredWorkspace,
@@ -2510,14 +2062,46 @@
         }
     };
 
+    // Background re-mount watch (MutationObserver + poll). In the Live shell,
+    // three child Forge documents stay resident; leaving each one's observer +
+    // 800 ms poll running while it is hidden was a real source of switch jank.
+    // The shell posts LIVE_VISIBILITY_MESSAGE on every activate()/ready, and a
+    // hidden frame pauses this watch. The essential re-mount path via Forge's
+    // own onAfterUiUpdate(ensureMounted) stays registered regardless, so a
+    // paused frame still re-mounts on a genuine Forge UI rebuild — pausing only
+    // drops the redundant polling.
+    var _bgObserver = null;
+    var _bgInterval = null;
+    var _bgStopped = false;   // true after the one-time 5-min settle cutoff
+    var _bgActive = true;     // shell-reported visibility for this frame
+
+    function startBackgroundWatch() {
+        if (_bgStopped || _bgObserver || _bgInterval) return;
+        _bgObserver = new MutationObserver(function () { ensureMounted(); });
+        try { _bgObserver.observe(document.documentElement, { childList: true, subtree: true }); } catch (e) {}
+        _bgInterval = setInterval(ensureMounted, 800);
+    }
+
+    function stopBackgroundWatch() {
+        if (_bgObserver) { try { _bgObserver.disconnect(); } catch (e) {} _bgObserver = null; }
+        if (_bgInterval) { clearInterval(_bgInterval); _bgInterval = null; }
+    }
+
+    function setBackgroundActive(active) {
+        active = active !== false;
+        if (active === _bgActive) return;
+        _bgActive = active;
+        if (_bgStopped) return;
+        if (active) { ensureMounted(); startBackgroundWatch(); }
+        else { stopBackgroundWatch(); }
+    }
+
     function start() {
         ensureMounted();
-        var observer = new MutationObserver(function () { ensureMounted(); });
-        try { observer.observe(document.documentElement, { childList: true, subtree: true }); } catch (e) {}
-        var interval = setInterval(ensureMounted, 800);
+        startBackgroundWatch();
         setTimeout(function () {
-            try { observer.disconnect(); } catch (e) {}
-            clearInterval(interval);
+            _bgStopped = true;
+            stopBackgroundWatch();
         }, 300000);
         if (typeof onAfterUiUpdate === "function") onAfterUiUpdate(ensureMounted);
     }

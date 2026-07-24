@@ -5,7 +5,9 @@ import unittest
 from fastapi import FastAPI
 
 from sam3ext.live_workspace_route import (
+    LIVE_WORKSPACE_ENABLED_PATH,
     LIVE_WORKSPACE_PATH,
+    live_workspace_enabled,
     live_workspace_html,
     register_live_workspace_route,
 )
@@ -32,6 +34,21 @@ class LiveWorkspaceRouteTests(unittest.TestCase):
         matches = [route for route in app.routes if route.path == LIVE_WORKSPACE_PATH]
         self.assertEqual(len(matches), 1)
         self.assertIn("GET", matches[0].methods)
+
+    def test_enabled_probe_route_registered(self):
+        app = FastAPI()
+        register_live_workspace_route(app)
+        matches = [
+            route for route in app.routes
+            if route.path == LIVE_WORKSPACE_ENABLED_PATH
+        ]
+        self.assertEqual(len(matches), 1)
+        self.assertIn("GET", matches[0].methods)
+
+    def test_live_enabled_defaults_to_true_without_setting(self):
+        # With no webui `modules.shared` available (as under test) the probe
+        # must default to Live — the historical default — not plain Forge.
+        self.assertTrue(live_workspace_enabled())
 
 
 if __name__ == "__main__":

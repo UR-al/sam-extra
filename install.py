@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 import os
+import shutil
 import subprocess
 import sys
 from importlib.metadata import version
@@ -75,6 +76,12 @@ check_environment()
 
 _ANIMA_REPO = "https://github.com/kohya-ss/sd-scripts.git"
 _ANIMA_BRANCH = "main"
+# Optional pin: set to a verified upstream tag/branch to stop the vendor tree
+# floating with upstream main (which can silently break the source-patch
+# anchors in lora_manager_core.py and the Anima import surface). None tracks
+# _ANIMA_BRANCH — the historical behaviour. A shallow clone can pin a tag or
+# branch name, not an arbitrary commit SHA.
+_ANIMA_PIN: str | None = None
 _ANIMA_ROOT = Path(__file__).resolve().parent / "anima_vendor"
 # Sentinel = the actual entrypoint upstream ships. If the clone was
 # interrupted partway through, this file will be missing and the next run
@@ -92,6 +99,30 @@ def _have_git() -> bool:
         return True
     except Exception:
         return False
+
+
+def _reset_partial_clone(root: Path, label: str) -> None:
+    """Remove a non-empty vendor dir left by an interrupted clone.
+
+    ``git clone`` refuses to write into an existing non-empty directory, so a
+    clone that died after creating ``root`` but before the sentinel landed
+    would wedge every subsequent bootstrap. The sentinel is already known to
+    be missing by the time this is called, so anything present is partial.
+    """
+    if not root.exists():
+        return
+    print(
+        f"[forge_sam3_extension] removing partial {label} clone at {root} "
+        "before retrying",
+        file=sys.stderr,
+    )
+    try:
+        shutil.rmtree(root)
+    except Exception as e:  # noqa: BLE001 — best-effort; clone will error clearly
+        print(
+            f"[forge_sam3_extension] could not remove {root}: {e}",
+            file=sys.stderr,
+        )
 
 
 def ensure_anima_vendor() -> bool:
@@ -114,6 +145,7 @@ def ensure_anima_vendor() -> bool:
         )
         return False
 
+    _reset_partial_clone(_ANIMA_ROOT, "Anima vendor")
     _ANIMA_ROOT.parent.mkdir(parents=True, exist_ok=True)
     print(
         f"[forge_sam3_extension] cloning sd-scripts → {_ANIMA_ROOT} "
@@ -129,7 +161,7 @@ def ensure_anima_vendor() -> bool:
                 "1",
                 "--single-branch",
                 "--branch",
-                _ANIMA_BRANCH,
+                _ANIMA_PIN or _ANIMA_BRANCH,
                 _ANIMA_REPO,
                 str(_ANIMA_ROOT),
             ],
@@ -196,6 +228,12 @@ check_anima_environment()
 
 _LM_REPO = "https://github.com/willmiao/ComfyUI-Lora-Manager.git"
 _LM_BRANCH = "main"
+# Optional pin (see _ANIMA_PIN). lora_manager_core.py already assumes the
+# vendored manager is version 1.1.4 (its update-check patch anchors + the
+# "vendor pinned (1.1.4)" comment), so pinning the clone to that upstream tag
+# would make the tree actually match those assumptions. Left None until a
+# maintainer verifies the exact tag name (e.g. "1.1.4" vs "v1.1.4").
+_LM_PIN: str | None = None
 _LM_ROOT = Path(__file__).resolve().parent / "lora_manager_vendor"
 _LM_SENTINEL = _LM_ROOT / "standalone.py"
 
@@ -238,6 +276,7 @@ def ensure_lora_manager_vendor() -> bool:
         )
         return False
 
+    _reset_partial_clone(_LM_ROOT, "LoRA Manager vendor")
     _LM_ROOT.parent.mkdir(parents=True, exist_ok=True)
     print(
         f"[forge_sam3_extension] cloning ComfyUI-Lora-Manager → {_LM_ROOT} "
@@ -253,7 +292,7 @@ def ensure_lora_manager_vendor() -> bool:
                 "1",
                 "--single-branch",
                 "--branch",
-                _LM_BRANCH,
+                _LM_PIN or _LM_BRANCH,
                 _LM_REPO,
                 str(_LM_ROOT),
             ],

@@ -186,6 +186,38 @@ def make_axis_on_xyz_grid():
         xyz_grid.axis_options.extend(axis)
 
 
+WORKSPACE_MODE_LIVE = "Live Workspace"
+WORKSPACE_MODE_PLAIN = "기본 Forge UI"
+
+
+def workspace_live_enabled() -> bool:
+    """True when Live Workspace mode is selected (the default)."""
+    mode = getattr(shared.opts, "sam3_workspaces_mode", WORKSPACE_MODE_LIVE)
+    return str(mode or WORKSPACE_MODE_LIVE) != WORKSPACE_MODE_PLAIN
+
+
+def on_ui_settings_workspaces():
+    # Feature 5 mode selector. The frontend redirects a bare "/" to the
+    # lightweight "/sam3-live" shell only when Live Workspace is selected;
+    # picking "기본 Forge UI" keeps the plain, untouched Forge txt2img page
+    # (no workspace shell, no toolbar). Read server-side by the /sam3-live/enabled
+    # probe so the choice applies before window.opts is populated.
+    section = ("sam3_workspaces", "SAM3 Workspaces")
+    shared.opts.add_option(
+        "sam3_workspaces_mode",
+        shared.OptionInfo(
+            WORKSPACE_MODE_LIVE,
+            "txt2img 작업공간 모드 (기능 5 · 새로고침 후 적용)",
+            gr.Radio,
+            {"choices": [WORKSPACE_MODE_LIVE, WORKSPACE_MODE_PLAIN]},
+            section=section,
+        ),
+    )
+
+
+script_callbacks.on_ui_settings(on_ui_settings_workspaces)
+
+
 def on_before_ui():
     guarded = guard_sampler_app_started_callbacks(script_callbacks.callback_map)
     if guarded:
@@ -223,6 +255,15 @@ script_callbacks.on_app_started(
 
 class Sam3MaskScript(scripts.Script):
     alwayson = True
+    # Lead the SAM3 extension block. Without an explicit priority this accordion
+    # fell in with the unprioritised third-party scripts, letting them sit
+    # between SAM3 and the anima feature accordions (which carry explicit
+    # priorities and so sank below the unprioritised ones). A contiguous
+    # negative block keeps the whole SAM3 family together at the top, in order:
+    #   SAM3 (-30) → Detail Daemon (-29) → Skimmed CFG (-28) → Safe PAG (-27)
+    #   → VAE 2x (-26) → Reference PoC / log toggles (-25).
+    # (lower sorting_priority = higher up.)
+    sorting_priority = -30
 
     def title(self):
         return SAM3_NAME
@@ -489,8 +530,9 @@ anima_wired: bool = False
 # JS shim: replace the placeholder selected_index slot (index 1 in the inputs
 # array) with the current gallery selection from the DOM. This sidesteps
 # Gradio 5.x's check_all_files_in_cache validation of SelectData event_data
-# that we'd otherwise hit by subscribing to gallery.select.
-_REFINE_JS = (
+# that we'd otherwise hit by subscribing to gallery.select. Shared by every
+# Refine/Anima handler and seed/canvas button that needs the live selection.
+_SELECTED_INDEX_JS = (
     "(...args) => {"
     "  try { args[1] = selected_gallery_index(); } catch (e) { args[1] = -1; }"
     "  return args;"
@@ -506,7 +548,7 @@ def _wire_refine_panel(
     html_info,
     generation_info,
 ):
-    """Wire the Refine button. Index is injected client-side via ``_REFINE_JS``
+    """Wire the Refine button. Index is injected client-side via ``_SELECTED_INDEX_JS``
     so we don't need a ``gallery.select`` handler (which would otherwise
     trigger Gradio's file-cache validation on the selected image's path).
 
@@ -530,7 +572,7 @@ def _wire_refine_panel(
     )
     refine_run = refine_show_stop.then(
         fn=handle_refine_click,
-        _js=_REFINE_JS,
+        _js=_SELECTED_INDEX_JS,
         inputs=[
             gallery,
             panel.selected_index_state,
@@ -573,7 +615,7 @@ def _wire_refine_panel(
     )
     panel.seed_pull_button.click(
         fn=_pull_seed_from_gallery_item,
-        _js="(...args) => { try { args[1] = selected_gallery_index(); } catch (e) { args[1] = -1; } return args; }",
+        _js=_SELECTED_INDEX_JS,
         inputs=[gallery, panel.selected_index_state, generation_info],
         outputs=[panel.seed],
         queue=False,
@@ -636,7 +678,7 @@ def _wire_refine_panel(
 
         panel.canvas_load_button.click(
             fn=_load_to_canvas,
-            _js="(...args) => { try { args[1] = selected_gallery_index(); } catch (e) { args[1] = -1; } return args; }",
+            _js=_SELECTED_INDEX_JS,
             inputs=[gallery, panel.selected_index_state],
             outputs=[panel.canvas_bg],
             queue=False,
@@ -665,16 +707,6 @@ def _wire_refine_panel(
     )
 
 
-# JS shim identical to Refine's — replaces selected_index in args slot 1
-# with the live frontend selection.
-_ANIMA_JS = (
-    "(...args) => {"
-    "  try { args[1] = selected_gallery_index(); } catch (e) { args[1] = -1; }"
-    "  return args;"
-    "}"
-)
-
-
 def _wire_anima_panel(
     panel: AnimaPanel,
     gallery,
@@ -695,7 +727,7 @@ def _wire_anima_panel(
     )
     run = show_stop.then(
         fn=handle_anima_click,
-        _js=_ANIMA_JS,
+        _js=_SELECTED_INDEX_JS,
         inputs=[
             gallery,
             panel.selected_index_state,
@@ -733,7 +765,7 @@ def _wire_anima_panel(
     )
     panel.seed_pull_button.click(
         fn=_pull_seed_from_gallery_item,
-        _js=_ANIMA_JS,
+        _js=_SELECTED_INDEX_JS,
         inputs=[gallery, panel.selected_index_state, generation_info],
         outputs=[panel.seed],
         queue=False,

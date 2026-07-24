@@ -18,6 +18,7 @@
     var CONTROL_MESSAGE = "sam3-live-workspace-control-v1";
     var CONTROL_REPLY = "sam3-live-workspace-control-reply-v1";
     var STATUS_MESSAGE = "sam3-live-workspace-status-v1";
+    var VISIBILITY_MESSAGE = "sam3-live-workspace-visibility-v1";
     var MAX_IMPORT_BYTES = 4 * 1024 * 1024;
 
     var standaloneRedirect = null;
@@ -25,24 +26,40 @@
             && window.location.pathname !== "/sam3-live") {
         // The Forge root is a complete Gradio document. It used to finish
         // building that unused UI and then create another complete document
-        // for Workspace 1. Move to the extension-owned lightweight parent as
-        // soon as this script is evaluated; child workspaces still load "/".
-        // Verify the Python route first so a browser-only refresh against an
-        // older, not-yet-restarted WebUI falls back to the original shell
-        // instead of landing on a temporary 404.
+        // for Workspace 1. When Live Workspace mode is selected we move to the
+        // extension-owned lightweight parent as soon as this script runs;
+        // child workspaces still load "/".
+        //
+        // The Settings mode selector (Live Workspace vs 기본 Forge UI) decides
+        // whether to redirect at all, but that choice isn't in window.opts this
+        // early — so ask the server via /sam3-live/enabled (it reads the setting
+        // at request time). If that probe is missing (older backend that
+        // predates the setting), fall back to the historical "redirect when the
+        // shell route exists" behavior so Live stays the default.
         var shellUrl = new URL("/sam3-live", window.location.origin);
         shellUrl.search = window.location.search;
-        standaloneRedirect = window.fetch(shellUrl.toString(), {
-            method: "GET",
-            credentials: "same-origin",
-            cache: "no-store"
-        }).then(function (response) {
-            if (!response.ok) return false;
+        var probeUrl = new URL("/sam3-live/enabled", window.location.origin);
+        var fetchOpts = { method: "GET", credentials: "same-origin", cache: "no-store" };
+
+        var redirectToShell = function () {
             window.location.replace(shellUrl.toString());
             return true;
-        }).catch(function () {
-            return false;
-        });
+        };
+        var shellExistsFallback = function () {
+            return window.fetch(shellUrl.toString(), fetchOpts)
+                .then(function (r) { return r.ok ? redirectToShell() : false; })
+                .catch(function () { return false; });
+        };
+
+        standaloneRedirect = window.fetch(probeUrl.toString(), fetchOpts)
+            .then(function (response) {
+                if (!response.ok) return shellExistsFallback();
+                return response.json().then(function (cfg) {
+                    if (cfg && cfg.live === false) return false;  // plain Forge
+                    return redirectToShell();
+                }).catch(shellExistsFallback);
+            })
+            .catch(function () { return false; });
     }
 
     function app() {
@@ -231,15 +248,25 @@
             '        <input type="file" accept="application/json,.json" data-sam3-live-import></label>',
             '    </div>',
             '  </details>',
+            '  <button type="button" data-sam3-live-lora hidden ',
+            '    title="LoRA Manager를 열어 현재 Workspace 프롬프트에 삽입">LoRA</button>',
             '  <button type="button" data-sam3-live-native-tabs ',
             '    title="iframe을 닫고 각 Workspace를 실제 브라우저 탭으로 엽니다">실제 탭으로 열기</button>',
-            '  <button type="button" data-sam3-live-legacy title="기존 값 복원 Workspace UI로 전환">기본 UI</button>',
             '</header>',
             '<div class="sam3-live-frames">',
             '  <div class="sam3-live-loading" role="status" aria-live="polite">',
             '    <span class="sam3-live-spinner" aria-hidden="true"></span>',
             '    <span data-sam3-live-loading-text>Workspace 준비 중…</span>',
             '  </div>',
+            '</div>',
+            '<div class="sam3-live-lora-overlay" data-sam3-live-lora-overlay hidden>',
+            '  <div class="sam3-live-lora-bar">',
+            '    <strong>LoRA Manager</strong>',
+            '    <span class="sam3-live-lora-status" data-sam3-live-lora-status></span>',
+            '    <span class="sam3-live-lora-active" data-sam3-live-lora-active></span>',
+            '    <button type="button" data-sam3-live-lora-close aria-label="닫기">✕</button>',
+            '  </div>',
+            '  <iframe class="sam3-live-lora-frame" data-sam3-live-lora-frame title="LoRA Manager"></iframe>',
             '</div>'
         ].join("");
         document.body.appendChild(shell);
@@ -325,10 +352,20 @@
         }
 
         function queueDefaultWorkspaces() {
-            DEFAULT_SLOT_IDS.forEach(function (slot) {
-                if (slotIds.indexOf(slot) === -1 || slot === state.active) return;
-                queueLoad(slot, false);
-            });
+            var activeIdx = DEFAULT_SLOT_IDS.indexOf(state.active);
+            DEFAULT_SLOT_IDS
+                .filter(function (slot) {
+                    return slotIds.indexOf(slot) !== -1 && slot !== state.active;
+                })
+                .sort(function (a, b) {
+                    // Preload the active tab's nearest neighbour first so the
+                    // most likely next switch is already built; farther slots
+                    // follow. (Loads still run one at a time.)
+                    if (activeIdx < 0) return 0;
+                    return Math.abs(DEFAULT_SLOT_IDS.indexOf(a) - activeIdx)
+                        - Math.abs(DEFAULT_SLOT_IDS.indexOf(b) - activeIdx);
+                })
+                .forEach(function (slot) { queueLoad(slot, false); });
         }
 
         function hasPendingLoads() {
@@ -356,14 +393,33 @@
             if (state.active === slot && !childStatuses[slot]) {
                 setShellStatus((state.names[slot] || slot) + " 준비됨", "saved");
             }
+            // A freshly-ready background frame should pause its watch right away
+            // instead of waiting for the next tab switch.
+            notifyChildVisibility(slot, state.active === slot);
             // Build one full Forge document at a time. This avoids three-way
             // CPU/DOM/API contention while still preparing every default
             // Workspace automatically in the background.
             setTimeout(loadNext, 100);
         }
 
+        function notifyChildVisibility(slot, active) {
+            // Tell a ready child frame whether it is the visible workspace so it
+            // can pause/resume its background re-mount watch. Fire-and-forget.
+            var iframe = frameFor(slot);
+            if (!iframe || !readySlots[slot]) return;
+            try {
+                if (iframe.contentWindow) {
+                    iframe.contentWindow.postMessage(
+                        { type: VISIBILITY_MESSAGE, slot: slot, active: !!active },
+                        window.location.origin
+                    );
+                }
+            } catch (e) {}
+        }
+
         function activate(slot) {
             if (slotIds.indexOf(slot) === -1) return;
+            var previous = state.active;
             state.active = slot;
             writeShellState(state);
             Array.prototype.forEach.call(tabs.querySelectorAll("button[data-slot]"), function (button) {
@@ -371,12 +427,25 @@
                 button.classList.toggle("active", active);
                 button.setAttribute("aria-selected", active ? "true" : "false");
             });
-            Array.prototype.forEach.call(frames.querySelectorAll("iframe[data-slot]"), function (iframe) {
-                var active = iframe.getAttribute("data-slot") === slot;
-                iframe.setAttribute("data-active", active ? "true" : "false");
-                iframe.setAttribute("aria-hidden", active ? "false" : "true");
-                iframe.toggleAttribute("inert", !active);
-            });
+            // Only re-attribute the two frames whose active-state actually
+            // changes. Toggling inert/aria-hidden on every resident Forge
+            // document each switch forced a needless style/a11y-tree reflow.
+            if (previous && previous !== slot) {
+                var prevFrame = frameFor(previous);
+                if (prevFrame) {
+                    prevFrame.setAttribute("data-active", "false");
+                    prevFrame.setAttribute("aria-hidden", "true");
+                    prevFrame.toggleAttribute("inert", true);
+                }
+                notifyChildVisibility(previous, false);
+            }
+            var activeFrame = frameFor(slot);
+            if (activeFrame) {
+                activeFrame.setAttribute("data-active", "true");
+                activeFrame.setAttribute("aria-hidden", "false");
+                activeFrame.toggleAttribute("inert", false);
+            }
+            notifyChildVisibility(slot, true);
             syncNameEditor();
             var childStatus = childStatuses[slot];
             if (childStatus) {
@@ -796,15 +865,103 @@
             "click",
             openNativeWorkspaceTabs
         );
-        shell.querySelector("[data-sam3-live-legacy]").addEventListener("click", function () {
-            var url = standaloneShell
-                ? new URL("/", window.location.origin)
-                : new URL(window.location.href);
-            if (standaloneShell) url.search = window.location.search;
-            url.searchParams.delete("__sam3_live_workspace");
-            url.searchParams.set("sam3_live", "off");
-            window.location.href = url.toString();
-        });
+
+        // --- Shared LoRA Manager overlay (Live-Workspace-aware) --------------
+        // One manager for the whole shell (no per-workspace nesting). "Add LoRA"
+        // from the manager iframe is forwarded to the ACTIVE workspace's prompt.
+        var loraBtn = shell.querySelector("[data-sam3-live-lora]");
+        var loraOverlay = shell.querySelector("[data-sam3-live-lora-overlay]");
+        var loraFrame = shell.querySelector("[data-sam3-live-lora-frame]");
+        var loraStatusEl = shell.querySelector("[data-sam3-live-lora-status]");
+        var loraActiveEl = shell.querySelector("[data-sam3-live-lora-active]");
+        var loraLoaded = false;
+
+        function setLoraStatus(msg) {
+            if (loraStatusEl) loraStatusEl.textContent = msg || "";
+        }
+        function loadLoraFrame(url) {
+            if (loraLoaded) return;
+            loraFrame.src = url;
+            loraLoaded = true;
+            setLoraStatus("");
+        }
+        function pollLoraUp(url) {
+            var tries = 0;
+            var iv = setInterval(function () {
+                tries++;
+                window.fetch(url, { mode: "no-cors", cache: "no-store" })
+                    .then(function () { clearInterval(iv); loadLoraFrame(url); })
+                    .catch(function () {
+                        if (tries >= 360) {
+                            clearInterval(iv);
+                            setLoraStatus("시작 시간 초과 — forge_standalone.log 확인");
+                        } else {
+                            setLoraStatus("LoRA 모델 스캔 중… (최초 1회) " + (tries * 2) + "s");
+                        }
+                    });
+            }, 2000);
+        }
+        function ensureLoraServer() {
+            if (loraLoaded) return;
+            setLoraStatus("LoRA Manager 서버 시작 중…");
+            window.fetch("/sam3-lora/spawn", { credentials: "same-origin", cache: "no-store" })
+                .then(function (r) { return r.json(); })
+                .then(function (res) {
+                    if (!res || !res.url) {
+                        setLoraStatus("시작 실패: " + ((res && res.message) || "unknown"));
+                        return;
+                    }
+                    if (res.status === "running" || res.status === "spawned") {
+                        loadLoraFrame(res.url);
+                    } else {
+                        setLoraStatus("LoRA 모델 스캔 중… (최초 1회)");
+                        pollLoraUp(res.url);
+                    }
+                })
+                .catch(function (err) { setLoraStatus("브리지 오류: " + err); });
+        }
+        if (loraBtn && loraOverlay) {
+            loraBtn.addEventListener("click", function () {
+                if (loraActiveEl) {
+                    loraActiveEl.textContent =
+                        "→ " + (state.names[state.active] || state.active);
+                }
+                loraOverlay.hidden = false;
+                ensureLoraServer();
+            });
+            var loraClose = shell.querySelector("[data-sam3-live-lora-close]");
+            if (loraClose) {
+                loraClose.addEventListener("click", function () {
+                    loraOverlay.hidden = true;
+                });
+            }
+            // Reveal the button only when the vendored manager is available.
+            window.fetch("/sam3-lora/config", { credentials: "same-origin", cache: "no-store" })
+                .then(function (r) { return r.json(); })
+                .then(function (cfg) { if (cfg && cfg.available) loraBtn.hidden = false; })
+                .catch(function () {});
+            // Forward "Add LoRA" from the manager iframe (cross-origin, so match
+            // by source + shape, not origin) into the ACTIVE workspace's prompt.
+            window.addEventListener("message", function (event) {
+                var d = event && event.data;
+                if (!d || typeof d !== "object" || d.type !== "sam3-add-lora") return;
+                if (loraFrame && event.source !== loraFrame.contentWindow) return;
+                if (typeof d.text !== "string" || d.text.indexOf("<lora:") !== 0) return;
+                var target = frameFor(state.active);
+                if (target && target.contentWindow) {
+                    try {
+                        target.contentWindow.postMessage(
+                            { type: "sam3-add-lora", text: d.text, replace: !!d.replace },
+                            window.location.origin
+                        );
+                    } catch (e) {}
+                }
+                if (loraActiveEl) {
+                    loraActiveEl.textContent =
+                        "✓ " + (state.names[state.active] || state.active) + "에 추가";
+                }
+            });
+        }
 
         syncNameEditor();
         activate(state.active);
@@ -1035,9 +1192,27 @@
         });
     }
 
+    function installChildVisibilityBridge() {
+        // Hidden child frames pause their background re-mount watch when the
+        // shell tells them they are not the visible workspace. Native tabs are
+        // real top-level tabs (already throttled by the browser), so skip them.
+        if (!frameSlot || nativeWorkspaceTab) return;
+        window.addEventListener("message", function (event) {
+            var detail = event && event.data;
+            if (event.origin !== window.location.origin
+                    || event.source !== window.parent
+                    || !detail || detail.type !== VISIBILITY_MESSAGE) return;
+            var manager = window.__sam3WorkspaceManager;
+            if (manager && typeof manager.setBackgroundActive === "function") {
+                manager.setBackgroundActive(detail.active !== false);
+            }
+        });
+    }
+
     function start() {
         if (frameSlot) {
             installChildControlBridge();
+            installChildVisibilityBridge();
             mountChildFrame();
             if (nativeWorkspaceTab) {
                 window.addEventListener("storage", function () {

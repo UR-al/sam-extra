@@ -3,6 +3,125 @@
 버전 태그는 GitHub Releases에도 발행됩니다. 아래는 요약이며, guidance/속도 기능의
 상세는 [docs/GUIDANCE.md](docs/GUIDANCE.md)를 참고하세요.
 
+## v0.19.0 — LoRA 벌크/컨텍스트 전송을 Forge로 (ComfyUI 하드코딩 제거)
+
+멀티 선택 후 우클릭 "한번에 넣기"가 ComfyUI로만 가서 못 쓰던 문제를 해결. 매니저의 모든
+"send to workflow" 경로를 Forge 프롬프트 삽입으로 연동.
+
+- **컨텍스트 메뉴 인터셉트**: 주입 브리지(`forge_bridge.js`)가 이제 카드 1개의 paper-plane뿐
+  아니라 **단일 컨텍스트 메뉴**(`#loraContextMenu`의 `sendappend`/`sendreplace`)와
+  **멀티 선택 벌크 서브메뉴**(`#bulkContextMenu`의 `send-to-workflow-append/replace`, 대상은
+  `.model-card.selected` 전체)를 capture 단계에서 가로채 ComfyUI 전송을 막고 Forge로 postMessage.
+  대상 카드의 `data-file_name`/`data-folder`/`data-usage_tips`로 `<lora:...>` 문법을 만들어
+  전송(벌크는 콤마 결합).
+- **Append/Replace 지원**: 메시지에 `replace` 플래그를 실어, Replace면 프롬프트의 기존
+  `<lora:...>` 토큰을 제거한 뒤 새 세트를 넣음(Append는 기존대로 이어붙임). Live 셸도 이
+  플래그를 활성 워크스페이스로 그대로 전달.
+- **라벨 정리**: 벌크 서브메뉴 라벨(`loras.bulkOperations.*`)도 "Add LoRA"로 리브랜드 대상에 추가.
+- **적용 시점**: 브리지는 서버 spawn 시 벤더 트리에 재기록(content 기준 idempotent)되므로,
+  업데이트 후 다음 매니저 기동부터 자동 반영.
+- **검증**: 회귀 테스트 88개 전부 통과(브리지 인터셉트·Forge측 replace 처리 자산 검사 포함).
+  실제 멀티 선택 전송은 브라우저+Forge에서 확인 필요.
+
+## v0.18.0 — LoRA Manager ↔ Live Workspace 연동
+
+LoRA 매니저를 "iframe에 얹은 외부 앱"에서 **Live Workspace-인식 통합**으로 한 단계 끌어올린
+릴리즈. 벤더 앱/서버 자체는 그대로 쓰되 연동을 실제 Forge Neo 흐름에 맞춤.
+
+- **HTTP config/spawn 엔드포인트**: `/sam3-lora/config`, `/sam3-lora/spawn`(same-origin JSON)을
+  추가해 경량 Live 셸이 히든 Gradio 브리지 버튼 없이 서버를 조회·기동. 기존 `get_or_spawn`
+  라이프사이클을 그대로 래핑(일반 모드용 Gradio 브리지도 같은 payload 공유). 신규 테스트 2개.
+- **Live 셸 공유 오버레이**: 셸 헤더의 `LoRA` 버튼이 **매니저 하나**를 오버레이로 엶(이전엔
+  워크스페이스마다 중복 주입되어 `셸→워크스페이스→매니저` 3중 iframe이었음). 벤더 미설치 시
+  버튼 자동 숨김.
+- **활성 워크스페이스로 삽입 라우팅**: 매니저에서 Add LoRA → 셸이 그 메시지를 **현재 활성
+  워크스페이스 iframe**의 프롬프트로 postMessage 전달(cross-origin은 source+shape로 검증).
+- **중복 탭 억제**: Live 워크스페이스 자식 iframe에서는 `lora_manager.js`가 Manage 탭을 주입하지
+  않음(네이티브 탭·일반 모드는 기존대로 자체 탭 유지). 삽입 브리지는 항상 리슨.
+- **검증**: 회귀 테스트 85개 전부 통과(신규 route·shell 연동 자산 검사 포함). 실제 매니저
+  기동·삽입 동작은 브라우저+Forge에서 확인 필요(이 환경 미검증).
+
+## v0.17.0 — CI·개발 인프라 + 안정성 보강 + 정리
+
+기능 추가 없이 안전망·정확성·정리에 집중한 릴리즈.
+
+- **CI 도입**: `.github/workflows/ci.yml`이 push/PR마다 pytest(CPU torch+gradio) +
+  `node --check`를 실행. 이전엔 회귀 테스트 83개가 자동으로 안 돌았음.
+- **웹 세션 SessionStart 훅**: `.claude/hooks/session-start.sh`가 Claude Code on the web
+  세션에서 테스트 의존성을 자동 설치(멱등·remote 전용). `.claude/settings.json`에 등록.
+- **args 검증 강화**: `sam3_device`(auto/cpu/cuda/cuda:N, 그 외 auto로 폴백), seed 범위
+  클램프, inpaint width/height 8의 배수 스냅, CN guidance start>end 자동 swap — 모두
+  raise 대신 정규화(호출부가 검증 실패 시 SAM3를 꺼버리므로). 신규 테스트 5개.
+- **Anima 전역 전략 복원**: `TokenizeStrategy`/`TextEncodingStrategy` 싱글턴을 Anima 패스
+  전후로 `try/finally` 복원 — 이후 비-Anima 경로로의 상태 누수 방지.
+- **guidance 패치 teardown 프레임워크**: Safe PAG의 attention/block/self_attn + k-diffusion
+  noise 전역 monkey-patch에 clean uninstall 경로 추가. `on_script_unloaded`에 등록해 reload
+  시 stale 패치 제거(런타임 경로는 그대로). install→teardown 테스트 추가.
+- **정리**: `!sam3.py`의 동일 JS shim 4벌 → `_SELECTED_INDEX_JS` 하나로. install.py에
+  벤더 pin 훅(`_ANIMA_PIN`/`_LM_PIN`, 기본 None=기존 동작) 추가. LoRA 모듈 버전 드리프트
+  문구 정리.
+- **실험 기능 진단 문서**: [docs/EXPERIMENTAL_STATUS.md](EXPERIMENTAL_STATUS.md) — Refine·Anima의
+  전제 조건과 실제 Forge 실행으로만 확인 가능한 항목·캡처할 로그 정리.
+- **검증**: 회귀 테스트 83개 전부 통과. 브라우저/GPU E2E는 이 환경에서 확인 불가.
+
+## v0.16.0 — Live Workspace 기본화 + 모드 선택 + 탭 전환 부드럽게
+
+기능 5를 Live Workspace 중심으로 재편하고, 인-페이지 툴바(비-Live UI)를 폐기하며,
+Live 탭 전환 버벅임을 줄인 릴리즈. 코드 중복도 일부 정리.
+
+- **모드 선택 설정**: 기존 on/off 토글(`sam3_workspaces_enable`)을 `Settings → SAM3 Workspaces`의
+  라디오 `sam3_workspaces_mode`(`Live Workspace` 기본 / `기본 Forge UI`)로 교체. `Live Workspace`는
+  `/`를 경량 `/sam3-live` 셸로 리다이렉트하고, `기본 Forge UI`는 리다이렉트 없이 순정 Forge를 유지.
+  리다이렉트 결정은 `window.opts`가 로드되기 전이라 서버 프로브 `/sam3-live/enabled`(설정을 요청
+  시점에 읽음)로 처리.
+- **비-Live 인-페이지 툴바 폐기**: 이전 `?sam3_live=off` 경로의 워크스페이스 툴바(Mode D)를 제거.
+  `createToolbar`와 셸의 `기본 UI` 전환 버튼 삭제, `mountToolbar`는 Live 자식 프레임만 처리.
+  이후 호출자가 사라진 툴바 전용 헬퍼 함수 8개(`switchWorkspace`/`createWorkspace` 등, ~180줄)와
+  `.sam3-workspace-*` 툴바 CSS(복원 상태 클래스 `.sam3-workspace-restoring` 제외)도 제거.
+  워크스페이스 전환은 이제 Live 셸에서만 이뤄지며, 저장 로직·`실제 탭으로 열기`(네이티브 탭)는 유지.
+- **탭 전환 부드럽게(버벅임 완화)**:
+  - *숨겨진 워크스페이스 일시정지*: 셸→자식 `visibility` postMessage로 비활성 iframe의
+    MutationObserver+800ms 폴링을 멈추고 활성 시 재개(필수 재-마운트 경로인 Forge `onAfterUiUpdate`는
+    항상 유지). 세 개의 살아있는 Forge 문서가 계속 CPU를 태우던 문제 완화.
+  - *inert 토글 최소화*: `activate()`가 모든 iframe이 아니라 바뀐 두 프레임(이전·새 활성)만
+    inert/aria 갱신 → 전환마다 발생하던 style/a11y 리플로우 감소.
+  - *인접 탭 선-빌드*: 배경 프리로드가 활성 탭의 가장 가까운 이웃부터 로드.
+- **중복 코드 정리**: Refine·Anima의 `_as_float`/`_as_int`를 `sam3ext/coerce.py`로 통합.
+- **검증**: 회귀 테스트 77개 전부 통과(신규 route 프로브·모드 게이트·전환 개선 자산 검사 포함).
+  브라우저 E2E(실제 Live 셸/탭 전환)는 이 환경에서 확인하지 못했습니다.
+
+## v0.15.0 — Workspace 토글·갤러리 타이밍, 충돌 정리 + 리뷰 버그 수정
+
+코드 리뷰에서 나온 런타임 충돌·버그를 정리하고, txt2img Workspaces(기능 5)의 제어를
+개선한 릴리즈.
+
+- **아코디언 정렬 고정**: SAM3 계열 확장 아코디언을 연속된 음수 `sorting_priority` 블록으로
+  묶어 SAM3 바로 밑에 차례대로 배치. `SAM3(-30) → Detail Daemon(-29) → Skimmed CFG(-28)
+  → Safe PAG(-27) → VAE 2x(-26) → Reference PoC/로그 토글(-25)`. 기존엔 SAM3 mask에
+  우선순위가 없어 guidance 계열이 우선순위 없는 타 확장 밑으로 밀려 맨 아래 렌더됐음.
+- **Workspaces 설정 토글**: Settings → `SAM3 Workspaces`에 `txt2img Workspaces 활성화`
+  옵션(`sam3_workspaces_enable`)을 추가. 끄면 `workspace_manager.js`가 `window.opts`를
+  읽어 툴바/탭 마운트를 통째로 건너뜀(페이지 새로고침 후 적용).
+- **갤러리 비움 타이밍 변경**: 생성 버튼을 누르는 즉시 이전 갤러리를 감추던 동작을 제거.
+  이제 이전 결과를 그대로 두고 Forge live preview가 위에 겹쳐지며, **새 이미지가 완성될
+  때** 최종 결과로 교체됨. 사용하지 않게 된 hide-on-generate 로직(JS·CSS)도 제거.
+- **PAG 자동 감쇠(안전 브레이크) 제거**: PAG/SEG + SLG 병용 시 각 scale을 활성 항 수로
+  나누던 `auto_decay` 토글을 삭제. perturbation은 항상 설정된 full scale로 적용됨. 스크립트
+  인자 index는 inert placeholder로 보존해 append-only 계약 유지.
+- **guidance 스택 충돌 점검**: PAG·DCW·CWM·SMC·Skimmed CFG 동시 사용이 서로를 무력화하지
+  않음을 확인하고 회귀 테스트로 고정(Skimmed→Safe PAG 순서 불변식, 각 단계 기여 검증).
+- **런타임 충돌 수정**: (1) unet `model_function_wrapper` 단일 슬롯을 두 스크립트가 덮어쓰던
+  문제 — Safe PAG가 우선권을 갖고 경고 로그를 남기며, Ref PoC는 기존 wrapper가 있으면
+  yield. (2) CNS 노이즈 패치의 `continue`가 `break`를 건너뛰어 두 k-diffusion 사본을 이중
+  패치하던 버그 수정. (3) Anima VAE 2x wrapper 이중 wrap 방지(원본 VAE 재-wrap).
+- **리뷰 버그 수정**: inpaint noise multiplier의 `0.0`→`1.0` falsy 강제 제거; Refine
+  `inherit_main_neg_prompt` 폴백이 위젯 기본값과 반대로 뒤집히던 문제; Anima 랜덤 시드(-1)
+  재현성(명시적 시드 선택); `write_artifacts`가 개별 마스크를 덮어쓰던 free-slot 탐색;
+  `unload_sam3`의 명시적 CPU 이동; LoRA Manager 이중 spawn·health false-positive·로그 핸들
+  누수; ControlNet `global_state` 등록 idempotent화; 중단된 vendor clone 자가복구.
+- **검증**: 회귀 테스트 74개 전부 통과(guidance 조합 3개 신규). 실제 생성 E2E는 아직
+  확인하지 않았습니다.
+
 ## v0.14.0 — 독립 CFG base 토글 + Skimmed CFG
 
 상호배타였던 CFG base 라디오를 독립 토글로 분해해 SMC·APG·CWM을 자유롭게 조합할 수 있게

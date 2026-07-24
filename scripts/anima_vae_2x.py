@@ -308,7 +308,7 @@ def _resolve_vae_path(name: str) -> str | None:
 
 
 class AnimaVAE2x(scripts.Script):
-    sorting_priority = 3  # just under SAM3 / guidance block
+    sorting_priority = -26  # just under the guidance block, above the log toggles
 
     def title(self):
         return "Anima VAE 2x (spacepxl decoder)"
@@ -386,6 +386,13 @@ class AnimaVAE2x(scripts.Script):
         if orig_vae is None:
             _log("no forge_objects.vae — cannot attach.")
             return
+
+        # Idempotency guard: if forge_objects.vae is already our wrapper (e.g. a
+        # hires/second pass re-entered without Forge resetting forge_objects),
+        # re-wrap the ORIGINAL stock VAE rather than the wrapper. Wrapping a
+        # wrapper would apply the 2x pixel-shuffle twice and corrupt the decode.
+        if isinstance(orig_vae, _VAE2xWrapper):
+            orig_vae = getattr(orig_vae, "_orig", orig_vae)
 
         try:
             device = next(orig_vae.first_stage_model.parameters()).device

@@ -78,8 +78,21 @@ def _controlnet_model_choices() -> list[str]:
         global_state.update_controlnet_filenames()
         extras = _scan_sam3_dir_for_cn_models()
         if extras:
-            global_state.controlnet_filename_dict.update(extras)
-            global_state.controlnet_names = sorted(global_state.controlnet_filename_dict.keys())
+            # Only register entries the host doesn't already know about. This
+            # function runs at least twice per session (here + build_refine_panel);
+            # re-assigning global_state.controlnet_names every time needlessly
+            # clobbers the host CN extension's list object. Skipping when our
+            # extras are already present makes the later calls no-ops.
+            new = {
+                k: v
+                for k, v in extras.items()
+                if global_state.controlnet_filename_dict.get(k) != v
+            }
+            if new:
+                global_state.controlnet_filename_dict.update(new)
+                global_state.controlnet_names = sorted(
+                    global_state.controlnet_filename_dict.keys()
+                )
         names = list(global_state.get_all_controlnet_names())
         return names or ["None"]
     except Exception:

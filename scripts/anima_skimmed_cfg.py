@@ -182,11 +182,11 @@ def _post_cfg(args):
 
 
 class AnimaSkimmedCFG(scripts.Script):
-    # Larger sorting_priority appears further down. 1 places this accordion
-    # directly under Anima Detail Daemon (0) and above Anima Safe PAG (2), and
-    # the same order registers our post-CFG hook BEFORE the Safe PAG suite so
-    # its default "preserve incoming" keeps the skimmed result.
-    sorting_priority = 1
+    # Larger sorting_priority appears further down. This places the accordion
+    # directly under Anima Detail Daemon (-29) and above Anima Safe PAG (-27),
+    # and the same order registers our post-CFG hook BEFORE the Safe PAG suite
+    # so its default "preserve incoming" keeps the skimmed result.
+    sorting_priority = -28
 
     def title(self):
         return "Anima Skimmed CFG"

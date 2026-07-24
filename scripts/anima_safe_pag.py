@@ -64,6 +64,7 @@ import importlib
 import sys
 import time
 import traceback
+import weakref
 from functools import partial
 
 import gradio as gr
@@ -120,7 +121,6 @@ _STATE: dict = {
     "slg_on": False,
     "slg_scale": 3.0,
     "slg_targets": set(),  # block indices to skip
-    "auto_decay": True,   # halve each scale when >1 perturbation is active (toggle)
     "rescale": 0.20,      # std-matching rescale factor
     "rescale_mode": "full",  # full=CFG+guidance, partial=cond+guidance std source
     "start": 0.0,         # start percent of sampling
@@ -286,6 +286,17 @@ _ORIG_ANIMA_ATTN_OP = None
 _ORIG_CNS_DEFAULT_FACTORY = None
 _ORIG_CNS_BROWNIAN_CALL = None
 _PATCH_OWNER = object()
+
+# What we patched, tracked so _teardown_global_patches() can restore the
+# originals cleanly (e.g. on extension reload). The attention op is a
+# class-level global and the CNS sources are k-diffusion module globals — those
+# outlive the model and are the real cross-extension/model leak surface. Block /
+# self_attn wraps live on the model instance (recreated on reload), tracked
+# weakly so we never keep a dead model alive.
+_PATCHED_ATTN_OWNER = None
+_PATCHED_BLOCKS: "weakref.WeakSet" = weakref.WeakSet()
+_PATCHED_SELFATTN: "weakref.WeakSet" = weakref.WeakSet()
+_PATCHED_CNS_TARGETS: list = []  # [(sampling_module, brownian_cls_or_None)]
 
 
 # ---------------------------------------------------------------------------
@@ -603,7 +614,7 @@ def _ensure_patched(diffusion_model) -> int:
         _log("SelfCrossAttention.torch_attention_op is unavailable.")
         return 0
 
-    global _ORIG_ANIMA_ATTN_OP
+    global _ORIG_ANIMA_ATTN_OP, _PATCHED_ATTN_OWNER
     original = (
         getattr(owner_cls, "_pag_orig_torch_attention_op", None)
         or getattr(owner_cls, "_pag_orig_attention_op", None)
@@ -634,6 +645,7 @@ def _ensure_patched(diffusion_model) -> int:
             f"patched {owner_cls.__name__}.torch_attention_op "
             "(staticmethod) ✅"
         )
+    _PATCHED_ATTN_OWNER = owner_cls
 
     wrapped_sa = wrapped_bl = 0
     for idx, block in enumerate(blocks):
@@ -644,6 +656,7 @@ def _ensure_patched(diffusion_model) -> int:
                     block._pag_orig_block_forward = block.forward
                 block.forward = _make_block_wrapper(idx, block._pag_orig_block_forward)
                 block._pag_block_wrapped = True
+                _PATCHED_BLOCKS.add(block)
                 wrapped_bl += 1
             except Exception as e:
                 _log(f"failed to wrap block {idx} forward: {type(e).__name__}: {e}")
@@ -656,6 +669,7 @@ def _ensure_patched(diffusion_model) -> int:
                     sa._pag_orig_forward = sa.forward
                 sa.forward = _make_selfattn_wrapper(idx, sa._pag_orig_forward)
                 sa._pag_wrapped = True
+                _PATCHED_SELFATTN.add(sa)
                 wrapped_sa += 1
             except Exception as e:
                 _log(f"failed to wrap block {idx} self_attn: {type(e).__name__}: {e}")
@@ -765,37 +779,46 @@ def _ensure_cns_noise_patched() -> bool:
                     installed = True
 
         brownian_cls = getattr(sampling, "BrownianTreeNoiseSampler", None)
-        if brownian_cls is None:
-            continue
-        descriptor = brownian_cls.__dict__.get("__call__")
-        current_call = descriptor
-        if not callable(current_call):
-            continue
-        found = True
-        original_call = getattr(
-            brownian_cls, "_sam_extra_cns_orig_call", None
-        )
-        if original_call is None:
-            if (
-                getattr(current_call, "_anima_pag_owner", None) is not None
-                or getattr(current_call, "__name__", "")
-                == "_patched_brownian_call"
-            ):
-                original_call = getattr(current_call, "__globals__", {}).get(
-                    "_ORIG_CNS_BROWNIAN_CALL"
+        # NOTE: do not `continue` from here on a missing/non-callable Brownian
+        # class. If this module already yielded default_noise_sampler
+        # (found=True) we must still hit the `break` below — otherwise the loop
+        # falls through to the second k-diffusion copy and patches *its*
+        # default_noise_sampler too, leaving one module's slot pointing at our
+        # wrapper while _ORIG_CNS_DEFAULT_FACTORY holds the *other* module's
+        # original (cross-wired). Guard the Brownian work inline instead.
+        if brownian_cls is not None:
+            descriptor = brownian_cls.__dict__.get("__call__")
+            current_call = descriptor
+            if callable(current_call):
+                found = True
+                original_call = getattr(
+                    brownian_cls, "_sam_extra_cns_orig_call", None
                 )
-            else:
-                original_call = current_call
-        if callable(original_call):
-            brownian_cls._sam_extra_cns_orig_call = original_call
-            _ORIG_CNS_BROWNIAN_CALL = original_call
-            if (
-                getattr(current_call, "_anima_pag_owner", None)
-                is not _PATCH_OWNER
-            ):
-                brownian_cls.__call__ = _patched_brownian_call
-                installed = True
+                if original_call is None:
+                    if (
+                        getattr(current_call, "_anima_pag_owner", None) is not None
+                        or getattr(current_call, "__name__", "")
+                        == "_patched_brownian_call"
+                    ):
+                        original_call = getattr(
+                            current_call, "__globals__", {}
+                        ).get("_ORIG_CNS_BROWNIAN_CALL")
+                    else:
+                        original_call = current_call
+                if callable(original_call):
+                    brownian_cls._sam_extra_cns_orig_call = original_call
+                    _ORIG_CNS_BROWNIAN_CALL = original_call
+                    if (
+                        getattr(current_call, "_anima_pag_owner", None)
+                        is not _PATCH_OWNER
+                    ):
+                        brownian_cls.__call__ = _patched_brownian_call
+                        installed = True
         if found:
+            # Record the module we touched so _teardown_global_patches() can
+            # restore it. Dedup by module identity.
+            if not any(existing is sampling for existing, _ in _PATCHED_CNS_TARGETS):
+                _PATCHED_CNS_TARGETS.append((sampling, brownian_cls))
             # The second name is only a fallback import path. Patching two
             # independently-loaded copies would make one global original
             # ambiguous across WebUI script reloads.
@@ -806,6 +829,90 @@ def _ensure_cns_noise_patched() -> bool:
     elif not found:
         _log("CNS could not find k-diffusion noise sources; feature stays inert.")
     return found
+
+
+def _teardown_global_patches() -> None:
+    """Restore every global monkey-patch this script installed to its original.
+
+    Covers the class-level Anima ``torch_attention_op``, the wrapped
+    block/self_attn forwards, and the k-diffusion ``default_noise_sampler`` /
+    ``BrownianTreeNoiseSampler.__call__``. Idempotent and safe to call when
+    nothing was patched. Registered on script unload so a Forge "reload scripts"
+    (or extension update) doesn't leave stale patches — and the sam-extra
+    markers are cleared so a later reload re-patches from a clean base.
+    """
+    global _PATCHED_ATTN_OWNER
+
+    owner = _PATCHED_ATTN_OWNER
+    if owner is not None:
+        try:
+            original = getattr(owner, "_pag_orig_torch_attention_op", None)
+            if callable(original):
+                owner.torch_attention_op = staticmethod(original)
+            for attr in (
+                "_pag_attention_op_patched",
+                "_pag_orig_torch_attention_op",
+                "_pag_orig_attention_op",
+            ):
+                if hasattr(owner, attr):
+                    try:
+                        delattr(owner, attr)
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+        _PATCHED_ATTN_OWNER = None
+
+    for block in list(_PATCHED_BLOCKS):
+        try:
+            original = getattr(block, "_pag_orig_block_forward", None)
+            if original is not None:
+                block.forward = original
+            for attr in ("_pag_orig_block_forward", "_pag_block_wrapped"):
+                if hasattr(block, attr):
+                    delattr(block, attr)
+        except Exception:
+            pass
+    _PATCHED_BLOCKS.clear()
+
+    for sa in list(_PATCHED_SELFATTN):
+        try:
+            original = getattr(sa, "_pag_orig_forward", None)
+            if original is not None:
+                sa.forward = original
+            for attr in ("_pag_orig_forward", "_pag_wrapped"):
+                if hasattr(sa, attr):
+                    delattr(sa, attr)
+        except Exception:
+            pass
+    _PATCHED_SELFATTN.clear()
+
+    for sampling, brownian_cls in _PATCHED_CNS_TARGETS:
+        try:
+            orig_factory = getattr(
+                sampling, "_sam_extra_cns_orig_default_noise_sampler", None
+            )
+            if callable(orig_factory):
+                sampling.default_noise_sampler = orig_factory
+                delattr(sampling, "_sam_extra_cns_orig_default_noise_sampler")
+        except Exception:
+            pass
+        if brownian_cls is not None:
+            try:
+                orig_call = getattr(brownian_cls, "_sam_extra_cns_orig_call", None)
+                if callable(orig_call):
+                    brownian_cls.__call__ = orig_call
+                    delattr(brownian_cls, "_sam_extra_cns_orig_call")
+            except Exception:
+                pass
+    _PATCHED_CNS_TARGETS.clear()
+
+
+try:
+    script_callbacks.on_script_unloaded(_teardown_global_patches)
+except Exception:
+    # Older WebUI without this callback: patches simply persist as before.
+    pass
 
 
 # ---------------------------------------------------------------------------
@@ -1070,6 +1177,38 @@ def _model_wrapper(apply_model, w):
         return apply_model(x, ts, **c)
 
 
+# Owner tag so a co-loaded script (e.g. anima_ref_poc) can recognise our unet
+# function wrapper in ``model_options`` and step aside instead of silently
+# clobbering it — the single wrapper slot can't hold two batch-manipulating
+# wrappers at once.
+_model_wrapper._anima_pag_owner = _PATCH_OWNER
+
+
+def _existing_unet_wrapper(unet):
+    """Return the unet ``model_function_wrapper`` already installed on ``unet``
+    (its clone carries the model_options of whatever ran earlier), or None."""
+    try:
+        return (getattr(unet, "model_options", None) or {}).get(
+            "model_function_wrapper"
+        )
+    except Exception:
+        return None
+
+
+def _warn_foreign_unet_wrapper(unet) -> None:
+    existing = _existing_unet_wrapper(unet)
+    if (
+        existing is not None
+        and getattr(existing, "_anima_pag_owner", None) is not _PATCH_OWNER
+    ):
+        _log(
+            "another extension already installed a unet model_function_wrapper "
+            f"({getattr(existing, '__qualname__', existing)!r}); the Anima "
+            "Guidance suite needs exclusive control of the cond/uncond batch, "
+            "so it takes precedence and overrides that wrapper this generation."
+        )
+
+
 def _project(v0, v1):
     """Decompose ``v0`` into (parallel, orthogonal) components relative to the
     direction of ``v1``. Per-sample (reduce over every dim except batch)."""
@@ -1249,8 +1388,9 @@ def _apply_perturbation(args, base):
     ``scale·(cond_denoised − weak_denoised)`` for each active weak prediction
     (attention-perturbed for PAG/SEG, and/or layer-skipped for SLG). Forge's
     ``model.apply_model`` has already converted every prediction to denoised
-    x0, so no eps/v/flow conversion is needed here. When more than one term is
-    active AND ``auto_decay`` is on, each scale is divided by the active count.
+    x0, so no eps/v/flow conversion is needed here. Each active term applies at
+    its full configured scale (the former auto-decay safety brake, which halved
+    each scale when >1 term was active, has been removed).
     Returns ``base`` unchanged on any problem."""
     cd = args["cond_denoised"].float()
     attn_raw = _STATE["attn_raw"]
@@ -1264,10 +1404,9 @@ def _apply_perturbation(args, base):
     if not terms:
         return base
 
-    decay = 1.0 / len(terms) if (_STATE["auto_decay"] and len(terms) > 1) else 1.0
     guidance = torch.zeros_like(base, dtype=torch.float32)
     for scale, weak in terms:
-        guidance = guidance + (scale * decay) * (cd - weak)
+        guidance = guidance + scale * (cd - weak)
 
     if not _STATE["delta_logged"]:
         _STATE["delta_logged"] = True
@@ -1634,11 +1773,11 @@ def _clear_extra_generation_params(p) -> None:
 class AnimaSafePAG(scripts.Script):
     # sorting_priority governs BOTH the accordion position and the
     # process order (lower = higher up / earlier). This panel sits in the SAM3
-    # extension block under Detail Daemon (0) and Skimmed CFG (1); running
+    # extension block under Detail Daemon (-29) and Skimmed CFG (-28); running
     # after Skimmed CFG also means its post-CFG hook receives the skimmed
     # result as "incoming". We still clone from the CURRENT
     # forge_objects.unet, so other unet-patching scripts compose regardless.
-    sorting_priority = 2
+    sorting_priority = -27
 
     def title(self):
         return "Anima Perturbation Guidance"
@@ -1773,12 +1912,13 @@ class AnimaSafePAG(scripts.Script):
                 elem_id="anima_safe_pag_slg_blocks",
             )
 
-            auto_decay = gr.Checkbox(
-                label="PAG/SEG + SLG 병용 시 각 scale 자동 감쇠 (÷활성 수)",
-                value=True,
-                info="병용 시 과도한 보정을 막는 안전장치입니다. 개별 scale을 직접 맞출 때만 끄세요.",
-                elem_id="anima_safe_pag_auto_decay",
-            )
+            # Removed: the "auto-decay" safety brake that divided each PAG/SEG/
+            # SLG scale by the active-term count. Perturbations now always apply
+            # at their full configured scale. A hidden, inert placeholder keeps
+            # this script argument at its historical index (11) so saved API
+            # payloads / XYZ presets that pass the full positional array still
+            # line up — matching the extension's append-only arg contract.
+            auto_decay = gr.Checkbox(value=False, visible=False)
 
             gr.Markdown("---\n### APG (Adaptive Projected Guidance)")
             gr.Markdown(
@@ -2231,7 +2371,8 @@ class AnimaSafePAG(scripts.Script):
                 xyz["rescale_mode"]
                 if "rescale_mode" in xyz else _arg(41, "full")
             ).strip().lower()
-            auto_decay = _as_bool(_arg(11, True), True)
+            # arg index 11 (formerly auto_decay) is now an inert hidden
+            # placeholder — the safety brake was removed, so it is not read.
             apg_eta = _xyz_num("apg_eta", float(_arg(13, 0.0)))
             apg_norm = _xyz_num("apg_norm", float(_arg(14, 15.0)))
             apg_momentum = _xyz_num("apg_momentum", float(_arg(15, 0.0)))
@@ -2443,7 +2584,7 @@ class AnimaSafePAG(scripts.Script):
                 seg_sigma=seg_sigma, head_spec=head_spec,
                 attn_targets=attn_targets,
                 slg_on=bool(slg_on and slg_targets), slg_scale=slg_scale,
-                slg_targets=slg_targets, auto_decay=auto_decay, rescale=rescale,
+                slg_targets=slg_targets, rescale=rescale,
                 rescale_mode=rescale_mode,
                 start=requested_start, end=effective_end,
                 requested_start=requested_start, requested_end=requested_end,
@@ -2482,6 +2623,7 @@ class AnimaSafePAG(scripts.Script):
             # The wrapper is needed for perturbation AND for Adaptive Guidance
             # (both manipulate the cond/uncond batch before apply_model).
             if _STATE["on"] or _ADG["on"]:
+                _warn_foreign_unet_wrapper(unet)
                 unet.set_model_unet_function_wrapper(_model_wrapper)
             unet.set_model_sampler_post_cfg_function(_post_cfg)
             p.sd_model.forge_objects.unet = unet
@@ -2508,7 +2650,6 @@ class AnimaSafePAG(scripts.Script):
                     + f"; effective_range={_STATE['start']:.2f}-{_STATE['end']:.2f}"
                     + f"; range_mode={_STATE['range_mode']}"
                     + f"; rescale={rescale}({rescale_mode})"
-                    + f"; auto_decay={auto_decay}"
                 )
             if _APG["on"]:
                 p.extra_generation_params["Anima APG"] = (
@@ -2555,7 +2696,6 @@ class AnimaSafePAG(scripts.Script):
                 f"range={_STATE['requested_start']:.2f}-{_STATE['requested_end']:.2f}"
                 f"→{_STATE['start']:.2f}-{_STATE['end']:.2f}"
                 f"({_STATE['range_mode']}) "
-                f"auto_decay={auto_decay} "
                 f"rescale={'auto-off' if (_APG['on'] and apg_autooff) else rescale}"
                 f"({rescale_mode})) "
                 f"APG={'on' if _APG['on'] else 'off'} "

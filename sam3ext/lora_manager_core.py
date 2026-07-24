@@ -1,8 +1,8 @@
 """LoRA Manager integration core — lazy-spawns willmiao/ComfyUI-Lora-Manager's
 standalone aiohttp server and points Forge's UI at it via an iframe.
 
-Design (v0.9.0)
----------------
+Design (introduced in v0.9.0)
+-----------------------------
 - The manager is vendored (shallow clone) at ``lora_manager_vendor/`` by
   install.py. We never modify the vendor tree.
 - We write ``lora_manager_vendor/settings.json`` with ``use_portable_settings:
@@ -303,6 +303,64 @@ _BRIDGE_JS = r'''/* forge_bridge.js (forge_sam3) */
         } catch (e2) {}
     }, true);
 
+    /* Track the card a single-card context menu was opened on, so the
+     * "send to workflow" menu item knows its target. */
+    var _lastCard = null;
+    document.addEventListener("contextmenu", function (e) {
+        try {
+            _lastCard = (e.target && e.target.closest)
+                ? e.target.closest(".model-card") : null;
+        } catch (err) { _lastCard = null; }
+    }, true);
+
+    function postLoras(syntaxes, replace) {
+        var texts = [];
+        for (var i = 0; i < syntaxes.length; i++) {
+            if (syntaxes[i]) texts.push(syntaxes[i]);
+        }
+        if (!texts.length) return;
+        try {
+            window.parent.postMessage(
+                { type: "sam3-add-lora", text: texts.join(", "), replace: !!replace },
+                "*"
+            );
+        } catch (err) {}
+    }
+
+    /* Context-menu "send to workflow" — SINGLE (#loraContextMenu:
+     * data-action sendappend/sendreplace) AND BULK multi-select
+     * (#bulkContextMenu: send-to-workflow-append/replace over every
+     * .model-card.selected). The vendor would send these to ComfyUI (a no-op
+     * in standalone); intercept in capture phase, build the syntax for the
+     * target card(s), and post to Forge instead. */
+    document.addEventListener("click", function (e) {
+        var item = e.target && e.target.closest
+            && e.target.closest(".context-menu-item[data-action]");
+        if (!item || !isLoras()) return;
+        var action = (item.getAttribute("data-action") || "").toLowerCase();
+        if (action.indexOf("send") === -1) return; /* skip copy-all etc. */
+        var bulk = !!(item.closest && item.closest("#bulkContextMenu"));
+        var replace = action.indexOf("replace") !== -1;
+        var cards = [];
+        if (bulk) {
+            cards = Array.prototype.slice.call(
+                document.querySelectorAll(".model-card.selected")
+            );
+        } else if (_lastCard) {
+            cards = [_lastCard];
+        }
+        if (!cards.length) return;
+        var syntaxes = [];
+        for (var i = 0; i < cards.length; i++) {
+            var s = syntaxFromCard(cards[i]);
+            if (s) syntaxes.push(s);
+        }
+        if (!syntaxes.length) return;
+        e.preventDefault();
+        e.stopImmediatePropagation();
+        postLoras(syntaxes, replace);
+    }, true);
+
     /* Label rebrand fallback (locale patch is primary). */
     function relabel(root) {
         if (!root || !root.querySelectorAll) return;
@@ -409,6 +467,10 @@ _LOCALE_ADD_LORA_KEYS = (
     "modals.model.actions.sendToWorkflowText",
     "loras.contextMenu.sendToWorkflowAppend",
     "loras.contextMenu.sendToWorkflowReplace",
+    # Bulk multi-select submenu (missing keys are ignored by _set_json_path).
+    "loras.bulkOperations.sendToWorkflow",
+    "loras.bulkOperations.sendToWorkflowAppend",
+    "loras.bulkOperations.sendToWorkflowReplace",
 )
 
 
@@ -656,9 +718,12 @@ def _health_ok(port: int, timeout: float = 1.0) -> bool:
         req = urllib.request.Request(url, method="GET")
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             return 200 <= resp.status < 400
-    except urllib.error.HTTPError as e:
-        # Any HTTP response means the server is up (even a 4xx/5xx page).
-        return True if e.code else False
+    except urllib.error.HTTPError:
+        # A 4xx/5xx page means *something* is listening, but our healthy
+        # manager serves 200 at /loras. Treating any error page as "up" made
+        # an unrelated service on this port read as the LoRA Manager and point
+        # the iframe at a foreign server. Require a real success response.
+        return False
     except Exception:
         return False
 
@@ -725,6 +790,22 @@ def get_or_spawn(port: int = DEFAULT_PORT, wait_seconds: float = 3.0) -> dict[st
         if _proc is not None and _proc.poll() is not None:
             _proc = None
 
+        # Already-booting guard: a live process that simply isn't answering
+        # health yet is the *expected* state during the multi-minute first-run
+        # library scan (aiohttp doesn't open the port until the scan finishes).
+        # Without this, a second Manage-tab open would Popen another server on
+        # the same port — the duplicate fails to bind and exits, and its early
+        # exit can then be misreported as an error over the healthy first one.
+        if _proc is not None and _proc.poll() is None:
+            _proc_port = port
+            return {
+                "url": manager_url(port),
+                "port": port,
+                "status": "starting",
+                "message": "server is still booting (first-run library scan) — "
+                "reusing the process already starting on this port",
+            }
+
         try:
             ensure_settings_json()
         except Exception:
@@ -783,6 +864,15 @@ def get_or_spawn(port: int = DEFAULT_PORT, wait_seconds: float = 3.0) -> dict[st
                 "status": "error",
                 "message": f"spawn failed: {e}",
             }
+        finally:
+            # The child holds its own dup of the fd; the parent never writes to
+            # it, so release our copy immediately (both on success and on the
+            # failure path) instead of leaking a handle every crash/respawn.
+            if log_fh is not subprocess.DEVNULL:
+                try:
+                    log_fh.close()
+                except Exception:
+                    pass
 
     # Short grace poll OUTSIDE the lock — only to catch the fast case where
     # the cache is already serialized and the server comes up in a second or
@@ -827,6 +917,86 @@ def _read_log_tail(n: int = 20) -> str:
         return "\n".join(lines[-n:])
     except Exception:
         return "(no log)"
+
+
+# ---------------------------------------------------------------------------
+# HTTP config/spawn endpoints
+# ---------------------------------------------------------------------------
+# The Live Workspace shell is a lightweight page with no Gradio doc, so it
+# cannot click the hidden bridge buttons the normal txt2img UI uses. These
+# same-origin JSON routes let the shell (or any page) query config and lazily
+# spawn the server directly. They wrap the exact same get_or_spawn() lifecycle.
+
+LORA_CONFIG_PATH = "/sam3-lora/config"
+LORA_SPAWN_PATH = "/sam3-lora/spawn"
+_OPT_TAB_MODE = "sam3_lora_manager_tab_mode"
+_OPT_PORT = "sam3_lora_manager_port"
+_TAB_MODE_REPLACE = "Replace LoRA tab"
+
+
+def _read_lora_opts() -> tuple[bool, int]:
+    """(replace_mode, port) from Settings — defensive so it works headless."""
+    replace = False
+    port = DEFAULT_PORT
+    try:
+        from modules import shared
+
+        mode = getattr(shared.opts, _OPT_TAB_MODE, None)
+        replace = str(mode) == _TAB_MODE_REPLACE
+        port = int(getattr(shared.opts, _OPT_PORT, DEFAULT_PORT) or DEFAULT_PORT)
+    except Exception:
+        pass
+    return replace, port
+
+
+def lora_config_data() -> dict[str, Any]:
+    replace, port = _read_lora_opts()
+    return {
+        "available": lora_manager_available(),
+        "replace": replace,
+        "port": port,
+    }
+
+
+def lora_spawn_data() -> dict[str, Any]:
+    _replace, port = _read_lora_opts()
+    try:
+        return get_or_spawn(port)
+    except Exception as e:  # pragma: no cover - defensive
+        import traceback
+
+        traceback.print_exc(file=sys.stderr)
+        return {"url": "", "port": port, "status": "error", "message": str(e)}
+
+
+def register_lora_routes(app: Any) -> bool:
+    """Register the config/spawn JSON routes once. Returns True if newly added
+    (idempotent — Forge re-fires app-start after Reload UI)."""
+    existing = {getattr(r, "path", None) for r in getattr(app, "routes", ())}
+    if LORA_CONFIG_PATH in existing and LORA_SPAWN_PATH in existing:
+        return False
+
+    from fastapi.responses import JSONResponse
+
+    _no_store = {"Cache-Control": "no-store, max-age=0", "Pragma": "no-cache"}
+
+    async def _config_route() -> JSONResponse:
+        return JSONResponse(lora_config_data(), headers=_no_store)
+
+    async def _spawn_route() -> JSONResponse:
+        return JSONResponse(lora_spawn_data(), headers=_no_store)
+
+    if LORA_CONFIG_PATH not in existing:
+        app.add_api_route(
+            LORA_CONFIG_PATH, _config_route, methods=["GET"],
+            include_in_schema=False, name="sam3-lora-config",
+        )
+    if LORA_SPAWN_PATH not in existing:
+        app.add_api_route(
+            LORA_SPAWN_PATH, _spawn_route, methods=["GET"],
+            include_in_schema=False, name="sam3-lora-spawn",
+        )
+    return True
 
 
 # ---------------------------------------------------------------------------

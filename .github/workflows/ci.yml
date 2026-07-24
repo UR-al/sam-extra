@@ -1,0 +1,42 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          # CPU-only torch keeps the install small and fast; the tests never
+          # touch CUDA.
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+          pip install pytest "gradio>=4.0,<6.0" pydantic numpy "Pillow>=11.1.0" fastapi
+
+      - name: Run Python tests
+        run: python -m pytest tests/ -q
+
+      - name: Check JavaScript syntax
+        run: |
+          for f in javascript/*.js; do
+            echo "node --check $f"
+            node --check "$f"
+          done

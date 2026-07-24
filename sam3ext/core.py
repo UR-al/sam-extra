@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import re
 import sys
+import weakref
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
@@ -214,6 +215,18 @@ def unload_sam3() -> None:
     """
     import gc
 
+    # Move every model we put on the GPU back to CPU *before* dropping the
+    # cache ref. ``cache_clear()`` alone only decrefs the bundle; if anything
+    # else still holds the model (e.g. a Sam3Processor back-ref) the GPU
+    # storage never frees. ``nn.Module.to("cpu")`` moves parameters in place,
+    # so the GPU tensors are released even for those lingering holders.
+    for model in list(_GPU_MODELS):
+        try:
+            model.to("cpu")
+        except Exception:
+            pass
+    _GPU_MODELS.clear()
+
     _load_model_bundle.cache_clear()
     gc.collect()
     try:
@@ -224,6 +237,12 @@ def unload_sam3() -> None:
             torch.cuda.ipc_collect()
     except Exception:
         pass
+
+
+# Weakly track every model we move onto the GPU so ``unload_sam3`` can push
+# them back to CPU explicitly. WeakSet never keeps a model alive on its own —
+# entries drop out once the lru_cache releases them.
+_GPU_MODELS: "weakref.WeakSet" = weakref.WeakSet()
 
 
 # maxsize=1: each cached SAM3 bundle is ~3.5 GB on GPU. 16 GB GPUs running
@@ -258,6 +277,10 @@ def _load_model_bundle(checkpoint_key: str, device: str):
             load_from_HF=checkpoint_path is None,
         )
     processor = Sam3Processor(model, device=device)
+    try:
+        _GPU_MODELS.add(model)
+    except TypeError:
+        pass
     return model, processor
 
 
@@ -651,6 +674,14 @@ def write_artifacts(result: Sam3Result, seed: int | None, label: str | None = No
     stem = f"sam3_{seed}" if seed is not None else "sam3"
     # Safeguard: cap at 10000 to avoid runaway loops if the output dir gets
     # thousands of artifacts and the while True can't find a free slot fast.
+    mask_count = len(result.masks)
+
+    def _individual_paths(sfx: str) -> list[Path]:
+        return [
+            output_dir / f"{stem}_{slug}_mask_{idx:02d}{sfx}.png"
+            for idx in range(1, mask_count + 1)
+        ]
+
     suffix = ""
     mask_path = overlay_path = meta_path = None
     for index in range(1, 10001):
@@ -658,7 +689,15 @@ def write_artifacts(result: Sam3Result, seed: int | None, label: str | None = No
         mask_path = output_dir / f"{stem}_{slug}_mask{suffix}.png"
         overlay_path = output_dir / f"{stem}_{slug}_overlay{suffix}.png"
         meta_path = output_dir / f"{stem}_{slug}_prompt{suffix}.json"
-        if not mask_path.exists() and not overlay_path.exists() and not meta_path.exists():
+        # Also check the per-mask filenames for this suffix: the combined
+        # mask/overlay/meta could be absent (deleted) while individual masks
+        # from a prior run still occupy the slot, which we'd otherwise clobber.
+        if (
+            not mask_path.exists()
+            and not overlay_path.exists()
+            and not meta_path.exists()
+            and not any(p.exists() for p in _individual_paths(suffix))
+        ):
             break
     else:
         # Hit the cap — fall back to a timestamp suffix so saves still succeed.
@@ -671,8 +710,7 @@ def write_artifacts(result: Sam3Result, seed: int | None, label: str | None = No
 
     result.mask.save(mask_path)
     result.overlay.save(overlay_path)
-    for idx, mask in enumerate(result.masks, start=1):
-        single_mask_path = output_dir / f"{stem}_{slug}_mask_{idx:02d}{suffix}.png"
+    for single_mask_path, mask in zip(_individual_paths(suffix), result.masks):
         mask.save(single_mask_path)
     meta_path.write_text(
         json.dumps(

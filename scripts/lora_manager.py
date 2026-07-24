@@ -1,4 +1,4 @@
-"""LoRA Manager bridge (v0.9.0).
+"""LoRA Manager bridge (introduced in v0.9.0).
 
 Registers two things:
 
@@ -27,8 +27,9 @@ from modules import script_callbacks, scripts, shared
 
 from sam3ext.lora_manager_core import (
     DEFAULT_PORT,
-    get_or_spawn,
-    lora_manager_available,
+    lora_config_data,
+    lora_spawn_data,
+    register_lora_routes,
 )
 
 
@@ -64,36 +65,28 @@ def on_ui_settings():
 script_callbacks.on_ui_settings(on_ui_settings)
 
 
-def _read_opts() -> tuple[str, int]:
-    tab_mode = getattr(shared.opts, OPT_TAB_MODE, _TAB_MODE_ADD)
-    try:
-        port = int(getattr(shared.opts, OPT_PORT, DEFAULT_PORT) or DEFAULT_PORT)
-    except (TypeError, ValueError):
-        port = DEFAULT_PORT
-    return tab_mode, port
-
-
 def _config_handler() -> str:
-    """Cheap — no spawn. JS calls this once on load to decide tab placement."""
-    tab_mode, port = _read_opts()
-    return json.dumps(
-        {
-            "available": lora_manager_available(),
-            "replace": tab_mode == _TAB_MODE_REPLACE,
-            "port": port,
-        }
-    )
+    """Cheap — no spawn. JS calls this once on load to decide tab placement.
+    Shares its payload with the /sam3-lora/config HTTP route."""
+    return json.dumps(lora_config_data())
 
 
 def _spawn_handler() -> str:
-    """Lazy spawn — JS calls this the first time the Manage tab is shown."""
-    _tab_mode, port = _read_opts()
+    """Lazy spawn — JS calls this the first time the Manage tab is shown.
+    Shares its lifecycle with the /sam3-lora/spawn HTTP route."""
+    return json.dumps(lora_spawn_data())
+
+
+def _on_app_started(demo, app) -> None:
+    # Register the lightweight config/spawn JSON routes so the Live Workspace
+    # shell can drive the manager without the hidden Gradio bridge.
     try:
-        res = get_or_spawn(port)
-    except Exception as e:  # pragma: no cover - defensive
+        register_lora_routes(app)
+    except Exception:
         traceback.print_exc(file=sys.stderr)
-        res = {"url": "", "port": port, "status": "error", "message": str(e)}
-    return json.dumps(res)
+
+
+script_callbacks.on_app_started(_on_app_started)
 
 
 class LoraManagerBridge(scripts.Script):

@@ -69,7 +69,6 @@ class AnimaSafePagTests(unittest.TestCase):
             slg_on=False,
             slg_scale=3.0,
             slg_targets=set(),
-            auto_decay=False,
             rescale=0.0,
             rescale_mode="full",
             active=0,
