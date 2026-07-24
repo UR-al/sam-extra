@@ -951,7 +951,7 @@
                 if (target && target.contentWindow) {
                     try {
                         target.contentWindow.postMessage(
-                            { type: "sam3-add-lora", text: d.text },
+                            { type: "sam3-add-lora", text: d.text, replace: !!d.replace },
                             window.location.origin
                         );
                     } catch (e) {}

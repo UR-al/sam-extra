@@ -303,6 +303,64 @@ _BRIDGE_JS = r'''/* forge_bridge.js (forge_sam3) */
         } catch (e2) {}
     }, true);
 
+    /* Track the card a single-card context menu was opened on, so the
+     * "send to workflow" menu item knows its target. */
+    var _lastCard = null;
+    document.addEventListener("contextmenu", function (e) {
+        try {
+            _lastCard = (e.target && e.target.closest)
+                ? e.target.closest(".model-card") : null;
+        } catch (err) { _lastCard = null; }
+    }, true);
+
+    function postLoras(syntaxes, replace) {
+        var texts = [];
+        for (var i = 0; i < syntaxes.length; i++) {
+            if (syntaxes[i]) texts.push(syntaxes[i]);
+        }
+        if (!texts.length) return;
+        try {
+            window.parent.postMessage(
+                { type: "sam3-add-lora", text: texts.join(", "), replace: !!replace },
+                "*"
+            );
+        } catch (err) {}
+    }
+
+    /* Context-menu "send to workflow" — SINGLE (#loraContextMenu:
+     * data-action sendappend/sendreplace) AND BULK multi-select
+     * (#bulkContextMenu: send-to-workflow-append/replace over every
+     * .model-card.selected). The vendor would send these to ComfyUI (a no-op
+     * in standalone); intercept in capture phase, build the syntax for the
+     * target card(s), and post to Forge instead. */
+    document.addEventListener("click", function (e) {
+        var item = e.target && e.target.closest
+            && e.target.closest(".context-menu-item[data-action]");
+        if (!item || !isLoras()) return;
+        var action = (item.getAttribute("data-action") || "").toLowerCase();
+        if (action.indexOf("send") === -1) return; /* skip copy-all etc. */
+        var bulk = !!(item.closest && item.closest("#bulkContextMenu"));
+        var replace = action.indexOf("replace") !== -1;
+        var cards = [];
+        if (bulk) {
+            cards = Array.prototype.slice.call(
+                document.querySelectorAll(".model-card.selected")
+            );
+        } else if (_lastCard) {
+            cards = [_lastCard];
+        }
+        if (!cards.length) return;
+        var syntaxes = [];
+        for (var i = 0; i < cards.length; i++) {
+            var s = syntaxFromCard(cards[i]);
+            if (s) syntaxes.push(s);
+        }
+        if (!syntaxes.length) return;
+        e.preventDefault();
+        e.stopImmediatePropagation();
+        postLoras(syntaxes, replace);
+    }, true);
+
     /* Label rebrand fallback (locale patch is primary). */
     function relabel(root) {
         if (!root || !root.querySelectorAll) return;
@@ -409,6 +467,10 @@ _LOCALE_ADD_LORA_KEYS = (
     "modals.model.actions.sendToWorkflowText",
     "loras.contextMenu.sendToWorkflowAppend",
     "loras.contextMenu.sendToWorkflowReplace",
+    # Bulk multi-select submenu (missing keys are ignored by _set_json_path).
+    "loras.bulkOperations.sendToWorkflow",
+    "loras.bulkOperations.sendToWorkflowAppend",
+    "loras.bulkOperations.sendToWorkflowReplace",
 )
 
 

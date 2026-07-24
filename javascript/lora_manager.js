@@ -312,13 +312,21 @@
         return ", ";
     }
 
-    function sam3InsertLora(text) {
+    function sam3InsertLora(text, replace) {
         if (!text) return;
         var tab = sam3ActiveTab();
         var ta = sam3PositiveTextarea(tab);
         if (!ta) { console.log("[SAM3] add-lora: no positive prompt textarea for", tab); return; }
         var cur = ta.value || "";
-        if (cur.indexOf(text) === -1) {
+        if (replace) {
+            // "Send to workflow (Replace)": drop existing <lora:...> tokens,
+            // collapse the leftover separators, then set the new set.
+            cur = cur.replace(/<lora:[^>]*>/gi, "")
+                     .replace(/,\s*,/g, ", ")
+                     .replace(/^[\s,]+/, "")
+                     .replace(/[\s,]+$/, "");
+            ta.value = cur.length ? (cur + sam3Separator() + text) : text;
+        } else if (cur.indexOf(text) === -1) {
             ta.value = cur.length ? (cur + sam3Separator() + text) : text;
         }
         // Mirror ui.js updateInput so Gradio registers the change.
@@ -337,7 +345,7 @@
             if (d.type !== "sam3-add-lora") return;
             // port is dynamic / cross-origin, so validate by message shape.
             if (typeof d.text !== "string" || d.text.indexOf("<lora:") !== 0) return;
-            sam3InsertLora(d.text);
+            sam3InsertLora(d.text, !!d.replace);
         });
     }
 

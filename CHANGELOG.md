@@ -3,6 +3,26 @@
 버전 태그는 GitHub Releases에도 발행됩니다. 아래는 요약이며, guidance/속도 기능의
 상세는 [docs/GUIDANCE.md](docs/GUIDANCE.md)를 참고하세요.
 
+## v0.19.0 — LoRA 벌크/컨텍스트 전송을 Forge로 (ComfyUI 하드코딩 제거)
+
+멀티 선택 후 우클릭 "한번에 넣기"가 ComfyUI로만 가서 못 쓰던 문제를 해결. 매니저의 모든
+"send to workflow" 경로를 Forge 프롬프트 삽입으로 연동.
+
+- **컨텍스트 메뉴 인터셉트**: 주입 브리지(`forge_bridge.js`)가 이제 카드 1개의 paper-plane뿐
+  아니라 **단일 컨텍스트 메뉴**(`#loraContextMenu`의 `sendappend`/`sendreplace`)와
+  **멀티 선택 벌크 서브메뉴**(`#bulkContextMenu`의 `send-to-workflow-append/replace`, 대상은
+  `.model-card.selected` 전체)를 capture 단계에서 가로채 ComfyUI 전송을 막고 Forge로 postMessage.
+  대상 카드의 `data-file_name`/`data-folder`/`data-usage_tips`로 `<lora:...>` 문법을 만들어
+  전송(벌크는 콤마 결합).
+- **Append/Replace 지원**: 메시지에 `replace` 플래그를 실어, Replace면 프롬프트의 기존
+  `<lora:...>` 토큰을 제거한 뒤 새 세트를 넣음(Append는 기존대로 이어붙임). Live 셸도 이
+  플래그를 활성 워크스페이스로 그대로 전달.
+- **라벨 정리**: 벌크 서브메뉴 라벨(`loras.bulkOperations.*`)도 "Add LoRA"로 리브랜드 대상에 추가.
+- **적용 시점**: 브리지는 서버 spawn 시 벤더 트리에 재기록(content 기준 idempotent)되므로,
+  업데이트 후 다음 매니저 기동부터 자동 반영.
+- **검증**: 회귀 테스트 88개 전부 통과(브리지 인터셉트·Forge측 replace 처리 자산 검사 포함).
+  실제 멀티 선택 전송은 브라우저+Forge에서 확인 필요.
+
 ## v0.18.0 — LoRA Manager ↔ Live Workspace 연동
 
 LoRA 매니저를 "iframe에 얹은 외부 앱"에서 **Live Workspace-인식 통합**으로 한 단계 끌어올린

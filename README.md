@@ -280,6 +280,10 @@ t2i Generate → 갤러리 N장
 - Manage 탭 안에 `<iframe>`으로 manager UI 임베드
 - Forge의 LoRA/checkpoint/embeddings 폴더 경로를 manager `settings.json`에 자동 동기화
 - Forge 종료 시 서버 자동 종료 (atexit)
+- **모든 "send to workflow" → Forge 프롬프트 삽입 (v0.19.0+):** 카드 paper-plane뿐 아니라
+  단일 우클릭 메뉴와 **멀티 선택 후 우클릭 벌크 전송**(`.model-card.selected` 전체)도 가로채
+  ComfyUI 대신 현재 프롬프트로 삽입합니다. Append는 이어붙이고, Replace는 기존 `<lora:...>`를
+  교체합니다. (벤더의 ComfyUI 하드코딩 전송을 브리지가 capture 단계에서 차단)
 
 **Live Workspace 연동 (v0.18.0+):** Live Workspace 모드에서는 워크스페이스마다 매니저를
 중복 주입하지 않고, **Live 셸 헤더의 `LoRA` 버튼**이 매니저 하나를 오버레이로 엽니다. 매니저에서
