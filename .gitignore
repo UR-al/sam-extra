@@ -6,7 +6,9 @@ models/
 *.pt
 *.pth
 *.safetensors
-.claude/
+# Keep shared Claude Code config (settings.json + hooks) tracked; ignore only
+# the per-user local overrides.
+.claude/settings.local.json
 pip
 
 # v0.8.0 — shallow clone of kohya-ss/sd-scripts populated by install.py
