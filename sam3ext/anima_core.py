@@ -731,42 +731,57 @@ def run_tile_repair(
             with ctx:
                 # Set the tokenize/encode strategies up front (vendor main()
                 # does this; we have to do it ourselves because we're
-                # bypassing main()).
+                # bypassing main()). These are PROCESS-GLOBAL singletons, so we
+                # snapshot the previous strategy and restore it in `finally` —
+                # otherwise the Anima strategy stays pinned and leaks into any
+                # later code that reads TokenizeStrategy.get_strategy().
                 from library import strategy_anima, strategy_base  # type: ignore
 
-                strategy_base.TokenizeStrategy.set_strategy(
-                    strategy_anima.AnimaTokenizeStrategy(
-                        qwen3_path=args.text_encoder,
-                        t5_tokenizer_path=None,
-                        qwen3_max_length=512,
-                        t5_max_length=512,
+                _get_tok = getattr(strategy_base.TokenizeStrategy, "get_strategy", None)
+                _get_te = getattr(strategy_base.TextEncodingStrategy, "get_strategy", None)
+                _prev_tok = _get_tok() if callable(_get_tok) else None
+                _prev_te = _get_te() if callable(_get_te) else None
+
+                try:
+                    strategy_base.TokenizeStrategy.set_strategy(
+                        strategy_anima.AnimaTokenizeStrategy(
+                            qwen3_path=args.text_encoder,
+                            t5_tokenizer_path=None,
+                            qwen3_max_length=512,
+                            t5_max_length=512,
+                        )
                     )
-                )
-                strategy_base.TextEncodingStrategy.set_strategy(
-                    strategy_anima.AnimaTextEncodingStrategy()
-                )
+                    strategy_base.TextEncodingStrategy.set_strategy(
+                        strategy_anima.AnimaTextEncodingStrategy()
+                    )
 
-                device = torch.device(
-                    "cuda" if torch.cuda.is_available() else "cpu"
-                )
-                args.device = device
+                    device = torch.device(
+                        "cuda" if torch.cuda.is_available() else "cpu"
+                    )
+                    args.device = device
 
-                gen_settings = ami.get_generation_settings(args)
-                latent = ami.generate(args, gen_settings)
+                    gen_settings = ami.get_generation_settings(args)
+                    latent = ami.generate(args, gen_settings)
 
-                # Decode — vendor loads VAE separately to keep DiT in VRAM
-                # during sampling and frees it before the VAE pass.
-                from library import anima_train_utils  # type: ignore
+                    # Decode — vendor loads VAE separately to keep DiT in VRAM
+                    # during sampling and frees it before the VAE pass.
+                    from library import anima_train_utils  # type: ignore
 
-                vae = anima_train_utils.load_qwen_image_vae(
-                    args, device="cpu", disable_mmap=True
-                )
-                vae.to(torch.bfloat16).eval()
-                pixels = ami.decode_latent(vae, latent, device)
-                pil = _tensor_to_pil(pixels)
+                    vae = anima_train_utils.load_qwen_image_vae(
+                        args, device="cpu", disable_mmap=True
+                    )
+                    vae.to(torch.bfloat16).eval()
+                    pixels = ami.decode_latent(vae, latent, device)
+                    pil = _tensor_to_pil(pixels)
 
-                seed_used = int(args.seed) if args.seed is not None else -1
-                out_pairs.append((pil, _build_infotext(repair, seed_used)))
+                    seed_used = int(args.seed) if args.seed is not None else -1
+                    out_pairs.append((pil, _build_infotext(repair, seed_used)))
+                finally:
+                    try:
+                        strategy_base.TokenizeStrategy.set_strategy(_prev_tok)
+                        strategy_base.TextEncodingStrategy.set_strategy(_prev_te)
+                    except Exception:
+                        pass
         except Exception as e:
             traceback.print_exc(file=sys.stderr)
             # Humanize the most common load failure: a non-Anima DiT/VAE was

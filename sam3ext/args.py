@@ -1,13 +1,35 @@
 from __future__ import annotations
 
+import re
 from collections import UserList
 from functools import partial
 from typing import Any, Literal, NamedTuple
 
 try:
-    from pydantic.v1 import BaseModel, Extra, NonNegativeFloat, NonNegativeInt, PositiveInt, confloat
+    from pydantic.v1 import (
+        BaseModel,
+        Extra,
+        NonNegativeFloat,
+        NonNegativeInt,
+        PositiveInt,
+        confloat,
+        root_validator,
+        validator,
+    )
 except ImportError:
-    from pydantic import BaseModel, Extra, NonNegativeFloat, NonNegativeInt, PositiveInt, confloat
+    from pydantic import (
+        BaseModel,
+        Extra,
+        NonNegativeFloat,
+        NonNegativeInt,
+        PositiveInt,
+        confloat,
+        root_validator,
+        validator,
+    )
+
+
+_DEVICE_RE = re.compile(r"^cuda:\d+$")
 
 
 class Arg(NamedTuple):
@@ -89,6 +111,43 @@ class Sam3Args(BaseModel, extra=Extra.forbid):
     sam3_cn_processor_res: NonNegativeInt = 512
     sam3_cn_threshold_a: float = -1.0
     sam3_cn_threshold_b: float = -1.0
+
+    # --- coercing validators -------------------------------------------------
+    # These normalise instead of raising: the caller wraps Sam3Args(**payload)
+    # in a try/except that disables SAM3 on ANY error, so a hard raise here
+    # would silently turn the whole feature off for a benign out-of-range value.
+
+    @validator("sam3_device")
+    def _normalise_device(cls, value: str) -> str:
+        v = str(value or "").strip().lower() or "auto"
+        if v in {"auto", "cpu", "cuda"} or _DEVICE_RE.match(v):
+            return v
+        # Unknown device string → fall back to auto rather than deferring an
+        # opaque torch error into model load.
+        return "auto"
+
+    @validator("sam3_seed")
+    def _clamp_seed(cls, value: int) -> int:
+        v = int(value)
+        if v < -1:
+            return -1
+        return min(v, 2 ** 32 - 1)
+
+    @validator("sam3_inpaint_width", "sam3_inpaint_height")
+    def _snap_to_multiple_of_8(cls, value: int) -> int:
+        # The WebUI sampler expects latent-aligned sizes; snap down to a
+        # multiple of 8 (min 64) the way the txt2img width/height sliders do.
+        return max(64, (int(value) // 8) * 8)
+
+    @root_validator(skip_on_failure=True)
+    def _order_cn_guidance(cls, values: dict[str, Any]) -> dict[str, Any]:
+        start = values.get("sam3_cn_guidance_start")
+        end = values.get("sam3_cn_guidance_end")
+        if start is not None and end is not None and start > end:
+            # A transposed window (start > end) would silently disable the CN
+            # unit; swap so the intended range is preserved.
+            values["sam3_cn_guidance_start"], values["sam3_cn_guidance_end"] = end, start
+        return values
 
     @staticmethod
     def ppop(p: dict[str, Any], key: str, pops: list[str] | None = None, cond: Any = None) -> None:
