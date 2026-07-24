@@ -239,10 +239,10 @@ def _as_bool(value, default: bool) -> bool:
 
 
 class AnimaDetailDaemon(scripts.Script):
-    # 0 keeps the accordion in the SAM3 extension block, right under SAM3
-    # (lower sorting_priority = higher up). The sigma callback is global and
-    # order-independent, so processing early is safe.
-    sorting_priority = 0
+    # Sits directly under the SAM3 mask accordion (-30) in the SAM3 extension
+    # block (lower sorting_priority = higher up). The sigma callback is global
+    # and order-independent, so processing early is safe.
+    sorting_priority = -29
 
     def title(self):
         return "Anima Detail Daemon"

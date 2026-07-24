@@ -57,8 +57,9 @@ def _log(msg: str) -> None:
 
 
 class AnimaRefPoC(scripts.Script):
-    # Run late so other scripts have set up the unet first.
-    sorting_priority = 99
+    # Last in the SAM3 extension block (the diagnostic / log toggle), but still
+    # runs after the other SAM3-family scripts have set up the unet first.
+    sorting_priority = -25
 
     def title(self):
         return "Anima Reference PoC (shape logger)"

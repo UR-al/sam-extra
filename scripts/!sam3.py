@@ -242,6 +242,15 @@ script_callbacks.on_app_started(
 
 class Sam3MaskScript(scripts.Script):
     alwayson = True
+    # Lead the SAM3 extension block. Without an explicit priority this accordion
+    # fell in with the unprioritised third-party scripts, letting them sit
+    # between SAM3 and the anima feature accordions (which carry explicit
+    # priorities and so sank below the unprioritised ones). A contiguous
+    # negative block keeps the whole SAM3 family together at the top, in order:
+    #   SAM3 (-30) → Detail Daemon (-29) → Skimmed CFG (-28) → Safe PAG (-27)
+    #   → VAE 2x (-26) → Reference PoC / log toggles (-25).
+    # (lower sorting_priority = higher up.)
+    sorting_priority = -30
 
     def title(self):
         return SAM3_NAME

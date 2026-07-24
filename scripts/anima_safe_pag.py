@@ -1670,11 +1670,11 @@ def _clear_extra_generation_params(p) -> None:
 class AnimaSafePAG(scripts.Script):
     # sorting_priority governs BOTH the accordion position and the
     # process order (lower = higher up / earlier). This panel sits in the SAM3
-    # extension block under Detail Daemon (0) and Skimmed CFG (1); running
+    # extension block under Detail Daemon (-29) and Skimmed CFG (-28); running
     # after Skimmed CFG also means its post-CFG hook receives the skimmed
     # result as "incoming". We still clone from the CURRENT
     # forge_objects.unet, so other unet-patching scripts compose regardless.
-    sorting_priority = 2
+    sorting_priority = -27
 
     def title(self):
         return "Anima Perturbation Guidance"
