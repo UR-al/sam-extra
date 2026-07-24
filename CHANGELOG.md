@@ -3,6 +3,29 @@
 버전 태그는 GitHub Releases에도 발행됩니다. 아래는 요약이며, guidance/속도 기능의
 상세는 [docs/GUIDANCE.md](docs/GUIDANCE.md)를 참고하세요.
 
+## v0.17.0 — CI·개발 인프라 + 안정성 보강 + 정리
+
+기능 추가 없이 안전망·정확성·정리에 집중한 릴리즈.
+
+- **CI 도입**: `.github/workflows/ci.yml`이 push/PR마다 pytest(CPU torch+gradio) +
+  `node --check`를 실행. 이전엔 회귀 테스트 83개가 자동으로 안 돌았음.
+- **웹 세션 SessionStart 훅**: `.claude/hooks/session-start.sh`가 Claude Code on the web
+  세션에서 테스트 의존성을 자동 설치(멱등·remote 전용). `.claude/settings.json`에 등록.
+- **args 검증 강화**: `sam3_device`(auto/cpu/cuda/cuda:N, 그 외 auto로 폴백), seed 범위
+  클램프, inpaint width/height 8의 배수 스냅, CN guidance start>end 자동 swap — 모두
+  raise 대신 정규화(호출부가 검증 실패 시 SAM3를 꺼버리므로). 신규 테스트 5개.
+- **Anima 전역 전략 복원**: `TokenizeStrategy`/`TextEncodingStrategy` 싱글턴을 Anima 패스
+  전후로 `try/finally` 복원 — 이후 비-Anima 경로로의 상태 누수 방지.
+- **guidance 패치 teardown 프레임워크**: Safe PAG의 attention/block/self_attn + k-diffusion
+  noise 전역 monkey-patch에 clean uninstall 경로 추가. `on_script_unloaded`에 등록해 reload
+  시 stale 패치 제거(런타임 경로는 그대로). install→teardown 테스트 추가.
+- **정리**: `!sam3.py`의 동일 JS shim 4벌 → `_SELECTED_INDEX_JS` 하나로. install.py에
+  벤더 pin 훅(`_ANIMA_PIN`/`_LM_PIN`, 기본 None=기존 동작) 추가. LoRA 모듈 버전 드리프트
+  문구 정리.
+- **실험 기능 진단 문서**: [docs/EXPERIMENTAL_STATUS.md](EXPERIMENTAL_STATUS.md) — Refine·Anima의
+  전제 조건과 실제 Forge 실행으로만 확인 가능한 항목·캡처할 로그 정리.
+- **검증**: 회귀 테스트 83개 전부 통과. 브라우저/GPU E2E는 이 환경에서 확인 불가.
+
 ## v0.16.0 — Live Workspace 기본화 + 모드 선택 + 탭 전환 부드럽게
 
 기능 5를 Live Workspace 중심으로 재편하고, 인-페이지 툴바(비-Live UI)를 폐기하며,
