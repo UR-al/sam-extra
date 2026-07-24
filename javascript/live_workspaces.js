@@ -248,6 +248,8 @@
             '        <input type="file" accept="application/json,.json" data-sam3-live-import></label>',
             '    </div>',
             '  </details>',
+            '  <button type="button" data-sam3-live-lora hidden ',
+            '    title="LoRA Manager를 열어 현재 Workspace 프롬프트에 삽입">LoRA</button>',
             '  <button type="button" data-sam3-live-native-tabs ',
             '    title="iframe을 닫고 각 Workspace를 실제 브라우저 탭으로 엽니다">실제 탭으로 열기</button>',
             '</header>',
@@ -256,6 +258,15 @@
             '    <span class="sam3-live-spinner" aria-hidden="true"></span>',
             '    <span data-sam3-live-loading-text>Workspace 준비 중…</span>',
             '  </div>',
+            '</div>',
+            '<div class="sam3-live-lora-overlay" data-sam3-live-lora-overlay hidden>',
+            '  <div class="sam3-live-lora-bar">',
+            '    <strong>LoRA Manager</strong>',
+            '    <span class="sam3-live-lora-status" data-sam3-live-lora-status></span>',
+            '    <span class="sam3-live-lora-active" data-sam3-live-lora-active></span>',
+            '    <button type="button" data-sam3-live-lora-close aria-label="닫기">✕</button>',
+            '  </div>',
+            '  <iframe class="sam3-live-lora-frame" data-sam3-live-lora-frame title="LoRA Manager"></iframe>',
             '</div>'
         ].join("");
         document.body.appendChild(shell);
@@ -854,6 +865,103 @@
             "click",
             openNativeWorkspaceTabs
         );
+
+        // --- Shared LoRA Manager overlay (Live-Workspace-aware) --------------
+        // One manager for the whole shell (no per-workspace nesting). "Add LoRA"
+        // from the manager iframe is forwarded to the ACTIVE workspace's prompt.
+        var loraBtn = shell.querySelector("[data-sam3-live-lora]");
+        var loraOverlay = shell.querySelector("[data-sam3-live-lora-overlay]");
+        var loraFrame = shell.querySelector("[data-sam3-live-lora-frame]");
+        var loraStatusEl = shell.querySelector("[data-sam3-live-lora-status]");
+        var loraActiveEl = shell.querySelector("[data-sam3-live-lora-active]");
+        var loraLoaded = false;
+
+        function setLoraStatus(msg) {
+            if (loraStatusEl) loraStatusEl.textContent = msg || "";
+        }
+        function loadLoraFrame(url) {
+            if (loraLoaded) return;
+            loraFrame.src = url;
+            loraLoaded = true;
+            setLoraStatus("");
+        }
+        function pollLoraUp(url) {
+            var tries = 0;
+            var iv = setInterval(function () {
+                tries++;
+                window.fetch(url, { mode: "no-cors", cache: "no-store" })
+                    .then(function () { clearInterval(iv); loadLoraFrame(url); })
+                    .catch(function () {
+                        if (tries >= 360) {
+                            clearInterval(iv);
+                            setLoraStatus("시작 시간 초과 — forge_standalone.log 확인");
+                        } else {
+                            setLoraStatus("LoRA 모델 스캔 중… (최초 1회) " + (tries * 2) + "s");
+                        }
+                    });
+            }, 2000);
+        }
+        function ensureLoraServer() {
+            if (loraLoaded) return;
+            setLoraStatus("LoRA Manager 서버 시작 중…");
+            window.fetch("/sam3-lora/spawn", { credentials: "same-origin", cache: "no-store" })
+                .then(function (r) { return r.json(); })
+                .then(function (res) {
+                    if (!res || !res.url) {
+                        setLoraStatus("시작 실패: " + ((res && res.message) || "unknown"));
+                        return;
+                    }
+                    if (res.status === "running" || res.status === "spawned") {
+                        loadLoraFrame(res.url);
+                    } else {
+                        setLoraStatus("LoRA 모델 스캔 중… (최초 1회)");
+                        pollLoraUp(res.url);
+                    }
+                })
+                .catch(function (err) { setLoraStatus("브리지 오류: " + err); });
+        }
+        if (loraBtn && loraOverlay) {
+            loraBtn.addEventListener("click", function () {
+                if (loraActiveEl) {
+                    loraActiveEl.textContent =
+                        "→ " + (state.names[state.active] || state.active);
+                }
+                loraOverlay.hidden = false;
+                ensureLoraServer();
+            });
+            var loraClose = shell.querySelector("[data-sam3-live-lora-close]");
+            if (loraClose) {
+                loraClose.addEventListener("click", function () {
+                    loraOverlay.hidden = true;
+                });
+            }
+            // Reveal the button only when the vendored manager is available.
+            window.fetch("/sam3-lora/config", { credentials: "same-origin", cache: "no-store" })
+                .then(function (r) { return r.json(); })
+                .then(function (cfg) { if (cfg && cfg.available) loraBtn.hidden = false; })
+                .catch(function () {});
+            // Forward "Add LoRA" from the manager iframe (cross-origin, so match
+            // by source + shape, not origin) into the ACTIVE workspace's prompt.
+            window.addEventListener("message", function (event) {
+                var d = event && event.data;
+                if (!d || typeof d !== "object" || d.type !== "sam3-add-lora") return;
+                if (loraFrame && event.source !== loraFrame.contentWindow) return;
+                if (typeof d.text !== "string" || d.text.indexOf("<lora:") !== 0) return;
+                var target = frameFor(state.active);
+                if (target && target.contentWindow) {
+                    try {
+                        target.contentWindow.postMessage(
+                            { type: "sam3-add-lora", text: d.text },
+                            window.location.origin
+                        );
+                    } catch (e) {}
+                }
+                if (loraActiveEl) {
+                    loraActiveEl.textContent =
+                        "✓ " + (state.names[state.active] || state.active) + "에 추가";
+                }
+            });
+        }
 
         syncNameEditor();
         activate(state.active);

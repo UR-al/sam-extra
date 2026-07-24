@@ -244,6 +244,66 @@ html.sam3-live-shell-active body > :not(#sam3_live_workspace_shell) {
     to { transform: rotate(360deg); }
 }
 
+/* Shared LoRA Manager overlay in the Live shell (one manager for all
+ * workspaces; "Add LoRA" routes to the active workspace's prompt). */
+.sam3-live-lora-overlay {
+    position: fixed;
+    inset: 0;
+    z-index: 100001;
+    display: grid;
+    grid-template-rows: auto minmax(0, 1fr);
+    background: var(--body-background-fill, #080d17);
+}
+
+.sam3-live-lora-overlay[hidden] {
+    display: none !important;
+}
+
+.sam3-live-lora-bar {
+    display: flex;
+    align-items: center;
+    gap: .6rem;
+    min-height: 46px;
+    padding: .4rem .65rem;
+    border-bottom: 1px solid var(--border-color-primary, #334155);
+    background: var(--background-fill-secondary, #101827);
+}
+
+.sam3-live-lora-bar > strong {
+    flex: 0 0 auto;
+    color: var(--color-accent, #fb923c);
+}
+
+.sam3-live-lora-status,
+.sam3-live-lora-active {
+    min-width: 0;
+    overflow: hidden;
+    color: var(--body-text-color-subdued, #94a3b8);
+    font-size: .8rem;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.sam3-live-lora-bar > [data-sam3-live-lora-close] {
+    flex: 0 0 auto;
+    margin-left: auto;
+    min-width: 2.2rem;
+    padding: .3rem .65rem;
+    border: 1px solid var(--border-color-primary, #475569);
+    border-radius: .45rem;
+    color: inherit;
+    background: var(--button-secondary-background-fill, #1e293b);
+    cursor: pointer;
+}
+
+.sam3-live-lora-frame {
+    width: 100%;
+    height: 100%;
+    min-height: 0;
+    border: 0;
+    background: var(--body-background-fill, #080d17);
+}
+
 html.sam3-live-frame-active body {
     margin: 0 !important;
     overflow: auto !important;

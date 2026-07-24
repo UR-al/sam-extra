@@ -342,16 +342,29 @@
     }
 
     function start() {
-        tryAll();
-        // Keep trying as the DOM finishes building (heavy first render).
-        var obs = new MutationObserver(function () { tryAll(); });
-        try { obs.observe(document.documentElement, { childList: true, subtree: true }); } catch (e) {}
-        var iv = setInterval(tryAll, 800);
-        setTimeout(function () { try { obs.disconnect(); } catch (e) {} clearInterval(iv); }, 300000);
+        var params = new URLSearchParams(window.location.search);
+        // Inside a Live Workspace child *iframe* the shell hosts one shared LoRA
+        // Manager overlay, so skip the per-workspace tab injection (which would
+        // nest a third iframe and duplicate the manager). A native workspace tab
+        // (top-level, window.parent === window) has no shell, so it keeps its
+        // own tab.
+        var inLiveChildFrame =
+            params.has("__sam3_live_workspace") && window.parent !== window;
 
+        if (!inLiveChildFrame) {
+            tryAll();
+            // Keep trying as the DOM finishes building (heavy first render).
+            var obs = new MutationObserver(function () { tryAll(); });
+            try { obs.observe(document.documentElement, { childList: true, subtree: true }); } catch (e) {}
+            var iv = setInterval(tryAll, 800);
+            setTimeout(function () { try { obs.disconnect(); } catch (e) {} clearInterval(iv); }, 300000);
+            // config affects only replace-mode/availability — fetch independently.
+            loadConfig();
+        }
+
+        // Always listen: in a Live child frame this receives the sam3-add-lora
+        // message the shell forwards from the shared manager overlay.
         attachLoraBridge();
-        // config affects only replace-mode/availability — fetch independently.
-        loadConfig();
     }
 
     if (typeof onUiLoaded === "function") {

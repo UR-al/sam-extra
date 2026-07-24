@@ -3,6 +3,24 @@
 버전 태그는 GitHub Releases에도 발행됩니다. 아래는 요약이며, guidance/속도 기능의
 상세는 [docs/GUIDANCE.md](docs/GUIDANCE.md)를 참고하세요.
 
+## v0.18.0 — LoRA Manager ↔ Live Workspace 연동
+
+LoRA 매니저를 "iframe에 얹은 외부 앱"에서 **Live Workspace-인식 통합**으로 한 단계 끌어올린
+릴리즈. 벤더 앱/서버 자체는 그대로 쓰되 연동을 실제 Forge Neo 흐름에 맞춤.
+
+- **HTTP config/spawn 엔드포인트**: `/sam3-lora/config`, `/sam3-lora/spawn`(same-origin JSON)을
+  추가해 경량 Live 셸이 히든 Gradio 브리지 버튼 없이 서버를 조회·기동. 기존 `get_or_spawn`
+  라이프사이클을 그대로 래핑(일반 모드용 Gradio 브리지도 같은 payload 공유). 신규 테스트 2개.
+- **Live 셸 공유 오버레이**: 셸 헤더의 `LoRA` 버튼이 **매니저 하나**를 오버레이로 엶(이전엔
+  워크스페이스마다 중복 주입되어 `셸→워크스페이스→매니저` 3중 iframe이었음). 벤더 미설치 시
+  버튼 자동 숨김.
+- **활성 워크스페이스로 삽입 라우팅**: 매니저에서 Add LoRA → 셸이 그 메시지를 **현재 활성
+  워크스페이스 iframe**의 프롬프트로 postMessage 전달(cross-origin은 source+shape로 검증).
+- **중복 탭 억제**: Live 워크스페이스 자식 iframe에서는 `lora_manager.js`가 Manage 탭을 주입하지
+  않음(네이티브 탭·일반 모드는 기존대로 자체 탭 유지). 삽입 브리지는 항상 리슨.
+- **검증**: 회귀 테스트 85개 전부 통과(신규 route·shell 연동 자산 검사 포함). 실제 매니저
+  기동·삽입 동작은 브라우저+Forge에서 확인 필요(이 환경 미검증).
+
 ## v0.17.0 — CI·개발 인프라 + 안정성 보강 + 정리
 
 기능 추가 없이 안전망·정확성·정리에 집중한 릴리즈.

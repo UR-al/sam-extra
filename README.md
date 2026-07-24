@@ -281,6 +281,12 @@ t2i Generate → 갤러리 N장
 - Forge의 LoRA/checkpoint/embeddings 폴더 경로를 manager `settings.json`에 자동 동기화
 - Forge 종료 시 서버 자동 종료 (atexit)
 
+**Live Workspace 연동 (v0.18.0+):** Live Workspace 모드에서는 워크스페이스마다 매니저를
+중복 주입하지 않고, **Live 셸 헤더의 `LoRA` 버튼**이 매니저 하나를 오버레이로 엽니다. 매니저에서
+LoRA를 추가하면 셸이 그걸 **현재 보고 있는 워크스페이스의 프롬프트**로 전달합니다. 셸은 히든
+Gradio 브리지 대신 `/sam3-lora/config`·`/sam3-lora/spawn` HTTP 엔드포인트로 서버를 조회·기동합니다.
+(네이티브 탭·일반 Forge 모드는 기존처럼 각자 Manage 탭을 그대로 유지.)
+
 ### 의존성 자동 설치
 
 확장 첫 로드 시 `install.py`가:

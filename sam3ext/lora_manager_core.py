@@ -858,6 +858,86 @@ def _read_log_tail(n: int = 20) -> str:
 
 
 # ---------------------------------------------------------------------------
+# HTTP config/spawn endpoints
+# ---------------------------------------------------------------------------
+# The Live Workspace shell is a lightweight page with no Gradio doc, so it
+# cannot click the hidden bridge buttons the normal txt2img UI uses. These
+# same-origin JSON routes let the shell (or any page) query config and lazily
+# spawn the server directly. They wrap the exact same get_or_spawn() lifecycle.
+
+LORA_CONFIG_PATH = "/sam3-lora/config"
+LORA_SPAWN_PATH = "/sam3-lora/spawn"
+_OPT_TAB_MODE = "sam3_lora_manager_tab_mode"
+_OPT_PORT = "sam3_lora_manager_port"
+_TAB_MODE_REPLACE = "Replace LoRA tab"
+
+
+def _read_lora_opts() -> tuple[bool, int]:
+    """(replace_mode, port) from Settings — defensive so it works headless."""
+    replace = False
+    port = DEFAULT_PORT
+    try:
+        from modules import shared
+
+        mode = getattr(shared.opts, _OPT_TAB_MODE, None)
+        replace = str(mode) == _TAB_MODE_REPLACE
+        port = int(getattr(shared.opts, _OPT_PORT, DEFAULT_PORT) or DEFAULT_PORT)
+    except Exception:
+        pass
+    return replace, port
+
+
+def lora_config_data() -> dict[str, Any]:
+    replace, port = _read_lora_opts()
+    return {
+        "available": lora_manager_available(),
+        "replace": replace,
+        "port": port,
+    }
+
+
+def lora_spawn_data() -> dict[str, Any]:
+    _replace, port = _read_lora_opts()
+    try:
+        return get_or_spawn(port)
+    except Exception as e:  # pragma: no cover - defensive
+        import traceback
+
+        traceback.print_exc(file=sys.stderr)
+        return {"url": "", "port": port, "status": "error", "message": str(e)}
+
+
+def register_lora_routes(app: Any) -> bool:
+    """Register the config/spawn JSON routes once. Returns True if newly added
+    (idempotent — Forge re-fires app-start after Reload UI)."""
+    existing = {getattr(r, "path", None) for r in getattr(app, "routes", ())}
+    if LORA_CONFIG_PATH in existing and LORA_SPAWN_PATH in existing:
+        return False
+
+    from fastapi.responses import JSONResponse
+
+    _no_store = {"Cache-Control": "no-store, max-age=0", "Pragma": "no-cache"}
+
+    async def _config_route() -> JSONResponse:
+        return JSONResponse(lora_config_data(), headers=_no_store)
+
+    async def _spawn_route() -> JSONResponse:
+        return JSONResponse(lora_spawn_data(), headers=_no_store)
+
+    if LORA_CONFIG_PATH not in existing:
+        app.add_api_route(
+            LORA_CONFIG_PATH, _config_route, methods=["GET"],
+            include_in_schema=False, name="sam3-lora-config",
+        )
+    if LORA_SPAWN_PATH not in existing:
+        app.add_api_route(
+            LORA_SPAWN_PATH, _spawn_route, methods=["GET"],
+            include_in_schema=False, name="sam3-lora-spawn",
+        )
+    return True
+
+
+# ---------------------------------------------------------------------------
 # Lifecycle
 # ---------------------------------------------------------------------------
 

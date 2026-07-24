@@ -275,5 +275,24 @@ class LiveWorkspaceAssetTests(unittest.TestCase):
         self.assertNotIn('bar.id = "sam3_workspace_bar"', manager)
 
 
+    def test_shell_hosts_shared_lora_manager_routed_to_active_workspace(self):
+        live = (ROOT / "javascript" / "live_workspaces.js").read_text(encoding="utf-8")
+        lora = (ROOT / "javascript" / "lora_manager.js").read_text(encoding="utf-8")
+        css = (ROOT / "style.css").read_text(encoding="utf-8")
+
+        # Shell has a single LoRA overlay driven by the HTTP endpoints.
+        self.assertIn("data-sam3-live-lora-overlay", live)
+        self.assertIn('window.fetch("/sam3-lora/spawn"', live)
+        self.assertIn('window.fetch("/sam3-lora/config"', live)
+        # "Add LoRA" is forwarded to the ACTIVE workspace's prompt.
+        self.assertIn('d.type !== "sam3-add-lora"', live)
+        self.assertIn("frameFor(state.active)", live)
+        self.assertIn(".sam3-live-lora-overlay", css)
+
+        # A Live child iframe must NOT inject its own (nested) manager tab.
+        self.assertIn("inLiveChildFrame", lora)
+        self.assertIn('params.has("__sam3_live_workspace") && window.parent !== window', lora)
+
+
 if __name__ == "__main__":
     unittest.main()
