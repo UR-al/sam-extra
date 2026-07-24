@@ -186,6 +186,25 @@ def make_axis_on_xyz_grid():
         xyz_grid.axis_options.extend(axis)
 
 
+def on_ui_settings_workspaces():
+    # Feature 5 kill switch. Read on the frontend (workspace_manager.js →
+    # window.opts.sam3_workspaces_enable) to skip mounting the workspace
+    # toolbar/tabs entirely when unchecked. Default on; takes effect after a
+    # page reload since the mount happens once at UI load.
+    section = ("sam3_workspaces", "SAM3 Workspaces")
+    shared.opts.add_option(
+        "sam3_workspaces_enable",
+        shared.OptionInfo(
+            True,
+            "txt2img Workspaces 활성화 (기능 5 · 끄면 페이지 새로고침 후 적용)",
+            section=section,
+        ),
+    )
+
+
+script_callbacks.on_ui_settings(on_ui_settings_workspaces)
+
+
 def on_before_ui():
     guarded = guard_sampler_app_started_callbacks(script_callbacks.callback_map)
     if guarded:

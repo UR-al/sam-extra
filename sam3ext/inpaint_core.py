@@ -188,7 +188,10 @@ def get_seed(p, args: dict[str, Any]) -> int:
 def get_noise_multiplier(p, args: dict[str, Any]) -> float:
     if args.get("sam3_use_noise_multiplier"):
         return float(args.get("sam3_noise_multiplier", 1.0))
-    return getattr(p, "initial_noise_multiplier", None) or 1.0
+    # Distinguish an unset attribute from a deliberately-configured 0.0: a plain
+    # ``or 1.0`` would coerce a valid 0.0 back to 1.0.
+    value = getattr(p, "initial_noise_multiplier", None)
+    return float(value) if value is not None else 1.0
 
 
 def build_i2i(p, image: Image.Image, args: dict[str, Any]) -> StableDiffusionProcessingImg2Img:

@@ -907,7 +907,9 @@ def map_widget_values_to_sam3_args(values: tuple) -> dict[str, Any]:
         "sam3_cn_threshold_b": _as_float(keyed.get("cn_threshold_b"), -1.0),
         "_insert_mode": str(keyed.get("insert_mode") or "After selected"),
         "_inherit_main_prompt": bool(keyed.get("inherit_main_prompt", True)),
-        "_inherit_main_neg_prompt": bool(keyed.get("inherit_main_neg_prompt", True)),
+        # Fallback must match the widget default (value=False above): if the
+        # value is ever missing, don't silently invert to "inherit".
+        "_inherit_main_neg_prompt": bool(keyed.get("inherit_main_neg_prompt", False)),
         # Canvas slots — pulled out as raw payloads (PIL Image or None) and
         # decoded into the actual override image / user_mask further down in
         # handle_refine_click. Stored under leading-underscore keys so they
@@ -1055,7 +1057,7 @@ def handle_refine_click(
     args = map_widget_values_to_sam3_args(widget_values)
     insert_mode = args.pop("_insert_mode", "After selected")
     inherit_main = args.pop("_inherit_main_prompt", True)
-    inherit_main_neg = args.pop("_inherit_main_neg_prompt", True)
+    inherit_main_neg = args.pop("_inherit_main_neg_prompt", False)
     sd_model_override = args.pop("_sd_model_override", "Use current")
     resize_mode = args.pop("_resize_mode", "Just Resize")
     mask_invert = args.pop("_mask_invert", False)

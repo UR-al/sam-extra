@@ -195,7 +195,9 @@ class LiveWorkspaceAssetTests(unittest.TestCase):
         self.assertIn("triggerDriverDependency(dependencyDriver", manager)
         self.assertIn("waitForXyzChoiceOptions(snapshot, catalog)", manager)
 
-    def test_generate_keeps_gallery_root_for_forge_live_preview(self):
+    def test_generate_keeps_previous_gallery_until_completion(self):
+        """On Generate the previous gallery stays visible until the new image
+        actually completes; only non-generate (switch/reset) paths clear it."""
         manager = (ROOT / "javascript" / "workspace_manager.js").read_text(
             encoding="utf-8"
         )
@@ -205,19 +207,18 @@ class LiveWorkspaceAssetTests(unittest.TestCase):
         clear_end = manager.index("function dispatchGradioChange", clear_start)
         clear_body = manager[clear_start:clear_end]
 
-        self.assertIn("beginGalleryGenerationPending()", clear_body)
-        generate_start = clear_body.index('if (reason === "generate")')
-        generate_end = clear_body.index("} else {", generate_start)
-        generate_branch = clear_body[generate_start:generate_end]
-        non_generate_end = clear_body.index(
-            "if (outputSaveTimer)",
-            generate_end,
-        )
-        non_generate_branch = clear_body[generate_end:non_generate_end]
-        self.assertNotIn(
-            "dispatchOutputValue(",
-            generate_branch,
-        )
+        split = clear_body.index("// Non-generate paths")
+        generate_branch = clear_body[:split]
+        non_generate_branch = clear_body[split:]
+
+        # Generate: no hide, no output mutation, early return — the previous
+        # result is left on screen and the final image replaces it normally.
+        self.assertIn('if (reason === "generate")', generate_branch)
+        self.assertIn("return;", generate_branch)
+        self.assertNotIn("dispatchOutputValue(", generate_branch)
+        self.assertNotIn("emptyWorkspaceOutputs()", generate_branch)
+
+        # Non-generate: clear gallery/info/html immediately.
         self.assertIn(
             "dispatchOutputValue(outputComponentIds.gallery, [])",
             non_generate_branch,
@@ -230,18 +231,11 @@ class LiveWorkspaceAssetTests(unittest.TestCase):
             'dispatchOutputValue(outputComponentIds.htmlInfo, "")',
             non_generate_branch,
         )
-        self.assertIn("endGalleryGenerationPending()", manager)
-        self.assertIn("sam3-workspace-generation-pending", manager)
-        self.assertIn(
-            "#txt2img_gallery.sam3-workspace-generation-pending "
-            "> :not(.livePreview)",
-            css,
-        )
-        self.assertIn(
-            "#txt2img_gallery.sam3-workspace-generation-pending "
-            "> .livePreview",
-            css,
-        )
+
+        # The old hide-on-generate machinery is fully removed.
+        self.assertNotIn("GalleryGenerationPending", manager)
+        self.assertNotIn("sam3-workspace-generation-pending", manager)
+        self.assertNotIn("sam3-workspace-generation-pending", css)
 
 
 if __name__ == "__main__":

@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import gc
 import os
+import random
 import sys
 import tempfile
 import traceback
@@ -484,7 +485,11 @@ def _build_anima_args(repair: AnimaTileRepairArgs, control_image_path: str) -> S
     ns.infer_steps = int(repair.steps)
     ns.guidance_scale = float(repair.cfg)
     ns.flow_shift = float(repair.flow_shift)
-    ns.seed = int(repair.seed) if repair.seed >= 0 else None
+    # For a random request (-1) pick a concrete seed ourselves instead of
+    # handing the vendor ``None``. The vendor would draw its own internal
+    # random seed that we can't read back, so the infotext would record -1 and
+    # the image would be irreproducible. An explicit int is used verbatim.
+    ns.seed = int(repair.seed) if repair.seed >= 0 else random.randint(0, 2**31 - 1)
 
     # --- model paths ---
     dit = (

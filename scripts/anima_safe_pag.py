@@ -120,7 +120,6 @@ _STATE: dict = {
     "slg_on": False,
     "slg_scale": 3.0,
     "slg_targets": set(),  # block indices to skip
-    "auto_decay": True,   # halve each scale when >1 perturbation is active (toggle)
     "rescale": 0.20,      # std-matching rescale factor
     "rescale_mode": "full",  # full=CFG+guidance, partial=cond+guidance std source
     "start": 0.0,         # start percent of sampling
@@ -1249,8 +1248,9 @@ def _apply_perturbation(args, base):
     ``scale·(cond_denoised − weak_denoised)`` for each active weak prediction
     (attention-perturbed for PAG/SEG, and/or layer-skipped for SLG). Forge's
     ``model.apply_model`` has already converted every prediction to denoised
-    x0, so no eps/v/flow conversion is needed here. When more than one term is
-    active AND ``auto_decay`` is on, each scale is divided by the active count.
+    x0, so no eps/v/flow conversion is needed here. Each active term applies at
+    its full configured scale (the former auto-decay safety brake, which halved
+    each scale when >1 term was active, has been removed).
     Returns ``base`` unchanged on any problem."""
     cd = args["cond_denoised"].float()
     attn_raw = _STATE["attn_raw"]
@@ -1264,10 +1264,9 @@ def _apply_perturbation(args, base):
     if not terms:
         return base
 
-    decay = 1.0 / len(terms) if (_STATE["auto_decay"] and len(terms) > 1) else 1.0
     guidance = torch.zeros_like(base, dtype=torch.float32)
     for scale, weak in terms:
-        guidance = guidance + (scale * decay) * (cd - weak)
+        guidance = guidance + scale * (cd - weak)
 
     if not _STATE["delta_logged"]:
         _STATE["delta_logged"] = True
@@ -1773,12 +1772,13 @@ class AnimaSafePAG(scripts.Script):
                 elem_id="anima_safe_pag_slg_blocks",
             )
 
-            auto_decay = gr.Checkbox(
-                label="PAG/SEG + SLG 병용 시 각 scale 자동 감쇠 (÷활성 수)",
-                value=True,
-                info="병용 시 과도한 보정을 막는 안전장치입니다. 개별 scale을 직접 맞출 때만 끄세요.",
-                elem_id="anima_safe_pag_auto_decay",
-            )
+            # Removed: the "auto-decay" safety brake that divided each PAG/SEG/
+            # SLG scale by the active-term count. Perturbations now always apply
+            # at their full configured scale. A hidden, inert placeholder keeps
+            # this script argument at its historical index (11) so saved API
+            # payloads / XYZ presets that pass the full positional array still
+            # line up — matching the extension's append-only arg contract.
+            auto_decay = gr.Checkbox(value=False, visible=False)
 
             gr.Markdown("---\n### APG (Adaptive Projected Guidance)")
             gr.Markdown(
@@ -2231,7 +2231,8 @@ class AnimaSafePAG(scripts.Script):
                 xyz["rescale_mode"]
                 if "rescale_mode" in xyz else _arg(41, "full")
             ).strip().lower()
-            auto_decay = _as_bool(_arg(11, True), True)
+            # arg index 11 (formerly auto_decay) is now an inert hidden
+            # placeholder — the safety brake was removed, so it is not read.
             apg_eta = _xyz_num("apg_eta", float(_arg(13, 0.0)))
             apg_norm = _xyz_num("apg_norm", float(_arg(14, 15.0)))
             apg_momentum = _xyz_num("apg_momentum", float(_arg(15, 0.0)))
@@ -2443,7 +2444,7 @@ class AnimaSafePAG(scripts.Script):
                 seg_sigma=seg_sigma, head_spec=head_spec,
                 attn_targets=attn_targets,
                 slg_on=bool(slg_on and slg_targets), slg_scale=slg_scale,
-                slg_targets=slg_targets, auto_decay=auto_decay, rescale=rescale,
+                slg_targets=slg_targets, rescale=rescale,
                 rescale_mode=rescale_mode,
                 start=requested_start, end=effective_end,
                 requested_start=requested_start, requested_end=requested_end,
@@ -2508,7 +2509,6 @@ class AnimaSafePAG(scripts.Script):
                     + f"; effective_range={_STATE['start']:.2f}-{_STATE['end']:.2f}"
                     + f"; range_mode={_STATE['range_mode']}"
                     + f"; rescale={rescale}({rescale_mode})"
-                    + f"; auto_decay={auto_decay}"
                 )
             if _APG["on"]:
                 p.extra_generation_params["Anima APG"] = (
@@ -2555,7 +2555,6 @@ class AnimaSafePAG(scripts.Script):
                 f"range={_STATE['requested_start']:.2f}-{_STATE['requested_end']:.2f}"
                 f"→{_STATE['start']:.2f}-{_STATE['end']:.2f}"
                 f"({_STATE['range_mode']}) "
-                f"auto_decay={auto_decay} "
                 f"rescale={'auto-off' if (_APG['on'] and apg_autooff) else rescale}"
                 f"({rescale_mode})) "
                 f"APG={'on' if _APG['on'] else 'off'} "

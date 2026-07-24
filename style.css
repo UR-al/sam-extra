@@ -580,21 +580,6 @@ html.sam3-live-frame-active .sam3-live-original-root {
     opacity: .78;
 }
 
-/*
- * Keep Forge's Gallery node stable at Generate time so progressbar.js can
- * attach its absolute-positioned .livePreview to it. The old thumbnails retain
- * the Gallery height but stay invisible until the final result replaces them.
- */
-#txt2img_gallery.sam3-workspace-generation-pending > :not(.livePreview) {
-    visibility: hidden !important;
-    pointer-events: none !important;
-}
-
-#txt2img_gallery.sam3-workspace-generation-pending > .livePreview {
-    visibility: visible !important;
-    pointer-events: auto !important;
-}
-
 @media (max-width: 1100px) {
     .sam3-live-note { display: none; }
     .sam3-native-workspace-bar > span:not(.sam3-native-workspace-status) {

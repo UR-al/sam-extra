@@ -92,9 +92,6 @@
     var outputSaveTimer = null;
     var outputDbPromise = null;
     var outputDbWarned = false;
-    var galleryPendingTimer = null;
-    var galleryPendingSawRunning = false;
-    var galleryPendingStartedAt = 0;
     var activeSlot = LIVE_FRAME_SLOT || readActiveSlot();
     var tabId = readTabId();
     var knownSlotRevision = 0;
@@ -1057,44 +1054,6 @@
         }
     }
 
-    function applyGalleryGenerationPending(pending) {
-        var gallery = app().querySelector("#txt2img_gallery");
-        if (!gallery || !gallery.classList) return;
-        gallery.classList.toggle(
-            "sam3-workspace-generation-pending",
-            !!pending
-        );
-    }
-
-    function endGalleryGenerationPending() {
-        if (galleryPendingTimer) {
-            clearInterval(galleryPendingTimer);
-            galleryPendingTimer = null;
-        }
-        galleryPendingSawRunning = false;
-        galleryPendingStartedAt = 0;
-        applyGalleryGenerationPending(false);
-    }
-
-    function beginGalleryGenerationPending() {
-        endGalleryGenerationPending();
-        galleryPendingStartedAt = Date.now();
-        applyGalleryGenerationPending(true);
-        galleryPendingTimer = setInterval(function () {
-            // Keep the class on the current Gallery root if Gradio happens to
-            // rebuild it for an unrelated UI update while generation runs.
-            applyGalleryGenerationPending(true);
-            if (generationRunning()) galleryPendingSawRunning = true;
-            else if (galleryPendingSawRunning
-                    || Date.now() - galleryPendingStartedAt > 15000) {
-                // Covers normal completion, interrupt/error, and a click that
-                // never reached Forge. A successful gallery prop_change also
-                // ends this immediately below.
-                endGalleryGenerationPending();
-            }
-        }, 100);
-    }
-
     function captureWorkspaceOutputChange(detail) {
         if (!detail || detail.prop !== "value") return false;
         var id = Number(detail.id);
@@ -1105,7 +1064,6 @@
             var gallery = sanitizeGalleryItems(value);
             outputState.items = gallery.items;
             outputState.truncated = gallery.truncated;
-            endGalleryGenerationPending();
             if (!restoring && !switching && gallery.items.length) {
                 setStatus(
                     activeWorkspaceName() + " 마지막 생성 결과 · 갤러리 "
@@ -1142,30 +1100,34 @@
 
     function clearVisibleWorkspaceOutputs(slot, reason) {
         slot = sanitizeSlotId(slot || activeSlot);
-        outputState = emptyWorkspaceOutputs();
-        // Do not prop_change *any* Gradio output in the Generate click's
-        // capture phase. A nested prop_change here can re-enter Gradio before
-        // Forge's submit() returns its generated task id, leaving
-        // requestProgress() on "Waiting..." while the backend is already
-        // sampling. Hide the previous thumbnails without changing component
-        // values; the final output replaces gallery/info values normally.
         if (reason === "generate") {
-            beginGalleryGenerationPending();
-        } else {
-            restoring++;
-            try {
-                dispatchOutputValue(outputComponentIds.gallery, []);
-                dispatchOutputValue(outputComponentIds.generationInfo, "");
-                dispatchOutputValue(outputComponentIds.htmlInfo, "");
-            } finally {
-                restoring--;
-            }
+            // Keep the previous gallery visible while generation runs. Forge's
+            // progressbar livePreview overlays it, and the final result replaces
+            // the old thumbnails on completion (captureWorkspaceOutputChange
+            // updates outputState + saves). We used to hide the previous result
+            // the instant Generate was clicked; users preferred keeping it on
+            // screen until the new image is actually finished. We deliberately
+            // do NOT clear outputState or the stored record here either, so a
+            // mid-generation workspace switch/reload still shows the last
+            // result rather than a blank gallery.
+            setStatus(
+                activeWorkspaceName() + " 생성 중 · 완료되면 새 결과로 교체",
+                "pending"
+            );
+            return;
+        }
+        // Non-generate paths (workspace switch / reset): clear immediately.
+        outputState = emptyWorkspaceOutputs();
+        restoring++;
+        try {
+            dispatchOutputValue(outputComponentIds.gallery, []);
+            dispatchOutputValue(outputComponentIds.generationInfo, "");
+            dispatchOutputValue(outputComponentIds.htmlInfo, "");
+        } finally {
+            restoring--;
         }
         if (outputSaveTimer) { clearTimeout(outputSaveTimer); outputSaveTimer = null; }
         deleteWorkspaceOutputs(slot);
-        if (reason === "generate") {
-            setStatus(activeWorkspaceName() + " 생성 시작 · 이전 갤러리 비움", "pending");
-        }
     }
 
     function dispatchGradioChange(adapter) {
@@ -2400,7 +2362,21 @@
         }
     }
 
+    function workspacesEnabled() {
+        // Feature 5 kill switch (Settings → SAM3 Workspaces →
+        // "txt2img Workspaces 활성화"). Only an explicit false disables; when
+        // opts hasn't populated yet the feature stays on so normal startup
+        // isn't skipped. A Settings toggle applies on the next page reload.
+        try {
+            var o = (typeof opts !== "undefined" && opts) ? opts : (window.opts || null);
+            return !(o && o.sam3_workspaces_enable === false);
+        } catch (e) {
+            return true;
+        }
+    }
+
     function ensureMounted() {
+        if (!workspacesEnabled()) return;
         var pane = findGenerationPane();
         if (!pane) return;
         var replaced = generationPane && pane !== generationPane;

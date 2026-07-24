@@ -656,9 +656,12 @@ def _health_ok(port: int, timeout: float = 1.0) -> bool:
         req = urllib.request.Request(url, method="GET")
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             return 200 <= resp.status < 400
-    except urllib.error.HTTPError as e:
-        # Any HTTP response means the server is up (even a 4xx/5xx page).
-        return True if e.code else False
+    except urllib.error.HTTPError:
+        # A 4xx/5xx page means *something* is listening, but our healthy
+        # manager serves 200 at /loras. Treating any error page as "up" made
+        # an unrelated service on this port read as the LoRA Manager and point
+        # the iframe at a foreign server. Require a real success response.
+        return False
     except Exception:
         return False
 
@@ -725,6 +728,22 @@ def get_or_spawn(port: int = DEFAULT_PORT, wait_seconds: float = 3.0) -> dict[st
         if _proc is not None and _proc.poll() is not None:
             _proc = None
 
+        # Already-booting guard: a live process that simply isn't answering
+        # health yet is the *expected* state during the multi-minute first-run
+        # library scan (aiohttp doesn't open the port until the scan finishes).
+        # Without this, a second Manage-tab open would Popen another server on
+        # the same port — the duplicate fails to bind and exits, and its early
+        # exit can then be misreported as an error over the healthy first one.
+        if _proc is not None and _proc.poll() is None:
+            _proc_port = port
+            return {
+                "url": manager_url(port),
+                "port": port,
+                "status": "starting",
+                "message": "server is still booting (first-run library scan) — "
+                "reusing the process already starting on this port",
+            }
+
         try:
             ensure_settings_json()
         except Exception:
@@ -783,6 +802,15 @@ def get_or_spawn(port: int = DEFAULT_PORT, wait_seconds: float = 3.0) -> dict[st
                 "status": "error",
                 "message": f"spawn failed: {e}",
             }
+        finally:
+            # The child holds its own dup of the fd; the parent never writes to
+            # it, so release our copy immediately (both on success and on the
+            # failure path) instead of leaking a handle every crash/respawn.
+            if log_fh is not subprocess.DEVNULL:
+                try:
+                    log_fh.close()
+                except Exception:
+                    pass
 
     # Short grace poll OUTSIDE the lock — only to catch the fast case where
     # the cache is already serialized and the server comes up in a second or

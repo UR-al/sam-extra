@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 import os
+import shutil
 import subprocess
 import sys
 from importlib.metadata import version
@@ -94,6 +95,30 @@ def _have_git() -> bool:
         return False
 
 
+def _reset_partial_clone(root: Path, label: str) -> None:
+    """Remove a non-empty vendor dir left by an interrupted clone.
+
+    ``git clone`` refuses to write into an existing non-empty directory, so a
+    clone that died after creating ``root`` but before the sentinel landed
+    would wedge every subsequent bootstrap. The sentinel is already known to
+    be missing by the time this is called, so anything present is partial.
+    """
+    if not root.exists():
+        return
+    print(
+        f"[forge_sam3_extension] removing partial {label} clone at {root} "
+        "before retrying",
+        file=sys.stderr,
+    )
+    try:
+        shutil.rmtree(root)
+    except Exception as e:  # noqa: BLE001 — best-effort; clone will error clearly
+        print(
+            f"[forge_sam3_extension] could not remove {root}: {e}",
+            file=sys.stderr,
+        )
+
+
 def ensure_anima_vendor() -> bool:
     """Clone kohya-ss/sd-scripts into ``anima_vendor/`` if the sentinel file
     is missing. Idempotent.
@@ -114,6 +139,7 @@ def ensure_anima_vendor() -> bool:
         )
         return False
 
+    _reset_partial_clone(_ANIMA_ROOT, "Anima vendor")
     _ANIMA_ROOT.parent.mkdir(parents=True, exist_ok=True)
     print(
         f"[forge_sam3_extension] cloning sd-scripts → {_ANIMA_ROOT} "
@@ -238,6 +264,7 @@ def ensure_lora_manager_vendor() -> bool:
         )
         return False
 
+    _reset_partial_clone(_LM_ROOT, "LoRA Manager vendor")
     _LM_ROOT.parent.mkdir(parents=True, exist_ok=True)
     print(
         f"[forge_sam3_extension] cloning ComfyUI-Lora-Manager → {_LM_ROOT} "
