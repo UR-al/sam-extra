@@ -16,6 +16,7 @@ import gradio as gr
 import numpy as np
 from PIL import Image
 
+from .coerce import as_float, as_int
 from .ui import (
     _controlnet_model_choices,
     _controlnet_module_choices,
@@ -812,30 +813,9 @@ def _parse_detect_tokens(detect_prompt: str) -> list[str]:
     return [t.strip() for t in tokens if t.strip()]
 
 
-def _as_float(value: Any, default: float) -> float:
-    """Bulletproof float coercion: empty string / None / non-numeric → default.
-
-    Sliders return floats and dropdowns return their selected string, but
-    widget-order quirks or browser-side surprises can put an empty textbox
-    value where a number was expected. We previously raised loudly, but the
-    user-facing failure mode (refine button silently broken) is worse than
-    silently falling back to the slider/component default.
-    """
-    if value is None or (isinstance(value, str) and value.strip() == ""):
-        return default
-    try:
-        return float(value)
-    except (TypeError, ValueError):
-        return default
-
-
-def _as_int(value: Any, default: int) -> int:
-    if value is None or (isinstance(value, str) and value.strip() == ""):
-        return default
-    try:
-        return int(float(value))  # float-first so "12.0" works
-    except (TypeError, ValueError):
-        return default
+# Defensive numeric coercion shared with the Anima handler (see sam3ext.coerce).
+_as_float = as_float
+_as_int = as_int
 
 
 def map_widget_values_to_sam3_args(values: tuple) -> dict[str, Any]:

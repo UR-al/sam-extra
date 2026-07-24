@@ -238,5 +238,42 @@ class LiveWorkspaceAssetTests(unittest.TestCase):
         self.assertNotIn("sam3-workspace-generation-pending", css)
 
 
+    def test_mode_gate_and_smoother_switching(self):
+        live = (ROOT / "javascript" / "live_workspaces.js").read_text(
+            encoding="utf-8"
+        )
+        manager = (ROOT / "javascript" / "workspace_manager.js").read_text(
+            encoding="utf-8"
+        )
+
+        # Redirect to the Live shell is gated on the server mode probe, and the
+        # plain-Forge choice cancels it.
+        self.assertIn('new URL("/sam3-live/enabled", window.location.origin)', live)
+        self.assertIn("cfg.live === false", live)
+        # The in-shell mode-switch button was removed (choice lives in Settings).
+        self.assertNotIn("data-sam3-live-legacy", live)
+
+        # Hidden child frames pause their background watch via a visibility msg.
+        self.assertIn(
+            'var VISIBILITY_MESSAGE = "sam3-live-workspace-visibility-v1"', live
+        )
+        self.assertIn("function notifyChildVisibility(slot, active)", live)
+        self.assertIn("installChildVisibilityBridge()", live)
+        self.assertIn(
+            'var LIVE_VISIBILITY_MESSAGE = "sam3-live-workspace-visibility-v1"',
+            manager,
+        )
+        self.assertIn("setBackgroundActive: setBackgroundActive", manager)
+        self.assertIn("function stopBackgroundWatch()", manager)
+
+        # activate() only re-attributes the changed frames (inert reflow cut).
+        self.assertIn("var previous = state.active;", live)
+
+        # The legacy in-page toolbar builder is gone; the child-frame early
+        # return (asserted elsewhere) is all that remains of mountToolbar.
+        self.assertNotIn("function createToolbar()", manager)
+        self.assertNotIn('bar.id = "sam3_workspace_bar"', manager)
+
+
 if __name__ == "__main__":
     unittest.main()

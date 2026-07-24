@@ -53,6 +53,7 @@
     var STORAGE_KEY = "sam-extra.workspace-manager.v1";
     var ACTIVE_KEY = "sam-extra.workspace-manager.active.v1";
     var LIVE_STATUS_MESSAGE = "sam3-live-workspace-status-v1";
+    var LIVE_VISIBILITY_MESSAGE = "sam3-live-workspace-visibility-v1";
     var SAVE_DELAY_MS = 750;
     var MAX_STORAGE_BYTES = 4 * 1024 * 1024;
     var MAX_WORKSPACES = 20;
@@ -2144,106 +2145,18 @@
         }
     }
 
-    function createToolbar() {
-        var bar = document.createElement("div");
-        bar.id = "sam3_workspace_bar";
-        bar.className = "sam3-workspace-bar";
-        bar.setAttribute("data-sam3-workspaces", "1");
-        bar.innerHTML = [
-            '<button type="button" class="sam3-workspace-title" data-workspace-create ',
-            '  aria-label="새 Workspace 만들기" title="새 Workspace 만들기">',
-            '  <span>Workspaces</span><span aria-hidden="true">＋</span>',
-            '</button>',
-            '<div class="sam3-workspace-slots" role="group" aria-label="txt2img workspaces">',
-            '</div>',
-            '<span class="sam3-workspace-status" data-workspace-status aria-live="polite"></span>',
-            '<details class="sam3-workspace-menu">',
-            '  <summary aria-label="Workspace 메뉴" title="Workspace 메뉴">⋯</summary>',
-            '  <div class="sam3-workspace-menu-panel">',
-            '    <label class="sam3-workspace-name-editor">',
-            '      <span>현재 Workspace 이름</span>',
-            '      <input type="text" maxlength="' + MAX_WORKSPACE_NAME + '" data-workspace-name ',
-            '        aria-label="현재 Workspace 이름">',
-            '    </label>',
-            '    <button type="button" data-workspace-rename>이름 저장</button>',
-            '    <button type="button" data-workspace-export>내보내기</button>',
-            '    <label>가져오기<input type="file" accept="application/json,.json" data-workspace-import></label>',
-            '    <button type="button" data-workspace-live>Live Workspaces로 전환</button>',
-            '    <button type="button" class="danger" data-workspace-reset>현재 Workspace 새로 시작</button>',
-            '    <button type="button" class="danger" data-workspace-delete>현재 Workspace 삭제</button>',
-            '  </div>',
-            '</details>'
-        ].join("");
-
-        bar.querySelector("[data-workspace-create]").addEventListener("click", function () {
-            createWorkspace();
-        });
-        bar.querySelector(".sam3-workspace-slots").addEventListener("click", function (event) {
-            var button = event.target && event.target.closest
-                ? event.target.closest("[data-workspace-slot]")
-                : null;
-            if (button && this.contains(button)) switchWorkspace(button.getAttribute("data-workspace-slot"));
-        });
-        bar.querySelector("[data-workspace-rename]").addEventListener("click", function () {
-            renameCurrentWorkspace();
-            bar.querySelector("details").open = false;
-        });
-        bar.querySelector("[data-workspace-name]").addEventListener("keydown", function (event) {
-            if (event.key === "Enter") {
-                event.preventDefault();
-                renameCurrentWorkspace();
-                bar.querySelector("details").open = false;
-            } else if (event.key === "Escape") {
-                event.preventDefault();
-                syncWorkspaceNameEditor(readStore());
-                bar.querySelector("details").open = false;
-            }
-        });
-        bar.querySelector("details").addEventListener("toggle", function () {
-            if (this.open) syncWorkspaceNameEditor(readStore());
-        });
-        bar.querySelector("[data-workspace-export]").addEventListener("click", function () {
-            downloadExport();
-            bar.querySelector("details").open = false;
-        });
-        bar.querySelector("[data-workspace-import]").addEventListener("change", function (event) {
-            importFile(event.target.files && event.target.files[0]);
-            event.target.value = "";
-            bar.querySelector("details").open = false;
-        });
-        bar.querySelector("[data-workspace-live]").addEventListener("click", function () {
-            var url = new URL(window.location.href);
-            url.searchParams.delete("sam3_live");
-            window.location.href = url.toString();
-        });
-        bar.querySelector("[data-workspace-reset]").addEventListener("click", resetCurrentWorkspace);
-        bar.querySelector("[data-workspace-delete]").addEventListener("click", deleteCurrentWorkspace);
-        return bar;
-    }
-
     function mountToolbar() {
+        // The standalone in-page workspace toolbar (legacy "기본 UI" / Mode D)
+        // has been removed: workspace switching lives entirely in the Live
+        // shell now. When Live Workspace mode is off the user gets plain,
+        // untouched Forge with nothing injected. The only case that proceeds
+        // past here is a Live child frame, which restores this slot's values
+        // into the full Forge document without any nested toolbar.
         var pane = findGenerationPane();
         if (!pane) return false;
         generationPane = pane;
         if (LIVE_FRAME_SLOT) return true;
-        var existing = app().querySelector("#sam3_workspace_bar");
-        if (existing && existing.isConnected) {
-            toolbar = existing;
-            updateButtons();
-            return true;
-        }
-        toolbar = createToolbar();
-        // #txt2img_settings is one column of Forge's resize row.  Adding the
-        // toolbar *inside that row* creates a third flex column and crushes the
-        // controls.  Insert it immediately above the whole row: full width,
-        // and still visible when Forge wraps settings in a closed accordion.
-        var settings = pane.querySelector("#txt2img_settings");
-        var layoutRow = settings && settings.closest(".resize-handle-row");
-        if (layoutRow && layoutRow.parentNode) layoutRow.parentNode.insertBefore(toolbar, layoutRow);
-        else if (settings) settings.insertBefore(toolbar, settings.firstChild);
-        else pane.insertBefore(toolbar, pane.firstChild);
-        updateButtons();
-        return true;
+        return false;
     }
 
     function eventInsideCaptureRoots(target) {
@@ -2362,21 +2275,12 @@
         }
     }
 
-    function workspacesEnabled() {
-        // Feature 5 kill switch (Settings → SAM3 Workspaces →
-        // "txt2img Workspaces 활성화"). Only an explicit false disables; when
-        // opts hasn't populated yet the feature stays on so normal startup
-        // isn't skipped. A Settings toggle applies on the next page reload.
-        try {
-            var o = (typeof opts !== "undefined" && opts) ? opts : (window.opts || null);
-            return !(o && o.sam3_workspaces_enable === false);
-        } catch (e) {
-            return true;
-        }
-    }
-
     function ensureMounted() {
-        if (!workspacesEnabled()) return;
+        // Live vs plain Forge is decided server-side by the /sam3-live redirect
+        // gate (Settings → SAM3 Workspaces mode), so there is no separate
+        // frontend kill switch here. Only Live child frames reach mountToolbar's
+        // "return true" path; on a plain page mountToolbar returns false and
+        // initialize() bails, leaving Forge untouched.
         var pane = findGenerationPane();
         if (!pane) return;
         var replaced = generationPane && pane !== generationPane;
@@ -2472,6 +2376,7 @@
         flushForLiveShell: flushForLiveShell,
         prepareForLiveImport: prepareForLiveImport,
         cancelLiveImport: cancelLiveImport,
+        setBackgroundActive: setBackgroundActive,
         storage: {
             list: storedWorkspaceList,
             rename: renameStoredWorkspace,
@@ -2486,14 +2391,46 @@
         }
     };
 
+    // Background re-mount watch (MutationObserver + poll). In the Live shell,
+    // three child Forge documents stay resident; leaving each one's observer +
+    // 800 ms poll running while it is hidden was a real source of switch jank.
+    // The shell posts LIVE_VISIBILITY_MESSAGE on every activate()/ready, and a
+    // hidden frame pauses this watch. The essential re-mount path via Forge's
+    // own onAfterUiUpdate(ensureMounted) stays registered regardless, so a
+    // paused frame still re-mounts on a genuine Forge UI rebuild — pausing only
+    // drops the redundant polling.
+    var _bgObserver = null;
+    var _bgInterval = null;
+    var _bgStopped = false;   // true after the one-time 5-min settle cutoff
+    var _bgActive = true;     // shell-reported visibility for this frame
+
+    function startBackgroundWatch() {
+        if (_bgStopped || _bgObserver || _bgInterval) return;
+        _bgObserver = new MutationObserver(function () { ensureMounted(); });
+        try { _bgObserver.observe(document.documentElement, { childList: true, subtree: true }); } catch (e) {}
+        _bgInterval = setInterval(ensureMounted, 800);
+    }
+
+    function stopBackgroundWatch() {
+        if (_bgObserver) { try { _bgObserver.disconnect(); } catch (e) {} _bgObserver = null; }
+        if (_bgInterval) { clearInterval(_bgInterval); _bgInterval = null; }
+    }
+
+    function setBackgroundActive(active) {
+        active = active !== false;
+        if (active === _bgActive) return;
+        _bgActive = active;
+        if (_bgStopped) return;
+        if (active) { ensureMounted(); startBackgroundWatch(); }
+        else { stopBackgroundWatch(); }
+    }
+
     function start() {
         ensureMounted();
-        var observer = new MutationObserver(function () { ensureMounted(); });
-        try { observer.observe(document.documentElement, { childList: true, subtree: true }); } catch (e) {}
-        var interval = setInterval(ensureMounted, 800);
+        startBackgroundWatch();
         setTimeout(function () {
-            try { observer.disconnect(); } catch (e) {}
-            clearInterval(interval);
+            _bgStopped = true;
+            stopBackgroundWatch();
         }, 300000);
         if (typeof onAfterUiUpdate === "function") onAfterUiUpdate(ensureMounted);
     }

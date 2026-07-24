@@ -186,17 +186,30 @@ def make_axis_on_xyz_grid():
         xyz_grid.axis_options.extend(axis)
 
 
+WORKSPACE_MODE_LIVE = "Live Workspace"
+WORKSPACE_MODE_PLAIN = "기본 Forge UI"
+
+
+def workspace_live_enabled() -> bool:
+    """True when Live Workspace mode is selected (the default)."""
+    mode = getattr(shared.opts, "sam3_workspaces_mode", WORKSPACE_MODE_LIVE)
+    return str(mode or WORKSPACE_MODE_LIVE) != WORKSPACE_MODE_PLAIN
+
+
 def on_ui_settings_workspaces():
-    # Feature 5 kill switch. Read on the frontend (workspace_manager.js →
-    # window.opts.sam3_workspaces_enable) to skip mounting the workspace
-    # toolbar/tabs entirely when unchecked. Default on; takes effect after a
-    # page reload since the mount happens once at UI load.
+    # Feature 5 mode selector. The frontend redirects a bare "/" to the
+    # lightweight "/sam3-live" shell only when Live Workspace is selected;
+    # picking "기본 Forge UI" keeps the plain, untouched Forge txt2img page
+    # (no workspace shell, no toolbar). Read server-side by the /sam3-live/enabled
+    # probe so the choice applies before window.opts is populated.
     section = ("sam3_workspaces", "SAM3 Workspaces")
     shared.opts.add_option(
-        "sam3_workspaces_enable",
+        "sam3_workspaces_mode",
         shared.OptionInfo(
-            True,
-            "txt2img Workspaces 활성화 (기능 5 · 끄면 페이지 새로고침 후 적용)",
+            WORKSPACE_MODE_LIVE,
+            "txt2img 작업공간 모드 (기능 5 · 새로고침 후 적용)",
+            gr.Radio,
+            {"choices": [WORKSPACE_MODE_LIVE, WORKSPACE_MODE_PLAIN]},
             section=section,
         ),
     )
