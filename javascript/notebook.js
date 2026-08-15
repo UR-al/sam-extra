@@ -644,6 +644,9 @@
         var allChoices = normalizeFastChoices(choices);
         var selectedValues = [];
         var optionButtons = [];
+        var renderedChoiceLimit = fastDropdownVisibleChoiceLimit();
+        var lastRenderedQuery = "";
+        var lastOrderedChoices = [];
 
         function selectedTokenValues() {
             if (!isMulti) return [];
@@ -702,7 +705,12 @@
         }
 
         function renderOptions(query) {
+            var preserveLimit = arguments.length > 1 && arguments[1] === true;
             var normalizedQuery = String(query || "").trim().toLocaleLowerCase();
+            if (!preserveLimit || normalizedQuery !== lastRenderedQuery) {
+                renderedChoiceLimit = fastDropdownVisibleChoiceLimit();
+            }
+            lastRenderedQuery = normalizedQuery;
             var matches = allChoices.filter(function (choice) {
                 return !normalizedQuery
                     || choice.toLocaleLowerCase().indexOf(normalizedQuery) !== -1;
@@ -716,8 +724,8 @@
             matches.forEach(function (choice) {
                 if (ordered.indexOf(choice) === -1) ordered.push(choice);
             });
-            var renderLimit = fastDropdownVisibleChoiceLimit();
-            var rendered = ordered.slice(0, renderLimit);
+            lastOrderedChoices = ordered;
+            var rendered = ordered.slice(0, renderedChoiceLimit);
             list.textContent = "";
             optionButtons = [];
             rendered.forEach(function (choice, index) {
@@ -760,12 +768,16 @@
                 empty.hidden = false;
             } else if (matches.length > rendered.length) {
                 empty.textContent = matches.length + "개 중 "
-                    + rendered.length + "개 표시 · 검색어를 더 입력하세요";
+                    + rendered.length + "개 표시 · 아래로 스크롤하면 더 표시";
                 empty.hidden = false;
             } else {
                 empty.hidden = true;
             }
             list.setAttribute("data-rendered-count", String(rendered.length));
+            list.setAttribute(
+                "data-has-more",
+                String(rendered.length < lastOrderedChoices.length)
+            );
             if (popoverIsOpen()) positionPopover();
         }
 
@@ -799,9 +811,23 @@
                 Math.floor(availableWidth / baseWidth)
             );
             var columns = Math.min(idealColumns, maxColumns);
+            var hasMore = list.getAttribute("data-has-more") === "true";
+            if (hasMore) {
+                // Keep at least one row below the viewport so a real scrollbar
+                // exists even on a large monitor. Reaching its end appends the
+                // next configured page instead of hiding unknown choices.
+                var maxColumnsWithOverflow = Math.max(
+                    1,
+                    Math.floor((itemCount - 1) / maxRows)
+                );
+                columns = Math.min(columns, maxColumnsWithOverflow);
+            }
             var rows = Math.max(1, Math.ceil(itemCount / columns));
             var visibleRows = Math.min(rows, maxRows);
-            var needsScroll = rows > maxRows;
+            if (hasMore && rows <= maxRows) {
+                visibleRows = Math.max(4, rows - 1);
+            }
+            var needsScroll = hasMore || rows > maxRows;
             var width = Math.min(baseWidth * columns, availableWidth);
             var panelHeight = Math.min(
                 availableHeight,
@@ -908,6 +934,19 @@
             allChoices = normalizeFastChoices(nextChoices);
             renderOptions(search.value);
         }
+
+        list.addEventListener("scroll", function () {
+            if (list.getAttribute("data-has-more") !== "true") return;
+            if (list.scrollTop + list.clientHeight < list.scrollHeight - 48) return;
+            var previousScrollTop = list.scrollTop;
+            renderedChoiceLimit += fastDropdownVisibleChoiceLimit();
+            renderedChoiceLimit = Math.min(
+                renderedChoiceLimit,
+                lastOrderedChoices.length
+            );
+            renderOptions(search.value, true);
+            list.scrollTop = previousScrollTop;
+        });
 
         wrapper.__sam3FastDropdownSync = syncValue;
         wrapper.__sam3FastDropdownSetChoices = setChoices;
@@ -2612,6 +2651,14 @@
         }
         installFastDropdowns();
         await loadNotebook();
+    }
+
+    // Opt-in test seam only. Production pages never create this object, while
+    // jsdom can exercise the real dropdown DOM/event implementation without
+    // booting the complete Forge txt2img layout.
+    if (window.__sam3NotebookTestHooks
+            && typeof window.__sam3NotebookTestHooks === "object") {
+        window.__sam3NotebookTestHooks.installFastDropdown = installFastDropdown;
     }
 
     if (typeof onUiLoaded === "function") {

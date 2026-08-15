@@ -1,12 +1,13 @@
 # sam-extra (Forge SAM3 Extension)
 
-SAM3 / SAM3.1 마스크 + 인페인트 확장. 다섯 가지 워크플로 제공:
+SAM3 / SAM3.1 마스크 + 인페인트 확장. 여섯 가지 워크플로 제공:
 
 1. **In-flight** — t2i/img2img 생성 직후 자동으로 SAM3 마스킹 → 인페인트 (ADetailer 스타일)
 2. **Refine 패널** (v0.4.0+) — ⚠️ **실험 기능 (아직 제대로 작동하지 않음)** — 갤러리에서 이미지 골라 즉시 SAM3+인페인트+CN으로 재손질, 결과를 갤러리에 누적
 3. **Anima Tile-Repair** (v0.8.0+) — ⚠️ **실험 기능 (아직 제대로 작동하지 않음)** — [kohya-ss/sd-scripts](https://github.com/kohya-ss/sd-scripts)의 Anima ControlNet-LLLite 추론을 가져와 임베드 (Apache-2.0)
 4. **LoRA Manager** (v0.9.0+) — [willmiao/ComfyUI-Lora-Manager](https://github.com/willmiao/ComfyUI-Lora-Manager)를 그대로 가져와 extra-networks 탭에 임베드 (GPL-3.0)
 5. **txt2img Notebook** — 한 Forge 화면에서 이름 붙인 프리셋을 만들고 프롬프트·네거티브·LoRA·XYZ Plot·생성 설정을 원하는 조합으로 즉시 적용
+6. **Anima Character Reference / ReStyler** — 참조 이미지 옆에 생성 영역을 만들고 Anima Edit로 마스킹 인페인트한 뒤 원하는 해상도로 정확히 추출
 
 ControlNet 통합 (LLLite 인페인트 모델 자동 호환 처리), 옷 교체용 Target/Replacement 워크플로, 시드 고정, VRAM 절약 옵션, XYZ plot 다축 등 지원.
 
@@ -19,7 +20,9 @@ Adaptive Guidance · Detail Daemon)를 제공합니다.
 그리고 **Anima VAE 2x** (v0.9.14+, 실험) — spacepxl 2x Wan-VAE 파인튜닝을 디코더로 써서
 speckle↓·skin/hair 정리(`scripts/anima_vae_2x.py`). Qwen/Wan VAE latent 공유로 Anima에도 적용.
 
-> 워크플로 3·4는 외부 프로젝트를 vendored하여 통합한 것입니다. 자세한 출처는 아래 [출처 / 크레딧](#출처--크레딧-credits) 참고.
+> 워크플로 3·4는 외부 프로젝트를 vendored하여 통합한 것입니다. 워크플로 6은 공개
+> ReStyler 워크플로의 동작을 Forge 네이티브 경로로 다시 구현했으며 외부 코드는
+> vendoring하지 않습니다. 자세한 출처는 아래 [출처 / 크레딧](#출처--크레딧-credits) 참고.
 
 ---
 
@@ -348,6 +351,9 @@ Live Workspace의 다중 Gradio 문서·iframe·별도 라우트 대신, 원래 
 - **Gallery**: Forge 기본 갤러리·진행 미리보기와 그 아래 Notebook 표시
 - 네거티브 프롬프트 아래의 Forge 원본 **Generation / Textual Inversion / Checkpoints / Lora**
   탭 바도 함께 복구하므로 Checkpoint·LoRA 카드 브라우저를 계속 사용할 수 있음
+- 커스텀 빠른 드롭다운은 처음에 설정된 개수(기본 60개)를 표시하고, 목록 끝까지 내리면
+  다음 묶음을 자동으로 추가합니다. XYZ의 100개 이상 축 유형도 이름을 몰라도 끝까지
+  스크롤해 고를 수 있으며, 묶음 크기는 `Settings → SAM Extra Appearance`에서 바꿀 수 있습니다.
 
 Notebook을 펼친 뒤 머리의 `＋`를 누르면 `preset1`, `preset2` 순으로 프리셋이 생깁니다.
 프리셋 이름을 클릭하면 편집 영역을 열고 닫으며, `✎`로 이름을 바꾸고 `…`에서 삭제합니다.
@@ -394,6 +400,56 @@ Notebook을 펼친 뒤 머리의 `＋`를 누르면 `preset1`, `preset2` 순으�
 
 ---
 
+## 워크플로 6: Anima Character Reference / ReStyler
+
+> ⚠️ **초기 구현 — 실제 Anima 체크포인트 이미지 A/B 검증 전입니다.** 캔버스·마스크·크롭,
+> UI 매핑과 Forge 옵션 복구는 테스트했지만, 권장 LoRA를 올린 실제 생성 품질은 별도 확인이
+> 필요합니다.
+
+참조 캐릭터와 단색 생성 영역을 하나의 split canvas로 합치고 생성 영역만 마스킹합니다.
+Forge Neo의 `anima_do_reference`를 해당 작업 중에만 켜 standalone img2img를 실행한 뒤,
+생성 패널만 잘라 사용자가 지정한 정확한 크기로 반환합니다. Forge Neo 본체 파일과 저장된
+전역 설정은 변경하지 않습니다.
+
+### 기본 사용
+
+1. 현재 체크포인트로 Anima를 로드합니다.
+2. Feature 6 아코디언에 참조 이미지를 붙여넣거나, T2I Gallery 이미지를 선택한 뒤
+   `선택한 T2I 이미지를 Reference로`를 누릅니다.
+3. `Canvas / Mask 미리보기`로 레퍼런스/빈 영역과 직사각형 마스크를 확인합니다.
+4. Anima Edit V2와 Extend Image LoRA를 설치·선택하고 프롬프트를 입력합니다.
+5. `Generate Character Reference`를 누르면 결과가 원래 T2I Gallery에 추가됩니다.
+
+기본값은 공개 ReStyler v1.2 흐름을 기준으로 `960×1088`, composite `1.4 MP`,
+`(split screen, multiple views:1.2)`, Edit LoRA `0.72`, Extend LoRA `0.4`,
+Steps `30`, CFG `5`, denoise `1.0`입니다. LoRA 파일은 자동 다운로드하지 않으며
+[Anima ReStyler 페이지](https://civitai.com/models/2803070/anima-restyler)의 요구 모델을
+사용자가 설치해야 합니다.
+
+### UI에서 바꿀 수 있는 값
+
+- **Canvas / Mask / Crop**: 결과 width/height, 생성 패널 좌우 위치·폭 배율·색,
+  투명 이미지 matte 색, composite MP, 해상도 배수, resize filter, mask overlap
+- **Prompt / LoRA**: 메인 프롬프트·네거티브 상속, 전용 프롬프트, prefix 텍스트·가중치,
+  extra prefix/suffix, Edit/Extend LoRA 이름·강도·활성화, 누락 LoRA 가드
+- **Model**: 현재/별도 체크포인트, VAE/Text Encoder 모듈 override와 새로고침
+- **Sampling**: Steps, CFG, Shift, sampler, scheduler, denoise, masked content,
+  mask blur/round/invert/conditioning weight, 초기 noise multiplier
+- **Sampler advanced**: Eta, `s_min_uncond`, `s_churn`, `s_tmin`, `s_tmax`, `s_noise`
+- **Seed / Output**: seed, 후보별 seed 증가량, 후보 수, face restoration,
+  native reference A/B 토글, target/generated/input/mask 저장, Gallery 표시·삽입 방식
+
+두 값은 사용자 튜닝값이 아니라 엔진 안전 불변조건이라 고정됩니다.
+
+- **batch size = 1**: Anima reference latent가 프로세스 전역 상태이므로 후보를 순차 실행
+- **Inpaint area = whole picture**: `Only masked` 전처리는 참조 패널 자체를 잘라내므로 금지
+
+생성 버튼은 Feature 6 전용 clean runner를 사용합니다. 따라서 다른 selectable/always-on
+Script의 오래된 UI 상태나 ImageStitch reference가 섞이지 않으며, LoRA는 내부 prompt의
+Forge 표준 `<lora:...>` 처리로 적용됩니다.
+
+---
+
 ## 별도 기능: Anima Guidance Suite
 
 SAM3 처리와 분리된 opt-in 기능 모음입니다. Forge Neo 코어 파일은 수정하지 않으며, lightweight
@@ -418,6 +474,7 @@ SAM3 처리와 분리된 opt-in 기능 모음입니다. Forge Neo 코어 파일�
 | **APG** | post-CFG guidance를 cond 평행/직교 성분으로 투영 | 중립값 단위 검증. **CFG>1 권장**, reference와 픽셀 동일하지 않음 |
 | **CWM / SMC** | Haar 대역별 CFG 배율 / step 간 unit-L2 switching control | 수학·중립값 검증, 실제 CWM 실행 확인 |
 | **DCW** | live x_t와 x0의 wavelet 차이를 post-CFG 마지막에 보정 | 4D/5D·홀수 해상도·중립값 검증, 실제 실행 확인 |
+| **RDC** | DCW Haar 대역의 step 간 EMA drift를 보정 | tau=0 비트 동일·상태/해상도 재초기화 단위 검증, 이미지 A/B 필요 |
 | **DAVE** | Anima block 출력의 token/spatial DC 성분 감쇠 | 실제 block hit 확인, 다양성/권장 block은 추가 A/B 필요 |
 | **CNS-inspired** | 기존 seeded/Brownian noise를 live x_t 에너지로 재색칠 | Euler a noise call 확인. deterministic sampler에서는 inert |
 | **Anima Modulation Guidance** | 보조 CLIP-L 방향을 공개 어댑터로 block AdaLN에 가산 | 실제 CLIP/어댑터 로드·투영·주입 검증. 이미지 품질 A/B는 추가 필요 |
@@ -435,9 +492,10 @@ Modulation Guidance를 쓰려면 768차원 CLIP-L safetensors를
 
 `ADG/PAG 배치 → CLIP block modulation → DAVE → attention PAG/SEG → Skimmed CFG
 → CFG base(SMC → APG → CWM)
-→ PAG/SEG/SLG delta → DCW → CNS sampler noise`
+→ PAG/SEG/SLG delta → DCW/RDC → CNS sampler noise`
 
-- CFG base의 **SMC·APG·CWM은 독립 토글**입니다. 셋 다 끄면 MaHiRo/custom CFG 결과를
+- CFG base의 **SMC·APG·CWM은 독립 토글**입니다. SMC는 프리셋과 별도의 master
+  체크박스로 값을 유지한 채 A/B할 수 있습니다. 셋 다 끄면 MaHiRo/custom CFG 결과를
   그대로 유지하고, 켜진 것들은 항상 `SMC → APG → CWM` 순서로 적용됩니다.
 - SMC는 ComfyUI-DCW와 같은 `Off / Auto / SD1.5·2 / SDXL / SD3·3.5 / Flux /
   Qwen-Image / Cosmos·Wan / Custom` 프리셋을 제공합니다. `Auto`에서 Forge `Anima`는
@@ -451,6 +509,9 @@ Modulation Guidance를 쓰려면 768차원 CLIP-L safetensors를
 - `Legacy CFG base mode` 아코디언의 라디오와 `Experimental stack`은 구버전 호환용이며
   위 토글과 OR로 합쳐집니다.
 - CWM `alpha high > +0.15`는 Anima 16채널 latent에서 캐릭터 분리를 만들 수 있어 UI 경고가 뜹니다.
+- DCW와 RDC도 각각 별도 토글입니다. RDC는 DCW의 Haar pass를 공유하는 step 간 EMA 보정이며,
+  `tau=0.15`, `alpha LL=0.03`, `alpha HH=0`을 시작값으로 제공합니다. HH는 텍스처가
+  뭉개질 수 있어 기본 0입니다.
 - UI와 XYZ의 **Attn Scale**은 같은 값이며 attention 점수가 아니라
   `scale × (cond − weak)` 보정 배율입니다.
 - PAG/SEG 공통 `Perturbation strength` 기본은 `0.75`, `1.0`이면 전체 perturbation입니다.
@@ -460,13 +521,13 @@ Modulation Guidance를 쓰려면 768차원 CLIP-L safetensors를
 - Modulation Guidance는 메인 Qwen을 교체하지 않고 별도 768차원 CLIP-L을 사용합니다.
   기본 OFF이고 `w=0`에서도 base modulation은 남으므로 진짜 기준 이미지는 토글 OFF입니다.
 - PAG/SEG 자체 A/B는 `Rescale=0`, SLG/APG/ADG off로 원인을 분리하세요.
-- Guidance 본문의 관련 패널은 `DCW → CWM → SMC` 순으로 배치하고 DCW·DAVE·CNS도
+- Guidance 본문의 관련 패널은 `DCW → RDC → CWM → SMC` 순으로 배치하고 DCW·DAVE·CNS도
   펼쳐 표시합니다. 이 화면 순서는 계산 순서(`SMC → APG → CWM`, 이후 DCW)와 구분됩니다.
   APG/Adaptive의 고급값만 접힌 세부 영역으로 둡니다.
 
 확장 목록 아래 **Anima Reference-Latent PoC (debug / 안전)** 패널의
 `Log Guidance verification summary`를 켜면 attention hit/raw delta, CFG `w_eff`/fit,
-DCW eval, DAVE/Modulation block hit, CNS noise call, Adaptive 실제 생략 여부가 출력됩니다.
+DCW/RDC eval, DAVE/Modulation block hit, CNS noise call, Adaptive 실제 생략 여부가 출력됩니다.
 
 - 구현: `scripts/anima_safe_pag.py`, `sam3ext/guidance/`, `scripts/anima_detail_daemon.py`
 - 테스트: `tests/test_anima_attention_patch.py`, `tests/test_anima_safe_pag.py`,
@@ -484,8 +545,9 @@ DCW eval, DAVE/Modulation block hit, CNS noise call, Adaptive 실제 생략 여�
 |---|---|---|---|
 | **LoRA Manager** (워크플로 4) | [willmiao/ComfyUI-Lora-Manager](https://github.com/willmiao/ComfyUI-Lora-Manager) | GPL-3.0 | `lora_manager_vendor/` |
 | **Anima Tile-Repair** (워크플로 3) | [kohya-ss/sd-scripts](https://github.com/kohya-ss/sd-scripts) (`anima_minimal_inference*`) | Apache-2.0 | `anima_vendor/` |
+| **Anima Character Reference / ReStyler** (워크플로 6) | [Anima ReStyler workflow](https://civitai.com/models/2803070/anima-restyler) · [원 아이디어 Reddit 게시물](https://www.reddit.com/r/StableDiffusion/s/0Az0DgoaKj) | 워크플로 페이지 조건 참고 | 동작을 Forge 네이티브 img2img/reference로 재구현 (vendor·코드 복사 없음) |
 | **Anima Safe PAG** (별도 기능) | [iljung1106/comfyui-anima-safe-pag](https://github.com/iljung1106/comfyui-anima-safe-pag) | 원 저장소 라이선스 참고 | 이식 (vendor 아님) |
-| **DCW / CWM / SMC** | [namemechan/ComfyUI-DCW](https://github.com/namemechan/ComfyUI-DCW) | GPL-3.0 | 수식 기반 Forge 재작성 (vendor 아님) |
+| **DCW / RDC / CWM / SMC** | [namemechan/ComfyUI-DCW](https://github.com/namemechan/ComfyUI-DCW) | GPL-3.0 | 수식 기반 Forge 재작성 (vendor 아님) |
 | **DAVE** | [daheekwon/DAVE](https://github.com/daheekwon/DAVE) · [sorryhyun/ComfyUI-Anima-DAVE](https://github.com/sorryhyun/ComfyUI-Anima-DAVE) | MIT | Forge block 재구현 (vendor 아님) |
 | **CNS-inspired Wavelet Noise** | [namemechan/comfyui-cns_sampler_patch](https://github.com/namemechan/comfyui-cns_sampler_patch) | GPL-3.0 | sampler-noise 재작성 (vendor 아님) |
 | **Anima Modulation Guidance** | [Anzhc/Anima-Mod-Guidance-ComfyUI-Node](https://github.com/Anzhc/Anima-Mod-Guidance-ComfyUI-Node) · [quickjkee/modulation-guidance](https://github.com/quickjkee/modulation-guidance) · [yresearch/cosmos-pooled](https://huggingface.co/yresearch/cosmos-pooled) | MIT(코드 선언) / 자산 모델 카드 | Forge block 재작성 (vendor 아님) |

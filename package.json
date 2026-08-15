@@ -3,7 +3,7 @@
   "private": true,
   "description": "Test-only manifest. The extension ships plain scripts that Forge injects directly; nothing here is bundled or published.",
   "scripts": {
-    "test": "node --test \"tests/js/*.test.mjs\""
+    "test": "node --test tests/js/*.test.mjs"
   },
   "devDependencies": {
     "jsdom": "^26.0.0"

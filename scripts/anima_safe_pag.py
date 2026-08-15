@@ -201,6 +201,7 @@ _STATE: dict = {
     "requested_smc": False,
     "requested_cwm": False,
     "requested_dcw": False,
+    "requested_rdc": False,
     "requested_dave": False,
     "requested_cns": False,
     "requested_modulation": False,
@@ -216,6 +217,7 @@ _EXTRA_GENERATION_PARAM_KEYS = (
     "Anima Adaptive Guidance",
     "Anima CFG Orchestrator",
     "Anima DCW",
+    "Anima RDC",
     "Anima DAVE",
     "Anima CNS Wavelet Noise",
     "Anima Modulation Guidance",
@@ -288,9 +290,16 @@ _CFG: dict = {
 
 _DCW: dict = {
     "on": False,
+    "dcw_on": False,
+    "rdc_on": False,
     "lambda_low": 0.10,
     "lambda_high": 0.02,
     "steps": 0,
+    "dcw_steps": 0,
+    "rdc_steps": 0,
+    "rdc_tau": 0.0,
+    "rdc_alpha_ll": 0.03,
+    "rdc_alpha_hh": 0.0,
 }
 
 _DAVE: dict = {
@@ -1625,14 +1634,34 @@ def _post_cfg(args):
                     result,
                     live_input,
                     args.get("sigma"),
-                    float(_DCW["lambda_low"]),
-                    float(_DCW["lambda_high"]),
+                    (
+                        float(_DCW["lambda_low"])
+                        if _DCW["dcw_on"] else 0.0
+                    ),
+                    (
+                        float(_DCW["lambda_high"])
+                        if _DCW["dcw_on"] else 0.0
+                    ),
+                    rdc_tau=(
+                        float(_DCW["rdc_tau"])
+                        if _DCW["rdc_on"] else 0.0
+                    ),
+                    rdc_alpha_ll=float(_DCW["rdc_alpha_ll"]),
+                    rdc_alpha_hh=float(_DCW["rdc_alpha_hh"]),
+                    rdc_state=_RUNTIME.rdc_state,
                 )
                 _DCW["steps"] += 1
+                if _DCW["dcw_on"]:
+                    _DCW["dcw_steps"] += 1
+                if _DCW["rdc_on"]:
+                    _DCW["rdc_steps"] += 1
             except Exception as e:
-                # DCW is the final optional transform. A bad/missing live
+                # DCW/RDC is the final optional transform. A bad/missing live
                 # latent must not discard an already-valid CFG/PAG result.
-                _log(f"DCW fallback (earlier guidance kept): {type(e).__name__}: {e}")
+                _log(
+                    "DCW/RDC fallback (earlier guidance kept): "
+                    f"{type(e).__name__}: {e}"
+                )
 
         return result.to(denoised.dtype)
     except Exception as e:
@@ -1920,6 +1949,24 @@ def _make_pag_xyz_axis() -> None:
             "[Anima SMC] Preset", str,
             partial(_pag_xyz_set, field="smc_preset"),
             choices=lambda: list(SMC_PRESET_NAMES),
+        ),
+        # RDC was introduced upstream after the existing 47-axis compatibility
+        # prefix. Append only: xyz_grid persists the integer axis index.
+        xyz_grid.AxisOption(
+            "[Anima RDC] Enable", str,
+            partial(_pag_xyz_set, field="rdc_enabled"), choices=bool_choices,
+        ),
+        xyz_grid.AxisOption(
+            "[Anima RDC] Tau", float,
+            partial(_pag_xyz_set, field="rdc_tau"),
+        ),
+        xyz_grid.AxisOption(
+            "[Anima RDC] Alpha LL", float,
+            partial(_pag_xyz_set, field="rdc_alpha_ll"),
+        ),
+        xyz_grid.AxisOption(
+            "[Anima RDC] Alpha HH", float,
+            partial(_pag_xyz_set, field="rdc_alpha_hh"),
         ),
     ]
 
@@ -2211,11 +2258,12 @@ class AnimaSafePAG(scripts.Script):
 
             gr.Markdown("---\n### Guidance Orchestrator (CFG / Wavelet / Control)")
             gr.Markdown(
-                "**SMC · APG · CWM은 서로 독립 토글**입니다. 원하는 만큼 함께 켤 수 "
+                "**DCW · RDC · CWM · SMC · APG는 서로 독립 토글**입니다. 원하는 만큼 함께 켤 수 "
                 "있고, 여러 개가 켜지면 항상 **SMC → APG → CWM** 순서로 적용됩니다. "
-                "APG 토글은 위 APG 섹션에 있습니다. 셋 다 끄면 Forge·MaHiRo·다른 CFG "
+                "APG 토글은 위 APG 섹션에 있습니다. CFG 세 기능(SMC·APG·CWM)을 "
+                "모두 끄면 Forge·MaHiRo·다른 CFG "
                 "확장의 결과를 그대로 보존합니다. 아래 패널은 찾기 쉽도록 "
-                "**DCW → CWM → SMC** 순서로 배치했습니다."
+                "**DCW → RDC → CWM → SMC** 순서로 배치했습니다."
             )
 
             gr.Markdown("#### DCW — post-CFG wavelet correction")
@@ -2236,6 +2284,45 @@ class AnimaSafePAG(scripts.Script):
                     minimum=-0.5, maximum=0.5, step=0.005, value=0.02,
                     info="윤곽 링·미세 노이즈가 생기면 0 쪽으로 줄이세요.",
                     elem_id="anima_guidance_dcw_lambda_high",
+                )
+
+            gr.Markdown("#### RDC — band-wise reverse drift compensation")
+            rdc_enabled = gr.Checkbox(
+                label="Enable RDC",
+                value=False,
+                info=(
+                    "여러 스텝에 걸쳐 구도·포즈가 서서히 표류하는 현상을 대역별 "
+                    "EMA로 억제합니다. DCW와 독립적으로 켤 수 있습니다."
+                ),
+                elem_id="anima_guidance_rdc_enable",
+            )
+            rdc_tau = gr.Slider(
+                label="RDC tau (EMA 기억 구간)",
+                minimum=0.0, maximum=0.5, step=0.01, value=0.15,
+                info=(
+                    "0.05~0.10은 빠른 반응, 0.15~0.20은 권장 절충값입니다. "
+                    "구도가 초반 상태에 고착되면 낮추세요."
+                ),
+                elem_id="anima_guidance_rdc_tau",
+            )
+            with gr.Row():
+                rdc_alpha_ll = gr.Slider(
+                    label="RDC alpha LL (구조 drift)",
+                    minimum=0.0, maximum=0.3, step=0.005, value=0.03,
+                    info=(
+                        "권장 시작값 0.02~0.05. 포즈·구도 변화가 지나치게 "
+                        "고정되면 0 쪽으로 낮추세요."
+                    ),
+                    elem_id="anima_guidance_rdc_alpha_ll",
+                )
+                rdc_alpha_hh = gr.Slider(
+                    label="RDC alpha HH (텍스처 drift)",
+                    minimum=0.0, maximum=0.1, step=0.001, value=0.0,
+                    info=(
+                        "기본 0 권장. 텍스처가 흐려지면 0으로 되돌리세요. "
+                        "필요한 경우에도 0.01 이하부터 시작하세요."
+                    ),
+                    elem_id="anima_guidance_rdc_alpha_hh",
                 )
 
             gr.Markdown("#### CWM — CFG wavelet mixing (주파수 대역별 CFG 재가중)")
@@ -2275,10 +2362,19 @@ class AnimaSafePAG(scripts.Script):
             )
 
             gr.Markdown("#### SMC — sliding-mode control (스텝 간 CFG error 안정화)")
+            smc_master_enabled = gr.Checkbox(
+                label="Enable SMC",
+                value=False,
+                info=(
+                    "프리셋 값은 유지한 채 SMC만 즉시 ON/OFF합니다. "
+                    "CWM과 함께 켜면 SMC → CWM 순서로 실행됩니다."
+                ),
+                elem_id="anima_guidance_smc_master_enable",
+            )
             smc_preset = gr.Dropdown(
                 label="SMC preset",
-                choices=list(SMC_PRESET_NAMES),
-                value="Off",
+                choices=list(SMC_PRESET_NAMES[1:]),
+                value="Auto",
                 info=(
                     "Auto는 현재 모델을 감지해 원본 ComfyUI-DCW 값을 적용합니다. "
                     "Anima는 Cosmos / Wan (lambda 6.0, k 0.20)으로 판별됩니다."
@@ -2522,6 +2618,11 @@ class AnimaSafePAG(scripts.Script):
             mod_adapter_mode, mod_adapter_path,
             # Appended after v0.20 to preserve all 56 older argument indexes.
             smc_preset,
+            # Appended after v0.21.2. Keep the complete historical prefix:
+            # current SMC gets an explicit master toggle and RDC gets its own
+            # independent toggle plus all three upstream parameters.
+            smc_master_enabled,
+            rdc_enabled, rdc_tau, rdc_alpha_ll, rdc_alpha_hh,
         ]
 
     def process_before_every_sampling(self, p, *args, **kwargs):
@@ -2541,7 +2642,14 @@ class AnimaSafePAG(scripts.Script):
             fit_error=None, effective_scale=None,
             external_cfg_detected=False, warned=False,
         )
-        _DCW.update(on=False, steps=0)
+        _DCW.update(
+            on=False,
+            dcw_on=False,
+            rdc_on=False,
+            steps=0,
+            dcw_steps=0,
+            rdc_steps=0,
+        )
         _DAVE.update(on=False, targets=set(), steps=0)
         _CNS.update(on=False, warned=False)
         _MOD.update(
@@ -2565,6 +2673,7 @@ class AnimaSafePAG(scripts.Script):
             requested_adg=False, requested_cfg_mode="preserve",
             requested_cfg_stack=False, requested_smc=False,
             requested_cwm=False, requested_dcw=False,
+            requested_rdc=False,
             requested_dave=False, requested_cns=False,
             requested_modulation=False,
             requested_method=None, engine="?",
@@ -2636,7 +2745,7 @@ class AnimaSafePAG(scripts.Script):
         )
         if cfg_mode == "preserve" and apg_enabled:
             cfg_mode = "apg"  # backwards-compatible quick checkbox
-        smc_enabled = (
+        legacy_smc_enabled = (
             _as_bool(xyz["smc_enabled"], _as_bool(_arg(42, False), False))
             if "smc_enabled" in xyz
             else _as_bool(_arg(42, False), False)
@@ -2656,6 +2765,11 @@ class AnimaSafePAG(scripts.Script):
             if "dcw_enabled" in xyz
             else _as_bool(_arg(28, False), False)
         )
+        rdc_enabled = (
+            _as_bool(xyz["rdc_enabled"], _as_bool(_arg(58, False), False))
+            if "rdc_enabled" in xyz
+            else _as_bool(_arg(58, False), False)
+        )
         dave_enabled = (
             _as_bool(xyz["dave_enabled"], _as_bool(_arg(31, False), False))
             if "dave_enabled" in xyz
@@ -2673,14 +2787,28 @@ class AnimaSafePAG(scripts.Script):
         )
         resolved_apg = apg_enabled or cfg_mode == "apg" or experimental_stack
         legacy_smc_requested = (
-            smc_enabled or experimental_stack or cfg_mode in {"smc", "smc+cwm"}
+            legacy_smc_enabled
+            or experimental_stack
+            or cfg_mode in {"smc", "smc+cwm"}
+        )
+        smc_master_is_explicit = "smc_enabled" in xyz or len(args) > 57
+        smc_master_enabled = (
+            _as_bool(xyz["smc_enabled"], False)
+            if "smc_enabled" in xyz
+            else _as_bool(_arg(57, False), False)
+        )
+        # Before the appended master checkbox existed, choosing a non-Off
+        # preset itself enabled SMC. Preserve that contract for short API/
+        # infotext argument lists; new UI calls use the explicit checkbox.
+        resolved_smc = legacy_smc_requested or (
+            smc_master_enabled
+            if smc_master_is_explicit
+            else smc_preset != "Off"
         )
         effective_smc_preset = (
-            smc_preset
-            if smc_preset != "Off"
-            else ("Custom" if legacy_smc_requested else "Off")
+            (smc_preset if smc_preset != "Off" else "Custom")
+            if resolved_smc else "Off"
         )
-        resolved_smc = effective_smc_preset != "Off"
         resolved_cwm = (
             cwm_enabled or experimental_stack or cfg_mode in {"cwm", "smc+cwm"}
         )
@@ -2694,6 +2822,7 @@ class AnimaSafePAG(scripts.Script):
             requested_smc=resolved_smc,
             requested_cwm=resolved_cwm,
             requested_dcw=dcw_enabled,
+            requested_rdc=rdc_enabled,
             requested_dave=dave_enabled,
             requested_cns=cns_enabled,
             requested_modulation=mod_enabled,
@@ -2707,6 +2836,7 @@ class AnimaSafePAG(scripts.Script):
             resolved_smc,
             resolved_cwm,
             dcw_enabled,
+            rdc_enabled,
             dave_enabled,
             cns_enabled,
             mod_enabled,
@@ -2769,6 +2899,13 @@ class AnimaSafePAG(scripts.Script):
             )
             dcw_lambda_high = _xyz_num(
                 "dcw_lambda_high", float(_arg(30, 0.02))
+            )
+            rdc_tau = _xyz_num("rdc_tau", float(_arg(59, 0.15)))
+            rdc_alpha_ll = _xyz_num(
+                "rdc_alpha_ll", float(_arg(60, 0.03))
+            )
+            rdc_alpha_hh = _xyz_num(
+                "rdc_alpha_hh", float(_arg(61, 0.0))
             )
             dave_strength = _xyz_num(
                 "dave_strength", float(_arg(32, 0.30))
@@ -2854,6 +2991,9 @@ class AnimaSafePAG(scripts.Script):
         smc_k = _finite_clamp(smc_k, 0.0, 5.0, 0.20)
         dcw_lambda_low = _finite_clamp(dcw_lambda_low, -0.5, 0.5, 0.10)
         dcw_lambda_high = _finite_clamp(dcw_lambda_high, -0.5, 0.5, 0.02)
+        rdc_tau = _finite_clamp(rdc_tau, 0.0, 0.5, 0.15)
+        rdc_alpha_ll = _finite_clamp(rdc_alpha_ll, 0.0, 0.3, 0.03)
+        rdc_alpha_hh = _finite_clamp(rdc_alpha_hh, 0.0, 0.1, 0.0)
         dave_strength = _finite_clamp(dave_strength, 0.0, 1.0, 0.30)
         dave_tau = _finite_clamp(dave_tau, 0.0, 1.0, 0.10)
         cns_strength = _finite_clamp(cns_strength, 0.0, 1.0, 1.0)
@@ -2891,9 +3031,14 @@ class AnimaSafePAG(scripts.Script):
             smc_k=smc_k,
         )
         _DCW.update(
-            on=dcw_enabled,
+            on=dcw_enabled or rdc_enabled,
+            dcw_on=dcw_enabled,
+            rdc_on=rdc_enabled,
             lambda_low=dcw_lambda_low,
             lambda_high=dcw_lambda_high,
+            rdc_tau=rdc_tau,
+            rdc_alpha_ll=rdc_alpha_ll,
+            rdc_alpha_hh=rdc_alpha_hh,
         )
         _CNS.update(
             on=cns_enabled,
@@ -2927,12 +3072,16 @@ class AnimaSafePAG(scripts.Script):
             custom_k=smc_k,
         )
         smc_preset_label = (
-            "Legacy Custom"
-            if smc_preset == "Off" and legacy_smc_requested
+            "Off"
+            if not resolved_smc
             else (
-                f"Auto→{smc_resolved_preset}"
-                if smc_preset == "Auto"
-                else smc_resolved_preset
+                "Legacy Custom"
+                if smc_preset == "Off" and legacy_smc_requested
+                else (
+                    f"Auto→{smc_resolved_preset}"
+                    if smc_preset == "Auto"
+                    else smc_resolved_preset
+                )
             )
         )
         _CFG.update(
@@ -2941,7 +3090,7 @@ class AnimaSafePAG(scripts.Script):
             smc_lambda=smc_lambda,
             smc_k=smc_k,
         )
-        if smc_preset == "Auto":
+        if resolved_smc and smc_preset == "Auto":
             _log(
                 f"SMC Auto detected {smc_resolved_preset}: "
                 f"lambda={smc_lambda:g}, k={smc_k:g}"
@@ -3236,10 +3385,15 @@ class AnimaSafePAG(scripts.Script):
                         if smc_on else ""
                     )
                 )
-            if _DCW["on"]:
+            if _DCW["dcw_on"]:
                 p.extra_generation_params["Anima DCW"] = (
                     f"lambda_low={dcw_lambda_low}, "
                     f"lambda_high={dcw_lambda_high}"
+                )
+            if _DCW["rdc_on"]:
+                p.extra_generation_params["Anima RDC"] = (
+                    f"tau={rdc_tau}, alpha_ll={rdc_alpha_ll}, "
+                    f"alpha_hh={rdc_alpha_hh}"
                 )
             if _DAVE["on"]:
                 p.extra_generation_params["Anima DAVE"] = (
@@ -3282,7 +3436,8 @@ class AnimaSafePAG(scripts.Script):
                 f"CFGBase={_CFG['mode']} stack={_CFG['experimental_stack']} "
                 f"SMC={smc_preset_label}"
                 f"({smc_lambda:g},{smc_k:g}) "
-                f"DCW={_DCW['on']} DAVE={_DAVE['on']} CNS={_CNS['on']} "
+                f"DCW={_DCW['dcw_on']} RDC={_DCW['rdc_on']} "
+                f"DAVE={_DAVE['on']} CNS={_CNS['on']} "
                 f"Mod={'on' if _MOD['on'] else 'off'}"
                 + (
                     f"(w={_MOD['weight']:g}, "
@@ -3296,7 +3451,7 @@ class AnimaSafePAG(scripts.Script):
             _ADG["on"] = False
             _CFG["mode"] = "preserve"
             _CFG["experimental_stack"] = False
-            _DCW["on"] = False
+            _DCW.update(on=False, dcw_on=False, rdc_on=False)
             _DAVE["on"] = False
             _CNS["on"] = False
             _MOD.update(
@@ -3428,8 +3583,16 @@ class AnimaSafePAG(scripts.Script):
                 "OFF"
                 if not _STATE["requested_dcw"]
                 else (
-                    f"APPLIED({_DCW['steps']} evals)"
-                    if _DCW["steps"] > 0 else "NO-OP"
+                    f"APPLIED({_DCW['dcw_steps']} evals)"
+                    if _DCW["dcw_steps"] > 0 else "NO-OP"
+                )
+            )
+            rdc_verdict = (
+                "OFF"
+                if not _STATE["requested_rdc"]
+                else (
+                    f"APPLIED({_DCW['rdc_steps']} evals)"
+                    if _DCW["rdc_steps"] > 0 else "NO-OP"
                 )
             )
             dave_verdict = (
@@ -3462,7 +3625,8 @@ class AnimaSafePAG(scripts.Script):
                 f"attention={attention_verdict}, "
                 f"CFG={requested_mode}:{cfg_verdict} "
                 f"(w_eff={scale_text}, fit={fit_text}), "
-                f"DCW={dcw_verdict}, DAVE={dave_verdict}, CNS={cns_verdict}, "
+                f"DCW={dcw_verdict}, RDC={rdc_verdict}, "
+                f"DAVE={dave_verdict}, CNS={cns_verdict}, "
                 f"Modulation={modulation_verdict}"
             )
         _STATE["on"] = False
@@ -3482,7 +3646,14 @@ class AnimaSafePAG(scripts.Script):
             external_cfg_detected=False,
             warned=False,
         )
-        _DCW.update(on=False, steps=0)
+        _DCW.update(
+            on=False,
+            dcw_on=False,
+            rdc_on=False,
+            steps=0,
+            dcw_steps=0,
+            rdc_steps=0,
+        )
         _DAVE.update(on=False, targets=set(), steps=0)
         _CNS.update(on=False, warned=False)
         _MOD.update(

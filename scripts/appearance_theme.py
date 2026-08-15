@@ -46,13 +46,13 @@ def on_ui_settings() -> None:
         OPT_FAST_DROPDOWN_VISIBLE_CHOICES,
         shared.OptionInfo(
             DEFAULT_FAST_DROPDOWN_VISIBLE_CHOICES,
-            "빠른 드롭다운 최대 표시 항목 수",
+            "빠른 드롭다운 한 번에 표시할 항목 수",
             gr.Slider,
             {"minimum": 10, "maximum": 200, "step": 5},
             section=section,
         ).info(
-            "목록이 이 값 이하면 전부 펼쳐 표시합니다. "
-            "더 긴 목록은 여기까지 표시하고 검색으로 나머지를 찾습니다."
+            "처음 열 때와 목록 끝까지 스크롤할 때마다 이 개수씩 표시합니다. "
+            "검색어를 몰라도 아래로 내려 전체 항목에 접근할 수 있습니다."
         ),
     )
 

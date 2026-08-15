@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import math
+
 import torch
 
 from .haar import (
@@ -30,9 +32,26 @@ def apply_dcw(
     sigma,
     lambda_low: float,
     lambda_high: float,
+    *,
+    rdc_tau: float = 0.0,
+    rdc_alpha_ll: float = 0.03,
+    rdc_alpha_hh: float = 0.0,
+    rdc_state: dict | None = None,
 ) -> torch.Tensor:
-    """Correct x0 bands toward the live latent, with an identity zero path."""
-    if lambda_low == 0.0 and lambda_high == 0.0:
+    """Apply instantaneous DCW and optional cross-step RDC in one Haar pass.
+
+    ``rdc_state`` belongs to one generation/pass.  The first step seeds a
+    per-band EMA; later steps pull each corrected band back toward that EMA.
+    A zero ``rdc_tau`` is an exact no-op and retains DCW's historical identity
+    fast path.
+    """
+    tau = float(rdc_tau)
+    alpha_ll = float(rdc_alpha_ll)
+    alpha_hh = float(rdc_alpha_hh)
+    if tau < 0.0 or alpha_ll < 0.0 or alpha_hh < 0.0:
+        raise ValueError("RDC tau and alpha values must be non-negative")
+    rdc_active = tau > 0.0 and rdc_state is not None
+    if lambda_low == 0.0 and lambda_high == 0.0 and not rdc_active:
         return denoised
     if denoised.shape != x_t.shape or denoised.ndim not in (4, 5):
         raise ValueError(
@@ -54,10 +73,47 @@ def apply_dcw(
     clean_bands = haar_dwt2d(clean_pad)
     live_bands = haar_dwt2d(live_pad)
     gains = (low_gain, middle_gain, middle_gain, high_gain)
-    corrected = tuple(
+    corrected = list(
         clean_band
         + gain * _channel_energy_weight(live_band) * (live_band - clean_band)
         for clean_band, live_band, gain in zip(clean_bands, live_bands, gains)
     )
+
+    if rdc_active:
+        schedule_value = (
+            float(schedule.float().mean().item())
+            if torch.is_tensor(schedule)
+            else float(schedule)
+        )
+        previous_schedule = float(rdc_state.get("_s_prev", schedule_value))
+        delta_schedule = abs(previous_schedule - schedule_value)
+        beta = 1.0 - math.exp(-delta_schedule / max(tau, 1e-6))
+        rdc_state["_s_prev"] = schedule_value
+
+        middle_alpha = (alpha_ll + alpha_hh) * 0.5
+        band_names = ("LL", "LH", "HL", "HH")
+        alphas = (alpha_ll, middle_alpha, middle_alpha, alpha_hh)
+        for index, (name, band, alpha) in enumerate(
+            zip(band_names, corrected, alphas)
+        ):
+            if alpha == 0.0:
+                continue
+            detached = band.detach()
+            previous_ema = rdc_state.get(name)
+            if (
+                not torch.is_tensor(previous_ema)
+                or previous_ema.shape != detached.shape
+                or previous_ema.device != detached.device
+            ):
+                rdc_state[name] = detached.to(dtype=compute_dtype).clone()
+                continue
+            previous_ema = previous_ema.to(
+                device=detached.device,
+                dtype=compute_dtype,
+            )
+            new_ema = (1.0 - beta) * previous_ema + beta * detached
+            rdc_state[name] = new_ema.detach().clone()
+            corrected[index] = band - alpha * (band - new_ema)
+
     result = haar_idwt2d(*corrected)[..., :height, :width]
     return result.to(dtype=original_dtype)

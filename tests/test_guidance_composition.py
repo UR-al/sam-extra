@@ -122,7 +122,16 @@ class GuidanceCompositionTests(unittest.TestCase):
             external_cfg_detected=False, steps=0,
             smc_on=smc, apg_on=False, cwm_on=cwm,
         )
-        p._DCW.update(on=dcw, lambda_low=0.10, lambda_high=0.02, steps=0)
+        p._DCW.update(
+            on=dcw,
+            dcw_on=dcw,
+            rdc_on=False,
+            lambda_low=0.10,
+            lambda_high=0.02,
+            steps=0,
+            dcw_steps=0,
+            rdc_steps=0,
+        )
         p._STATE.update(
             on=pert, adg_skipped=False, attn_scale=3.0, slg_scale=3.0,
             slg_raw=None, rescale=0.0, apg_autooff_rescale=True,

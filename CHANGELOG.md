@@ -3,6 +3,40 @@
 버전 태그는 GitHub Releases에도 발행됩니다. 아래는 요약이며, guidance/속도 기능의
 상세는 [docs/GUIDANCE.md](docs/GUIDANCE.md)를 참고하세요.
 
+## Unreleased
+
+- **DCW / CWM / SMC 명시적 ON/OFF**: Guidance 본문에 세 기능의 독립 체크박스를
+  모두 노출했습니다. SMC는 선택한 `Auto`/모델별/`Custom` 프리셋 값을 유지한 채 master
+  체크박스로 즉시 A/B할 수 있습니다. 기존 script argument와 XYZ 축 정수 인덱스는 그대로
+  두고 새 입력을 맨 뒤에 append했습니다.
+- **RDC 이식**: 최신
+  [namemechan/ComfyUI-DCW](https://github.com/namemechan/ComfyUI-DCW)의 band-wise
+  reverse drift compensation을 Forge post-CFG 경로에 재작성했습니다. DCW와 Haar 변환을
+  공유하지만 별도 토글로 단독 사용 가능하며 `tau`, `alpha LL`, `alpha HH`를 UI/XYZ/infotext에
+  모두 노출합니다. generation마다 EMA가 초기화되고 해상도 변경 시 안전하게 다시 seed됩니다.
+- **긴 빠른 드롭다운 전체 탐색**: 설정값(기본 60개)은 더 이상 전체 상한이 아니라 한 번에
+  추가하는 page 크기입니다. 목록 끝까지 스크롤하면 다음 묶음을 자동 렌더해, XYZ 축처럼
+  163개 이상인 목록도 이름을 몰라 검색하지 못하는 항목 없이 끝까지 볼 수 있습니다.
+
+### Feature 6 Anima Character Reference 초기 구현
+
+- **Character Reference / ReStyler 패널**: 참조 이미지와 사용자 지정 단색 영역을
+  split canvas로 합성하고 직사각형 마스크로 Anima Edit img2img를 실행한 뒤, 생성
+  영역만 정확한 target width/height로 추출해 원래 T2I Gallery에 삽입합니다.
+- **Forge 네이티브 경로**: Forge Neo의 `anima_do_reference`를 생성 중에만 임시
+  활성화하고 `finally`에서 reference latent와 옵션을 복구합니다. Forge 본체 파일이나
+  저장된 설정은 변경하지 않습니다. batch 1 순차 실행과 whole-picture inpaint는
+  reference 패널 보존을 위한 불변조건입니다.
+- **모든 워크플로우 값 UI화**: 캔버스/마스크/크롭, 프롬프트 prefix, Edit/Extend LoRA,
+  checkpoint·VAE/TE, Steps/CFG/Shift/sampler/scheduler, denoise/mask/noise, Eta와
+  sigma 고급값, seed 후보군, 저장·Gallery 삽입 방식을 각각 편집할 수 있습니다.
+- **안전장치**: 실제 설치된 LoRA 이름/alias를 검사하는 선택형 가드, 생성 전 캔버스·마스크
+  미리보기, non-Anima 모델 차단, checkpoint override 결과 엔진 재검사, 생성 결과가 없어도
+  명확한 상태 메시지, clean runner로 다른 Script/ImageStitch 상태 격리.
+- **검증**: Python 전체 166개 통과(신규 geometry/request/UI/Gallery 테스트 포함),
+  jsdom 6개 통과, Python byte-compile 및 `git diff --check` 통과. 실제 Anima
+  체크포인트+권장 LoRA의 GPU 이미지 A/B는 아직 실행하지 않았습니다.
+
 ## v0.21.2 — 레거시 콘솔 인코딩에서 로그가 생성을 죽이던 문제 + CI 연결
 
 - **로그 한 줄이 샘플링을 중단시킬 수 있던 문제 수정**: `_log`가 em-dash나 `✅` 같은

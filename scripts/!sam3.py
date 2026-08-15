@@ -30,6 +30,14 @@ from sam3ext.inpaint_core import apply_prompt_sr, copy_prompt, run_inpaint_passe
 from sam3ext.notebook_store import register_notebook_routes
 from sam3ext.ui import WebuiButtons, sam3_ui
 from sam3ext.ui_anima import AnimaPanel, build_anima_panel, handle_anima_click
+from sam3ext.ui_anima_reference import (
+    AnimaReferencePanel,
+    build_anima_reference_panel,
+    handle_anima_reference_click,
+    load_selected_reference,
+    preview_reference_layout,
+    refresh_reference_model_choices,
+)
 from sam3ext.ui_refine import RefinePanel, _pull_seed_from_gallery_item, build_refine_panel, handle_refine_click
 try:
     from sam3ext.sampler_load_guard import (
@@ -266,6 +274,7 @@ class Sam3MaskScript(scripts.Script):
         # panel into the throwaway and leave anima_panel holding components that
         # belong to no live Blocks — permanently dead for the process.
         global anima_panel, anima_build_attempted
+        global anima_reference_panel, anima_reference_build_attempted
         if not is_img2img and not anima_build_attempted and anima_available():
             anima_build_attempted = True
             try:
@@ -282,6 +291,25 @@ class Sam3MaskScript(scripts.Script):
                 "skipped. Re-run install.py to clone kohya-ss/sd-scripts.",
                 file=sys.stderr,
             )
+
+        # Feature 6 uses Forge Neo's native Anima reference/img2img path and
+        # therefore does not depend on the optional anima_vendor checkout.
+        # Like the Tile-Repair panel, it is a sibling accordion whose widgets
+        # are wired separately and do not enter this always-on script's args.
+        if not is_img2img and not anima_reference_build_attempted:
+            anima_reference_build_attempted = True
+            try:
+                anima_reference_panel = build_anima_reference_panel(
+                    [s.name for s in _all_samplers],
+                    [s.label for s in _all_schedulers],
+                )
+            except Exception:
+                error = traceback.format_exc()
+                print(
+                    "[-] SAM3: failed to render Feature 6 Anima Reference "
+                    f"panel:\n{error}",
+                    file=sys.stderr,
+                )
 
         self.infotext_fields = [(components[0], "SAM3 Enable"), *infotext_fields]
         return components
@@ -485,14 +513,17 @@ txt2img_html_info_component = None
 txt2img_generation_info_component = None
 refine_panel: RefinePanel | None = None
 anima_panel: AnimaPanel | None = None
+anima_reference_panel: AnimaReferencePanel | None = None
 # Set True the first time Sam3MaskScript.ui() tries to build the Anima panel,
 # whether or not it succeeded, so the API's throwaway-Blocks ui() pass can't retry.
 anima_build_attempted: bool = False
+anima_reference_build_attempted: bool = False
 # Set True the first time on_after_component wires the Anima panel's click
 # chain. Distinct from `anima_panel is None` because the panel is created
 # in Sam3MaskScript.ui() (alwayson script ui callback) but wiring needs the
 # gallery component captured later via on_after_component.
 anima_wired: bool = False
+anima_reference_wired: bool = False
 
 
 # JS shim: replace the placeholder selected_index slot (index 1 in the inputs
@@ -740,6 +771,106 @@ def _wire_anima_panel(
     )
 
 
+def _wire_anima_reference_panel(
+    panel: AnimaReferencePanel,
+    gallery,
+    main_prompt,
+    main_neg_prompt,
+    html_info,
+    generation_info,
+):
+    """Wire Feature 6 without adding its controls to main Generate."""
+
+    panel.load_selected_button.click(
+        fn=load_selected_reference,
+        _js=_SELECTED_INDEX_JS,
+        inputs=[gallery, panel.selected_index_state],
+        outputs=[panel.reference_image],
+        queue=False,
+        show_progress=False,
+    )
+
+    panel.preview_button.click(
+        fn=preview_reference_layout,
+        inputs=panel.geometry_widgets(),
+        outputs=[panel.preview_canvas, panel.preview_mask, panel.status],
+        queue=False,
+        show_progress=False,
+    )
+
+    panel.refresh_models_button.click(
+        fn=refresh_reference_model_choices,
+        inputs=[],
+        outputs=[
+            panel.edit_lora_name,
+            panel.extend_lora_name,
+            panel.checkpoint_override,
+            panel.additional_modules,
+        ],
+        queue=False,
+        show_progress=False,
+    )
+
+    show_stop = panel.generate_button.click(
+        fn=lambda: (gr.update(visible=False), gr.update(visible=True)),
+        inputs=[],
+        outputs=[panel.generate_button, panel.stop_button],
+        queue=False,
+    )
+    run = show_stop.then(
+        fn=handle_anima_reference_click,
+        _js=_SELECTED_INDEX_JS,
+        inputs=[
+            gallery,
+            panel.selected_index_state,
+            *panel.all_widgets(),
+            main_prompt,
+            main_neg_prompt,
+            generation_info,
+        ],
+        outputs=[
+            gallery,
+            panel.status,
+            html_info,
+            generation_info,
+            panel.preview_canvas,
+            panel.preview_mask,
+        ],
+    )
+    run.then(
+        fn=lambda: (gr.update(visible=True), gr.update(visible=False)),
+        inputs=[],
+        outputs=[panel.generate_button, panel.stop_button],
+        queue=False,
+    )
+
+    def _stop_reference():
+        from modules import shared as _shared
+
+        _shared.state.interrupted = True
+        _shared.state.skipped = True
+
+    panel.stop_button.click(
+        fn=_stop_reference,
+        inputs=[],
+        outputs=[],
+        queue=False,
+    )
+    panel.seed_random_button.click(
+        fn=lambda: -1,
+        inputs=[],
+        outputs=[panel.seed],
+        queue=False,
+    )
+    panel.seed_pull_button.click(
+        fn=_pull_seed_from_gallery_item,
+        _js=_SELECTED_INDEX_JS,
+        inputs=[gallery, panel.selected_index_state, generation_info],
+        outputs=[panel.seed],
+        queue=False,
+    )
+
+
 def on_after_component(component, **kwargs):
     global txt2img_submit_button, img2img_submit_button
     global txt2img_gallery_component, txt2img_prompt_component, txt2img_neg_prompt_component
@@ -837,6 +968,29 @@ def on_after_component(component, **kwargs):
                 error = traceback.format_exc()
                 print(
                     f"[-] SAM3: failed to wire Anima panel:\n{error}",
+                    file=sys.stderr,
+                )
+
+        global anima_reference_wired
+        if (
+            anima_reference_panel is not None
+            and not anima_reference_wired
+        ):
+            try:
+                _wire_anima_reference_panel(
+                    anima_reference_panel,
+                    txt2img_gallery_component,
+                    txt2img_prompt_component,
+                    txt2img_neg_prompt_component,
+                    txt2img_html_info_component,
+                    txt2img_generation_info_component,
+                )
+                anima_reference_wired = True
+            except Exception:
+                error = traceback.format_exc()
+                print(
+                    "[-] SAM3: failed to wire Feature 6 Anima Reference "
+                    f"panel:\n{error}",
                     file=sys.stderr,
                 )
 

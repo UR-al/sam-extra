@@ -20,7 +20,7 @@ SAM3 처리 모듈은 초기화하지 않고 `sam3ext.guidance`의 경량 수학
 | 파일 | 역할 |
 |---|---|
 | `scripts/anima_safe_pag.py` | 단일 오케스트레이터, UI, Forge hook, XYZ 축 |
-| `sam3ext/guidance/runtime.py` | generation/pass 단위 APG·SMC·CNS 상태 정리 |
+| `sam3ext/guidance/runtime.py` | generation/pass 단위 APG·SMC·RDC·CNS 상태 정리 |
 | `sam3ext/guidance/haar.py` | 4D/5D·홀수 크기 공용 Haar DWT/IDWT |
 | `sam3ext/guidance/cwm_smc.py` | CWM·SMC CFG base |
 | `scripts/anima_skimmed_cfg.py` | Skimmed CFG anti-burn (독립 스크립트·아코디언) |
@@ -44,7 +44,7 @@ shared.state.sampling_step / sampling_steps
       2. ADG skip이면 APG/SMC state reset 후 incoming 유지
       3. CFG base 토글(SMC → APG → CWM, 켜진 것만)
       4. PAG/SEG/SLG delta 가산
-      5. DCW
+      5. DCW / RDC
   → ancestral/SDE noise sampler: CNS 재색칠
 ```
 
@@ -154,7 +154,8 @@ MaHiRo/RescaleCFG/custom CFG를 쓰는 경우 먼저 전부 끈 상태로 비교
 |---|---:|---|
 | CWM alpha low | 0.30 | 초반 LL 대역 CFG 변화 |
 | CWM alpha high | 0.15 | 후반 HH 대역 CFG 변화 |
-| SMC preset | `Off` | `Auto`는 모델군을 감지해 upstream 값을 선택 |
+| Enable SMC | off | 프리셋 값을 유지한 채 SMC master ON/OFF |
+| SMC preset | `Auto` | master가 켜졌을 때 모델군을 감지해 upstream 값을 선택 |
 | Custom lambda | 6.0 | `Custom`에서만 사용, UI 범위 0.5–30.0 |
 | Custom k | 0.10 | `Custom`에서만 사용, UI 범위 0–5.0 |
 
@@ -172,7 +173,8 @@ SMC 프리셋과 Auto 감지는
 | Cosmos / Wan | 6.0 | 0.20 |
 
 Forge의 `Anima` 엔진은 Auto에서 `Cosmos / Wan`으로 판별됩니다. 감지하지 못한 모델은
-upstream처럼 `SD1.5 / SD2`로 되돌아갑니다. 구버전의 `Enable SMC` 체크박스와
+upstream처럼 `SD1.5 / SD2`로 되돌아갑니다. 현재 master가 off이면 선택한 preset은
+유지되지만 계산에는 들어가지 않습니다. 구버전의 `Enable SMC` 체크박스와
 `[Anima SMC] Enable` XYZ는 호환용으로 유지되며, preset이 `Off`인 상태에서 이를 켜면
 Custom lambda/k가 적용됩니다. 새 XYZ에는 `[Anima SMC] Preset`도 있습니다.
 
@@ -181,10 +183,10 @@ UI는 동적 경고만 표시하며 값을 강제로 자르지 않습니다.
 SMC/CWM 입력의 NaN·양/음의 Inf는 reference 구현처럼 0으로 정리해 비정상 값이 latent 전체로
 증폭되지 않게 합니다.
 
-화면 패널은 찾기 쉽도록 `DCW → CWM → SMC` 순서입니다. 이는 수학적 실행 순서를
-바꾸는 설정이 아니며 실제 처리는 원본 정의대로 `SMC → APG → CWM`, 그 뒤 DCW입니다.
+화면 패널은 찾기 쉽도록 `DCW → RDC → CWM → SMC` 순서입니다. 이는 수학적 실행 순서를
+바꾸는 설정이 아니며 실제 처리는 원본 정의대로 `SMC → APG → CWM`, 그 뒤 DCW/RDC입니다.
 
-## 3. DCW
+## 3. DCW / RDC
 
 CFG·perturbation 뒤 마지막에 live `x_t`와 denoised 예측의 Haar 대역 차이를 보정합니다.
 
@@ -195,6 +197,26 @@ band_out = band_x0 + lambda_band(sigma) × channel_weight × (band_xt − band_x
 기본은 off, `lambda low=0.10`, `lambda high=0.02`입니다. 둘 다 0이면 bitwise identity
 fast-path입니다. 4D/5D latent와 홀수 H/W를 지원하며 dtype을 보존합니다. Anima flow sigma는
 `sigma/(sigma+1)` 최대치가 낮으므로 다른 EDM 예제와 수치 체감이 다를 수 있습니다.
+
+RDC는 같은 Haar 분해 결과의 각 대역에 generation-local EMA를 유지해 여러 step에 걸친
+구도·포즈 drift를 되돌립니다. 이 확장에서는 upstream의 `tau=0` 비활성 계약에 더해 명시적
+`Enable RDC`를 제공하므로, 슬라이더 값을 유지한 채 A/B할 수 있고 DCW 순간 보정을 끈 채
+RDC만 켤 수도 있습니다.
+
+```text
+beta = 1 - exp(-abs(sigma_norm_prev - sigma_norm_now) / tau)
+ema_new = (1 - beta) * ema_prev + beta * band_now
+band_out = band_now - alpha * (band_now - ema_new)
+```
+
+| 필드 | UI 시작값 | 주의 |
+|---|---:|---|
+| RDC tau | 0.15 | 0이면 수학적으로 no-op. 작을수록 짧은 기억, 클수록 초기 구도 고착 가능 |
+| RDC alpha LL | 0.03 | 권장 시작 0.02–0.05. 포즈·구조가 굳으면 낮춤 |
+| RDC alpha HH | 0.0 | 기본 0 권장. 필요해도 0.01 이하부터, 높으면 텍스처 흐림 |
+
+첫 스텝과 해상도/device가 바뀐 첫 스텝은 EMA 기준만 seed하고 보정하지 않습니다. 새 sampling
+pass가 시작될 때 상태를 비워 hires pass나 다음 생성으로 누출하지 않습니다.
 
 ## 4. DAVE
 
@@ -304,7 +326,7 @@ Euler a, ancestral, SDE처럼 sampler가 원본 noise sampler를 호출할 때�
 - `[Anima APG]`, `[Anima AdaptiveG]`
 - `[Anima CFG]`: Base Mode, Experimental Stack
 - `[Anima CWM]`, `[Anima SMC]`
-- `[Anima DCW]`, `[Anima DAVE]`, `[Anima CNS]`
+- `[Anima DCW]`, `[Anima RDC]`, `[Anima DAVE]`, `[Anima CNS]`
 - `[Anima Mod]`: Enable, Direction Weight, Start/End Block
 - `[Detail Daemon]`
 
@@ -320,6 +342,7 @@ Anima APG
 Anima Adaptive Guidance
 Anima CFG Orchestrator
 Anima DCW
+Anima RDC
 Anima DAVE
 Anima CNS Wavelet Noise
 Anima Modulation Guidance
@@ -333,7 +356,7 @@ Anima Modulation Guidance
 [AnimaSafePAG] attention perturb active ✅ hits=... relative_raw_delta=...
 [AnimaSafePAG] [VERIFY] verdict: perturb=..., APG=..., Adaptive=...
 [AnimaSafePAG] [VERIFY] suite: attention=..., CFG=... (w_eff=..., fit=...),
-                               DCW=..., DAVE=..., CNS=..., Modulation=...
+                               DCW=..., RDC=..., DAVE=..., CNS=..., Modulation=...
 ```
 
 2026-07-23 실제 최소 검증(256×256, 3 steps):
@@ -353,7 +376,8 @@ python -m unittest discover -s tests -v
 ```
 
 검증 범위는 attention staticmethod binding/weak-row 한정 변경, official SEG 실제 H/W,
-Haar 4D/5D·홀수 크기 round-trip, CWM/SMC/DCW/DAVE 중립값, APG 표준 CFG 환원,
+Haar 4D/5D·홀수 크기 round-trip, CWM/SMC/DCW/DAVE 중립값, RDC tau=0 identity와
+step/해상도 state reset, APG 표준 CFG 환원,
 SMC/CWM 비정상 수치 정리, ADG state flush, CNS 결정성·RNG 비소비·표준편차 보존,
 Skimmed callback 실제 prepend 순서와 PAG scale 반응, CLIP adapter 수식·Forge Anima
 shape 추론·block AdaLN 무변이 주입, pass 종료 tensor 해제와 Notebook 자산
@@ -367,7 +391,7 @@ shape 추론·block AdaLN 무변이 주입, pass 종료 tensor 해제와 Noteboo
 | SEG | [SusungHong/SEG-SDXL](https://github.com/SusungHong/SEG-SDXL), [SEG 논문](https://arxiv.org/abs/2408.00760) | Anima H/W용 재구현 |
 | SLG | Stability AI SD3.5 / Wan 커뮤니티 구현 | Forge block wrapper |
 | APG | [MythicalChu/ComfyUI-APG_ImYourCFGNow](https://github.com/MythicalChu/ComfyUI-APG_ImYourCFGNow), [APG 논문](https://arxiv.org/abs/2410.02416) | post-CFG 재구현 |
-| DCW/CWM/SMC | [namemechan/ComfyUI-DCW](https://github.com/namemechan/ComfyUI-DCW) (GPL-3.0) | 공개 수식 기반 Forge 재작성, vendor 아님 |
+| DCW/RDC/CWM/SMC | [namemechan/ComfyUI-DCW](https://github.com/namemechan/ComfyUI-DCW) (GPL-3.0) | 공개 수식 기반 Forge 재작성, vendor 아님 |
 | Skimmed CFG | [Extraltodeus/Skimmed_CFG](https://github.com/Extraltodeus/Skimmed_CFG) (LICENSE 파일 미공개) | 공개 수식 기반 Forge 재작성, vendor 아님 |
 | DAVE | [daheekwon/DAVE](https://github.com/daheekwon/DAVE) (MIT), [ComfyUI-Anima-DAVE](https://github.com/sorryhyun/ComfyUI-Anima-DAVE) (MIT), [논문](https://arxiv.org/abs/2606.06813) | block 수식 재구현 |
 | CNS | [namemechan/comfyui-cns_sampler_patch](https://github.com/namemechan/comfyui-cns_sampler_patch) (GPL-3.0), [논문](https://arxiv.org/abs/2605.30332) | CNS-inspired 재작성, vendor 아님 |

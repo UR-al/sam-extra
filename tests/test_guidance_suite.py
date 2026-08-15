@@ -63,6 +63,91 @@ class GuidanceMathTests(unittest.TestCase):
             self.assertEqual(out.dtype, denoised.dtype)
             self.assertTrue(torch.isfinite(out).all())
 
+    def test_rdc_tau_zero_is_a_bitwise_noop(self):
+        denoised = torch.randn(1, 4, 7, 9)
+        live = torch.randn_like(denoised)
+        state = {}
+
+        out = apply_dcw(
+            denoised,
+            live,
+            torch.tensor([1.0]),
+            0.0,
+            0.0,
+            rdc_tau=0.0,
+            rdc_alpha_ll=0.03,
+            rdc_alpha_hh=0.01,
+            rdc_state=state,
+        )
+
+        self.assertIs(out, denoised)
+        self.assertEqual(state, {})
+
+    def test_rdc_seeds_first_step_then_corrects_cross_step_drift(self):
+        state = {}
+        first = torch.zeros(1, 4, 8, 8)
+        live = torch.zeros_like(first)
+
+        seeded = apply_dcw(
+            first,
+            live,
+            torch.tensor([4.0]),
+            0.0,
+            0.0,
+            rdc_tau=0.20,
+            rdc_alpha_ll=0.20,
+            rdc_alpha_hh=0.0,
+            rdc_state=state,
+        )
+        drifted = torch.ones_like(first)
+        corrected = apply_dcw(
+            drifted,
+            live,
+            torch.tensor([1.0]),
+            0.0,
+            0.0,
+            rdc_tau=0.20,
+            rdc_alpha_ll=0.20,
+            rdc_alpha_hh=0.0,
+            rdc_state=state,
+        )
+
+        torch.testing.assert_close(seeded, first)
+        self.assertIn("_s_prev", state)
+        self.assertIn("LL", state)
+        self.assertFalse(torch.equal(corrected, drifted))
+        self.assertLess(float(corrected.mean()), float(drifted.mean()))
+        self.assertTrue(torch.isfinite(corrected).all())
+
+    def test_rdc_resolution_change_reseeds_without_shape_error(self):
+        state = {}
+        apply_dcw(
+            torch.zeros(1, 4, 8, 8),
+            torch.zeros(1, 4, 8, 8),
+            torch.tensor([4.0]),
+            0.0,
+            0.0,
+            rdc_tau=0.15,
+            rdc_alpha_ll=0.05,
+            rdc_state=state,
+        )
+        resized = torch.randn(1, 4, 7, 9)
+
+        out = apply_dcw(
+            resized,
+            torch.randn_like(resized),
+            torch.tensor([1.0]),
+            0.0,
+            0.0,
+            rdc_tau=0.15,
+            rdc_alpha_ll=0.05,
+            rdc_state=state,
+        )
+
+        self.assertEqual(out.shape, resized.shape)
+        self.assertTrue(torch.isfinite(out).all())
+        self.assertEqual(state["LL"].shape, (1, 4, 4, 5))
+
     def test_cwm_zero_alphas_matches_standard_cfg_error(self):
         error = torch.randn(2, 4, 7, 9)
 
@@ -246,6 +331,7 @@ class GuidanceRuntimeTests(unittest.TestCase):
             apg=apg,
             adg={},
             smc_prev=torch.ones(1),
+            rdc_state={"LL": torch.ones(1), "_s_prev": 0.5},
             cns_x_t=torch.ones(1),
             cns_noise_calls=4,
         )
@@ -255,6 +341,7 @@ class GuidanceRuntimeTests(unittest.TestCase):
         self.assertIsNone(apg["avg"])
         self.assertIsNone(apg["last_sigma"])
         self.assertIsNone(runtime.smc_prev)
+        self.assertEqual(runtime.rdc_state, {})
         self.assertIsNone(runtime.cns_x_t)
         self.assertEqual(runtime.cns_noise_calls, 0)
         self.assertIsNone(state["attn_raw"])

@@ -115,7 +115,14 @@ class AnimaSafePagTests(unittest.TestCase):
             external_cfg_detected=False,
             warned=False,
         )
-        p._DCW.update(on=False, steps=0)
+        p._DCW.update(
+            on=False,
+            dcw_on=False,
+            rdc_on=False,
+            steps=0,
+            dcw_steps=0,
+            rdc_steps=0,
+        )
         p._DAVE.update(on=False, targets=set(), steps=0)
         p._CNS.update(on=False, warned=False)
         p._MOD.update(
@@ -651,7 +658,7 @@ class AnimaSafePagTests(unittest.TestCase):
             attn_scale=2.0,
             rescale=0.0,
         )
-        p._DCW["on"] = True
+        p._DCW.update(on=True, dcw_on=True, rdc_on=False)
         original_apply_dcw = p.apply_dcw
 
         def fail_dcw(*_args, **_kwargs):
@@ -787,6 +794,8 @@ class AnimaSafePagTests(unittest.TestCase):
             source,
         )
         self.assertIn("anima_guidance_smc_preset", source)
+        self.assertIn("anima_guidance_smc_master_enable", source)
+        self.assertIn("anima_guidance_rdc_enable", source)
         self.assertIn('"[Anima SMC] Preset"', source)
         self.assertIn('_arg(56, "Off")', source)
         self.assertIn(
@@ -816,18 +825,26 @@ class AnimaSafePagTests(unittest.TestCase):
             source,
         )
 
-    def test_guidance_ui_builds_with_append_only_smc_preset_argument(self):
+    def test_guidance_ui_builds_with_append_only_smc_and_rdc_arguments(self):
         with gr.Blocks():
             inputs = self.pag.AnimaSafePAG().ui(False)
 
-        self.assertEqual(len(inputs), 57)
+        self.assertEqual(len(inputs), 62)
         self.assertEqual(inputs[26].elem_id, "anima_guidance_smc_lambda")
         self.assertEqual(inputs[26].maximum, 30.0)
         self.assertEqual(inputs[27].elem_id, "anima_guidance_smc_k")
         self.assertEqual(inputs[27].maximum, 5.0)
         self.assertEqual(inputs[42].elem_id, "anima_guidance_smc_enable")
         self.assertEqual(inputs[56].elem_id, "anima_guidance_smc_preset")
-        self.assertEqual(inputs[56].value, "Off")
+        self.assertEqual(inputs[56].value, "Auto")
+        self.assertEqual(
+            inputs[57].elem_id, "anima_guidance_smc_master_enable"
+        )
+        self.assertFalse(inputs[57].value)
+        self.assertEqual(inputs[58].elem_id, "anima_guidance_rdc_enable")
+        self.assertEqual(inputs[59].elem_id, "anima_guidance_rdc_tau")
+        self.assertEqual(inputs[60].elem_id, "anima_guidance_rdc_alpha_ll")
+        self.assertEqual(inputs[61].elem_id, "anima_guidance_rdc_alpha_hh")
 
     def test_xyz_axis_labels_are_append_only(self):
         """xyz_grid stores a chosen axis by its integer index in axis_options.
@@ -907,7 +924,16 @@ class AnimaSafePagTests(unittest.TestCase):
             "[Anima Mod] End Block",
         ]
         self.assertEqual(labels[:len(expected_prefix)], expected_prefix)
-        self.assertIn("[Anima SMC] Preset", labels[len(expected_prefix):])
+        self.assertEqual(
+            labels[len(expected_prefix):],
+            [
+                "[Anima SMC] Preset",
+                "[Anima RDC] Enable",
+                "[Anima RDC] Tau",
+                "[Anima RDC] Alpha LL",
+                "[Anima RDC] Alpha HH",
+            ],
+        )
 
     def test_smc_auto_resolves_on_real_process_argument_path(self):
         class DummyUnet:
@@ -933,6 +959,7 @@ class AnimaSafePagTests(unittest.TestCase):
             inputs = process.ui(False)
         args = [component.value for component in inputs]
         args[56] = "Auto"
+        args[57] = True
 
         process.process_before_every_sampling(request, *args)
 
@@ -950,6 +977,65 @@ class AnimaSafePagTests(unittest.TestCase):
             "smc=Auto→Cosmos / Wan(6,0.2)",
             request.extra_generation_params["Anima CFG Orchestrator"],
         )
+
+    def test_new_smc_master_toggle_can_keep_a_selected_preset_off(self):
+        Anima = type("Anima", (), {})
+        model = Anima()
+        model.forge_objects = types.SimpleNamespace(unet=types.SimpleNamespace())
+        request = types.SimpleNamespace(
+            sd_model=model,
+            extra_generation_params={},
+            steps=20,
+        )
+        process = self.pag.AnimaSafePAG()
+        with gr.Blocks():
+            inputs = process.ui(False)
+        args = [component.value for component in inputs]
+        args[56] = "Auto"
+        args[57] = False
+
+        process.process_before_every_sampling(request, *args)
+
+        self.assertFalse(self.pag._CFG["smc_on"])
+        self.assertNotIn("Anima CFG Orchestrator", request.extra_generation_params)
+
+    def test_rdc_can_run_without_instantaneous_dcw_correction(self):
+        class DummyUnet:
+            def __init__(self):
+                self.post_cfg = None
+
+            def clone(self):
+                return DummyUnet()
+
+            def set_model_sampler_post_cfg_function(self, function):
+                self.post_cfg = function
+
+        Anima = type("Anima", (), {})
+        model = Anima()
+        model.forge_objects = types.SimpleNamespace(unet=DummyUnet())
+        request = types.SimpleNamespace(
+            sd_model=model,
+            extra_generation_params={},
+            steps=20,
+        )
+        process = self.pag.AnimaSafePAG()
+        with gr.Blocks():
+            inputs = process.ui(False)
+        args = [component.value for component in inputs]
+        args[28] = False
+        args[58] = True
+        args[59] = 0.15
+        args[60] = 0.04
+        args[61] = 0.0
+
+        process.process_before_every_sampling(request, *args)
+
+        self.assertTrue(self.pag._DCW["on"])
+        self.assertFalse(self.pag._DCW["dcw_on"])
+        self.assertTrue(self.pag._DCW["rdc_on"])
+        self.assertIsNotNone(request.sd_model.forge_objects.unet.post_cfg)
+        self.assertIn("Anima RDC", request.extra_generation_params)
+        self.assertNotIn("Anima DCW", request.extra_generation_params)
 
     def test_legacy_short_smc_call_keeps_historical_omitted_k_default(self):
         class DummyUnet:

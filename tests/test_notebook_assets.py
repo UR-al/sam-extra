@@ -288,6 +288,11 @@ class NotebookAssetTests(unittest.TestCase):
         self.assertIn("function refreshFastDropdownVisibleLimits()", self.script)
         self.assertIn("gridTemplateColumns", self.script)
         self.assertIn("data-scroll", self.script)
+        self.assertIn("var renderedChoiceLimit", self.script)
+        self.assertIn('list.addEventListener("scroll"', self.script)
+        self.assertIn("renderedChoiceLimit += fastDropdownVisibleChoiceLimit()", self.script)
+        self.assertIn("아래로 스크롤하면 더 표시", self.script)
+        self.assertNotIn("검색어를 더 입력하세요", self.script)
 
     def test_original_forge_extra_network_tabs_are_restored_after_extraction(self):
         gallery_move = self.script.index(
