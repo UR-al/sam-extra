@@ -52,6 +52,9 @@
     var undoState = null;
     var gradioConfigSnapshot = null;
     var gradioConfigPromise = null;
+    var configIndexSource = null;
+    var configIndexLength = -1;
+    var configIndexByElemId = null;
     var delegatedEventRoots = typeof WeakSet === "function" ? new WeakSet() : [];
     var boundPanels = typeof WeakSet === "function" ? new WeakSet() : [];
     var fastDropdownVisibilityObserver = null;
@@ -321,13 +324,26 @@
         await gradioConfigPromise;
     }
 
+    // Forge's page config holds thousands of components and this lookup runs
+    // for every dropdown on every UI update, so resolve elem_ids through an
+    // index that is rebuilt only when the config array is replaced or grows.
+    // The first component wins for a duplicated elem_id, as a linear scan did.
     function metaForElemId(elemId) {
         var components = configComponents();
-        for (var i = 0; i < components.length; i++) {
-            var props = components[i] && components[i].props;
-            if (props && props.elem_id === elemId) return components[i];
+        if (components !== configIndexSource
+                || components.length !== configIndexLength) {
+            configIndexByElemId = Object.create(null);
+            for (var i = 0; i < components.length; i++) {
+                var props = components[i] && components[i].props;
+                var id = props && props.elem_id;
+                if (id && !(id in configIndexByElemId)) {
+                    configIndexByElemId[id] = components[i];
+                }
+            }
+            configIndexSource = components;
+            configIndexLength = components.length;
         }
-        return null;
+        return configIndexByElemId[elemId] || null;
     }
 
     function choiceLabels(rawChoices) {

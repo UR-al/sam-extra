@@ -12,19 +12,24 @@ each step**, which makes the model leave more high-frequency content in → more
 detail. Mechanically it multiplies the per-step ``sigma`` the denoiser sees by a
 bell-shaped schedule:
 
-    sigma *= 1 - schedule[step] * amount * (cfg_scale if coupled else 1)
+    sigma *= 1 - schedule[step] * 0.1 * multiplier * (cfg_scale if coupled else 1)
 
+``schedule`` peaks at ``amount``; the fixed 0.1 is muerrilla's own scale (and
+ComfyUI-Detail-Daemon's), so the same amount gives the same result in all three.
 Positive ``amount`` → sigma lowered → more detail; negative → smoother / less
 bokeh-noise. Zero (or disabled) → exact no-op.
 
 Hook
 ----
-Forge fires ``on_cfg_denoiser(params)`` each denoise step with a
-``CFGDenoiserParams`` carrying ``.sigma``, ``.sampling_step`` and
-``.total_sampling_steps``. We register one global callback that reads the shared
-``_DD`` state (set per-generation by the script's ``process_before_every_sampling``)
-and adjusts ``params.sigma`` in place. Everything is guarded; on any error it
-leaves sigma untouched, so enabling this can never break a generation.
+Forge fires ``on_cfg_denoiser(params)`` for every model call with a
+``CFGDenoiserParams`` carrying ``.sigma``, ``.sampling_step``,
+``.total_sampling_steps`` and ``.denoiser``. We register one global callback that
+reads the shared ``_DD`` state (set per-generation by the script's
+``process_before_every_sampling``) and adjusts ``params.sigma`` in place. The
+schedule position comes from the denoiser's model-call counter and the CFG from
+the pass actually running (base / HiRes / Refiner). Everything is guarded; on
+any error it leaves sigma untouched, so enabling this can never break a
+generation.
 
 UX principles (per request)
 ---------------------------
@@ -83,6 +88,10 @@ _PRESETS = {  # preset → detail amount
     "Medium": 0.10,
     "Strong": 0.25,
 }
+
+# muerrilla's Detail Daemon scales the schedule by a fixed 0.1 before it touches
+# sigma, and ComfyUI-Detail-Daemon does the same, so amounts transfer 1:1.
+_SIGMA_SCALE = 0.1
 
 
 # ---------------------------------------------------------------------------
@@ -151,6 +160,40 @@ def _get_schedule(steps: int):
 # ---------------------------------------------------------------------------
 
 
+def _schedule_position(params) -> tuple[int, int]:
+    """Return (index, schedule length) for the model call being made.
+
+    Forge sets ``state.sampling_step`` only after a step's model call, so it
+    trails by one step; the denoiser's own call counter does not. Second-order
+    samplers make two calls per step, so the curve is sized by model calls
+    (muerrilla's formula).
+    """
+    step = int(getattr(params, "sampling_step", 0) or 0)
+    steps = int(getattr(params, "total_sampling_steps", 0) or 0)
+    denoiser = getattr(params, "denoiser", None)
+    if denoiser is not None:
+        step = max(step, int(getattr(denoiser, "step", 0) or 0))
+        steps = max(steps, int(getattr(denoiser, "total_steps", 0) or 0))
+        sampler_steps = int(getattr(denoiser, "steps", 0) or 0)
+        if sampler_steps > 0:
+            steps -= max(steps // sampler_steps - 1, 0)
+    return step, steps
+
+
+def _active_cfg_scale(params) -> float:
+    """CFG the denoiser applies on this call (same rules as CFGDenoiser.forward)."""
+    cfg = float(_DD["cfg_scale"])
+    denoiser = getattr(params, "denoiser", None)
+    p = getattr(denoiser, "p", None)
+    if p is None:
+        return cfg
+    if getattr(p, "is_hr_pass", False) is True and getattr(p, "hr_cfg", None) is not None:
+        cfg = float(p.hr_cfg)
+    if getattr(denoiser, "_refiner_pass", False):
+        cfg = float(getattr(p, "refiner_cfg", None) or cfg)
+    return cfg
+
+
 def _denoiser_callback(params) -> None:
     if not _DD["on"] or np is None:
         return
@@ -158,18 +201,17 @@ def _denoiser_callback(params) -> None:
         sigma = getattr(params, "sigma", None)
         if sigma is None:
             return
-        steps = int(getattr(params, "total_sampling_steps", 0) or 0)
+        step, steps = _schedule_position(params)
         if steps <= 0:
             return
         sched = _get_schedule(steps)
         if sched is None or len(sched) == 0:
             return
-        step = int(getattr(params, "sampling_step", 0) or 0)
         idx = min(max(step, 0), len(sched) - 1)
-        mult = float(sched[idx]) * float(_DD["multiplier"])
+        mult = float(sched[idx]) * _SIGMA_SCALE * float(_DD["multiplier"])
         if mult == 0.0:
             return
-        cfg = float(_DD["cfg_scale"]) if _DD["cfg_couple"] else 1.0
+        cfg = _active_cfg_scale(params) if _DD["cfg_couple"] else 1.0
         factor = 1.0 - mult * cfg
         # Clamp so a stray large amount can't zero-out or explode the sigma.
         factor = min(3.0, max(0.05, factor))
@@ -225,6 +267,18 @@ def _dd_on_before_ui() -> None:
 script_callbacks.on_before_ui(_dd_on_before_ui)
 
 
+def _preset_amount_update(preset):
+    """Choosing a named preset fills the amount slider; Custom leaves it alone."""
+    if preset in _PRESETS:
+        return gr.update(value=_PRESETS[preset])
+    return gr.update()
+
+
+def _amount_input_preset_update(_amount):
+    """Moving the amount slider by hand marks the preset as Custom."""
+    return gr.update(value="Custom")
+
+
 def _as_bool(value, default: bool) -> bool:
     if isinstance(value, bool):
         return value
@@ -255,23 +309,35 @@ class AnimaDetailDaemon(scripts.Script):
             gr.Markdown(
                 "매 스텝 **제거하는 노이즈량을 줄여** 디테일·질감을 늘립니다(배경 뽀샤시↓). "
                 "추가 forward 없이 sampler sigma만 조정하며 **모든 모델에서 동작**합니다. "
-                "양수=디테일↑, 음수=매끈, 0/끄면 완전 무효. PAG·APG와 독립이라 같이 써도 됩니다."
+                "양수=디테일↑, 음수=매끈, 0/끄면 완전 무효. PAG·APG와 독립이라 같이 써도 됩니다. "
+                "Amount는 원본·ComfyUI Detail Daemon과 **같은 값 기준**입니다"
+                "(이전 버전의 값은 ×10 하면 같은 강도)."
             )
             enabled = gr.Checkbox(
                 label="Enable Detail Daemon",
                 value=False,
                 elem_id="anima_dd_enable",
             )
+            # Labels double as ui-config.json keys; they changed with the
+            # amount scale so the old saved -1..1 slider range is not reapplied.
             preset = gr.Radio(
-                label="Preset (Custom이면 아래 Amount 사용)",
+                label="Preset (고르면 아래 Amount 값을 채움)",
                 choices=["Custom", "Subtle", "Medium", "Strong"],
                 value="Medium",
                 elem_id="anima_dd_preset",
             )
             amount = gr.Slider(
-                label="Detail amount (음수=매끈 · 양수=디테일↑)",
-                minimum=-1.0, maximum=1.0, step=0.01, value=0.10,
+                label="Detail amount (ComfyUI detail_amount와 같은 값 · 음수=매끈 · 양수=디테일↑)",
+                minimum=-5.0, maximum=5.0, step=0.01, value=0.10,
                 elem_id="anima_dd_amount",
+            )
+            preset.change(
+                fn=_preset_amount_update, inputs=[preset], outputs=[amount],
+                queue=False, show_progress="hidden",
+            )
+            amount.input(
+                fn=_amount_input_preset_update, inputs=[amount], outputs=[preset],
+                queue=False, show_progress="hidden",
             )
             with gr.Accordion("Detail Daemon Advanced (세부값)", open=False):
                 gr.Markdown(
@@ -327,12 +393,9 @@ class AnimaDetailDaemon(scripts.Script):
             return
 
         try:
-            preset = str(_arg(1, "Custom"))
-            amount = float(_arg(2, 0.10))
-            # A preset overrides the amount slider (Custom = use the slider).
-            if preset in _PRESETS:
-                amount = _PRESETS[preset]
-            amount = _xyz_num("amount", amount)
+            # The preset (arg 1) only fills the slider in the UI; the slider
+            # value is what runs, so the two can never silently disagree.
+            amount = _xyz_num("amount", float(_arg(2, 0.10)))
 
             _DD.update(
                 on=True,
@@ -360,7 +423,10 @@ class AnimaDetailDaemon(scripts.Script):
             p.extra_generation_params = {}
         p.extra_generation_params["Anima Detail Daemon"] = (
             f"amount={_DD['amount']}, range={_DD['start']:.2f}-{_DD['end']:.2f}, "
-            f"bias={_DD['bias']}, cfg_couple={_DD['cfg_couple']}"
+            f"bias={_DD['bias']}, exponent={_DD['exponent']}, "
+            f"start_offset={_DD['start_offset']}, end_offset={_DD['end_offset']}, "
+            f"fade={_DD['fade']}, smooth={_DD['smooth']}, "
+            f"multiplier={_DD['multiplier']}, cfg_couple={_DD['cfg_couple']}"
         )
         _log(
             f"active ✅ amount={_DD['amount']} range={_DD['start']:.2f}-{_DD['end']:.2f} "

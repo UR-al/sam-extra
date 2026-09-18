@@ -12,8 +12,13 @@ No Forge core file is modified.  The two fixed invariants are intentional:
 * ``inpaint_full_res`` is false so the model sees reference and target panels
   together.  Cropping to only the mask would remove the reference panel.
 
-Everything else that changes the workflow is represented on
-``ReferenceGenerationRequest`` and is exposed by the Feature 6 UI.
+``ReferenceGenerationRequest`` carries the whole workflow; the Feature 6 UI
+exposes the main inputs plus an Expert section for everything else.
+
+Defaults reproduce the public Anima ReStyler v1.2 workflow
+(animaRestyler_v12.json): a solid ``#000000`` target panel kept as-is
+(``inpainting_fill="original"``) at denoise 1.0, AnimeEditV2 at 0.72, the
+Extend LoRA bypassed, Euler a / Simple / 30 steps / CFG 5.
 """
 from __future__ import annotations
 
@@ -36,7 +41,7 @@ from .anima_reference_core import (
 
 @dataclass(frozen=True)
 class ReferenceGenerationRequest:
-    """Complete user-editable state for one Feature 6 run."""
+    """Complete state for one Feature 6 run (defaults = ReStyler v1.2)."""
 
     reference_image: Image.Image
     canvas: ReferenceCanvasConfig = field(default_factory=ReferenceCanvasConfig)
@@ -46,20 +51,13 @@ class ReferenceGenerationRequest:
     prefix_enabled: bool = True
     prefix_text: str = "split screen, multiple views"
     prefix_strength: float = 1.2
-    extra_prefix: str = ""
-    extra_suffix: str = ""
 
     edit_lora_enabled: bool = True
     edit_lora_name: str = "AnimeEditV2"
     edit_lora_strength: float = 0.72
-    extend_lora_enabled: bool = True
+    extend_lora_enabled: bool = False
     extend_lora_name: str = "Extend Image (Anima Edit) v1"
     extend_lora_strength: float = 0.4
-    require_enabled_loras: bool = True
-
-    checkpoint_override: str = "Use current"
-    override_additional_modules: bool = False
-    additional_modules: tuple[str, ...] = ()
 
     steps: int = 30
     cfg_scale: float = 5.0
@@ -67,26 +65,21 @@ class ReferenceGenerationRequest:
     sampler: str = "Euler a"
     scheduler: str = "Simple"
     denoising_strength: float = 1.0
-    resize_mode: str = "Just Resize"
-    inpainting_fill: str = "latent noise"
+    inpainting_fill: str = "original"
     mask_blur: int = 0
-    mask_round: bool = True
-    mask_invert: bool = False
-    inpainting_mask_weight: float = 1.0
     initial_noise_multiplier: float = 1.0
-
-    eta: float = 1.0
-    s_min_uncond: float = 0.0
-    s_churn: float = 0.0
-    s_tmin: float = 0.0
-    s_tmax: float = 0.0
-    s_noise: float = 1.0
+    # None keeps Forge's own Settings value instead of overriding it.
+    eta: float | None = None
+    s_min_uncond: float | None = None
 
     seed: int = -1
     seed_step: int = 1
-    candidate_count: int = 1
-    restore_faces: bool = False
+    candidate_count: int = 2
     native_reference_enabled: bool = True
+
+    # Recorded in the infotext so GPU A/B runs can be compared.
+    keep_scope: str = "identity"
+    sampling_source: str = "recipe"
 
     save_target: bool = True
     save_generated_canvas: bool = False
@@ -110,34 +103,20 @@ class ReferenceGenerationRequest:
             raise ValueError("Denoising strength must be between 0 and 1.")
         if not 0 <= int(self.mask_blur) <= 1024:
             raise ValueError("Mask blur must be between 0 and 1024.")
-        if not 0.0 <= float(self.inpainting_mask_weight) <= 1.0:
-            raise ValueError("Inpainting mask weight must be between 0 and 1.")
         if not 0.0 <= float(self.initial_noise_multiplier) <= 10.0:
             raise ValueError("Initial noise multiplier must be between 0 and 10.")
-        if not 0.0 <= float(self.eta) <= 10.0:
+        if self.eta is not None and not 0.0 <= float(self.eta) <= 10.0:
             raise ValueError("Eta must be between 0 and 10.")
-        if not 0.0 <= float(self.s_min_uncond) <= 1000.0:
+        if self.s_min_uncond is not None and not (
+            0.0 <= float(self.s_min_uncond) <= 1000.0
+        ):
             raise ValueError("s_min_uncond must be between 0 and 1000.")
-        if not 0.0 <= float(self.s_churn) <= 1000.0:
-            raise ValueError("s_churn must be between 0 and 1000.")
-        if not 0.0 <= float(self.s_tmin) <= 1000.0:
-            raise ValueError("s_tmin must be between 0 and 1000.")
-        if not 0.0 <= float(self.s_tmax) <= 10000.0:
-            raise ValueError("s_tmax must be between 0 and 10000.")
-        if not 0.0 <= float(self.s_noise) <= 10.0:
-            raise ValueError("s_noise must be between 0 and 10.")
         if not 1 <= int(self.candidate_count) <= 64:
             raise ValueError("Candidate count must be between 1 and 64.")
         if not str(self.sampler or "").strip():
             raise ValueError("Sampler is required.")
         if not str(self.scheduler or "").strip():
             raise ValueError("Scheduler is required.")
-        if self.resize_mode not in (
-            "Just Resize",
-            "Crop and Resize",
-            "Resize and Fill",
-        ):
-            raise ValueError(f"Unsupported resize mode: {self.resize_mode!r}")
         if self.inpainting_fill not in (
             "fill",
             "original",
@@ -174,8 +153,6 @@ class ReferenceGenerationRequest:
             extend_lora_enabled=self.extend_lora_enabled,
             extend_lora_name=self.extend_lora_name,
             extend_lora_strength=self.extend_lora_strength,
-            extra_prefix=self.extra_prefix,
-            extra_suffix=self.extra_suffix,
         )
 
 
@@ -191,6 +168,7 @@ class ReferenceGenerationOutput:
 class ReferenceGenerationResult:
     prepared: PreparedReferenceCanvas
     outputs: tuple[ReferenceGenerationOutput, ...]
+    diagnostics: dict[str, Any] = field(default_factory=dict)
 
 
 def candidate_seed(base_seed: int, seed_step: int, index: int) -> int:
@@ -207,7 +185,7 @@ def build_processing_args(
     *,
     seed: int,
 ) -> dict[str, Any]:
-    """Translate the deep request model to the existing standalone i2i seam."""
+    """Translate the request to the existing standalone i2i seam."""
 
     return {
         "sam3_use_inpaint_width_height": False,
@@ -220,14 +198,16 @@ def build_processing_args(
         "sam3_seed": int(seed),
         "sam3_noise_multiplier": float(request.initial_noise_multiplier),
         "sam3_inpainting_fill": str(request.inpainting_fill),
-        "sam3_resize_mode": str(request.resize_mode),
-        "sam3_mask_invert": bool(request.mask_invert),
+        # The canvas already has the inference size, so resizing is a no-op.
+        "sam3_resize_mode": "Just Resize",
+        # Inverting would regenerate the reference and crop an empty panel.
+        "sam3_mask_invert": False,
         "sam3_denoising_strength": float(request.denoising_strength),
         "sam3_mask_blur": int(request.mask_blur),
         # Invariant: only-masked preprocessing would crop away the reference.
         "sam3_inpaint_only_masked": False,
         "sam3_inpaint_only_masked_padding": 0,
-        "sam3_restore_face": bool(request.restore_faces),
+        "sam3_restore_face": False,
     }
 
 
@@ -240,6 +220,52 @@ def _is_anima_engine(model: Any) -> bool:
         or cls.__module__.endswith(".anima")
         or hasattr(model, "text_processing_engine_anima")
     )
+
+
+def _model_block_count(model: Any) -> int | None:
+    try:
+        diffusion = model.forge_objects.unet.model.diffusion_model
+    except AttributeError:
+        return None
+    blocks = getattr(diffusion, "blocks", None)
+    try:
+        return len(blocks) if blocks is not None else None
+    except TypeError:
+        return None
+
+
+def _reset_image_stitch_cache() -> None:
+    """Make ImageStitch re-encode its references on the next txt2img run.
+
+    Feature 6 clears the process-global reference latents; ImageStitch would
+    otherwise see an unchanged parameter cache and skip re-encoding.
+    """
+
+    try:
+        from modules import scripts
+    except Exception:
+        return
+    for data in list(getattr(scripts, "scripts_data", None) or []):
+        script_class = getattr(data, "script_class", None)
+        if (
+            script_class is not None
+            and script_class.__name__ == "ImageStitch"
+            and hasattr(script_class, "cached_parameters")
+        ):
+            script_class.cached_parameters = None
+
+
+def _panel_diagnostics(
+    request: "ReferenceGenerationRequest",
+    prepared: PreparedReferenceCanvas,
+) -> tuple[tuple[int, int], float]:
+    left, top, right, bottom = prepared.target_box
+    panel = (right - left, bottom - top)
+    upscale = max(
+        request.canvas.output_width / panel[0],
+        request.canvas.output_height / panel[1],
+    )
+    return panel, round(upscale, 2)
 
 
 def _clear_reference_state(
@@ -344,7 +370,10 @@ def _save_image(
 def _extra_generation_params(
     request: ReferenceGenerationRequest,
     prepared: PreparedReferenceCanvas,
+    *,
+    model_blocks: int | None,
 ) -> dict[str, Any]:
+    panel, upscale = _panel_diagnostics(request, prepared)
     return {
         "SAM3 Feature": "6 - Anima Character Reference",
         "Anima Native Reference": bool(request.native_reference_enabled),
@@ -377,11 +406,100 @@ def _extra_generation_params(
             if request.extend_lora_enabled
             else "disabled"
         ),
-        "Reference mask round": bool(request.mask_round),
-        "Reference mask invert": bool(request.mask_invert),
-        "Reference mask weight": request.inpainting_mask_weight,
         "Reference seed step": request.seed_step,
+        "Reference masked content": request.inpainting_fill,
+        "Reference target panel": f"{panel[0]}x{panel[1]}",
+        "Reference upscale": f"{upscale:.2f}",
+        "Reference keep": request.keep_scope,
+        "Reference sampling": request.sampling_source,
+        "Reference model blocks": (
+            str(model_blocks) if model_blocks is not None else "unknown"
+        ),
     }
+
+
+# Only used for legacy v1 checkpoints; bundled v2 checkpoints ignore it.
+# Matches DEFAULT_ADAPTER in scripts/anima_3_8b.py.
+_ANIMA38_ADAPTER = "Anima-3.8B-expanded_adapter.safetensors"
+
+
+def _anima38_runtime() -> tuple[Any, str | None]:
+    try:
+        from .anima38.runtime import shared_runtime
+
+        return shared_runtime(), None
+    except Exception as exc:  # pragma: no cover - depends on Forge/torch
+        return None, f"{type(exc).__name__}: {exc}"
+
+
+def _anima38_encoder_present() -> bool:
+    """Return whether Qwen3.5's text encoder is actually on disk.
+
+    ``Anima3BRuntime.install()`` never loads Qwen3.5 itself: it is only
+    reached lazily from ``process_images`` -> ``get_learned_conditioning``.
+    So a v2 bundle without the encoder would otherwise install "successfully"
+    and only fail deep inside sampling.
+    """
+
+    try:
+        from .anima38.files import qwen35_models
+
+        return bool(qwen35_models())
+    except Exception:
+        return False
+
+
+def _install_anima38(
+    runtime: Any,
+    error: str | None,
+    processing: Any,
+    model: Any,
+) -> str:
+    """Install the 3.8B Semantic Connector for bundled v2 checkpoints.
+
+    Feature 6 runs without a scripts runner, so the Anima38 script's own
+    process_batch never fires; this does the same install for the job.
+    """
+
+    if runtime is None:
+        return f"unavailable ({error})" if error else "unavailable"
+    try:
+        if not runtime.is_v2_bundle(model):
+            return "not a 3.8B v2 bundle"
+    except Exception as exc:
+        print(
+            f"[-] Feature 6: Anima 3.8B check failed:\n{traceback.format_exc()}",
+            file=sys.stderr,
+        )
+        return f"check failed ({type(exc).__name__})"
+    if not _anima38_encoder_present():
+        return (
+            "missing encoder (qwen35_4b.safetensors not found in "
+            "models/text_encoder)"
+        )
+    try:
+        runtime.install(processing, _ANIMA38_ADAPTER, 1.0, None)
+    except FileNotFoundError as exc:
+        _restore_anima38(runtime, processing)
+        return f"missing encoder ({exc})"
+    except Exception as exc:
+        print(
+            f"[-] Feature 6: Anima 3.8B install failed:\n{traceback.format_exc()}",
+            file=sys.stderr,
+        )
+        _restore_anima38(runtime, processing)
+        return f"install failed ({type(exc).__name__}: {exc})"
+    return "v2 bundle"
+
+
+def _restore_anima38(runtime: Any, processing: Any) -> None:
+    try:
+        runtime.restore(processing)
+    except Exception:
+        print(
+            f"[-] Feature 6: Anima 3.8B restore failed:\n{traceback.format_exc()}",
+            file=sys.stderr,
+        )
 
 
 def run_anima_reference(
@@ -405,12 +523,13 @@ def run_anima_reference(
     if model is None:
         raise RuntimeError("No Forge model is loaded.")
 
-    checkpoint_override = str(request.checkpoint_override or "Use current")
-    if checkpoint_override == "Use current" and not _is_anima_engine(model):
-        raise RuntimeError(
-            "Feature 6 requires an Anima model. Load Anima or choose an "
-            "Anima checkpoint override."
-        )
+    if not _is_anima_engine(model):
+        raise RuntimeError("Feature 6 requires an Anima model. Load Anima first.")
+
+    model_blocks = _model_block_count(model)
+    interrupted = False
+    anima38_runtime, anima38_error = _anima38_runtime()
+    anima38_label = "not attempted"
 
     sample_path = outpath_samples or getattr(
         shared.opts, "outdir_txt2img_samples", "outputs/txt2img-images"
@@ -418,14 +537,6 @@ def run_anima_reference(
     grid_path = outpath_grids or getattr(
         shared.opts, "outdir_txt2img_grids", "outputs/txt2img-grids"
     )
-
-    override_settings: dict[str, Any] = {}
-    if checkpoint_override not in ("", "Use current"):
-        override_settings["sd_model_checkpoint"] = checkpoint_override
-    if request.override_additional_modules:
-        override_settings["forge_additional_modules"] = list(
-            request.additional_modules
-        )
 
     outputs: list[ReferenceGenerationOutput] = []
     candidate_count = int(request.candidate_count)
@@ -440,6 +551,7 @@ def run_anima_reference(
             with pause_total_tqdm():
                 for index in range(candidate_count):
                     if shared.state.interrupted or shared.state.skipped:
+                        interrupted = True
                         break
                     seed = candidate_seed(request.seed, request.seed_step, index)
                     shared.state.job = (
@@ -465,24 +577,24 @@ def run_anima_reference(
                     p2.negative_prompt = str(request.negative_prompt or "")
                     p2.image_mask = prepared.mask
                     p2.distilled_cfg_scale = float(request.shift)
-                    p2.mask_round = bool(request.mask_round)
-                    p2.inpainting_mask_weight = float(
-                        request.inpainting_mask_weight
-                    )
-                    p2.eta = float(request.eta)
-                    p2.s_min_uncond = float(request.s_min_uncond)
-                    p2.s_churn = float(request.s_churn)
-                    p2.s_tmin = float(request.s_tmin)
-                    p2.s_tmax = float(request.s_tmax)
-                    p2.s_noise = float(request.s_noise)
-                    p2.override_settings = dict(override_settings)
+                    if request.eta is not None:
+                        p2.eta = float(request.eta)
+                    if request.s_min_uncond is not None:
+                        p2.s_min_uncond = float(request.s_min_uncond)
                     # Save the cropped target ourselves; otherwise Forge
                     # would save the temporary split-screen canvas.
                     p2.do_not_save_samples = True
                     p2.do_not_save_grid = True
                     p2.extra_generation_params.update(
-                        _extra_generation_params(request, prepared)
+                        _extra_generation_params(
+                            request, prepared, model_blocks=model_blocks
+                        )
                     )
+                    anima38_label = _install_anima38(
+                        anima38_runtime, anima38_error, p2, model
+                    )
+                    anima38_installed = anima38_label == "v2 bundle"
+                    p2.extra_generation_params["Reference Anima 3.8B"] = anima38_label
 
                     processed = None
                     try:
@@ -491,11 +603,16 @@ def run_anima_reference(
                             f"{candidate_count} - sampling"
                         )
                         processed = process_images(p2)
+                        if shared.state.interrupted or shared.state.skipped:
+                            # A stopped job returns a half-denoised canvas;
+                            # never save it or show it as a candidate.
+                            interrupted = True
+                            break
                         active_model = getattr(shared, "sd_model", None)
                         if not _is_anima_engine(active_model):
                             raise RuntimeError(
-                                "The selected checkpoint did not load as an "
-                                "Anima model; reference output was discarded."
+                                "The active model is not Anima after sampling; "
+                                "the reference output was discarded."
                             )
                         if processed is None or not processed.images:
                             raise RuntimeError(
@@ -577,17 +694,27 @@ def run_anima_reference(
                         )
                         raise
                     finally:
+                        if anima38_installed:
+                            _restore_anima38(anima38_runtime, p2)
                         p2.close()
-                        # Anima decode normally clears this already.  Keep a
-                        # defensive per-candidate dynamic clear, but do not
-                        # call model.clear_references() here: Forge's base
-                        # implementation also flushes the allocator and would
-                        # add avoidable stalls between candidates.
+                        # Clear the process-global reference latents between
+                        # candidates.  model.clear_references() is not called
+                        # here because Forge's implementation also flushes the
+                        # allocator and would stall every candidate.
                         _clear_reference_state()
     finally:
         shared.state.textinfo = ""
+        _reset_image_stitch_cache()
 
+    panel, upscale = _panel_diagnostics(request, prepared)
     return ReferenceGenerationResult(
         prepared=prepared,
         outputs=tuple(outputs),
+        diagnostics={
+            "target_panel": panel,
+            "upscale": upscale,
+            "model_blocks": model_blocks,
+            "interrupted": interrupted,
+            "anima38": anima38_label,
+        },
     )

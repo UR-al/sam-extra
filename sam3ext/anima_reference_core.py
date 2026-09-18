@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Literal
 
 from PIL import Image, ImageColor
@@ -195,12 +194,21 @@ def crop_reference_result(
     )
 
 
+_LORA_FILE_SUFFIXES = (".safetensors", ".pt", ".ckpt")
+
+
 def _lora_token(name: str, strength: float) -> str:
     cleaned = str(name or "").strip().replace("\\", "/")
     if not cleaned:
         return ""
-    # Forge accepts relative subdirectories but the extension must be omitted.
-    cleaned = str(Path(cleaned).with_suffix("")).replace("\\", "/")
+    # Forge accepts relative subdirectories but the file extension must be
+    # omitted.  Strip only real model extensions: Path.with_suffix would also
+    # cut version numbers such as "v1.2".
+    lowered = cleaned.casefold()
+    for suffix in _LORA_FILE_SUFFIXES:
+        if lowered.endswith(suffix):
+            cleaned = cleaned[: -len(suffix)]
+            break
     return f"<lora:{cleaned}:{float(strength):g}>"
 
 
@@ -213,7 +221,7 @@ def compose_reference_prompt(
     edit_lora_enabled: bool = True,
     edit_lora_name: str = "",
     edit_lora_strength: float = 0.72,
-    extend_lora_enabled: bool = True,
+    extend_lora_enabled: bool = False,
     extend_lora_name: str = "",
     extend_lora_strength: float = 0.4,
     extra_prefix: str = "",

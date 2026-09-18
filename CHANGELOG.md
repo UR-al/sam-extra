@@ -5,6 +5,43 @@
 
 ## Unreleased
 
+- **Feature 6 캐릭터 레퍼런스 단순화**: 60개 위젯을 메인 6개(캐릭터 이미지, 가져오기, 유지 범위,
+  프롬프트, 후보 수, 생성/상태) + 접힌 전문가 칸으로 줄였습니다. 원본 ReStyler v1.2 조건(빈 칸
+  `#000000` 그대로·디노이즈 1.0, Extend 기본 꺼짐)으로 돌고, 결과 크기는 txt2img를 따릅니다.
+  LoRA 자동 감지(점 포함 이름 안전), Edit 없을 때만 차단. 3.8B v2 번들은 레퍼런스 실행에도 공용
+  런타임으로 커넥터를 설치합니다. 고친 결함: txt2img와 같은 라벨 때문에 Denoise 0.05·Steps 32·
+  original이 들어오던 문제, 없는 Extend LoRA 때문에 기본 실행이 막히던 문제, Stop 후 이후 실행이
+  계속 중단되던 문제(대기열 잠금 + 작업 시작/종료), 중단된 후보 저장, ImageStitch 캐시, eta 강제,
+  직전 결과를 레퍼런스로 쓰던 폴백, 투명 PNG가 검게 나오던 문제. infotext에는 이제 실제 생성
+  패널 크기·결과 크기·확대 배율·마스크된 내용(masked content)·모델 블록 수·3.8B 커넥터 상태를
+  기록합니다(Forge 자체 `Size` 필드는 여전히 캔버스 크기를 보여줍니다).
+- **Detail Daemon 강도를 원본·ComfyUI 기준으로 복원 (동작 변경)**: 포크 때 빠졌던 muerrilla
+  원본의 고정 ×0.1 배율을 되살려, 같은 amount가 원본과 ComfyUI-Detail-Daemon의
+  `detail_amount`와 같은 결과를 냅니다. **이전 버전과 같은 강도는 amount × 10**이며, 이를 위해
+  슬라이더 범위를 −1~1 → −5~5로 넓혔습니다. 프리셋은 Amount 슬라이더 값을 채워 주는 단축
+  버튼이 되어 더 이상 슬라이더를 몰래 덮어쓰지 않습니다. Forge가 `state.sampling_step`을 모델
+  호출 뒤에 갱신해 곡선이 한 스텝 밀리던 문제를 denoiser 호출 카운터로 고쳤고(Heun 등 2차
+  샘플러는 호출 수 기준 곡선), CFG 결합은 HiRes/Refiner 패스의 실제 CFG를 씁니다. infotext에
+  exponent·offset·fade·smooth·multiplier까지 기록합니다. Amount/Preset 라벨이 바뀌어
+  `ui-config.json`의 예전 슬라이더 범위 저장값은 더 이상 적용되지 않습니다.
+- **빠른 드롭다운 스캔 가속**: UI 업데이트마다 도는 드롭다운 스캔이 드롭다운마다 Gradio
+  config 전체(약 5,600개)를 선형 탐색하던 것을 elem_id 인덱스 조회로 바꿨습니다. 실제 페이지
+  측정에서 스캔 1회 약 5.7ms 중 4.3ms가 이 탐색이었습니다. config가 교체되거나 늘어나면
+  인덱스를 다시 만들고, 중복 elem_id는 이전처럼 첫 컴포넌트를 씁니다.
+- **Anima 3.8B Qwen3.5 / Semantic Connector v2 편입**: [GumGum10/forge-anima-3.8B](https://github.com/GumGum10/forge-anima-3.8B)
+- fix(anima38): NegPiP 등 `get_learned_conditioning` 래퍼와 충돌하던 v2 조건 형식을 네이티브 list 계약으로 바꾸고 run id 를 텐서 마커로 전달 (`sam3ext/anima38/marker.py`). 조건·forward 패치는 플래그로 켜고 끄는 멱등 패치로 바꿔 다른 확장이 비중첩으로 되돌려도 낡은 래퍼가 되살아나지 않게 했고, 샘플링 중 예외로 남은 패치는 다음 생성 시작 때 먼저 원복한다. 패치는 해제하지 않고 플래그로만 껐다 켜, 두 확장이 비LIFO 로 해제해도 이미 사라진 래퍼를 되살리지 않는다. NegPiP 이 아래에 깔린 순서에서는 그 마스킹을 대신 적용한다. 격리 Forge 두 대(정방향/역방향 로드 순서)에서 6 케이스(v2+NegPiP / bypass+NegPiP / v2 / bypass / 반복 / hires) 픽셀 동일하게 통과.
+  (MIT) 의 런타임을 `sam3ext/anima38/` 로 들여와 `scripts/anima_3_8b.py` 한 스크립트로 붙였습니다.
+  v1.1 번들(safetensors metadata 판별)은 자동 활성, v1 은 아코디언에서 어댑터·강도 선택.
+  `qwen35_4b` 가 없으면 생성을 죽이지 않고 순정 Anima 로 진행합니다. API 는 위치 인자와
+  SAM3 식 dict 둘 다 받습니다. Qwen3.5 토크나이저는 `assets/qwen35_tokenizer/` 에 동봉
+  (`THIRD_PARTY_NOTICES.md`).
+- **ANIMA 28/40/52블록 LoRA 양방향 호환**: Forge의 LoRA 로드 seam을 확장 내부
+  adapter로 감싸 Base 1.0(28), 2.9B(40), 3.8B(52) 사이 여섯 방향을 모두 자동
+  재매핑합니다. 기존 Base→2.9B 의미를 유지하며 3.8B 체크포인트 metadata의 LLaMA-Pro
+  삽입 위치를 사용합니다. 하향 변환은 상속 블록만 남기는 손실 투영이고, 적용 불가능한
+  3.8B semantic-connector 전용 키는 제거 개수와 함께 경고하고, 별도 Qwen3.5 encoder
+  키는 블록 수만으로 삭제하지 않습니다. sparse LoRA는 추측 변환하지 않으며, Forge
+  본체 파일은 수정하지 않습니다.
 - **DCW / CWM / SMC 명시적 ON/OFF**: Guidance 본문에 세 기능의 독립 체크박스를
   모두 노출했습니다. SMC는 선택한 `Auto`/모델별/`Custom` 프리셋 값을 유지한 채 master
   체크박스로 즉시 A/B할 수 있습니다. 기존 script argument와 XYZ 축 정수 인덱스는 그대로
@@ -27,7 +64,7 @@
   활성화하고 `finally`에서 reference latent와 옵션을 복구합니다. Forge 본체 파일이나
   저장된 설정은 변경하지 않습니다. batch 1 순차 실행과 whole-picture inpaint는
   reference 패널 보존을 위한 불변조건입니다.
-- **모든 워크플로우 값 UI화**: 캔버스/마스크/크롭, 프롬프트 prefix, Edit/Extend LoRA,
+- **워크플로우 값 UI화(→ 이후 단순화)**: 캔버스/마스크/크롭, 프롬프트 prefix, Edit/Extend LoRA,
   checkpoint·VAE/TE, Steps/CFG/Shift/sampler/scheduler, denoise/mask/noise, Eta와
   sigma 고급값, seed 후보군, 저장·Gallery 삽입 방식을 각각 편집할 수 있습니다.
 - **안전장치**: 실제 설치된 LoRA 이름/alias를 검사하는 선택형 가드, 생성 전 캔버스·마스크

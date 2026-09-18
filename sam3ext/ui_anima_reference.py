@@ -1,30 +1,67 @@
 """Feature 6 UI for the Anima Character Reference / ReStyler workflow."""
 from __future__ import annotations
 
+import html
 import json
 import sys
 import traceback
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Any
 
 import gradio as gr
 from PIL import Image
 
 from .anima_reference_core import ReferenceCanvasConfig, prepare_reference_canvas
+from .anima_reference_recipe import (
+    FILL_ORIGINAL,
+    FILL_SMEAR,
+    KEEP_IDENTITY,
+    KEEP_OUTFIT,
+    KEEP_SCOPES,
+    KEEP_STYLE,
+    WARN_EXTEND_MISSING,
+    DetectedLoras,
+    SamplingSettings,
+    choose_fallback_index,
+    detect_reference_loras,
+    edit_strength_for_scope,
+    fill_settings,
+    forge_preset_sampling,
+    prepare_inherited_prompt,
+    prompt_syntax_warnings,
+    resolve_output_size,
+)
 from .anima_reference_runner import (
     ReferenceGenerationRequest,
     ReferenceGenerationResult,
     run_anima_reference,
 )
 from .coerce import as_float, as_int
-from .core import find_checkpoint_options
-from .ui_refine import _coerce_gallery_item_to_pil, _plaintext_to_html
-
+from .ui_refine import (
+    _coerce_gallery_item_to_pil,
+    _plaintext_to_html,
+    _pull_seed_from_gallery_item,
+)
 
 _RESTYLER_URL = "https://civitai.com/models/2803070/anima-restyler"
-_EDIT_LORA_DEFAULT = "AnimeEditV2"
-_EXTEND_LORA_DEFAULT = "Extend Image (Anima Edit) v1"
+# Every Feature 6 label starts with this.  Forge restores saved ui-config
+# values by label, and bare labels such as "Steps" picked up txt2img values.
+_LABEL = "[Ref] "
+
+# Forge's modules/ui_loadsave.py::radio_choices compares a saved value
+# against the display label, so (label, value) tuple choices never restore.
+# These radios use plain string choices equal to the Korean labels, and
+# request_from_values() maps label -> internal value (still accepting the
+# internal values themselves, e.g. from a saved ui-config or an old caller).
+_KEEP_SCOPE_LABEL_TO_VALUE = {
+    "정체성": KEEP_IDENTITY,
+    "정체성+의상": KEEP_OUTFIT,
+    "정체성+의상+그림체": KEEP_STYLE,
+}
+_FILL_MODE_LABEL_TO_VALUE = {
+    "원본 (단색 그대로)": FILL_ORIGINAL,
+    "번진 이미지": FILL_SMEAR,
+}
 
 
 def list_installed_lora_names(*, refresh: bool = False) -> list[str]:
@@ -47,258 +84,88 @@ def list_installed_lora_names(*, refresh: bool = False) -> list[str]:
     )
 
 
-def list_lora_choices(*, refresh: bool = False) -> list[str]:
-    """Return installed LoRAs plus the two editable workflow suggestions."""
-
-    names = list_installed_lora_names(refresh=refresh)
-    return sorted(
-        {
-            _EDIT_LORA_DEFAULT,
-            _EXTEND_LORA_DEFAULT,
-            *(str(name) for name in names if str(name).strip()),
-        },
-        key=str.casefold,
-    )
-
-
-def list_module_choices(*, refresh: bool = False) -> list[str]:
-    """Return VAE/Text Encoder module names shown by Forge's model picker."""
-
-    try:
-        from modules import shared
-        from modules_forge import main_entry
-
-        if refresh:
-            _, modules = main_entry.refresh_models()
-            return [str(item) for item in modules]
-        indexed = list(getattr(main_entry, "module_list", {}) or {})
-        current = [
-            Path(str(item)).name
-            for item in getattr(
-                shared.opts, "forge_additional_modules", []
-            )
-        ]
-        # Do not rescan model directories during extension UI construction.
-        # Forge's own picker populates this registry; the explicit refresh
-        # button above performs a scan when the user asks for one.
-        return sorted({*(str(item) for item in indexed), *current})
-    except Exception:
-        return []
-
-
-def refresh_reference_model_choices():
-    """Refresh LoRA, checkpoint, and VAE/TE dropdowns together."""
-
-    loras = list_lora_choices(refresh=True)
-    modules = list_module_choices(refresh=True)
-    checkpoints = ["Use current", *find_checkpoint_options()]
-    return (
-        gr.update(choices=loras),
-        gr.update(choices=loras),
-        gr.update(choices=checkpoints),
-        gr.update(choices=modules),
-    )
-
-
 @dataclass
 class AnimaReferencePanel:
     accordion: gr.Accordion
     selected_index_state: gr.Number
+    txt2img_width_fallback: gr.Number
+    txt2img_height_fallback: gr.Number
     reference_image: gr.Image
     load_selected_button: gr.Button
-
-    output_width: gr.Slider
-    output_height: gr.Slider
-    placement: gr.Radio
-    target_region_scale: gr.Slider
-    target_color: gr.ColorPicker
-    reference_matte_color: gr.ColorPicker
-    composite_megapixels: gr.Slider
-    dimension_multiple: gr.Number
-    resize_filter: gr.Radio
-    mask_overlap: gr.Slider
-
-    inherit_main_prompt: gr.Checkbox
-    prompt: gr.Textbox
-    inherit_main_negative: gr.Checkbox
-    negative_prompt: gr.Textbox
-    prefix_enabled: gr.Checkbox
-    prefix_text: gr.Textbox
-    prefix_strength: gr.Slider
-    extra_prefix: gr.Textbox
-    extra_suffix: gr.Textbox
-
-    edit_lora_enabled: gr.Checkbox
-    edit_lora_name: gr.Dropdown
-    edit_lora_strength: gr.Slider
-    extend_lora_enabled: gr.Checkbox
-    extend_lora_name: gr.Dropdown
-    extend_lora_strength: gr.Slider
-    require_enabled_loras: gr.Checkbox
-
-    checkpoint_override: gr.Dropdown
-    override_additional_modules: gr.Checkbox
-    additional_modules: gr.Dropdown
-    refresh_models_button: gr.Button
-
-    steps: gr.Slider
-    cfg_scale: gr.Slider
-    shift: gr.Slider
-    sampler: gr.Dropdown
-    scheduler: gr.Dropdown
-    denoising_strength: gr.Slider
-    resize_mode: gr.Radio
-    inpainting_fill: gr.Radio
-    mask_blur: gr.Slider
-    mask_round: gr.Checkbox
-    mask_invert: gr.Checkbox
-    inpainting_mask_weight: gr.Slider
-    initial_noise_multiplier: gr.Slider
-
-    eta: gr.Slider
-    s_min_uncond: gr.Slider
-    s_churn: gr.Slider
-    s_tmin: gr.Slider
-    s_tmax: gr.Slider
-    s_noise: gr.Slider
-
-    seed: gr.Number
-    seed_step: gr.Number
+    keep_scope: gr.Radio
     candidate_count: gr.Slider
-    seed_random_button: gr.Button
-    seed_pull_button: gr.Button
-    restore_faces: gr.Checkbox
-    native_reference_enabled: gr.Checkbox
-
-    save_target: gr.Checkbox
-    save_generated_canvas: gr.Checkbox
-    save_input_canvas: gr.Checkbox
-    save_mask: gr.Checkbox
-    gallery_content: gr.Radio
-    insert_mode: gr.Radio
-
-    preview_button: gr.Button
-    preview_canvas: gr.Image
-    preview_mask: gr.Image
+    prompt: gr.Textbox
     generate_button: gr.Button
     stop_button: gr.Button
     status: gr.HTML
+    expert_accordion: gr.Accordion
+    custom_size_enabled: gr.Checkbox
+    output_width: gr.Slider
+    output_height: gr.Slider
+    composite_megapixels: gr.Slider
+    edit_lora_strength: gr.Slider
+    extend_lora_enabled: gr.Checkbox
+    extend_lora_strength: gr.Slider
+    prefix_text: gr.Textbox
+    prefix_strength: gr.Slider
+    follow_forge_preset: gr.Checkbox
+    sampler: gr.Dropdown
+    scheduler: gr.Dropdown
+    steps: gr.Slider
+    cfg_scale: gr.Slider
+    shift: gr.Slider
+    fill_mode: gr.Radio
+    target_color: gr.ColorPicker
+    seed: gr.Number
+    seed_random_button: gr.Button
+    seed_pull_button: gr.Button
+    negative_prompt: gr.Textbox
+    save_debug_images: gr.Checkbox
+    preview_button: gr.Button
+    preview_canvas: gr.Image
+    preview_mask: gr.Image
 
     def all_widgets(self) -> list:
         return [getattr(self, name) for name in REFERENCE_ARG_KEYS]
 
-    def geometry_widgets(self) -> list:
-        return [
-            self.reference_image,
-            self.output_width,
-            self.output_height,
-            self.placement,
-            self.target_region_scale,
-            self.target_color,
-            self.reference_matte_color,
-            self.composite_megapixels,
-            self.dimension_multiple,
-            self.resize_filter,
-            self.mask_overlap,
-        ]
-
 
 REFERENCE_ARG_KEYS: tuple[str, ...] = (
     "reference_image",
+    "keep_scope",
+    "prompt",
+    "candidate_count",
+    "custom_size_enabled",
     "output_width",
     "output_height",
-    "placement",
-    "target_region_scale",
-    "target_color",
-    "reference_matte_color",
     "composite_megapixels",
-    "dimension_multiple",
-    "resize_filter",
-    "mask_overlap",
-    "inherit_main_prompt",
-    "prompt",
-    "inherit_main_negative",
-    "negative_prompt",
-    "prefix_enabled",
-    "prefix_text",
-    "prefix_strength",
-    "extra_prefix",
-    "extra_suffix",
-    "edit_lora_enabled",
-    "edit_lora_name",
     "edit_lora_strength",
     "extend_lora_enabled",
-    "extend_lora_name",
     "extend_lora_strength",
-    "require_enabled_loras",
-    "checkpoint_override",
-    "override_additional_modules",
-    "additional_modules",
+    "prefix_text",
+    "prefix_strength",
+    "follow_forge_preset",
+    "sampler",
+    "scheduler",
     "steps",
     "cfg_scale",
     "shift",
-    "sampler",
-    "scheduler",
-    "denoising_strength",
-    "resize_mode",
-    "inpainting_fill",
-    "mask_blur",
-    "mask_round",
-    "mask_invert",
-    "inpainting_mask_weight",
-    "initial_noise_multiplier",
-    "eta",
-    "s_min_uncond",
-    "s_churn",
-    "s_tmin",
-    "s_tmax",
-    "s_noise",
+    "fill_mode",
+    "target_color",
     "seed",
-    "seed_step",
-    "candidate_count",
-    "restore_faces",
-    "native_reference_enabled",
-    "save_target",
-    "save_generated_canvas",
-    "save_input_canvas",
-    "save_mask",
-    "gallery_content",
-    "insert_mode",
+    "negative_prompt",
+    "save_debug_images",
 )
 
-_REFERENCE_EXTRA_INPUTS = 3  # main prompt, main negative, generation_info
-
-
-def _slider(
-    label: str,
-    *,
-    value: float,
-    minimum: float,
-    maximum: float,
-    step: float,
-    elem_id: str,
-    info: str | None = None,
-) -> gr.Slider:
-    return gr.Slider(
-        label=label,
-        value=value,
-        minimum=minimum,
-        maximum=maximum,
-        step=step,
-        elem_id=elem_id,
-        info=info,
-    )
+# main prompt, main negative, generation_info, txt2img width, txt2img height
+_REFERENCE_EXTRA_INPUTS = 5
 
 
 def build_anima_reference_panel(
     samplers: list[str],
     schedulers: list[str],
 ) -> AnimaReferencePanel:
-    """Render Feature 6 as a sibling of the extension's other accordions."""
+    """Render Feature 6: one image in, everything else from the recipe."""
 
-    lora_choices = list_lora_choices()
-    checkpoint_choices = ["Use current", *find_checkpoint_options()]
-    module_choices = list_module_choices()
     sampler_choices = samplers or ["Euler a"]
     scheduler_choices = schedulers or ["Simple"]
     sampler_default = (
@@ -314,515 +181,217 @@ def build_anima_reference_panel(
     )
 
     with gr.Accordion(
-        "Feature 6 — Anima Character Reference / ReStyler",
+        "Feature 6 — Anima Character Reference",
         open=False,
         elem_id="sam3_anima_reference_panel",
     ) as accordion:
         selected_index_state = gr.Number(
-            value=-1,
-            precision=0,
-            visible=False,
+            value=-1, precision=0, visible=False,
             elem_id="sam3_anima_reference_selected_index",
         )
-        gr.Markdown(
-            "참조 캐릭터와 빈 생성 영역을 한 캔버스로 만든 뒤, 빈 영역만 "
-            "Anima Edit로 인페인트하고 정확한 출력 크기로 잘라냅니다. "
-            "Forge Neo 코어는 수정하지 않으며 **Anima 네이티브 Reference**를 "
-            "작업 중에만 켭니다. 모델/LoRA 안내: "
-            f"[Anima ReStyler]({_RESTYLER_URL})"
+        # Used only if Forge's txt2img width/height sliders were not captured.
+        txt2img_width_fallback = gr.Number(
+            value=0, precision=0, visible=False,
+            elem_id="sam3_anima_reference_width_fallback",
         )
-
+        txt2img_height_fallback = gr.Number(
+            value=0, precision=0, visible=False,
+            elem_id="sam3_anima_reference_height_fallback",
+        )
+        gr.Markdown(
+            "캐릭터 이미지 하나만 넣으면 원본 "
+            f"[Anima ReStyler v1.2]({_RESTYLER_URL}) 방식으로 그 캐릭터를 "
+            "레퍼런스합니다. 비워 두면 선택한 T2I 이미지를 씁니다. 결과 크기와 "
+            "프롬프트는 txt2img 설정을 따릅니다. 필요: `models/Lora`의 "
+            "**AnimeEditV2**. 권장 입력: 단순한 배경, 중립 포즈."
+        )
         with gr.Row():
             reference_image = gr.Image(
                 type="pil",
+                image_mode="RGBA",
                 sources=["upload", "clipboard"],
-                label="Reference character image",
+                label=_LABEL + "캐릭터 이미지",
                 height=360,
                 elem_id="sam3_anima_reference_image",
             )
             with gr.Column():
                 load_selected_button = gr.Button(
-                    "📋 선택한 T2I 이미지를 Reference로",
+                    "📋 선택한 T2I 이미지 가져오기",
                     elem_id="sam3_anima_reference_load_selected",
                 )
-                gr.Markdown(
-                    "**입력 권장:** 단순한 배경, 중립 포즈. 왼쪽/오른쪽 배치, "
-                    "빈 영역 색, 합성 해상도까지 아래에서 직접 바꿀 수 있습니다."
+                keep_scope = gr.Radio(
+                    choices=list(_KEEP_SCOPE_LABEL_TO_VALUE),
+                    value="정체성",
+                    label=_LABEL + "유지 범위",
+                    elem_id="sam3_anima_reference_keep_scope",
                 )
+                candidate_count = gr.Slider(
+                    label=_LABEL + "후보 수",
+                    value=2, minimum=1, maximum=16, step=1,
+                    elem_id="sam3_anima_reference_candidates",
+                )
+        prompt = gr.Textbox(
+            value="",
+            lines=2,
+            label=_LABEL + "프롬프트 (비우면 txt2img 프롬프트)",
+            elem_id="sam3_anima_reference_prompt",
+        )
+        with gr.Row():
+            generate_button = gr.Button(
+                "▶ 캐릭터 레퍼런스 생성",
+                variant="primary",
+                elem_id="sam3_anima_reference_generate",
+            )
+            stop_button = gr.Button(
+                "⏹ 중지",
+                variant="stop",
+                visible=False,
+                elem_id="sam3_anima_reference_stop",
+            )
+        status = gr.HTML(
+            "<span>캐릭터 이미지를 넣거나 T2I 이미지를 선택한 뒤 생성하세요.</span>",
+            elem_id="sam3_anima_reference_status",
+        )
 
-        with gr.Accordion("1. Canvas / Mask / Crop", open=True):
+        with gr.Accordion(
+            "전문가 설정",
+            open=False,
+            elem_id="sam3_anima_reference_expert",
+        ) as expert_accordion:
             with gr.Row():
-                output_width = _slider(
-                    "Result width",
-                    value=960,
-                    minimum=64,
-                    maximum=4096,
-                    step=8,
+                custom_size_enabled = gr.Checkbox(
+                    value=False,
+                    label=_LABEL + "결과 크기 직접 지정 (끄면 txt2img 크기)",
+                    elem_id="sam3_anima_reference_custom_size",
+                )
+                output_width = gr.Slider(
+                    label=_LABEL + "결과 가로",
+                    value=960, minimum=64, maximum=4096, step=8,
                     elem_id="sam3_anima_reference_output_width",
                 )
-                output_height = _slider(
-                    "Result height",
-                    value=1088,
-                    minimum=64,
-                    maximum=4096,
-                    step=8,
+                output_height = gr.Slider(
+                    label=_LABEL + "결과 세로",
+                    value=1088, minimum=64, maximum=4096, step=8,
                     elem_id="sam3_anima_reference_output_height",
                 )
-            with gr.Row():
-                placement = gr.Radio(
-                    ["right", "left"],
-                    value="right",
-                    label="Generated target placement",
-                    elem_id="sam3_anima_reference_placement",
-                )
-                target_region_scale = _slider(
-                    "Target panel width scale",
-                    value=1.0,
-                    minimum=0.05,
-                    maximum=4.0,
-                    step=0.01,
-                    elem_id="sam3_anima_reference_target_scale",
-                    info="출력 종횡비에 곱해지는 빈 패널 폭입니다.",
-                )
-            with gr.Row():
-                target_color = gr.ColorPicker(
-                    value="#000000",
-                    label="Empty target color",
-                    elem_id="sam3_anima_reference_target_color",
-                )
-                reference_matte_color = gr.ColorPicker(
-                    value="#ffffff",
-                    label="Transparent reference matte",
-                    elem_id="sam3_anima_reference_matte_color",
-                )
-            with gr.Row():
-                composite_megapixels = _slider(
-                    "Composite megapixels (0 = source height)",
-                    value=1.4,
-                    minimum=0.0,
-                    maximum=16.0,
-                    step=0.05,
-                    elem_id="sam3_anima_reference_megapixels",
-                )
-                dimension_multiple = gr.Number(
-                    value=16,
-                    precision=0,
-                    minimum=1,
-                    maximum=256,
-                    label="Dimension multiple",
-                    elem_id="sam3_anima_reference_multiple",
-                )
-            with gr.Row():
-                resize_filter = gr.Radio(
-                    ["nearest", "bilinear", "bicubic", "lanczos"],
-                    value="lanczos",
-                    label="Resize / final crop filter",
-                    elem_id="sam3_anima_reference_resize_filter",
-                )
-                mask_overlap = _slider(
-                    "Mask overlap into reference (px)",
-                    value=0,
-                    minimum=0,
-                    maximum=1024,
-                    step=1,
-                    elem_id="sam3_anima_reference_mask_overlap",
-                )
-
-        with gr.Accordion("2. Prompt / LoRA", open=True):
-            with gr.Row():
-                inherit_main_prompt = gr.Checkbox(
-                    value=True,
-                    label="Use current T2I prompt",
-                    elem_id="sam3_anima_reference_inherit_prompt",
-                )
-                inherit_main_negative = gr.Checkbox(
-                    value=True,
-                    label="Use current T2I negative prompt",
-                    elem_id="sam3_anima_reference_inherit_negative",
-                )
-            prompt = gr.Textbox(
-                value="",
-                lines=3,
-                label="Feature 6 prompt (used when current prompt is OFF)",
-                elem_id="sam3_anima_reference_prompt",
-            )
-            negative_prompt = gr.Textbox(
-                value="",
-                lines=2,
-                label="Feature 6 negative prompt (used when current negative is OFF)",
-                elem_id="sam3_anima_reference_negative",
+            composite_megapixels = gr.Slider(
+                label=_LABEL + "캔버스 메가픽셀",
+                value=1.4, minimum=0.5, maximum=4.0, step=0.05,
+                elem_id="sam3_anima_reference_megapixels",
             )
             with gr.Row():
-                prefix_enabled = gr.Checkbox(
-                    value=True,
-                    label="Enable reference prefix",
-                    elem_id="sam3_anima_reference_prefix_enabled",
-                )
-                prefix_text = gr.Textbox(
-                    value="split screen, multiple views",
-                    label="Reference prefix text",
-                    elem_id="sam3_anima_reference_prefix_text",
-                )
-                prefix_strength = _slider(
-                    "Prefix weight",
-                    value=1.2,
-                    minimum=-5.0,
-                    maximum=5.0,
-                    step=0.05,
-                    elem_id="sam3_anima_reference_prefix_strength",
-                )
-            with gr.Row():
-                extra_prefix = gr.Textbox(
-                    value="",
-                    label="Extra prefix",
-                    elem_id="sam3_anima_reference_extra_prefix",
-                )
-                extra_suffix = gr.Textbox(
-                    value="",
-                    label="Extra suffix",
-                    elem_id="sam3_anima_reference_extra_suffix",
-                )
-            gr.Markdown(
-                "기본 권장: **AnimeEditV2 = 0.72**, "
-                "**Extend Image (Anima Edit) v1 = 0.4**. 파일명과 강도를 "
-                "모두 직접 바꿀 수 있습니다."
-            )
-            with gr.Row():
-                edit_lora_enabled = gr.Checkbox(
-                    value=True,
-                    label="Enable Anima Edit LoRA",
-                    elem_id="sam3_anima_reference_edit_enabled",
-                )
-                edit_lora_name = gr.Dropdown(
-                    choices=lora_choices,
-                    value=_EDIT_LORA_DEFAULT,
-                    allow_custom_value=True,
-                    label="Anima Edit LoRA",
-                    elem_id="sam3_anima_reference_edit_lora",
-                )
-                edit_lora_strength = _slider(
-                    "Edit LoRA strength",
-                    value=0.72,
-                    minimum=-5.0,
-                    maximum=5.0,
-                    step=0.01,
+                edit_lora_strength = gr.Slider(
+                    label=_LABEL + "Edit LoRA 강도",
+                    value=0.72, minimum=0.0, maximum=2.0, step=0.01,
                     elem_id="sam3_anima_reference_edit_strength",
                 )
-            with gr.Row():
                 extend_lora_enabled = gr.Checkbox(
-                    value=True,
-                    label="Enable Extend LoRA",
+                    value=False,
+                    label=_LABEL + "Extend LoRA 사용",
                     elem_id="sam3_anima_reference_extend_enabled",
                 )
-                extend_lora_name = gr.Dropdown(
-                    choices=lora_choices,
-                    value=_EXTEND_LORA_DEFAULT,
-                    allow_custom_value=True,
-                    label="Extend Image LoRA",
-                    elem_id="sam3_anima_reference_extend_lora",
-                )
-                extend_lora_strength = _slider(
-                    "Extend LoRA strength",
-                    value=0.4,
-                    minimum=-5.0,
-                    maximum=5.0,
-                    step=0.01,
+                extend_lora_strength = gr.Slider(
+                    label=_LABEL + "Extend LoRA 강도",
+                    value=0.4, minimum=0.0, maximum=2.0, step=0.01,
                     elem_id="sam3_anima_reference_extend_strength",
                 )
-            require_enabled_loras = gr.Checkbox(
-                value=True,
-                label="Stop before generation if an enabled LoRA is missing",
-                elem_id="sam3_anima_reference_require_loras",
-            )
-
-        with gr.Accordion("3. Model / VAE / Text Encoder", open=False):
             with gr.Row():
-                checkpoint_override = gr.Dropdown(
-                    choices=checkpoint_choices,
-                    value="Use current",
-                    allow_custom_value=True,
-                    label="Checkpoint override",
-                    elem_id="sam3_anima_reference_checkpoint",
+                prefix_text = gr.Textbox(
+                    value="split screen, multiple views",
+                    label=_LABEL + "앞머리 문구",
+                    elem_id="sam3_anima_reference_prefix_text",
                 )
-                refresh_models_button = gr.Button(
-                    "🔄 Checkpoint / Module / LoRA 새로고침",
-                    elem_id="sam3_anima_reference_refresh",
+                prefix_strength = gr.Slider(
+                    label=_LABEL + "앞머리 가중치",
+                    value=1.2, minimum=0.0, maximum=3.0, step=0.05,
+                    elem_id="sam3_anima_reference_prefix_strength",
                 )
-            override_additional_modules = gr.Checkbox(
+            follow_forge_preset = gr.Checkbox(
                 value=False,
-                label="Override VAE / Text Encoder for this Feature 6 run",
-                elem_id="sam3_anima_reference_override_modules",
+                label=_LABEL + "Forge Anima img2img 프리셋 따르기 (켜면 아래 샘플링 값 무시)",
+                elem_id="sam3_anima_reference_forge_preset",
             )
-            additional_modules = gr.Dropdown(
-                choices=module_choices,
-                value=[],
-                multiselect=True,
-                allow_custom_value=True,
-                label="VAE / Text Encoder modules",
-                elem_id="sam3_anima_reference_modules",
-            )
-
-        with gr.Accordion("4. Sampling", open=True):
-            with gr.Row():
-                steps = _slider(
-                    "Steps",
-                    value=30,
-                    minimum=1,
-                    maximum=200,
-                    step=1,
-                    elem_id="sam3_anima_reference_steps",
-                )
-                cfg_scale = _slider(
-                    "CFG scale",
-                    value=5.0,
-                    minimum=0.0,
-                    maximum=30.0,
-                    step=0.1,
-                    elem_id="sam3_anima_reference_cfg",
-                )
-                shift = _slider(
-                    "Shift / Distilled CFG",
-                    value=3.0,
-                    minimum=0.0,
-                    maximum=30.0,
-                    step=0.1,
-                    elem_id="sam3_anima_reference_shift",
-                )
             with gr.Row():
                 sampler = gr.Dropdown(
                     choices=sampler_choices,
                     value=sampler_default,
-                    allow_custom_value=True,
-                    label="Sampler",
+                    label=_LABEL + "샘플러",
                     elem_id="sam3_anima_reference_sampler",
                 )
                 scheduler = gr.Dropdown(
                     choices=scheduler_choices,
                     value=scheduler_default,
-                    allow_custom_value=True,
-                    label="Scheduler",
+                    label=_LABEL + "스케줄러",
                     elem_id="sam3_anima_reference_scheduler",
                 )
             with gr.Row():
-                denoising_strength = _slider(
-                    "Denoising strength",
-                    value=1.0,
-                    minimum=0.0,
-                    maximum=1.0,
-                    step=0.01,
-                    elem_id="sam3_anima_reference_denoise",
-                    info="원본 워크플로우의 full-noise 기본값은 1.0입니다.",
+                steps = gr.Slider(
+                    label=_LABEL + "스텝",
+                    value=30, minimum=1, maximum=150, step=1,
+                    elem_id="sam3_anima_reference_steps",
                 )
-                initial_noise_multiplier = _slider(
-                    "Initial noise multiplier",
-                    value=1.0,
-                    minimum=0.0,
-                    maximum=3.0,
-                    step=0.01,
-                    elem_id="sam3_anima_reference_noise_multiplier",
+                cfg_scale = gr.Slider(
+                    label=_LABEL + "CFG",
+                    value=5.0, minimum=0.0, maximum=20.0, step=0.1,
+                    elem_id="sam3_anima_reference_cfg",
+                )
+                shift = gr.Slider(
+                    label=_LABEL + "Shift",
+                    value=3.0, minimum=0.0, maximum=20.0, step=0.1,
+                    elem_id="sam3_anima_reference_shift",
                 )
             with gr.Row():
-                resize_mode = gr.Radio(
-                    ["Just Resize", "Crop and Resize", "Resize and Fill"],
-                    value="Just Resize",
-                    label="Img2img resize mode",
-                    elem_id="sam3_anima_reference_i2i_resize",
+                fill_mode = gr.Radio(
+                    choices=list(_FILL_MODE_LABEL_TO_VALUE),
+                    value="원본 (단색 그대로)",
+                    label=_LABEL + "빈 칸 채우기",
+                    elem_id="sam3_anima_reference_fill_mode",
                 )
-                inpainting_fill = gr.Radio(
-                    ["fill", "original", "latent noise", "latent nothing"],
-                    value="latent noise",
-                    label="Masked content",
-                    elem_id="sam3_anima_reference_fill",
+                target_color = gr.ColorPicker(
+                    value="#000000",
+                    label=_LABEL + "빈 칸 색",
+                    elem_id="sam3_anima_reference_target_color",
                 )
-            with gr.Row():
-                mask_blur = _slider(
-                    "Mask blur",
-                    value=0,
-                    minimum=0,
-                    maximum=256,
-                    step=1,
-                    elem_id="sam3_anima_reference_mask_blur",
-                )
-                inpainting_mask_weight = _slider(
-                    "Inpainting conditioning mask weight",
-                    value=1.0,
-                    minimum=0.0,
-                    maximum=1.0,
-                    step=0.01,
-                    elem_id="sam3_anima_reference_mask_weight",
-                )
-            with gr.Row():
-                mask_round = gr.Checkbox(
-                    value=True,
-                    label="Round latent mask",
-                    elem_id="sam3_anima_reference_mask_round",
-                )
-                mask_invert = gr.Checkbox(
-                    value=False,
-                    label="Invert mask",
-                    elem_id="sam3_anima_reference_mask_invert",
-                )
-
-            with gr.Accordion("Sampler advanced values", open=False):
-                with gr.Row():
-                    eta = _slider(
-                        "Eta",
-                        value=1.0,
-                        minimum=0.0,
-                        maximum=10.0,
-                        step=0.01,
-                        elem_id="sam3_anima_reference_eta",
-                    )
-                    s_min_uncond = _slider(
-                        "s_min_uncond",
-                        value=0.0,
-                        minimum=0.0,
-                        maximum=20.0,
-                        step=0.01,
-                        elem_id="sam3_anima_reference_s_min_uncond",
-                    )
-                with gr.Row():
-                    s_churn = _slider(
-                        "s_churn",
-                        value=0.0,
-                        minimum=0.0,
-                        maximum=100.0,
-                        step=0.01,
-                        elem_id="sam3_anima_reference_s_churn",
-                    )
-                    s_tmin = _slider(
-                        "s_tmin",
-                        value=0.0,
-                        minimum=0.0,
-                        maximum=10.0,
-                        step=0.01,
-                        elem_id="sam3_anima_reference_s_tmin",
-                    )
-                    s_tmax = _slider(
-                        "s_tmax (0 = sampler default / infinity)",
-                        value=0.0,
-                        minimum=0.0,
-                        maximum=999.0,
-                        step=0.01,
-                        elem_id="sam3_anima_reference_s_tmax",
-                    )
-                    s_noise = _slider(
-                        "s_noise",
-                        value=1.0,
-                        minimum=0.0,
-                        maximum=3.0,
-                        step=0.001,
-                        elem_id="sam3_anima_reference_s_noise",
-                    )
-
-        with gr.Accordion("5. Seed / Output / Diagnostics", open=True):
             with gr.Row():
                 seed = gr.Number(
                     value=-1,
                     precision=0,
-                    label="Seed (-1 = random)",
+                    label=_LABEL + "시드 (-1 = 무작위)",
                     elem_id="sam3_anima_reference_seed",
                 )
                 seed_random_button = gr.Button(
-                    "🎲 -1",
-                    elem_id="sam3_anima_reference_seed_random",
+                    "🎲 -1", elem_id="sam3_anima_reference_seed_random"
                 )
                 seed_pull_button = gr.Button(
-                    "🎯 선택 이미지 Seed",
+                    "🎯 선택 이미지 시드",
                     elem_id="sam3_anima_reference_seed_pull",
                 )
-            with gr.Row():
-                seed_step = gr.Number(
-                    value=1,
-                    precision=0,
-                    label="Seed increment per candidate",
-                    elem_id="sam3_anima_reference_seed_step",
-                )
-                candidate_count = _slider(
-                    "Candidates",
-                    value=1,
-                    minimum=1,
-                    maximum=16,
-                    step=1,
-                    elem_id="sam3_anima_reference_candidates",
-                )
-            with gr.Row():
-                native_reference_enabled = gr.Checkbox(
-                    value=True,
-                    label="Enable Forge native Anima Reference",
-                    elem_id="sam3_anima_reference_native",
-                )
-                restore_faces = gr.Checkbox(
-                    value=False,
-                    label="Restore faces",
-                    elem_id="sam3_anima_reference_restore_faces",
-                )
-            with gr.Row():
-                save_target = gr.Checkbox(
-                    value=True,
-                    label="Save cropped target",
-                    elem_id="sam3_anima_reference_save_target",
-                )
-                save_generated_canvas = gr.Checkbox(
-                    value=False,
-                    label="Save generated split canvas",
-                    elem_id="sam3_anima_reference_save_generated",
-                )
-                save_input_canvas = gr.Checkbox(
-                    value=False,
-                    label="Save input split canvas",
-                    elem_id="sam3_anima_reference_save_input",
-                )
-                save_mask = gr.Checkbox(
-                    value=False,
-                    label="Save mask",
-                    elem_id="sam3_anima_reference_save_mask",
-                )
-            with gr.Row():
-                gallery_content = gr.Radio(
-                    ["Target only", "Target + generated canvas"],
-                    value="Target only",
-                    label="Add to T2I gallery",
-                    elem_id="sam3_anima_reference_gallery_content",
-                )
-                insert_mode = gr.Radio(
-                    ["After selected", "At end", "Replace gallery"],
-                    value="At end",
-                    label="Gallery insertion",
-                    elem_id="sam3_anima_reference_insert_mode",
-                )
-
-        with gr.Row():
+            negative_prompt = gr.Textbox(
+                value="",
+                lines=2,
+                label=_LABEL + "네거티브 프롬프트 (비우면 txt2img 네거티브)",
+                elem_id="sam3_anima_reference_negative",
+            )
+            save_debug_images = gr.Checkbox(
+                value=False,
+                label=_LABEL + "디버그 이미지 저장 (생성 캔버스·입력 캔버스·마스크)",
+                elem_id="sam3_anima_reference_save_debug",
+            )
             preview_button = gr.Button(
-                "🧩 Canvas / Mask 미리보기",
+                "🧩 캔버스 / 마스크 미리보기",
                 elem_id="sam3_anima_reference_preview",
             )
-            generate_button = gr.Button(
-                "▶ Generate Character Reference",
-                variant="primary",
-                elem_id="sam3_anima_reference_generate",
-            )
-            stop_button = gr.Button(
-                "⏹ Stop",
-                variant="stop",
-                visible=False,
-                elem_id="sam3_anima_reference_stop",
-            )
-        with gr.Row():
-            preview_canvas = gr.Image(
-                label="Prepared split canvas",
-                interactive=False,
-                elem_id="sam3_anima_reference_preview_canvas",
-            )
-            preview_mask = gr.Image(
-                label="Inpaint mask",
-                interactive=False,
-                elem_id="sam3_anima_reference_preview_mask",
-            )
-        status = gr.HTML(
-            "<span>Feature 6 ready — 모든 워크플로우 수치는 위에서 수정할 수 있습니다.</span>",
-            elem_id="sam3_anima_reference_status",
-        )
+            with gr.Row():
+                preview_canvas = gr.Image(
+                    label=_LABEL + "캔버스 미리보기",
+                    interactive=False,
+                    elem_id="sam3_anima_reference_preview_canvas",
+                )
+                preview_mask = gr.Image(
+                    label=_LABEL + "마스크 미리보기",
+                    interactive=False,
+                    elem_id="sam3_anima_reference_preview_mask",
+                )
 
     return AnimaReferencePanel(
         **{
@@ -833,231 +402,219 @@ def build_anima_reference_panel(
     )
 
 
-def _canvas_config_from_keyed(keyed: dict[str, Any]) -> ReferenceCanvasConfig:
-    return ReferenceCanvasConfig(
-        output_width=as_int(keyed.get("output_width"), 960),
-        output_height=as_int(keyed.get("output_height"), 1088),
-        placement=str(keyed.get("placement") or "right"),
-        target_region_scale=as_float(keyed.get("target_region_scale"), 1.0),
-        target_color=str(keyed.get("target_color") or "#000000"),
-        reference_matte_color=str(
-            keyed.get("reference_matte_color") or "#ffffff"
-        ),
-        composite_megapixels=as_float(
-            keyed.get("composite_megapixels"), 1.4
-        ),
-        dimension_multiple=as_int(keyed.get("dimension_multiple"), 16),
-        resize_filter=str(keyed.get("resize_filter") or "lanczos"),
-        mask_overlap=as_int(keyed.get("mask_overlap"), 0),
-    )
-
-
-def preview_reference_layout(*values):
-    """Preview handler for only the image and geometry controls."""
-
-    keys = REFERENCE_ARG_KEYS[:11]
-    keyed = dict(zip(keys, values))
-    image = _coerce_gallery_item_to_pil(keyed.get("reference_image"))
-    if image is None:
-        return (
-            gr.update(),
-            gr.update(),
-            "<span style='color:#c80'>Reference 이미지를 먼저 넣어 주세요.</span>",
-        )
-    try:
-        prepared = prepare_reference_canvas(
-            image,
-            _canvas_config_from_keyed(keyed),
-        )
-        return (
-            prepared.canvas,
-            prepared.mask,
-            (
-                "<span style='color:#383'>Prepared canvas "
-                f"{prepared.canvas.width}×{prepared.canvas.height}; "
-                f"target crop {prepared.output_size[0]}×"
-                f"{prepared.output_size[1]}.</span>"
-            ),
-        )
-    except Exception as exc:
-        return (
-            gr.update(),
-            gr.update(),
-            f"<span style='color:#c33'>Preview failed: {exc}</span>",
-        )
-
-
-def _module_tuple(raw: Any) -> tuple[str, ...]:
-    if raw is None:
-        return ()
-    if isinstance(raw, str):
-        return tuple(
-            part.strip() for part in raw.split(",") if part.strip()
-        )
-    try:
-        return tuple(str(item) for item in raw if str(item).strip())
-    except TypeError:
-        return ()
-
-
 def request_from_values(
     values: tuple[Any, ...],
     *,
     reference_image: Image.Image,
     main_prompt: str,
     main_negative: str,
-) -> tuple[ReferenceGenerationRequest, str, str]:
-    """Map the UI vector to the typed request and gallery-only settings."""
+    txt2img_width: Any = None,
+    txt2img_height: Any = None,
+    available_loras=(),
+    forge_opts: dict[str, Any] | None = None,
+) -> tuple[ReferenceGenerationRequest, DetectedLoras, list[str]]:
+    """Map the panel vector to a request; everything hidden uses the recipe."""
 
     keyed = dict(zip(REFERENCE_ARG_KEYS, values))
-    prompt = (
-        str(main_prompt or "")
-        if bool(keyed.get("inherit_main_prompt", True))
-        else str(keyed.get("prompt") or "")
-    )
+    scope_raw = str(keyed.get("keep_scope") or KEEP_IDENTITY)
+    scope = _KEEP_SCOPE_LABEL_TO_VALUE.get(scope_raw, scope_raw)
+    if scope not in KEEP_SCOPES:
+        scope = KEEP_IDENTITY
+    warnings: list[str] = []
+
+    panel_prompt = str(keyed.get("prompt") or "").strip()
+    if panel_prompt:
+        prompt = panel_prompt
+    else:
+        prompt = prepare_inherited_prompt(str(main_prompt or ""), scope)
+        warnings.extend(prompt_syntax_warnings(str(main_prompt or "")))
     negative = (
-        str(main_negative or "")
-        if bool(keyed.get("inherit_main_negative", True))
-        else str(keyed.get("negative_prompt") or "")
+        str(keyed.get("negative_prompt") or "").strip()
+        or str(main_negative or "")
     )
+
+    width, height = resolve_output_size(
+        bool(keyed.get("custom_size_enabled", False)),
+        as_int(keyed.get("output_width"), 960),
+        as_int(keyed.get("output_height"), 1088),
+        txt2img_width,
+        txt2img_height,
+    )
+    fill_raw = str(keyed.get("fill_mode") or FILL_ORIGINAL)
+    fill_choice = _FILL_MODE_LABEL_TO_VALUE.get(fill_raw, fill_raw)
+    inpainting_fill, target_color = fill_settings(
+        fill_choice,
+        str(keyed.get("target_color") or "#000000"),
+    )
+
+    panel_sampling = SamplingSettings(
+        sampler=str(keyed.get("sampler") or "Euler a"),
+        scheduler=str(keyed.get("scheduler") or "Simple"),
+        steps=as_int(keyed.get("steps"), 30),
+        cfg_scale=as_float(keyed.get("cfg_scale"), 5.0),
+        shift=as_float(keyed.get("shift"), 3.0),
+    )
+    follow_preset = bool(keyed.get("follow_forge_preset", False))
+    sampling = (
+        forge_preset_sampling(forge_opts or {}, panel_sampling)
+        if follow_preset
+        else panel_sampling
+    )
+
+    detected = detect_reference_loras(available_loras)
+    extend_wanted = bool(keyed.get("extend_lora_enabled", False))
+    if extend_wanted and detected.extend is None:
+        warnings.append(WARN_EXTEND_MISSING)
+    debug = bool(keyed.get("save_debug_images", False))
+
     request = ReferenceGenerationRequest(
         reference_image=reference_image,
-        canvas=_canvas_config_from_keyed(keyed),
+        canvas=ReferenceCanvasConfig(
+            output_width=width,
+            output_height=height,
+            target_color=target_color,
+            composite_megapixels=as_float(
+                keyed.get("composite_megapixels"), 1.4
+            ),
+        ),
         prompt=prompt,
         negative_prompt=negative,
-        prefix_enabled=bool(keyed.get("prefix_enabled", True)),
         prefix_text=str(
             keyed.get("prefix_text") or "split screen, multiple views"
         ),
         prefix_strength=as_float(keyed.get("prefix_strength"), 1.2),
-        extra_prefix=str(keyed.get("extra_prefix") or ""),
-        extra_suffix=str(keyed.get("extra_suffix") or ""),
-        edit_lora_enabled=bool(keyed.get("edit_lora_enabled", True)),
-        edit_lora_name=str(keyed.get("edit_lora_name") or ""),
-        edit_lora_strength=as_float(
-            keyed.get("edit_lora_strength"), 0.72
+        edit_lora_name=detected.edit or "",
+        edit_lora_strength=edit_strength_for_scope(
+            scope, as_float(keyed.get("edit_lora_strength"), 0.72)
         ),
-        extend_lora_enabled=bool(keyed.get("extend_lora_enabled", True)),
-        extend_lora_name=str(keyed.get("extend_lora_name") or ""),
+        extend_lora_enabled=extend_wanted and detected.extend is not None,
+        extend_lora_name=detected.extend or "",
         extend_lora_strength=as_float(
             keyed.get("extend_lora_strength"), 0.4
         ),
-        require_enabled_loras=bool(
-            keyed.get("require_enabled_loras", True)
-        ),
-        checkpoint_override=str(
-            keyed.get("checkpoint_override") or "Use current"
-        ),
-        override_additional_modules=bool(
-            keyed.get("override_additional_modules", False)
-        ),
-        additional_modules=_module_tuple(keyed.get("additional_modules")),
-        steps=as_int(keyed.get("steps"), 30),
-        cfg_scale=as_float(keyed.get("cfg_scale"), 5.0),
-        shift=as_float(keyed.get("shift"), 3.0),
-        sampler=str(keyed.get("sampler") or "Euler a"),
-        scheduler=str(keyed.get("scheduler") or "Simple"),
-        denoising_strength=as_float(
-            keyed.get("denoising_strength"), 1.0
-        ),
-        resize_mode=str(keyed.get("resize_mode") or "Just Resize"),
-        inpainting_fill=str(
-            keyed.get("inpainting_fill") or "latent noise"
-        ),
-        mask_blur=as_int(keyed.get("mask_blur"), 0),
-        mask_round=bool(keyed.get("mask_round", True)),
-        mask_invert=bool(keyed.get("mask_invert", False)),
-        inpainting_mask_weight=as_float(
-            keyed.get("inpainting_mask_weight"), 1.0
-        ),
-        initial_noise_multiplier=as_float(
-            keyed.get("initial_noise_multiplier"), 1.0
-        ),
-        eta=as_float(keyed.get("eta"), 1.0),
-        s_min_uncond=as_float(keyed.get("s_min_uncond"), 0.0),
-        s_churn=as_float(keyed.get("s_churn"), 0.0),
-        s_tmin=as_float(keyed.get("s_tmin"), 0.0),
-        s_tmax=as_float(keyed.get("s_tmax"), 0.0),
-        s_noise=as_float(keyed.get("s_noise"), 1.0),
+        steps=sampling.steps,
+        cfg_scale=sampling.cfg_scale,
+        shift=sampling.shift,
+        sampler=sampling.sampler,
+        scheduler=sampling.scheduler,
+        inpainting_fill=inpainting_fill,
         seed=as_int(keyed.get("seed"), -1),
-        seed_step=as_int(keyed.get("seed_step"), 1),
-        candidate_count=as_int(keyed.get("candidate_count"), 1),
-        restore_faces=bool(keyed.get("restore_faces", False)),
-        native_reference_enabled=bool(
-            keyed.get("native_reference_enabled", True)
-        ),
-        save_target=bool(keyed.get("save_target", True)),
-        save_generated_canvas=bool(
-            keyed.get("save_generated_canvas", False)
-        ),
-        save_input_canvas=bool(keyed.get("save_input_canvas", False)),
-        save_mask=bool(keyed.get("save_mask", False)),
+        candidate_count=as_int(keyed.get("candidate_count"), 2),
+        keep_scope=scope,
+        sampling_source="forge_preset" if follow_preset else "recipe",
+        save_generated_canvas=debug,
+        save_input_canvas=debug,
+        save_mask=debug,
     )
-    return (
-        request,
-        str(keyed.get("gallery_content") or "Target only"),
-        str(keyed.get("insert_mode") or "At end"),
-    )
+    return request, detected, warnings
 
 
-def _normalize_lora_name(name: str) -> set[str]:
-    text = str(name or "").strip().replace("\\", "/")
-    if not text:
-        return set()
-    without_ext = str(Path(text).with_suffix("")).replace("\\", "/")
-    return {
-        text.casefold(),
-        without_ext.casefold(),
-        Path(text).name.casefold(),
-        Path(without_ext).name.casefold(),
-    }
+_SOURCE_LABELS = {"uploaded": "업로드한 이미지", "gallery": "갤러리 이미지"}
+
+# Edit LoRA is trained for the 28-block base Anima UNet; any other block
+# count means the global 28->N compat hook (scripts/anima_lora_blocks.py)
+# remapped it.
+_BASE_MODEL_BLOCKS = 28
+# anima38 labels that mean "no connector is active" (as opposed to "checked,
+# and it is not applicable"/"installed") belong in the warning line, not the
+# green status line.
+_ANIMA38_OFF_PREFIXES = (
+    "unavailable",
+    "missing encoder",
+    "install failed",
+    "check failed",
+)
+WARN_ANIMA38_V1_ADAPTER = (
+    "3.8B v1 체크포인트는 캐릭터 레퍼런스에서 어댑터를 쓰지 않고 기본 "
+    "Anima로 진행했습니다"
+)
 
 
-def missing_enabled_loras(
-    request: ReferenceGenerationRequest,
-    available: list[str] | None = None,
-) -> list[str]:
-    if not request.require_enabled_loras:
+def _gallery_infotexts(current_info_json: str) -> list[str]:
+    try:
+        payload = json.loads(current_info_json) if current_info_json else {}
+    except Exception:
         return []
-    available_names: set[str] = set()
-    installed = (
-        available
-        if available is not None
-        else list_installed_lora_names()
-    )
-    for item in installed:
-        available_names.update(_normalize_lora_name(item))
-    missing = []
-    for enabled, name in (
-        (request.edit_lora_enabled, request.edit_lora_name),
-        (request.extend_lora_enabled, request.extend_lora_name),
-    ):
-        if enabled and name and not (
-            _normalize_lora_name(name) & available_names
-        ):
-            missing.append(name)
-    return missing
+    return [str(item or "") for item in (payload.get("infotexts") or [])]
 
 
-def _selected_gallery_image(
+def resolve_reference_image(
+    uploaded,
     gallery_value,
     selected_index,
-) -> tuple[Image.Image | None, int]:
+    current_info_json: str,
+) -> tuple[Image.Image | None, int, str]:
+    """Return (image, gallery index, source) for a run or a preview."""
+
+    if isinstance(uploaded, Image.Image):
+        # Keep transparency: the canvas code flattens it onto the matte.
+        return uploaded, -1, "uploaded"
+    image = _coerce_gallery_item_to_pil(uploaded)
+    if image is not None:
+        return image, -1, "uploaded"
+    items = list(gallery_value or [])
+    index = choose_fallback_index(
+        len(items), selected_index, _gallery_infotexts(current_info_json)
+    )
+    if index < 0:
+        return None, -1, "none"
+    return _coerce_gallery_item_to_pil(items[index]), index, "gallery"
+
+
+def load_selected_reference(gallery_value, selected_index):
+    """Explicit button: load exactly the selected (or last) gallery image."""
+
     items = list(gallery_value or [])
     if not items:
-        return None, -1
+        return None
     try:
         index = int(selected_index)
     except (TypeError, ValueError):
         index = -1
-    if index < 0 or index >= len(items):
+    if not 0 <= index < len(items):
         index = len(items) - 1
-    return _coerce_gallery_item_to_pil(items[index]), index
+    return _coerce_gallery_item_to_pil(items[index])
 
 
-def load_selected_reference(gallery_value, selected_index):
-    image, _ = _selected_gallery_image(gallery_value, selected_index)
-    return image
+def _forge_opts_data() -> dict[str, Any]:
+    try:
+        from modules import shared
+
+        return dict(getattr(shared.opts, "data", {}) or {})
+    except Exception:
+        return {}
+
+
+def _run_exclusive(job: str, fn):
+    """Run like Forge's own Generate: one job at a time, fresh stop flags."""
+
+    from modules import shared
+    from modules.call_queue import queue_lock
+
+    with queue_lock:
+        shared.state.begin(job=job)
+        try:
+            return fn()
+        finally:
+            shared.state.end()
+
+
+def _split_inputs(all_values):
+    expected = len(REFERENCE_ARG_KEYS) + _REFERENCE_EXTRA_INPUTS
+    if len(all_values) < expected:
+        return None
+    values = tuple(all_values[: len(REFERENCE_ARG_KEYS)])
+    main_prompt, main_negative, info_json, width, height = all_values[
+        len(REFERENCE_ARG_KEYS) : expected
+    ]
+    return (
+        values,
+        str(main_prompt or ""),
+        str(main_negative or ""),
+        str(info_json or ""),
+        width,
+        height,
+    )
 
 
 def _reference_error(gallery_value, message: str):
@@ -1068,22 +625,115 @@ def _reference_error(gallery_value, message: str):
         gr.update(),
         gr.update(),
         gr.update(),
+        gr.update(),
     )
 
 
-def _new_gallery_items(
+def format_reference_status(
     result: ReferenceGenerationResult,
-    gallery_content: str,
-) -> tuple[list[Image.Image], list[str]]:
-    images: list[Image.Image] = []
-    infotexts: list[str] = []
-    for output in result.outputs:
-        images.append(output.target_image)
-        infotexts.append(output.infotext)
-        if gallery_content == "Target + generated canvas":
-            images.append(output.generated_canvas)
-            infotexts.append(output.infotext)
-    return images, infotexts
+    request: ReferenceGenerationRequest,
+    detected: DetectedLoras,
+    warnings: list[str],
+    source: str,
+) -> str:
+    diagnostics = dict(result.diagnostics or {})
+    parts = [
+        f"{len(result.outputs)}장 생성",
+        f"레퍼런스: {_SOURCE_LABELS.get(source, source)}",
+        f"Edit LoRA: {detected.edit}",
+    ]
+    if request.extend_lora_enabled:
+        parts.append(f"Extend LoRA: {request.extend_lora_name}")
+    panel = diagnostics.get("target_panel")
+    if panel:
+        parts.append(
+            f"생성 영역 {panel[0]}×{panel[1]} "
+            f"(확대 {float(diagnostics.get('upscale', 1.0)):.2f}배)"
+        )
+    blocks = diagnostics.get("model_blocks")
+    parts.append(f"모델 {blocks}블록" if blocks else "모델 블록 수 확인 불가")
+    if isinstance(blocks, int) and blocks != _BASE_MODEL_BLOCKS:
+        parts.append(
+            f"Edit LoRA {_BASE_MODEL_BLOCKS}블록 → {blocks}블록 모델 "
+            "(블록 호환 훅으로 적용)"
+        )
+
+    anima38_label = str(diagnostics.get("anima38", "확인 불가"))
+    extra_warnings = list(warnings)
+    if anima38_label.startswith(_ANIMA38_OFF_PREFIXES):
+        parts.append("3.8B 커넥터: 꺼짐")
+        extra_warnings.append(f"3.8B 커넥터 사용 불가 ({anima38_label})")
+    else:
+        parts.append(f"3.8B 커넥터: {anima38_label}")
+        if blocks == 52 and anima38_label == "not a 3.8B v2 bundle":
+            extra_warnings.append(WARN_ANIMA38_V1_ADAPTER)
+
+    parts.append("시드 " + ", ".join(str(item.seed) for item in result.outputs))
+    text = (
+        "<span style='color:#383'>"
+        + html.escape(" · ".join(parts))
+        + "</span>"
+    )
+    if diagnostics.get("interrupted"):
+        text += "<br><span style='color:#c80'>중단되어 일부 후보만 생성했습니다.</span>"
+    if extra_warnings:
+        text += (
+            "<br><span style='color:#c80'>⚠ "
+            + html.escape(" / ".join(extra_warnings))
+            + "</span>"
+        )
+    return text
+
+
+def preview_reference_layout(gallery_value, selected_index, *all_values):
+    """Preview exactly the canvas and mask a Generate click would use."""
+
+    split = _split_inputs(all_values)
+    if split is None:
+        return (
+            gr.update(),
+            gr.update(),
+            "<span style='color:#c33'>Feature 6: missing UI values.</span>",
+        )
+    values, main_prompt, main_negative, info_json, width, height = split
+    keyed = dict(zip(REFERENCE_ARG_KEYS, values))
+    image, _, source = resolve_reference_image(
+        keyed.get("reference_image"), gallery_value, selected_index, info_json
+    )
+    if image is None:
+        return (
+            gr.update(),
+            gr.update(),
+            "<span style='color:#c80'>캐릭터 이미지를 넣거나 T2I 이미지를 선택해 주세요.</span>",
+        )
+    try:
+        request, _, _ = request_from_values(
+            values,
+            reference_image=image,
+            main_prompt=main_prompt,
+            main_negative=main_negative,
+            txt2img_width=width,
+            txt2img_height=height,
+        )
+        prepared = prepare_reference_canvas(image, request.canvas)
+    except Exception as exc:
+        return (
+            gr.update(),
+            gr.update(),
+            f"<span style='color:#c33'>미리보기 실패: {html.escape(str(exc))}</span>",
+        )
+    left, top, right, bottom = prepared.target_box
+    return (
+        prepared.canvas,
+        prepared.mask,
+        (
+            "<span style='color:#383'>"
+            f"캔버스 {prepared.canvas.width}×{prepared.canvas.height} · "
+            f"생성 영역 {right - left}×{bottom - top} → 결과 "
+            f"{prepared.output_size[0]}×{prepared.output_size[1]} · "
+            f"레퍼런스: {_SOURCE_LABELS.get(source, source)}</span>"
+        ),
+    )
 
 
 def _merge_gallery(
@@ -1126,55 +776,55 @@ def handle_anima_reference_click(
     *all_values,
     progress=gr.Progress(track_tqdm=True),
 ):
-    """Generate and insert Feature 6 outputs into the normal T2I gallery."""
+    """Generate candidates and append them to the normal T2I gallery."""
 
-    del progress  # Gradio injects it for tqdm forwarding; no direct calls needed.
-    expected = len(REFERENCE_ARG_KEYS) + _REFERENCE_EXTRA_INPUTS
-    if len(all_values) < expected:
+    del progress  # Gradio injects it for tqdm forwarding.
+    split = _split_inputs(all_values)
+    if split is None:
         return _reference_error(
             gallery_value,
             "<span style='color:#c33'>Feature 6: missing UI values.</span>",
         )
-    values = tuple(all_values[: len(REFERENCE_ARG_KEYS)])
-    extras = all_values[len(REFERENCE_ARG_KEYS) :]
-    main_prompt = str(extras[0] or "")
-    main_negative = str(extras[1] or "")
-    current_info_json = str(extras[2] or "")
+    values, main_prompt, main_negative, info_json, width, height = split
     keyed = dict(zip(REFERENCE_ARG_KEYS, values))
-
-    image = _coerce_gallery_item_to_pil(keyed.get("reference_image"))
-    selected_image, resolved_index = _selected_gallery_image(
-        gallery_value, selected_index
+    image, index, source = resolve_reference_image(
+        keyed.get("reference_image"), gallery_value, selected_index, info_json
     )
-    if image is None:
-        image = selected_image
     if image is None:
         return _reference_error(
             gallery_value,
-            "<span style='color:#c80'>Feature 6: Reference 이미지나 T2I Gallery 선택이 필요합니다.</span>",
+            "<span style='color:#c80'>캐릭터 이미지를 넣거나 T2I 이미지를 선택해 주세요.</span>",
         )
 
-    try:
-        request, gallery_content, insert_mode = request_from_values(
+    def build(refresh: bool):
+        return request_from_values(
             values,
             reference_image=image,
             main_prompt=main_prompt,
             main_negative=main_negative,
+            txt2img_width=width,
+            txt2img_height=height,
+            available_loras=list_installed_lora_names(refresh=refresh),
+            forge_opts=_forge_opts_data(),
         )
-        request.validate()
-        missing = missing_enabled_loras(request)
-        if missing:
-            names = ", ".join(missing)
+
+    try:
+        request, detected, warnings = build(False)
+        extend_wanted = bool(keyed.get("extend_lora_enabled", False))
+        if detected.edit is None or (extend_wanted and detected.extend is None):
+            # A LoRA copied in after startup is only seen after a rescan.
+            request, detected, warnings = build(True)
+        if detected.edit is None:
             return _reference_error(
                 gallery_value,
-                (
-                    "<span style='color:#c33'>Feature 6: enabled LoRA not "
-                    f"found: {names}. Install/refresh it or turn off the "
-                    "missing-LoRA guard.</span>"
-                ),
+                "<span style='color:#c33'>Edit LoRA(AnimeEditV2)를 "
+                "models/Lora에서 찾지 못했습니다. 설치한 뒤 다시 시도하세요.</span>",
             )
-
-        result = run_anima_reference(request)
+        request.validate()
+        result = _run_exclusive(
+            "sam3_character_reference",
+            lambda: run_anima_reference(request),
+        )
     except Exception as exc:
         print(
             f"[-] Feature 6 handler failed:\n{traceback.format_exc()}",
@@ -1182,36 +832,136 @@ def handle_anima_reference_click(
         )
         return _reference_error(
             gallery_value,
-            f"<span style='color:#c33'>Feature 6 failed: {exc}</span>",
+            f"<span style='color:#c33'>Feature 6 실패: {html.escape(str(exc))}</span>",
         )
 
     if not result.outputs:
         return _reference_error(
             gallery_value,
-            "<span style='color:#c80'>Feature 6: interrupted or no result.</span>",
+            "<span style='color:#c80'>중단됐거나 결과가 없습니다.</span>",
         )
 
-    new_images, new_infotexts = _new_gallery_items(
-        result, gallery_content
+    new_images = [item.target_image for item in result.outputs]
+    new_infotexts = [item.infotext for item in result.outputs]
+    updated, info_json_out = _merge_gallery(
+        gallery_value, index, new_images, new_infotexts, info_json, "At end"
     )
-    updated, info_json = _merge_gallery(
-        gallery_value,
-        resolved_index,
-        new_images,
-        new_infotexts,
-        current_info_json,
-        insert_mode,
-    )
-    latest = new_infotexts[-1] if new_infotexts else ""
+    pin = gr.update(value=image) if source == "gallery" else gr.update()
     return (
         updated,
-        (
-            "<span style='color:#383'>Feature 6: "
-            f"{len(result.outputs)} candidate(s), "
-            f"{len(new_images)} gallery image(s) added.</span>"
-        ),
-        _plaintext_to_html(latest),
-        info_json,
+        format_reference_status(result, request, detected, warnings, source),
+        _plaintext_to_html(new_infotexts[-1]),
+        info_json_out,
         result.prepared.canvas,
         result.prepared.mask,
+        pin,
+    )
+
+
+# Job names the runner sets while a Feature 6 candidate is running (see
+# run_anima_reference and _run_exclusive's "sam3_character_reference" job).
+_FEATURE6_JOB_PREFIXES = (
+    "sam3_character_reference",
+    "Anima Reference",
+    "Anima Character Reference",
+)
+
+
+def _stop_reference():
+    """Interrupt only if Feature 6 itself currently holds the job.
+
+    If txt2img holds the queue lock while Feature 6's click waits, blindly
+    setting these flags would stop txt2img instead.
+    """
+
+    from modules import shared
+
+    job = str(shared.state.job or "")
+    if not job.startswith(_FEATURE6_JOB_PREFIXES):
+        return
+    shared.state.interrupted = True
+    shared.state.skipped = True
+
+
+def wire_anima_reference_panel(
+    panel: AnimaReferencePanel,
+    *,
+    gallery,
+    main_prompt,
+    main_negative,
+    html_info,
+    generation_info,
+    width,
+    height,
+    selected_index_js: str,
+) -> None:
+    """Wire Feature 6 without adding its controls to the main Generate."""
+
+    width = width if width is not None else panel.txt2img_width_fallback
+    height = height if height is not None else panel.txt2img_height_fallback
+    run_inputs = [
+        gallery,
+        panel.selected_index_state,
+        *panel.all_widgets(),
+        main_prompt,
+        main_negative,
+        generation_info,
+        width,
+        height,
+    ]
+
+    panel.load_selected_button.click(
+        fn=load_selected_reference,
+        js=selected_index_js,
+        inputs=[gallery, panel.selected_index_state],
+        outputs=[panel.reference_image],
+        queue=False,
+        show_progress="hidden",
+    )
+    panel.preview_button.click(
+        fn=preview_reference_layout,
+        js=selected_index_js,
+        inputs=run_inputs,
+        outputs=[panel.preview_canvas, panel.preview_mask, panel.status],
+        queue=False,
+        show_progress="hidden",
+    )
+    show_stop = panel.generate_button.click(
+        fn=lambda: (gr.update(visible=False), gr.update(visible=True)),
+        inputs=[],
+        outputs=[panel.generate_button, panel.stop_button],
+        queue=False,
+    )
+    run = show_stop.then(
+        fn=handle_anima_reference_click,
+        js=selected_index_js,
+        inputs=run_inputs,
+        outputs=[
+            gallery,
+            panel.status,
+            html_info,
+            generation_info,
+            panel.preview_canvas,
+            panel.preview_mask,
+            panel.reference_image,
+        ],
+    )
+    run.then(
+        fn=lambda: (gr.update(visible=True), gr.update(visible=False)),
+        inputs=[],
+        outputs=[panel.generate_button, panel.stop_button],
+        queue=False,
+    )
+    panel.stop_button.click(
+        fn=_stop_reference, inputs=[], outputs=[], queue=False
+    )
+    panel.seed_random_button.click(
+        fn=lambda: -1, inputs=[], outputs=[panel.seed], queue=False
+    )
+    panel.seed_pull_button.click(
+        fn=_pull_seed_from_gallery_item,
+        js=selected_index_js,
+        inputs=[gallery, panel.selected_index_state, generation_info],
+        outputs=[panel.seed],
+        queue=False,
     )

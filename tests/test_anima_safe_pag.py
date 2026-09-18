@@ -5,6 +5,7 @@ import sys
 import types
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import gradio as gr
 import torch
@@ -44,6 +45,33 @@ def _load_pag_module():
             sys.modules.pop("modules", None)
         else:
             sys.modules["modules"] = old_modules
+
+
+def _load_forge_sampler():
+    """Execute Forge's real batching/area math with only host services stubbed."""
+    forge = ROOT.parents[1]
+    spec = importlib.util.spec_from_file_location(
+        "_pag_test_conditions", forge / "backend" / "sampling" / "condition.py"
+    )
+    conditions = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(conditions)
+    memory = types.SimpleNamespace(signal_empty_cache=False, get_free_memory=lambda _device: 100)
+    backend = types.ModuleType("backend")
+    backend.memory_management = memory
+    backend.utils = types.SimpleNamespace()
+    fake_args = types.ModuleType("backend.args")
+    fake_args.args = types.SimpleNamespace(disable_gpu_warning=True)
+    fake_args.dynamic_args = types.SimpleNamespace(context_handler=None)
+    with mock.patch.dict(sys.modules, {
+        "backend": backend, "backend.args": fake_args,
+        "backend.sampling.condition": conditions,
+    }):
+        spec = importlib.util.spec_from_file_location(
+            "_pag_test_sampler", forge / "backend" / "sampling" / "sampling_function.py"
+        )
+        sampler = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(sampler)
+    return sampler, conditions.Condition, memory
 
 
 class AnimaSafePagTests(unittest.TestCase):
@@ -201,6 +229,66 @@ class AnimaSafePagTests(unittest.TestCase):
         self.assertEqual(p._STATE["weak_steps"], 1)
         self.assertEqual(p._STATE["combined_calls"], 1)
         self.assertEqual(self._post_cfg().item(), -0.5)
+
+    def test_weighted_and_regional_guidance_survives_real_forge_aggregation(self):
+        sampler, Condition, memory = _load_forge_sampler()
+        p = self.pag
+
+        class Model:
+            calls = 0
+            @staticmethod
+            def memory_required(shape):
+                return shape[0]
+
+            @staticmethod
+            def apply_model(x, timestep, *, bias, transformer_options):
+                Model.calls += 1
+                out = bias.expand_as(x).clone()
+                a0, a1 = p._STATE["attn_b0"], p._STATE["attn_b1"]
+                if a0 is not None:
+                    out[a0:a1] += bias[a0:a1] * 0.5 + 1.5
+                return out
+
+        for layout in ("full", "region", "mask"):
+            for free_memory in (100, 0.5):
+                with self.subTest(layout=layout, microbatch=free_memory < 1):
+                    self.setUp()
+                    Model.calls = 0
+                    memory.get_free_memory = lambda _device: free_memory
+                    x = torch.zeros(1, 1, 4, 8)
+                    cond = [
+                        {"model_conds": {"bias": Condition(torch.tensor([[[[1.]]]]))}, "strength": 1.0},
+                        {"model_conds": {"bias": Condition(torch.tensor([[[[5.]]]]))}, "strength": 3.0},
+                    ]
+                    if layout == "region":
+                        cond[1].update(area=(4, 4, 0, 4), mask=torch.ones(1, 4, 8))
+                    elif layout == "mask":
+                        mask = torch.zeros(1, 4, 8)
+                        mask[..., 4:] = 0.5
+                        cond[1].update(mask=mask, mask_strength=0.5)
+                    uncond = [{"model_conds": {"bias": Condition(torch.zeros(1, 1, 1, 1))}}]
+                    options = {
+                        "model_function_wrapper": p._model_wrapper,
+                        "sampler_post_cfg_function": [p._post_cfg],
+                        "sampler_pre_cfg_function": [getattr(p, "_prepare_condition_aggregation", lambda *args: args)],
+                    }
+                    with mock.patch.dict(sys.modules, {"backend.sampling.sampling_function": sampler}):
+                        actual = sampler.sampling_function_inner(
+                            Model(), x, torch.ones(1), uncond, cond, 7.0, options,
+                        )
+                    # Official weighted CFG: edit_strength=4; aggregated
+                    # cond=4, weak=7.5 => 4*7*4 + 4*(4-7.5) = 98.
+                    expected = torch.full_like(x, 98.0)
+                    if layout != "full":
+                        # Left has only cond1, weak3: 1*7*4 + 4*(1-3)=20.
+                        expected[..., :4] = 20.0
+                    if layout == "mask":
+                        # Right condition2 has 3 * .5 * .5 weight:
+                        # cond=19/7, weak=39/7, result=28*19/7-80/7.
+                        expected[..., 4:] = 452.0 / 7.0
+                    torch.testing.assert_close(actual, expected)
+                    self.assertEqual(Model.calls, 3 if free_memory < 1 else (2 if layout == "region" else 1))
+                    self.assertNotIn("condition_aggregation", p._STATE)
 
     def test_adaptive_guidance_counts_only_a_real_combined_batch_skip(self):
         p = self.pag

@@ -339,6 +339,43 @@ standalone 웹 UI 기능(검색·다운로드·정리·프리뷰·메타데이�
 
 ---
 
+## 별도 기능: ANIMA LoRA 블록 호환 변환
+
+Forge 본체 파일을 수정하지 않고, LoRA가 로드되는 `networks.process_anima` seam에 작은
+adapter를 설치합니다. 현재 선택한 ANIMA 체크포인트의 실제 DiT 블록 수를 읽어 다음 변환을
+메모리에서 자동 적용합니다.
+
+| LoRA 원본 | 현재 모델 | 동작 |
+|---|---|---|
+| Base 1.0 (28) | 2.9B (40) / 3.8B (52) | 새 블록에 앞선 계보의 LoRA delta를 복제 |
+| 2.9B (40) | Base 1.0 (28) / 3.8B (52) | Base 계보만 선택하거나 3.8B 삽입 블록으로 확장 |
+| 3.8B (52) | Base 1.0 (28) / 2.9B (40) | 상속 블록만 선택하고 3.8B 전용 블록을 제거 |
+
+- 원본 `.safetensors` 파일은 변경하지 않으며 별도 버튼이나 체크포인트 변환 과정도 없습니다.
+- Base→2.9B는 Forge의 기존 매핑을 그대로 유지합니다. 2.9B→3.8B는 3.8B 체크포인트
+  metadata의 12개 삽입 위치(`3, 7, …, 47`)를 사용하고, Base↔3.8B는 두 세대 매핑을
+  합성합니다.
+- 상향 변환은 기존 Forge Base→2.9B와 같은 정책으로 삽입 블록에도 앞선 계보의 LoRA
+  delta를 복제합니다. 상속 블록에만 재배치하는 별도
+  [ComfyUI 브리지](https://github.com/Lakeside529/ComfyUI-Anima-3.8B-LoRA-Bridge)의
+  기본 정책과는 다르며, 3.8B에서 어느 쪽이 더 좋은지는 LoRA·시드별 실제 이미지 A/B가
+  필요합니다.
+- 하향 변환은 2.9B/3.8B 전용 LoRA delta를 버리는 **손실 투영**입니다. 3.8B→Base는
+  추가된 24블록을 제거하며 3.8B 전용 semantic-connector 키도 적용할 대상이 없어
+  제외하고 콘솔에 경고합니다. 별도 text encoder인 Qwen3.5 키는 블록 수만으로 삭제하지
+  않습니다.
+- Forge가 인식하는 Kohya 키(`lora_unet_blocks_0…N`)와 native diffusion 키
+  (`diffusion_model.blocks.0…N`)의 완전한 연속 레이아웃만 자동 변환합니다. 일부 블록만 든
+  sparse LoRA는 원본 세대를 안전하게 판정할 수 없으므로 DiT 블록은 추측 변환하지 않습니다
+  (Forge 공통 LLM-adapter 키 정규화만 그대로 수행).
+- 단, 더 큰 모델에서 **선두 블록만 정확히 `0…27` 또는 `0…39`로 저장한 특수 partial
+  LoRA**는 키만 보면 완전한 28/40블록 LoRA와 구별할 수 없습니다. 이런 파일은 자동 변환
+  대상에 쓰지 않는 것이 안전합니다.
+- 이는 **LoRA 인덱스 호환 변환**입니다. Base나 2.9B 체크포인트 자체를 학습된 3.8B
+  체크포인트로 바꾸는 기능은 아닙니다.
+
+---
+
 ## 워크플로 5: txt2img Notebook
 
 Live Workspace의 다중 Gradio 문서·iframe·별도 라우트 대신, 원래 Forge 주소의 **문서 하나**만
@@ -402,51 +439,37 @@ Notebook을 펼친 뒤 머리의 `＋`를 누르면 `preset1`, `preset2` 순으�
 
 ## 워크플로 6: Anima Character Reference / ReStyler
 
-> ⚠️ **초기 구현 — 실제 Anima 체크포인트 이미지 A/B 검증 전입니다.** 캔버스·마스크·크롭,
-> UI 매핑과 Forge 옵션 복구는 테스트했지만, 권장 LoRA를 올린 실제 생성 품질은 별도 확인이
-> 필요합니다.
+캐릭터 이미지 **하나**만 넣으면 공개 [Anima ReStyler v1.2](https://civitai.com/models/2803070/anima-restyler)
+워크플로와 같은 조건으로 그 캐릭터를 레퍼런스한 결과를 T2I 갤러리에 추가합니다. Forge Neo의
+`anima_do_reference`를 작업 중에만 켜고, 끝나면 되돌립니다.
 
-참조 캐릭터와 단색 생성 영역을 하나의 split canvas로 합치고 생성 영역만 마스킹합니다.
-Forge Neo의 `anima_do_reference`를 해당 작업 중에만 켜 standalone img2img를 실행한 뒤,
-생성 패널만 잘라 사용자가 지정한 정확한 크기로 반환합니다. Forge Neo 본체 파일과 저장된
-전역 설정은 변경하지 않습니다.
+**사용법**
+1. Anima 체크포인트를 로드합니다(3.8B v1.1 번들이면 3.8B 커넥터도 자동으로 켜집니다).
+2. `models/Lora`에 **AnimeEditV2**를 둡니다(필수, 자동 감지). Extend LoRA는 선택이며 기본값은
+   꺼짐입니다: [Extend Image - Image Edit (Anima Edit)](https://civitai.com/models/2752978?modelVersionId=3097523)
+   v1.0을 civitai에 로그인한 상태로 받아(작성자가 로그인을 요구합니다) `Extend Image (Anima
+   Edit) v1.safetensors`를 `models/Lora`에 두면(파일명에 "Extend Image"가 들어가면 자동 감지)
+   전문가 설정에서 켤 수 있습니다.
+3. 캐릭터 이미지를 넣거나, 비워 두고 T2I 갤러리에서 이미지를 선택합니다.
+4. 유지 범위(정체성 / +의상 / +그림체)와 후보 수를 고르고 생성합니다.
 
-### 기본 사용
+결과 크기와 프롬프트는 txt2img 설정을 따릅니다(프롬프트 칸에 쓰면 그 문장을 그대로 사용).
+상태 줄에 사용한 이미지, 모델 블록 수, 3.8B 커넥터, 찾은 LoRA, 생성 영역 크기와 확대 배율,
+시드가 표시됩니다.
 
-1. 현재 체크포인트로 Anima를 로드합니다.
-2. Feature 6 아코디언에 참조 이미지를 붙여넣거나, T2I Gallery 이미지를 선택한 뒤
-   `선택한 T2I 이미지를 Reference로`를 누릅니다.
-3. `Canvas / Mask 미리보기`로 레퍼런스/빈 영역과 직사각형 마스크를 확인합니다.
-4. Anima Edit V2와 Extend Image LoRA를 설치·선택하고 프롬프트를 입력합니다.
-5. `Generate Character Reference`를 누르면 결과가 원래 T2I Gallery에 추가됩니다.
+**전문가 설정**(접힘): 결과 크기 직접 지정, 캔버스 MP, Edit/Extend LoRA 강도, 앞머리, 샘플링
+(또는 Forge Anima img2img 프리셋 따르기), 빈 칸 채우기(원본 단색 / 번진 이미지), 시드,
+네거티브, 디버그 이미지 저장, 미리보기.
 
-기본값은 공개 ReStyler v1.2 흐름을 기준으로 `960×1088`, composite `1.4 MP`,
-`(split screen, multiple views:1.2)`, Edit LoRA `0.72`, Extend LoRA `0.4`,
-Steps `30`, CFG `5`, denoise `1.0`입니다. LoRA 파일은 자동 다운로드하지 않으며
-[Anima ReStyler 페이지](https://civitai.com/models/2803070/anima-restyler)의 요구 모델을
-사용자가 설치해야 합니다.
+**기본값 = ReStyler v1.2**: 960×1088(수동 지정 시), 캔버스 1.4 MP, 빈 칸 `#000000` 그대로
+(masked content `original`), 디노이즈 1.0, AnimeEditV2 0.72, Extend 0.4(기본 꺼짐),
+Euler a / Simple / 30 / CFG 5, 앞머리 `(split screen, multiple views:1.2)`.
 
-### UI에서 바꿀 수 있는 값
+**불변 조건**: batch 1(레퍼런스 latent가 프로세스 전역), 전체 그림 인페인트(레퍼런스 패널 유지),
+다른 스크립트 격리(와일드카드·negpip·LBW 문법은 처리되지 않으며 상태 줄에 경고).
 
-- **Canvas / Mask / Crop**: 결과 width/height, 생성 패널 좌우 위치·폭 배율·색,
-  투명 이미지 matte 색, composite MP, 해상도 배수, resize filter, mask overlap
-- **Prompt / LoRA**: 메인 프롬프트·네거티브 상속, 전용 프롬프트, prefix 텍스트·가중치,
-  extra prefix/suffix, Edit/Extend LoRA 이름·강도·활성화, 누락 LoRA 가드
-- **Model**: 현재/별도 체크포인트, VAE/Text Encoder 모듈 override와 새로고침
-- **Sampling**: Steps, CFG, Shift, sampler, scheduler, denoise, masked content,
-  mask blur/round/invert/conditioning weight, 초기 noise multiplier
-- **Sampler advanced**: Eta, `s_min_uncond`, `s_churn`, `s_tmin`, `s_tmax`, `s_noise`
-- **Seed / Output**: seed, 후보별 seed 증가량, 후보 수, face restoration,
-  native reference A/B 토글, target/generated/input/mask 저장, Gallery 표시·삽입 방식
-
-두 값은 사용자 튜닝값이 아니라 엔진 안전 불변조건이라 고정됩니다.
-
-- **batch size = 1**: Anima reference latent가 프로세스 전역 상태이므로 후보를 순차 실행
-- **Inpaint area = whole picture**: `Only masked` 전처리는 참조 패널 자체를 잘라내므로 금지
-
-생성 버튼은 Feature 6 전용 clean runner를 사용합니다. 따라서 다른 selectable/always-on
-Script의 오래된 UI 상태나 ImageStitch reference가 섞이지 않으며, LoRA는 내부 prompt의
-Forge 표준 `<lora:...>` 처리로 적용됩니다.
+> GPU로 원본 대비 정체성 유지 A/B는 아직 실행하지 않았습니다. 유지 범위(+의상/+그림체)의
+> 내부 값은 임시값입니다.
 
 ---
 
@@ -576,3 +599,45 @@ LoRA Manager(GPL-3.0)는 vendor 그대로 실행하되, `lora_manager_core.py`�
 ## 라이선스
 
 본 확장(통합 레이어) 자체는 내부 사용. 단, 임베드한 LoRA Manager가 **GPL-3.0**이므로 재배포 시 GPL-3.0 조건을 따릅니다. (vendor 코드는 저장소에 포함되지 않으며 런타임에 clone됩니다.)
+
+## 워크플로 5: Anima 3.8B — Qwen3.5 / Semantic Connector v2 (편입)
+
+Anima-3.8B v1.1 체크포인트는 Qwen3.5-4B 의 의미 특징을 매 디노이징 스텝에 주입하는
+**Semantic Connector v2** 가중치를 파일 안에 담고 있습니다. Forge 본체는 그 190개 텐서를
+`Anima Unexpected: anima_v2_connector…` 로 버리기 때문에, 확장 없이는 텍스트 인코더에
+`Anima-3.8B-expanded_adapter` 나 `qwen35_4b` 를 넣어도 결과가 **한 픽셀도 바뀌지 않습니다**
+(같은 시드 A/B 실측). [GumGum10/forge-anima-3.8B](https://github.com/GumGum10/forge-anima-3.8B)
+(MIT) 의 런타임을 `sam3ext/anima38/` 로 편입해 이 확장 하나로 그 경로가 돕니다.
+
+### 필요 파일
+| 파일 | 위치 |
+| --- | --- |
+| `Anima-3.8B-v1.1.safetensors` (v2 번들) | `models/Stable-diffusion/` |
+| `qwen35_4b.safetensors` (4.8 GB) | `models/text_encoder/` (파일명에 `qwen35_4b` 가 들어가면 자동 발견) |
+| `qwen_3_06b_base.safetensors`, `qwen_image_vae.safetensors` | 순정 Anima 그대로 |
+
+### 사용
+1. 체크포인트로 v2 번들을 고르고, VAE/텍스트 인코더는 순정 Anima 처럼 `qwen_image_vae` +
+   `qwen_3_06b_base` 를 선택합니다. (v1.1 번들에는 어댑터가 내장돼 있어 별도 어댑터 파일은
+   필요 없습니다.)
+2. 그냥 생성합니다 — 번들은 safetensors metadata 로 판별해 **아코디언이 접혀 있어도 자동**으로
+   켜집니다. 콘솔에 `[Anima38] active — v2 bundle` 이 찍힙니다.
+3. 선택: **Anima 3.8B (Qwen3.5 / v2)** 아코디언의 *Use adapter on negative prompt* 를 켜면
+   부정 프롬프트도 같은 경로를 탑니다(기본은 순정 인코더).
+4. 구형 v1(베이스 + 별도 `Anima-3.8B-expanded_adapter.safetensors`)은 아코디언을 켜고
+   어댑터·강도를 고릅니다.
+
+### API
+`alwayson_scripts["Anima 3.8B (Qwen3.5 / v2)"]` 에 위치 인자 목록
+`[enabled, adapter, strength, negative, negative_strength]` 또는 SAM3 처럼 dict 하나
+`{"args": [{"enabled": true, "negative": false}]}` 를 보낼 수 있습니다. v2 번들은 인자를
+안 보내도 켜집니다. 끄려면 아코디언의 **Bypass** 체크박스 또는 `{"args": [{"bypass": true}]}`.
+- **NegPiP 와 함께 쓸 수 있다 (설치 순서 무관).** v2 조건은 Forge 네이티브 계약(줄마다 텐서 하나)을 지키고 run id 는 마지막 토큰 행의 마커로 실어 보내므로 `get_learned_conditioning` 을 감싸는 확장이 있어도 죽지 않는다. NegPiP 이 우리 아래에 깔리는 순서에서는 NegPiP 의 가중치 마스킹을 우리가 대신 적용해 어느 순서에서도 결과가 같다. 패치는 생성이 끝나도 자리에 남되 꺼진 상태로 투명하게 위임하므로, 두 확장이 서로 다른 순서로 해제해도 사고가 없다.
+
+### 동작·한계
+- 두 인코더는 순차로 돌고 결과를 RAM 으로 옮긴 뒤 해제됩니다. 커넥터는 샘플링 모델의 일부로
+  Forge 가 관리하며(오프로딩 가능) 생성이 끝나면 전부 원복됩니다.
+- `qwen35_4b.safetensors` 가 없거나 런타임이 못 뜨면 생성을 죽이지 않고 한 번 경고한 뒤
+  순정 Anima 로 진행합니다.
+- LoRA·SAM3·ADetailer 와의 조합은 이 확장에서 함께 검증했습니다(ANIMA LoKr 3개 + SAM3
+  인페인트). 생성 파라미터에 `Anima 3.8B architecture/bundle` 이 기록됩니다.

@@ -33,10 +33,7 @@ from sam3ext.ui_anima import AnimaPanel, build_anima_panel, handle_anima_click
 from sam3ext.ui_anima_reference import (
     AnimaReferencePanel,
     build_anima_reference_panel,
-    handle_anima_reference_click,
-    load_selected_reference,
-    preview_reference_layout,
-    refresh_reference_model_choices,
+    wire_anima_reference_panel,
 )
 from sam3ext.ui_refine import RefinePanel, _pull_seed_from_gallery_item, build_refine_panel, handle_refine_click
 try:
@@ -511,6 +508,8 @@ txt2img_prompt_component = None
 txt2img_neg_prompt_component = None
 txt2img_html_info_component = None
 txt2img_generation_info_component = None
+txt2img_width_component = None
+txt2img_height_component = None
 refine_panel: RefinePanel | None = None
 anima_panel: AnimaPanel | None = None
 anima_reference_panel: AnimaReferencePanel | None = None
@@ -771,110 +770,11 @@ def _wire_anima_panel(
     )
 
 
-def _wire_anima_reference_panel(
-    panel: AnimaReferencePanel,
-    gallery,
-    main_prompt,
-    main_neg_prompt,
-    html_info,
-    generation_info,
-):
-    """Wire Feature 6 without adding its controls to main Generate."""
-
-    panel.load_selected_button.click(
-        fn=load_selected_reference,
-        _js=_SELECTED_INDEX_JS,
-        inputs=[gallery, panel.selected_index_state],
-        outputs=[panel.reference_image],
-        queue=False,
-        show_progress=False,
-    )
-
-    panel.preview_button.click(
-        fn=preview_reference_layout,
-        inputs=panel.geometry_widgets(),
-        outputs=[panel.preview_canvas, panel.preview_mask, panel.status],
-        queue=False,
-        show_progress=False,
-    )
-
-    panel.refresh_models_button.click(
-        fn=refresh_reference_model_choices,
-        inputs=[],
-        outputs=[
-            panel.edit_lora_name,
-            panel.extend_lora_name,
-            panel.checkpoint_override,
-            panel.additional_modules,
-        ],
-        queue=False,
-        show_progress=False,
-    )
-
-    show_stop = panel.generate_button.click(
-        fn=lambda: (gr.update(visible=False), gr.update(visible=True)),
-        inputs=[],
-        outputs=[panel.generate_button, panel.stop_button],
-        queue=False,
-    )
-    run = show_stop.then(
-        fn=handle_anima_reference_click,
-        _js=_SELECTED_INDEX_JS,
-        inputs=[
-            gallery,
-            panel.selected_index_state,
-            *panel.all_widgets(),
-            main_prompt,
-            main_neg_prompt,
-            generation_info,
-        ],
-        outputs=[
-            gallery,
-            panel.status,
-            html_info,
-            generation_info,
-            panel.preview_canvas,
-            panel.preview_mask,
-        ],
-    )
-    run.then(
-        fn=lambda: (gr.update(visible=True), gr.update(visible=False)),
-        inputs=[],
-        outputs=[panel.generate_button, panel.stop_button],
-        queue=False,
-    )
-
-    def _stop_reference():
-        from modules import shared as _shared
-
-        _shared.state.interrupted = True
-        _shared.state.skipped = True
-
-    panel.stop_button.click(
-        fn=_stop_reference,
-        inputs=[],
-        outputs=[],
-        queue=False,
-    )
-    panel.seed_random_button.click(
-        fn=lambda: -1,
-        inputs=[],
-        outputs=[panel.seed],
-        queue=False,
-    )
-    panel.seed_pull_button.click(
-        fn=_pull_seed_from_gallery_item,
-        _js=_SELECTED_INDEX_JS,
-        inputs=[gallery, panel.selected_index_state, generation_info],
-        outputs=[panel.seed],
-        queue=False,
-    )
-
-
 def on_after_component(component, **kwargs):
     global txt2img_submit_button, img2img_submit_button
     global txt2img_gallery_component, txt2img_prompt_component, txt2img_neg_prompt_component
     global txt2img_html_info_component, txt2img_generation_info_component
+    global txt2img_width_component, txt2img_height_component
     global refine_panel
 
     # Gradio rebuilds a component at *request* time whenever a handler returns
@@ -916,6 +816,10 @@ def on_after_component(component, **kwargs):
         txt2img_neg_prompt_component = component
     elif elem_id == "txt2img_gallery":
         txt2img_gallery_component = component
+    elif elem_id == "txt2img_width":
+        txt2img_width_component = component
+    elif elem_id == "txt2img_height":
+        txt2img_height_component = component
     elif elem_id == "html_info_txt2img":
         txt2img_html_info_component = component
     elif elem_id == "generation_info_txt2img":
@@ -977,13 +881,16 @@ def on_after_component(component, **kwargs):
             and not anima_reference_wired
         ):
             try:
-                _wire_anima_reference_panel(
+                wire_anima_reference_panel(
                     anima_reference_panel,
-                    txt2img_gallery_component,
-                    txt2img_prompt_component,
-                    txt2img_neg_prompt_component,
-                    txt2img_html_info_component,
-                    txt2img_generation_info_component,
+                    gallery=txt2img_gallery_component,
+                    main_prompt=txt2img_prompt_component,
+                    main_negative=txt2img_neg_prompt_component,
+                    html_info=txt2img_html_info_component,
+                    generation_info=txt2img_generation_info_component,
+                    width=txt2img_width_component,
+                    height=txt2img_height_component,
+                    selected_index_js=_SELECTED_INDEX_JS,
                 )
                 anima_reference_wired = True
             except Exception:

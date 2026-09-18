@@ -1142,6 +1142,94 @@ def reset_cfg_state() -> None:
 # ---------------------------------------------------------------------------
 
 
+_AGGREGATION_KEY = "_sam_extra_condition_aggregation"
+
+
+class _ConditionAggregation:
+    """Opaque conditioning metadata consumed before calling the model.
+
+    Implements Forge's Condition concatenation protocol so each queued
+    condition retains its original area/mult even when VRAM changes grouping.
+    It never reaches diffusion_model.forward or changes its real conditioning.
+    """
+    def __init__(self, aggregate, prepared, positive):
+        self.aggregate = aggregate
+        self.prepared = prepared
+        self.positive = positive
+
+    def process_cond(self, **_kwargs):
+        return self
+
+    def can_concat(self, _other):
+        return True
+
+    def concat(self, others):
+        return [self, *others]
+
+
+def _prepare_condition_aggregation(model, cond, uncond, x, timestep, model_options):
+    """Keep the exact Forge weights/regions for compositional weak predictions."""
+    _STATE.pop("condition_aggregation", None)
+    if not _STATE["on"] or not _percent_in_range() or not cond:
+        return model, cond, uncond, x, timestep, model_options
+    if len(cond) == 1 and not any(key in cond[0] for key in ("area", "mask")):
+        return model, cond, uncond, x, timestep, model_options
+    from backend.sampling.sampling_function import get_area_and_mult
+
+    aggregate = {
+        "cond": torch.zeros_like(x), "attn": torch.zeros_like(x),
+        "slg": torch.zeros_like(x), "count": torch.ones_like(x) * 1e-37,
+        "attn_seen": False, "slg_seen": False,
+    }
+
+    def attach(items, positive):
+        if items is None:
+            return None
+        output = []
+        for item in items:
+            # Delegate mask strength, crop feathering and timestep filtering
+            # to Forge itself; do not approximate them with a prompt average.
+            prepared = get_area_and_mult(
+                {**item, "model_conds": {}}, x, timestep,
+            ) if positive else None
+            metadata = None if prepared is None else (prepared.area, prepared.mult)
+            changed = dict(item)
+            changed["model_conds"] = {
+                **item["model_conds"],
+                _AGGREGATION_KEY: _ConditionAggregation(aggregate, metadata, positive),
+            }
+            output.append(changed)
+        return output
+
+    _STATE["condition_aggregation"] = aggregate
+    return model, attach(cond, True), attach(uncond, False), x, timestep, model_options
+
+
+def _accumulate_condition_predictions(metadata, output, attn, slg):
+    chunks = len(metadata)
+    batch = output.shape[0] // chunks
+    cond_offset = 0
+    for index, entry in enumerate(metadata):
+        if not entry.positive:
+            continue
+        current = output[index * batch:(index + 1) * batch]
+        weak_slice = slice(cond_offset, cond_offset + batch)
+        cond_offset += batch
+        if entry.prepared is None:
+            continue
+        area, mult = entry.prepared
+        target = (..., slice(area[2], area[2] + area[0]), slice(area[3], area[3] + area[1]))
+        aggregate = entry.aggregate
+        aggregate["cond"][target] += current * mult
+        aggregate["count"][target] += mult
+        # A condition where ControlNet/another guard blocks perturbation
+        # contributes an identity weak result, so only its own delta is zero.
+        for key, weak in (("attn", attn), ("slg", slg)):
+            prediction = current if weak is None else weak[weak_slice]
+            aggregate[key][target] += prediction * mult
+            aggregate[key + "_seen"] |= weak is not None
+
+
 def _clear_markers():
     _STATE["any_b0"] = None
     _STATE["attn_b0"] = _STATE["attn_b1"] = None
@@ -1150,6 +1238,23 @@ def _clear_markers():
 
 
 def _model_wrapper(apply_model, w):
+    metadata = (w.get("c") or {}).get(_AGGREGATION_KEY)
+    if metadata is None:
+        return _model_wrapper_inner(apply_model, w)
+    changed = dict(w)
+    changed["c"] = dict(w.get("c") or {})
+    changed["c"].pop(_AGGREGATION_KEY, None)
+    # A microbatch may have no active weak rows. Never reuse the preceding
+    # microbatch's cache when folding its output into the full image.
+    _STATE["attn_raw"] = _STATE["slg_raw"] = None
+    output = _model_wrapper_inner(apply_model, changed)
+    _accumulate_condition_predictions(
+        metadata, output, _STATE["attn_raw"], _STATE["slg_raw"],
+    )
+    return output
+
+
+def _model_wrapper_inner(apply_model, w):
     """model_function_wrapper: run an enlarged cond ``apply_model`` that also
     produces the weak predictions (attention-perturbed for PAG/SEG and/or
     layer-skipped for SLG) by appending copies of the cond rows. This supports
@@ -1603,6 +1708,14 @@ def _post_cfg(args):
     deltas; run DCW last inside sam-extra.
     """
     denoised = args["denoised"]
+    aggregate = _STATE.pop("condition_aggregation", None)
+    if aggregate is not None:
+        count = aggregate["count"]
+        _STATE["cond_raw"] = aggregate["cond"] / count
+        for key in ("attn", "slg"):
+            _STATE[key + "_raw"] = (
+                aggregate[key] / count if aggregate[key + "_seen"] else None
+            )
     if torch is None:
         return denoised
     live_input = args.get("input")
@@ -2632,6 +2745,7 @@ class AnimaSafePAG(scripts.Script):
         # XYZ-plot overrides (set per grid cell by the AxisOption apply fns).
         xyz = getattr(p, "_anima_safe_pag_xyz", {}) or {}
         _clear_extra_generation_params(p)
+        _STATE.pop("condition_aggregation", None)
         _RUNTIME.reset_pass()
         _APG.update(on=False, avg=None, last_sigma=None)
         _ADG["on"] = False
@@ -3340,6 +3454,8 @@ class AnimaSafePAG(scripts.Script):
             if _STATE["on"] or _ADG["on"]:
                 _warn_foreign_unet_wrapper(unet)
                 unet.set_model_unet_function_wrapper(_model_wrapper)
+            if _STATE["on"]:
+                unet.set_model_sampler_pre_cfg_function(_prepare_condition_aggregation)
             unet.set_model_sampler_post_cfg_function(_post_cfg)
             p.sd_model.forge_objects.unet = unet
 
@@ -3669,6 +3785,7 @@ class AnimaSafePAG(scripts.Script):
         _STATE["attn_raw"] = None
         _STATE["slg_raw"] = None
         _STATE["cond_raw"] = None
+        _STATE.pop("condition_aggregation", None)
         _STATE["adg_skipped"] = False
         _STATE["attn_spatial_shape"] = None
         _STATE["attn_hook_hits"] = 0

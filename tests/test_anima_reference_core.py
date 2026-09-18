@@ -137,6 +137,22 @@ class AnimaReferencePromptTests(unittest.TestCase):
         )
         self.assertEqual(prompt, "plain prompt")
 
+    def test_lora_names_with_dots_keep_their_version(self):
+        prompt = compose_reference_prompt(
+            "x",
+            prefix_enabled=False,
+            edit_lora_name="AnimeEdit v1.2",
+            extend_lora_enabled=False,
+        )
+        self.assertIn("<lora:AnimeEdit v1.2:0.72>", prompt)
+        prompt = compose_reference_prompt(
+            "x",
+            prefix_enabled=False,
+            edit_lora_name=r"anima\AnimeEdit v1.2.safetensors",
+            extend_lora_enabled=False,
+        )
+        self.assertIn("<lora:anima/AnimeEdit v1.2:0.72>", prompt)
+
 
 if __name__ == "__main__":
     unittest.main()
