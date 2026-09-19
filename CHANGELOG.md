@@ -5,6 +5,34 @@
 
 ## Unreleased
 
+- **Anima 3.8B 보강**:
+  - Feature 6 가 3.8B 에서 `Inference tensors do not track version counter` 로 죽던 문제 — txt2img 가
+    inference_mode 안에서 만든 커넥터 가중치를 밖에서 옮기면 버전 카운터 없는 파라미터가 되던 것을,
+    가중치를 늘 inference_mode 밖에서 만들어 고쳤습니다(Qwen3.5·v1 어댑터 로더 포함).
+  - Forge 재시작 직후 Feature 6 가 "requires an Anima model" 로 거절되던 문제 — 체크포인트가 첫 생성
+    때 로드되므로 판정 전에 선택한 체크포인트를 먼저 불러옵니다(드롭다운을 바꾼 직후도 같음).
+  - v1/v2 경로가 Anima 레퍼런스(img2img 캔버스·ImageStitch)를 DiT 에 넘기지 않던 문제 — Feature 6
+    캐릭터 레퍼런스가 3.8B 에서 레퍼런스 없이 돌았습니다.
+  - VRAM 이 모자라 Qwen3.5 가 부분 로드되면 RMSNorm 가중치가 CPU 에 남아 장치 불일치로 죽던 문제.
+  - SAM3 in-flight 인페인트 패스가 바깥 생성의 설치를 내려 그 뒤에 도는 ADetailer 패스(같은 이미지나
+    배치의 다음 이미지)가 0.6B 조건으로 떨어지던 문제, 다른 탭 생성이 도중에 죽으면 Bypass 생성도 v2 로 돌던 문제.
+  - `qwen35_4b` 가 없으면 문서와 달리 생성이 setup_conds 에서 죽던 문제 — 이제 설치 전에 확인하고
+    경고 후 순정 Anima 로 진행합니다.
+  - `qwen35_4b` 를 VAE/Text Encoder 목록에 넣어 두면 Forge 가 체크포인트마다 4.8 GB 를 읽고 버리던
+    것을 건너뜁니다 — XYZ 체크포인트 축에서 1.0/2.9B/3.8B 를 같은 모듈 목록으로 비교할 수 있습니다.
+  - 체크포인트를 바꿔도 공용 런타임이 이전 3.8B 모델(약 8 GiB)을 RAM 에 붙잡던 문제.
+  - 같은 프롬프트를 batch count·Feature 6 후보·ADetailer 마다 Qwen3.5-4B 로 다시 인코딩하던 것을
+    줄 단위 캐시와 batch count 사이 설치 유지로 줄였습니다(모델이 다시 로드되면 새로 설치, NegPiP 가 앞
+    순서라 래퍼가 빠지면 다시 겁니다). 순정 부정 조건은 Forge 공용 캐시를 씁니다.
+  - LoRA 세트가 바뀌어 Forge 가 UNet 을 새로 복제하면 커넥터가 메모리 관리 밖에서 돌던 문제.
+  - LoRA 의 `llm_adapter` 가중치가 v2 경로에서 빠지던 문제 — 커넥터가 번들 원본으로 만든 자기
+    `llm_adapter` 사본(텍스트 인코더와 같은 dtype, 약 +0.3 GiB RAM)에 LoRA 패치를 받고, 샘플링 직전마다
+    그 패스의 LoRA 세트에 맞춥니다.
+  - infotext 에 `Anima38`(v2 bundle / v1 adapter / bypass / off: …)·`Anima38 encoder`·`Anima38 negative` 를
+    남기고, PNG Info 붙여 넣기로 Bypass·부정·v1 설정을 되살립니다. 키에 `.` 이 있으면 Forge 가 읽지 못해
+    `Anima 3.8B …` 키를 `Anima38 …` 로 바꿨습니다(예전 이미지도 붙여 넣기에서 읽음). Feature 6 의
+    `Reference Anima 3.8B` 도 `Reference Anima38` 로 바꿨습니다. 아코디언에 상태 확인 버튼을 추가했습니다.
+  - GPU 측정: Qwen3.5 가 커넥터에 넘기는 층의 최대 |값| 35.5 — fp16 텍스트 인코더에서도 넘침 없음.
 - **Feature 6 캐릭터 레퍼런스 단순화**: 60개 위젯을 메인 6개(캐릭터 이미지, 가져오기, 유지 범위,
   프롬프트, 후보 수, 생성/상태) + 접힌 전문가 칸으로 줄였습니다. 원본 ReStyler v1.2 조건(빈 칸
   `#000000` 그대로·디노이즈 1.0, Extend 기본 꺼짐)으로 돌고, 결과 크기는 txt2img를 따릅니다.
@@ -29,12 +57,12 @@
   측정에서 스캔 1회 약 5.7ms 중 4.3ms가 이 탐색이었습니다. config가 교체되거나 늘어나면
   인덱스를 다시 만들고, 중복 elem_id는 이전처럼 첫 컴포넌트를 씁니다.
 - **Anima 3.8B Qwen3.5 / Semantic Connector v2 편입**: [GumGum10/forge-anima-3.8B](https://github.com/GumGum10/forge-anima-3.8B)
-- fix(anima38): NegPiP 등 `get_learned_conditioning` 래퍼와 충돌하던 v2 조건 형식을 네이티브 list 계약으로 바꾸고 run id 를 텐서 마커로 전달 (`sam3ext/anima38/marker.py`). 조건·forward 패치는 플래그로 켜고 끄는 멱등 패치로 바꿔 다른 확장이 비중첩으로 되돌려도 낡은 래퍼가 되살아나지 않게 했고, 샘플링 중 예외로 남은 패치는 다음 생성 시작 때 먼저 원복한다. 패치는 해제하지 않고 플래그로만 껐다 켜, 두 확장이 비LIFO 로 해제해도 이미 사라진 래퍼를 되살리지 않는다. NegPiP 이 아래에 깔린 순서에서는 그 마스킹을 대신 적용한다. 격리 Forge 두 대(정방향/역방향 로드 순서)에서 6 케이스(v2+NegPiP / bypass+NegPiP / v2 / bypass / 반복 / hires) 픽셀 동일하게 통과.
   (MIT) 의 런타임을 `sam3ext/anima38/` 로 들여와 `scripts/anima_3_8b.py` 한 스크립트로 붙였습니다.
   v1.1 번들(safetensors metadata 판별)은 자동 활성, v1 은 아코디언에서 어댑터·강도 선택.
   `qwen35_4b` 가 없으면 생성을 죽이지 않고 순정 Anima 로 진행합니다. API 는 위치 인자와
   SAM3 식 dict 둘 다 받습니다. Qwen3.5 토크나이저는 `assets/qwen35_tokenizer/` 에 동봉
   (`THIRD_PARTY_NOTICES.md`).
+- fix(anima38): NegPiP 등 `get_learned_conditioning` 래퍼와 충돌하던 v2 조건 형식을 네이티브 list 계약으로 바꾸고 run id 를 텐서 마커로 전달 (`sam3ext/anima38/marker.py`). 조건·forward 패치는 플래그로 켜고 끄는 멱등 패치로 바꿔 다른 확장이 비중첩으로 되돌려도 낡은 래퍼가 되살아나지 않게 했고, 샘플링 중 예외로 남은 패치는 다음 생성 시작 때 먼저 원복한다. 패치는 해제하지 않고 플래그로만 껐다 켜, 두 확장이 비LIFO 로 해제해도 이미 사라진 래퍼를 되살리지 않는다. NegPiP 이 아래에 깔린 순서에서는 그 마스킹을 대신 적용한다. 격리 Forge 두 대(정방향/역방향 로드 순서)에서 6 케이스(v2+NegPiP / bypass+NegPiP / v2 / bypass / 반복 / hires) 픽셀 동일하게 통과.
 - **ANIMA 28/40/52블록 LoRA 양방향 호환**: Forge의 LoRA 로드 seam을 확장 내부
   adapter로 감싸 Base 1.0(28), 2.9B(40), 3.8B(52) 사이 여섯 방향을 모두 자동
   재매핑합니다. 기존 Base→2.9B 의미를 유지하며 3.8B 체크포인트 metadata의 LLaMA-Pro

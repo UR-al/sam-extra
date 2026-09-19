@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import functools
 import logging
+import uuid
+import weakref
+from collections import OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -23,6 +26,7 @@ from .files import (
     adapters,
     bundle_metadata,
     qwen35_models,
+    tokenizer_dir,
 )
 from .qwen35 import Qwen35HybridModel
 from .semantic_v2 import BundledV2Models, QualityAnchoredSemanticConnectorV2
@@ -30,6 +34,9 @@ from .tokenizer import Qwen35Tokenizer
 
 logger = logging.getLogger(__name__)
 LAYER_INDICES = (7, 15, 23, 31)
+NATIVE_ADAPTER_PREFIX = "net.llm_adapter."   # 번들 안의 원본 llm_adapter (Forge 는 TE 로 옮겨 쓴다)
+TE_ADAPTER_PATCH_PREFIX = "qwen3_06b.llm_adapter."   # TE 패처(JointTextEncoder) 기준 LoRA 키
+SEMANTIC_CACHE_LINES = 32   # 줄당 수 MB (CPU) — batch count·Feature 6 후보·ADetailer 가 같은 줄을 되풀이한다
 
 
 def _outside_inference_mode(load):
@@ -47,6 +54,14 @@ def _outside_inference_mode(load):
             return load(*args, **kwargs)
 
     return wrapper
+
+
+def _anima_reference_state():
+    """Forge 의 Anima 레퍼런스 상태 — (dynamic_args, opts). 테스트에서 바꿔 끼운다."""
+    from backend.args import dynamic_args
+    from modules.shared import opts
+
+    return dynamic_args, opts
 
 
 @dataclass
@@ -70,31 +85,46 @@ class Anima3BRuntime:
         self._active_bundle_metadata: dict[str, str] | None = None
         self._v2_key: tuple[str, int] | None = None
         self._v2_models: BundledV2Models | None = None
+        self._v2_source = None   # 커넥터를 만든 TE llm_adapter 의 weakref (붙잡지 않는다)
         self._v2_sampling_patcher = None
-        self._v2_sampling_unet = None
+        self._v2_sampling_unets: list = []   # 패처를 단 UNet 의 weakref (설치 동안만 — restore 에서 비운다)
         self._installed_processing = None
-        self._v2_diffusion_model = None
-        self._v2_original_forward = None
+        self._installed_model = None   # 설치한 sd_model 의 weakref — 반복 사이 모델 재로드 판별
         self._v2_runs: dict[int, _V2Run] = {}
+        # (Qwen 파일, 줄, dtype) → Qwen3.5 의미 특징. 같은 줄이면 4.45 GiB 모델을 GPU 로 올리지 않는다.
+        self._semantic_cache: OrderedDict[tuple, tuple] = OrderedDict()
         self._v2_run_counter = 0
         # 다른 확장(NegPiP 등)이 같은 속성을 감싸고 비중첩으로 되돌릴 수 있으므로, 우리 패치는
         # "속성 교체" 가 아니라 이 플래그로 켜고 끈다. 꺼진 채 남아 있어도 순정으로 위임한다.
         self._cond_active = False
         self._cond_params: tuple[str, float, float | None] | None = None
         self._v2_active = False
-        self._cond_wrapper = None    # 우리가 설치한 클로저 (체인에 남아 있는지 확인용)
-        self._v2_forward_wrapper = None
-        self._cond_below = None      # 설치 당시 우리 아래에 있던 것 (NegPiP 래퍼일 수 있다)
+        # 모델마다 다른 것(우리 래퍼, 그 아래 원래 함수, DiT)은 여기 두지 않는다 — 공용 런타임은 프로세스
+        # 내내 살아서, 여기 붙잡으면 체크포인트를 바꿔도 이전 모델(3.8B 면 약 8 GiB)이 RAM 에 남는다.
+        # 래퍼는 약한 참조 집합으로 알아보고, 아래 함수는 래퍼 자신(_anima3b_below)이 들고 있다.
+        self._wrappers: weakref.WeakSet = weakref.WeakSet()
+
+    def _patched(self, candidate) -> bool:
+        """우리 래퍼인가 — 표시 속성이 아니라 정체성으로 본다. NegPiP 는 functools.wraps 로 우리 래퍼를
+        감싸 __dict__(_anima3b_patch 포함)를 복사하므로, 속성만 보면 위에 앉은 NegPiP 래퍼를 우리 것으로
+        오인해 마스킹을 대신 적용하고 dict 를 돌려준다(NegPiP 의 assert 에서 생성이 죽는다)."""
+        try:
+            return candidate in self._wrappers
+        except TypeError:   # None 처럼 약한 참조가 안 되는 값
+            return False
+
+    def _our_cond_wrapper(self, sd_model):
+        """조건 체인에 살아 있는 우리 클로저 — 맨 위, 또는 NegPiP 가 위에 있으면 orig_forward 자리."""
+        for candidate in (
+            getattr(sd_model, "get_learned_conditioning", None),
+            getattr(sd_model, "orig_forward", None),
+        ):
+            if self._patched(candidate):
+                return candidate
+        return None
 
     def _cond_installed(self, sd_model) -> bool:
-        """우리 클로저가 조건 체인에 (맨 위든 한 단계 아래든) 살아 있는가."""
-        if self._cond_wrapper is None:
-            return False
-        current = getattr(sd_model, "get_learned_conditioning", None)
-        if current is self._cond_wrapper:
-            return True
-        # NegPiP 가 우리 위에 있으면 우리를 orig_forward 에 담아 둔다
-        return getattr(sd_model, "orig_forward", None) is self._cond_wrapper
+        return self._our_cond_wrapper(sd_model) is not None
 
     @staticmethod
     def _negpip_patched(sd_model) -> bool:
@@ -113,8 +143,9 @@ class Anima3BRuntime:
         if not self._cond_active or self._cond_params is None:
             # 우리 패치는 영구적이지만 꺼져 있을 땐 투명해야 한다 — 아래에 NegPiP 래퍼가
             # 살아 있으면(orig_forward 존재) 그쪽으로 넘겨 NegPiP 가 계속 동작하게 한다.
-            below = self._cond_below
-            if below is not None and below is not self._cond_wrapper and self._negpip_patched(sd_model):
+            wrapper = self._our_cond_wrapper(sd_model)
+            below = getattr(wrapper, "_anima3b_below", None)
+            if below is not None and below is not wrapper and self._negpip_patched(sd_model):
                 return below(prompt)
             return self._native_conditioning(sd_model)(prompt)
         adapter_name, strength, negative_strength = self._cond_params
@@ -125,7 +156,7 @@ class Anima3BRuntime:
         if (
             isinstance(conds, list)
             and self._negpip_patched(sd_model)
-            and sd_model.get_learned_conditioning is self._cond_wrapper
+            and self._patched(sd_model.get_learned_conditioning)
         ):
             return self._apply_negpip(sd_model, prompt, conds)
         return conds
@@ -159,6 +190,24 @@ class Anima3BRuntime:
         if engine is None or clip is None:
             raise RuntimeError("Anima 3.8B requires a loaded Anima checkpoint.")
         return engine, clip
+
+    @staticmethod
+    def _hand_off_native_reference(sd_model) -> None:
+        """순정 Anima.get_learned_conditioning 이 긍정 프롬프트에서 하는 레퍼런스 인계를 대신 한다.
+
+        v1/v2 경로는 순정 함수를 부르지 않는데, 샘플링 때 DiT 가 읽는 dynamic_args.ref_latents 를
+        채우는 곳은 그 함수(backend/diffusion_engine/anima.py) 뿐이다. 건너뛰면 img2img 캔버스
+        (ini_latent)·ImageStitch 레퍼런스가 조용히 빠진다. 순정과 같은 순서로 옮긴다.
+        """
+        dynamic_args, opts = _anima_reference_state()
+        if not getattr(opts, "anima_do_reference", False):
+            dynamic_args.ref_latents.clear()
+            return
+        references = [*getattr(sd_model, "ref_latents", [])]
+        if getattr(sd_model, "ini_latent", None) is not None:
+            references.insert(0, sd_model.ini_latent)
+            sd_model.ini_latent = None
+        dynamic_args.ref_latents = references.copy()
 
     @staticmethod
     def _checkpoint_path(sd_model) -> str:
@@ -205,12 +254,7 @@ class Anima3BRuntime:
 
     @_outside_inference_mode
     def _load_qwen(self) -> tuple[Qwen35HybridModel, Qwen35Tokenizer, CLIP]:
-        choices = qwen35_models()
-        if not choices:
-            raise FileNotFoundError(
-                "qwen35_4b.safetensors was not found in models/text_encoder."
-            )
-        path = choices.get("qwen35_4b.safetensors") or next(iter(choices.values()))
+        path = self._qwen35_path()
         if self._qwen_path == path and self._qwen is not None:
             return self._qwen, self._tokenizer, self._qwen_clip
 
@@ -267,7 +311,10 @@ class Anima3BRuntime:
                 f"Adapter '{name}' is unavailable. Refresh Forge and select it again."
             )
         key = (path, id(native_adapter))
-        if key == self._adapter_key and self._adapter is not None:
+        if (
+            key == self._adapter_key
+            and getattr(self._adapter, "native_adapter", None) is native_adapter
+        ):
             return self._adapter
 
         adapter = ProgressiveCrossAdapter(native_adapter)
@@ -351,26 +398,35 @@ class Anima3BRuntime:
         finally:
             self._unload_patchers(native_clip.patcher)
 
-        semantic_rows = []
-        memory_management.load_model_gpu(qwen_clip.patcher)
-        try:
-            device = qwen_clip.patcher.load_device
-            for line in prompt:
-                semantic, semantic_mask = self._semantic_layers(
-                    qwen,
-                    tokenizer,
-                    str(line),
-                    device,
-                )
-                semantic_rows.append(
-                    (
+        lines = [str(line) for line in prompt]
+        rows: dict[str, tuple] = {}
+        for line in dict.fromkeys(lines):
+            key = (self._qwen_path, line, dtype)
+            if key in self._semantic_cache:
+                self._semantic_cache.move_to_end(key)
+                rows[line] = self._semantic_cache[key]
+        missing = [line for line in dict.fromkeys(lines) if line not in rows]
+        if missing:
+            memory_management.load_model_gpu(qwen_clip.patcher)
+            try:
+                device = qwen_clip.patcher.load_device
+                for line in missing:
+                    semantic, semantic_mask = self._semantic_layers(
+                        qwen,
+                        tokenizer,
+                        line,
+                        device,
+                    )
+                    rows[line] = (
                         [state.to(offload_device, dtype=dtype) for state in semantic],
                         semantic_mask.to(offload_device),
                     )
-                )
-        finally:
-            self._unload_patchers(qwen_clip.patcher)
-        return native_adapter, native_rows, semantic_rows
+                    self._semantic_cache[(self._qwen_path, line, dtype)] = rows[line]
+                    while len(self._semantic_cache) > SEMANTIC_CACHE_LINES:
+                        self._semantic_cache.popitem(last=False)
+            finally:
+                self._unload_patchers(qwen_clip.patcher)
+        return native_adapter, native_rows, [rows[line] for line in lines]
 
     @staticmethod
     def _adapter_metadata(metadata: dict[str, str]) -> dict[str, str]:
@@ -391,7 +447,12 @@ class Anima3BRuntime:
         _, native_clip = self._require_anima(sd_model)
         native_adapter = native_clip.cond_stage_model.qwen3_06b.llm_adapter
         key = (bundle_path, id(native_adapter))
-        if key == self._v2_key and self._v2_models is not None:
+        if (
+            key == self._v2_key
+            and self._v2_models is not None
+            and self._v2_source is not None
+            and self._v2_source() is native_adapter
+        ):
             return self._v2_models
 
         adapter_metadata = self._adapter_metadata(metadata)
@@ -434,6 +495,11 @@ class Anima3BRuntime:
         ] = connector_state.pop("semantic_resampler.layer_embeddings")
 
         dtype = native_adapter.embed.weight.dtype
+        # 커넥터는 샘플링 때 llm_adapter 를 다시 돌린다. TE 모듈을 같이 쓰면 LoRA 의 llm_adapter 몫을 옮겨
+        # 걸 수 없다(두 패처가 같은 가중치를 제자리 패치해 이중 적용) — 번들 원본으로 만든 사본을 쓴다.
+        connector_adapter = self._private_native_adapter(native_adapter, bundle_path, dtype)
+        if connector_adapter is None:
+            connector_adapter = native_adapter   # 번들에 원본이 없다 — LoRA 의 llm_adapter 몫은 빠진다
         with torch.device("meta"):
             with using_forge_operations(
                 device=torch.device("meta"),
@@ -441,7 +507,7 @@ class Anima3BRuntime:
                 manual_cast_enabled=True,
             ):
                 connector = QualityAnchoredSemanticConnectorV2(
-                    native_adapter=native_adapter,
+                    native_adapter=connector_adapter,
                     **config,
                 )
         incompatible = connector.load_state_dict(
@@ -457,11 +523,76 @@ class Anima3BRuntime:
             )
         del connector_state
         connector.eval().requires_grad_(False)
-        models = BundledV2Models(native_adapter, connector)
+        models = BundledV2Models(connector_adapter, connector)
         models.eval().requires_grad_(False)
         self._v2_key = key
         self._v2_models = models
+        self._v2_source = weakref.ref(native_adapter)
         return models
+
+    @staticmethod
+    def _private_native_adapter(native_adapter, bundle_path: str, dtype):
+        """번들의 원본 가중치로 만든 커넥터 전용 llm_adapter. 만들 수 없으면 None (TE 모듈을 같이 쓴다).
+
+        CPU 에서 만든다 — RotaryEmbedding 의 inv_freq 는 state dict 에 없는(persistent=False) 버퍼라
+        meta 에서 만들면 복구되지 않는다.
+        """
+        try:
+            # TE 모듈과 파라미터마다 같은 dtype — Forge 는 임베딩만 fp32 로 두고 나머지는 저장 dtype 이다
+            # (통째로 embed dtype 으로 만들면 RAM·VRAM 이 약 200 MB 더 든다)
+            dtypes = {name: parameter.dtype for name, parameter in native_adapter.named_parameters()}
+            state = {}
+            with safe_open(bundle_path, framework="pt", device="cpu") as checkpoint:
+                for name in checkpoint.keys():
+                    if name.startswith(NATIVE_ADAPTER_PREFIX):
+                        key = name[len(NATIVE_ADAPTER_PREFIX) :]
+                        state[key] = checkpoint.get_tensor(name).to(dtypes.get(key, dtype))
+            if not state:
+                return None
+            with using_forge_operations(
+                device=torch.device("cpu"),
+                dtype=dtype,
+                manual_cast_enabled=True,
+            ):
+                private = type(native_adapter)()
+            incompatible = private.load_state_dict(state, strict=False, assign=True)
+            parameters = {name for name, _ in private.named_parameters()}
+            if incompatible.unexpected_keys or not parameters <= set(state):
+                logger.warning("[Anima38] bundle llm_adapter does not match; sharing the TE module")
+                return None
+            return private.eval().requires_grad_(False)
+        except Exception as exc:  # pragma: no cover - Forge 버전 차이
+            logger.warning("[Anima38] private llm_adapter unavailable (%s); sharing the TE module", exc)
+            return None
+
+    def _sync_adapter_lora(self, native_clip) -> None:
+        """TE 에 걸린 LoRA 의 llm_adapter 몫을 커넥터 사본의 패처로 옮긴다 (LoRA 활성화 뒤, 조건 인코딩 때).
+
+        패치가 바뀔 때만 patches_uuid 를 바꿔 Forge 가 다음 로드 때 사본을 다시 패치하게 한다.
+        커넥터가 TE 모듈을 같이 쓰는 경우엔 옮기지 않는다 — 두 패처의 이중 적용이 된다.
+        """
+        patcher = self._v2_sampling_patcher
+        models = self._v2_models
+        if patcher is None or models is None or self._v2_source is None:
+            return
+        if models.native_adapter is self._v2_source():
+            return
+        wanted = {
+            "native_adapter." + key[len(TE_ADAPTER_PATCH_PREFIX) :]: list(value)
+            for key, value in getattr(native_clip.patcher, "patches", {}).items()
+            if key.startswith(TE_ADAPTER_PATCH_PREFIX)
+        }
+        current = {key: value for key, value in patcher.patches.items() if key.startswith("native_adapter.")}
+
+        def identities(patches):   # 패치 튜플 안에 텐서가 있어 == 로 비교할 수 없다
+            return {key: tuple(map(id, value)) for key, value in patches.items()}
+
+        if identities(wanted) == identities(current):
+            return
+        for key in current:
+            del patcher.patches[key]
+        patcher.patches.update(wanted)
+        patcher.patches_uuid = uuid.uuid4()
 
     def _register_v2_run(self, run: _V2Run) -> int:
         self._v2_run_counter += 1
@@ -469,6 +600,7 @@ class Anima3BRuntime:
         return self._v2_run_counter
 
     def _encode_v2(self, native_engine, native_clip, prompt):
+        self._sync_adapter_lora(native_clip)
         _, native_rows, semantic_rows = self._extract_prompt_features(
             native_engine,
             native_clip,
@@ -592,7 +724,8 @@ class Anima3BRuntime:
     ):
         native_engine, native_clip = self._require_anima(sd_model)
         original = self._native_conditioning(sd_model)
-        if getattr(prompt, "is_negative_prompt", False):
+        is_negative = bool(getattr(prompt, "is_negative_prompt", False))
+        if is_negative:
             strength = negative_strength
 
         if strength is None or strength == 0.0:
@@ -605,6 +738,8 @@ class Anima3BRuntime:
             finally:
                 self._unload_patchers(native_clip.patcher)
 
+        if not is_negative:
+            self._hand_off_native_reference(sd_model)
         if self._active_bundle_metadata is not None:
             return self._encode_v2(native_engine, native_clip, prompt)
 
@@ -660,23 +795,32 @@ class Anima3BRuntime:
     ) -> None:
         models = self._load_v2_models(processing.sd_model, path, metadata)
         unet = processing.sd_model.forge_objects.unet
-        # processing.sd_model follows shared.sd_model and can already point at
-        # another checkpoint when a failed generation is cleaned up later.
-        self._v2_sampling_unet = unet
         self._v2_sampling_patcher = unet.add_extra_torch_module_during_sampling(
             models,
             cast_to_unet_dtype=False,
         )
-        diffusion_model = unet.model.diffusion_model
-        self._v2_diffusion_model = diffusion_model
+        self._v2_sampling_unets = []
+        self._attach_sampling_patcher(processing.sd_model)
         self._v2_active = True
-        current = diffusion_model.forward
-        wrapper = self._v2_forward_wrapper
-        if wrapper is not None and (
-            current is wrapper or getattr(diffusion_model, "orig_forward", None) is wrapper
+        self._wrap_forward(unet.model.diffusion_model)
+
+    def _attach_sampling_patcher(self, sd_model) -> None:
+        """LoRA 세트가 바뀌면 Forge 는 forge_objects_original.unet 을 복제해 새 UNet 으로 샘플링한다 (설치가
+        process_images 보다 앞서는 Feature 6, batch count 사이 LoRA 가 바뀌는 경우). 복제는 extra 패처
+        목록을 복사하므로 원본·LoRA 적용본에도 같은 패처를 달아 두어야 커넥터가 메모리 관리 안에 든다.
+        processing.sd_model 은 shared.sd_model 을 따라가 나중에 다른 체크포인트를 가리킬 수 있어 기록해 둔다
+        (weakref — 샘플링이 죽어 restore 가 안 불려도 이전 모델을 붙잡지 않게)."""
+        for owner in self._unet_slots(sd_model):
+            if not any(item is self._v2_sampling_patcher for item in owner.extra_model_patchers_during_sampling):
+                owner.extra_model_patchers_during_sampling.append(self._v2_sampling_patcher)
+            if not any(ref() is owner for ref in self._v2_sampling_unets):
+                self._v2_sampling_unets.append(weakref.ref(owner))
+
+    def _wrap_forward(self, diffusion_model) -> None:
+        if self._patched(diffusion_model.forward) or self._patched(
+            getattr(diffusion_model, "orig_forward", None)
         ):
             return   # 우리 패치가 이미 체인에 있다 (NegPiP 가 위에 있을 수도) — 다시 감싸지 않는다
-        self._v2_original_forward = current
         native_forward = self._native_forward(diffusion_model)
 
         def patched_forward(x, timesteps, context, *args, **kwargs):
@@ -716,7 +860,7 @@ class Anima3BRuntime:
             return native_forward(x, timesteps, context, *args, **kwargs)
 
         patched_forward._anima3b_patch = self
-        self._v2_forward_wrapper = patched_forward
+        self._wrappers.add(patched_forward)
         diffusion_model.forward = patched_forward
 
     def install(
@@ -729,9 +873,11 @@ class Anima3BRuntime:
         if self._installed_processing is not None:
             self.restore(self._installed_processing)
         self._require_anima(processing.sd_model)
-        self._installed_processing = processing
         checkpoint_path = self._checkpoint_path(processing.sd_model)
         metadata = bundle_metadata(checkpoint_path)
+        self._require_encoder_files(adapter_name if metadata is None else None)
+        self._installed_processing = processing
+        self._installed_model = self._weak(processing.sd_model)
         self._active_bundle_path = checkpoint_path if metadata is not None else None
         self._active_bundle_metadata = metadata
         self._v2_runs.clear()
@@ -744,41 +890,122 @@ class Anima3BRuntime:
                 negative_strength = 1.0
         self._cond_params = (adapter_name, strength, negative_strength)
         self._cond_active = True
-        if not self._cond_installed(sd_model):
-            self._cond_below = sd_model.get_learned_conditioning
-
-            def patched(prompt):
-                return self._conditioning_entry(sd_model, prompt)
-
-            patched._anima3b_patch = self
-            self._cond_wrapper = patched
-            sd_model.get_learned_conditioning = patched
-        self._reset_cond_caches(processing)
+        self._wrap_conditioning(sd_model)
+        # 순정 경로로 가는 부정 조건엔 마커가 없다 — Forge 의 공용 캐시(persistent_cond_cache)를 그대로 쓴다
+        self._reset_cond_caches(processing, include_negative=negative_strength is not None)
         if metadata is not None:
             adapter_file = metadata.get(
                 "anima_v2_adapter_filename",
                 Path(checkpoint_path).name,
             )
+            # infotext 키는 Forge 파서(re_param_code: [\w\s\-/])가 읽을 수 있어야 붙여 넣기가 된다 — '.' 금지
             processing.extra_generation_params.update(
                 {
-                    "Anima 3.8B adapter": adapter_file,
-                    "Anima 3.8B strength": 1.0,
-                    "Anima 3.8B architecture": V2_ARCHITECTURE,
-                    "Anima 3.8B bundle": Path(checkpoint_path).name,
+                    "Anima38 adapter": adapter_file,
+                    "Anima38 strength": 1.0,
+                    "Anima38 architecture": V2_ARCHITECTURE,
+                    "Anima38 bundle": Path(checkpoint_path).name,
+                    # 공식 v1.1 워크플로는 부정 프롬프트도 커넥터로 인코딩한다 — 어느 쪽이었는지 남긴다
+                    "Anima38 negative": "connector" if negative_strength is not None else "native",
                 }
             )
         else:
             processing.extra_generation_params.update(
                 {
-                    "Anima 3.8B adapter": Path(adapter_name).name,
-                    "Anima 3.8B strength": float(strength),
-                    "Anima 3.8B architecture": ARCHITECTURE,
+                    "Anima38 adapter": Path(adapter_name).name,
+                    "Anima38 strength": float(strength),
+                    "Anima38 architecture": ARCHITECTURE,
                 }
             )
+        processing.extra_generation_params["Anima38 encoder"] = Path(self._qwen35_path()).name
         if negative_strength is not None:
             processing.extra_generation_params[
-                "Anima 3.8B negative strength"
+                "Anima38 negative strength"
             ] = float(negative_strength)
+
+    @staticmethod
+    def _qwen35_path() -> str:
+        """쓸 Qwen3.5 파일 — models/text_encoder 에서 자동으로 찾는다 (VAE/Text Encoder 목록과 무관)."""
+        choices = qwen35_models()
+        if not choices:
+            raise FileNotFoundError(
+                "qwen35_4b.safetensors was not found in models/text_encoder."
+            )
+        return choices.get("qwen35_4b.safetensors") or next(iter(choices.values()))
+
+    def _wrap_conditioning(self, sd_model) -> None:
+        if self._cond_installed(sd_model):
+            return
+        below = sd_model.get_learned_conditioning
+
+        def patched(prompt):
+            return self._conditioning_entry(sd_model, prompt)
+
+        patched._anima3b_patch = self
+        patched._anima3b_below = below   # 설치 당시 우리 아래에 있던 것 (NegPiP 래퍼일 수 있다)
+        self._wrappers.add(patched)
+        sd_model.get_learned_conditioning = patched
+
+    @staticmethod
+    def _weak(obj):
+        try:
+            return weakref.ref(obj)
+        except TypeError:
+            return None
+
+    def install_is_current(self, processing) -> bool:
+        """이 processing 을 위한 설치가 지금 모델 위에 그대로 있는가. Forge 는 Hires 체크포인트·Refiner 가
+        있으면 batch count 반복마다 1차 모델을 새로 불러온다 — 그러면 다시 설치해야 한다."""
+        if self._installed_processing is not processing or self._installed_model is None:
+            return False
+        return self._installed_model() is processing.sd_model
+
+    def ensure_attached(self, processing) -> None:
+        """설치를 내리지 않고(run·조건 캐시 유지) 체인에서 빠진 패치만 다시 건다. NegPiP 가 앞 순서면
+        반복·안쪽 패스마다 자기 패치를 원복하면서 우리 래퍼까지 떨군다."""
+        sd_model = processing.sd_model
+        if self._cond_active:
+            self._wrap_conditioning(sd_model)
+        if self._v2_active and self._v2_sampling_patcher is not None:
+            self._attach_sampling_patcher(sd_model)
+            self._wrap_forward(sd_model.forge_objects.unet.model.diffusion_model)
+
+    @classmethod
+    def _require_encoder_files(cls, v1_adapter_name: str | None) -> None:
+        """Qwen3.5 는 setup_conds 에서 게으르게 로드된다 — 파일이 없으면 무엇이든 패치하기 전에 여기서
+        실패해야 스크립트가 경고 한 번 후 순정 Anima 로 진행한다(아니면 생성이 샘플링 직전에 죽는다)."""
+        cls._qwen35_path()
+        tokenizer_dir()   # 동봉 토크나이저가 없으면 FileNotFoundError
+        if v1_adapter_name is not None and v1_adapter_name not in adapters():
+            raise FileNotFoundError(
+                f"Adapter '{v1_adapter_name}' is unavailable. Refresh Forge and select it again."
+            )
+
+    @staticmethod
+    def _unet_slots(sd_model) -> list:
+        """지금 샘플링용·LoRA 적용본·원본 UNet (겹치면 하나로)."""
+        unets = []
+        for slot in ("forge_objects", "forge_objects_after_applying_lora", "forge_objects_original"):
+            unet = getattr(getattr(sd_model, slot, None), "unet", None)
+            if unet is not None and not any(unet is seen for seen in unets):
+                unets.append(unet)
+        return unets
+
+    def release_stale_caches(self, sd_model) -> None:
+        """다른 모델이 로드되면 이전 모델의 llm_adapter 에 묶인 커넥터·v1 어댑터를 놓는다 (on_model_loaded).
+        Qwen3.5 는 체크포인트와 무관해 그대로 캐시한다 — XYZ 로 3.8B 를 오갈 때 4.8 GB 를 다시 읽지 않게."""
+        try:
+            native_adapter = sd_model.forge_objects.clip.cond_stage_model.qwen3_06b.llm_adapter
+        except AttributeError:
+            native_adapter = None
+        source = self._v2_source() if self._v2_source is not None else None
+        if source is None or source is not native_adapter:
+            self._v2_models = None
+            self._v2_key = None
+            self._v2_source = None
+        if getattr(self._adapter, "native_adapter", None) is not native_adapter:
+            self._adapter = None
+            self._adapter_key = None
 
     def restore(self, processing) -> None:
         model = processing.sd_model
@@ -789,23 +1016,23 @@ class Anima3BRuntime:
         self._cond_active = False
         self._cond_params = None
         self._v2_active = False
-        unet = getattr(getattr(model, "forge_objects", None), "unet", None)
         if self._v2_sampling_patcher is not None:
-            owners = [self._v2_sampling_unet]
-            if unet is not self._v2_sampling_unet:
-                # A sampling clone may have copied the same extra patcher.
-                owners.append(unet)
+            owners = [owner for owner in (ref() for ref in self._v2_sampling_unets) if owner is not None]
+            # 설치 뒤 생긴 LoRA 복제본도 같은 패처를 복사해 갔다 — 지금 모델의 UNet 자리들도 비운다
+            for unet in self._unet_slots(model):
+                if not any(unet is owner for owner in owners):
+                    owners.append(unet)
             for owner in owners:
-                if owner is not None:
-                    owner.extra_model_patchers_during_sampling = [
-                        patcher
-                        for patcher in owner.extra_model_patchers_during_sampling
-                        if patcher is not self._v2_sampling_patcher
-                    ]
+                owner.extra_model_patchers_during_sampling = [
+                    patcher
+                    for patcher in owner.extra_model_patchers_during_sampling
+                    if patcher is not self._v2_sampling_patcher
+                ]
             self._unload_patchers(self._v2_sampling_patcher)
         self._v2_sampling_patcher = None
-        self._v2_sampling_unet = None
+        self._v2_sampling_unets = []
         self._installed_processing = None
+        self._installed_model = None
         self._active_bundle_path = None
         self._active_bundle_metadata = None
         self._v2_runs.clear()
@@ -815,9 +1042,12 @@ class Anima3BRuntime:
             self._reset_cond_caches(installed_processing)
 
     @staticmethod
-    def _reset_cond_caches(processing) -> None:
-        """마커가 든 조건이 다음 생성(또는 hires 2차 패스)에 재사용되지 않게 네 캐시를 모두 비운다."""
-        for name in ("cached_c", "cached_uc", "cached_hr_c", "cached_hr_uc"):
+    def _reset_cond_caches(processing, include_negative: bool = True) -> None:
+        """마커가 든 조건이 다음 생성(또는 hires 2차 패스)에 재사용되지 않게 이 생성 전용 캐시로 바꾼다."""
+        names = ("cached_c", "cached_hr_c")
+        if include_negative:
+            names += ("cached_uc", "cached_hr_uc")
+        for name in names:
             if hasattr(processing, name):
                 setattr(processing, name, [None, None, None])
 

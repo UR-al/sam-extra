@@ -40,14 +40,33 @@ def text_encoder_roots() -> list[Path]:
     return list(dict.fromkeys(path.resolve() for path in roots if path.is_dir()))
 
 
+QWEN35_MARKERS = ("qwen35_4b", "qwen3.5-4b", "qwen3_5_4b")
+
+
 def qwen35_models() -> dict[str, str]:
     found: dict[str, str] = {}
-    markers = ("qwen35_4b", "qwen3.5-4b", "qwen3_5_4b")
     for root in text_encoder_roots():
         for path in root.rglob("*.safetensors"):
-            if any(marker in path.name.lower() for marker in markers):
+            if any(marker in path.name.lower() for marker in QWEN35_MARKERS):
                 found.setdefault(path.name, str(path))
     return dict(sorted(found.items()))
+
+
+def is_unused_qwen35_module(path: str | os.PathLike) -> bool:
+    """VAE/Text Encoder 목록에 들어 있지만 Forge 로더가 읽기만 하고 버리는 Qwen3.5-4B 파일인가.
+
+    Forge 의 replace_state_dict 는 텍스트 인코더를 ``model.`` 접두어 키로 알아보는데 이 파일엔 그런 키가
+    없다. 3.8B 는 런타임이 파일을 따로 찾아 쓰므로 목록에 있어도 모델을 불러올 때마다 4.8 GB 를 읽는
+    낭비일 뿐이다. ``model.`` 키가 있는 형식(Forge 가 나중에 지원할 수 있는)은 건드리지 않는다.
+    """
+    name = Path(path).name.lower()
+    if not name.endswith(".safetensors") or not any(marker in name for marker in QWEN35_MARKERS):
+        return False
+    try:
+        with safe_open(path, framework="pt", device="cpu") as checkpoint:
+            return not any(key.startswith("model.") for key in checkpoint.keys())
+    except (OSError, ValueError, SafetensorError):
+        return False
 
 
 def bundle_metadata(path: str | os.PathLike) -> dict[str, str] | None:

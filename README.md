@@ -1,6 +1,6 @@
 # sam-extra (Forge SAM3 Extension)
 
-SAM3 / SAM3.1 마스크 + 인페인트 확장. 여섯 가지 워크플로 제공:
+SAM3 / SAM3.1 마스크 + 인페인트 확장. 일곱 가지 워크플로 제공:
 
 1. **In-flight** — t2i/img2img 생성 직후 자동으로 SAM3 마스킹 → 인페인트 (ADetailer 스타일)
 2. **Refine 패널** (v0.4.0+) — ⚠️ **실험 기능 (아직 제대로 작동하지 않음)** — 갤러리에서 이미지 골라 즉시 SAM3+인페인트+CN으로 재손질, 결과를 갤러리에 누적
@@ -8,6 +8,7 @@ SAM3 / SAM3.1 마스크 + 인페인트 확장. 여섯 가지 워크플로 제공
 4. **LoRA Manager** (v0.9.0+) — [willmiao/ComfyUI-Lora-Manager](https://github.com/willmiao/ComfyUI-Lora-Manager)를 그대로 가져와 extra-networks 탭에 임베드 (GPL-3.0)
 5. **txt2img Notebook** — 한 Forge 화면에서 이름 붙인 프리셋을 만들고 프롬프트·네거티브·LoRA·XYZ Plot·생성 설정을 원하는 조합으로 즉시 적용
 6. **Anima Character Reference / ReStyler** — 참조 이미지 옆에 생성 영역을 만들고 Anima Edit로 마스킹 인페인트한 뒤 원하는 해상도로 정확히 추출
+7. **Anima 3.8B (Qwen3.5 / v2)** — Anima-3.8B v1.1 번들의 Semantic Connector v2 를 되살려 Qwen3.5-4B 의미 특징을 조건에 넣음 ([GumGum10/forge-anima-3.8B](https://github.com/GumGum10/forge-anima-3.8B) 편입, MIT)
 
 ControlNet 통합 (LLLite 인페인트 모델 자동 호환 처리), 옷 교체용 Target/Replacement 워크플로, 시드 고정, VRAM 절약 옵션, XYZ plot 다축 등 지원.
 
@@ -560,6 +561,93 @@ DCW/RDC eval, DAVE/Modulation block hit, CNS noise call, Adaptive 실제 생략 
 
 ---
 
+## 워크플로 7: Anima 3.8B — Qwen3.5 / Semantic Connector v2 (편입)
+
+Anima-3.8B v1.1 체크포인트는 Qwen3.5-4B 의 의미 특징을 매 디노이징 스텝에 주입하는
+**Semantic Connector v2** 가중치를 파일 안에 담고 있습니다. Forge 본체는 그 190개 텐서를
+`Anima Unexpected: anima_v2_connector…` 로 버리기 때문에, 확장 없이는 텍스트 인코더에
+`Anima-3.8B-expanded_adapter` 나 `qwen35_4b` 를 넣어도 결과가 **한 픽셀도 바뀌지 않습니다**
+(같은 시드 A/B 실측). [GumGum10/forge-anima-3.8B](https://github.com/GumGum10/forge-anima-3.8B)
+(MIT) 의 런타임을 `sam3ext/anima38/` 로 편입해 이 확장 하나로 그 경로가 돕니다.
+
+### 필요 파일
+| 파일 | 위치 |
+| --- | --- |
+| `Anima-3.8B-v1.1.safetensors` (v2 번들) | `models/Stable-diffusion/` |
+| `qwen35_4b.safetensors` (4.8 GB) | `models/text_encoder/` — 파일명에 `qwen35_4b` 가 들어가면 **자동으로 찾아 씁니다** |
+| `qwen_3_06b_base.safetensors`, `qwen_image_vae.safetensors` | 순정 Anima 그대로 |
+
+`qwen35_4b` 는 **VAE / Text Encoder 목록에서 고를 필요가 없습니다.** 목록에 넣어 두면 Forge 는
+체크포인트를 불러올 때마다 4.8 GB 를 통째로 읽고 버렸는데(키 형식이 달라 쓰지 않음), 이제 확장이
+그 파일을 로더에서 건너뜁니다. 그래서 XYZ Plot 의 체크포인트 축으로 Base 1.0 / 2.9B / 3.8B 를
+**같은 모듈 목록**(`qwen_image_vae` + `qwen_3_06b_base`)으로 비교할 수 있습니다 — 3.8B 칸에서만
+Qwen3.5 가 자동으로 붙습니다.
+
+### 사용
+1. 체크포인트로 v2 번들을 고르고, VAE/텍스트 인코더는 순정 Anima 처럼 `qwen_image_vae` +
+   `qwen_3_06b_base` 만 선택합니다. (v1.1 번들에는 어댑터가 내장돼 있어 별도 어댑터 파일은
+   필요 없습니다.)
+2. 그냥 생성합니다 — 번들은 safetensors metadata 로 판별해 **아코디언이 접혀 있어도 자동**으로
+   켜집니다. 콘솔에 `[Anima38] active — v2 bundle` 이 찍힙니다.
+3. 아코디언의 **상태 확인** 버튼은 찾은 Qwen3.5 파일, 드롭다운에서 고른 체크포인트가 v2 번들인지, 이 탭의
+   마지막 생성이 어떻게 돌았는지를 보여줍니다.
+4. 선택: *Use adapter on negative prompt* 를 켜면 부정 프롬프트도 커넥터로 인코딩합니다.
+   모델 카드의 공식 v1.1 ComfyUI 워크플로는 부정 프롬프트도 커넥터로 보냅니다. 이 확장의
+   기본값은 기존과 같은 순정 인코더이며, 같은 시드 A/B 로 비교한 뒤 기본값을 정할 예정입니다.
+5. 구형 v1(베이스 + 별도 `Anima-3.8B-expanded_adapter.safetensors`)은 아코디언을 켜고
+   어댑터·강도를 고릅니다.
+
+권장 시작점(모델 카드 v1.1): 약 1MP(예: 832×1216), CFG 4–7(공식 워크플로 6), 28–50 스텝(공식 40),
+샘플러 `res_multistep` + 스케줄러 `Beta` — 모두 Forge 에 있습니다.
+
+### 기록과 붙여 넣기
+생성 파라미터(infotext)에 다음이 남습니다.
+
+| 키 | 값 |
+| --- | --- |
+| `Anima38` | `v2 bundle` / `v1 adapter` / `bypass` / `off: <이유>` (예: `off: qwen35_4b.safetensors was not found …`) |
+| `Anima38 encoder` | 실제로 쓴 Qwen3.5 파일 이름 |
+| `Anima38 negative` | `native`(순정 인코더) / `connector`(커넥터) — v2 번들 |
+| `Anima38 architecture` · `bundle` · `adapter` · `strength` · `negative strength` | 번들·어댑터 정보 |
+
+PNG Info 나 Send to txt2img 로 붙여 넣으면 **Bypass·부정 프롬프트 설정·v1 어댑터와 강도**가 되살아나
+같은 설정으로 다시 생성됩니다. 3.8B 기록이 없는 이미지는 이 칸들을 건드리지 않습니다. 키에 `.` 이 있으면
+Forge 가 읽지 못해 이전 버전은 `Anima 3.8B …` 대신 `Anima38 …` 로 바꿨고, 예전 이미지(`Anima 3.8B …`)도
+붙여 넣기에서는 그대로 읽습니다.
+
+### API
+`alwayson_scripts["Anima 3.8B (Qwen3.5 / v2)"]` 에 위치 인자 여섯 개
+`[enabled, adapter, strength, negative, negative_strength, bypass]` 또는 SAM3 처럼 dict 하나
+`{"args": [{"enabled": true, "negative": false}]}` 를 보낼 수 있습니다. v2 번들은 인자를
+안 보내도 켜집니다. 끄려면 아코디언의 **Bypass** 체크박스 또는 `{"args": [{"bypass": true}]}`.
+- **NegPiP 와 함께 쓸 수 있다 (설치 순서 무관).** v2 조건은 Forge 네이티브 계약(줄마다 텐서 하나)을 지키고 run id 는 마지막 토큰 행의 마커로 실어 보내므로 `get_learned_conditioning` 을 감싸는 확장이 있어도 죽지 않는다. NegPiP 이 우리 아래에 깔리는 순서에서는 NegPiP 의 가중치 마스킹을 우리가 대신 적용해 어느 순서에서도 결과가 같다. 패치는 생성이 끝나도 자리에 남되 꺼진 상태로 투명하게 위임하므로, 두 확장이 서로 다른 순서로 해제해도 사고가 없다.
+
+### 동작·한계
+- 두 인코더는 순차로 돌고 결과를 RAM 으로 옮긴 뒤 해제됩니다. 커넥터는 샘플링 모델의 일부로
+  Forge 가 관리하며(오프로딩 가능) 생성이 끝나면 전부 원복됩니다. LoRA 세트가 바뀌어 Forge 가
+  UNet 을 새로 복제해도(Feature 6, batch count 사이 LoRA 변경) 커넥터가 따라가 메모리 관리 안에 듭니다.
+- 같은 프롬프트 줄의 Qwen3.5 특징은 최근 32줄까지 캐시합니다 — batch count·Feature 6 후보·
+  ADetailer 가 같은 줄이면 Qwen3.5-4B 를 GPU 로 다시 올리지 않습니다. batch count 사이에는 설치를
+  유지해 Forge 의 조건 캐시도 이어지고(Hires 체크포인트·Refiner 로 모델이 다시 로드되면 새로 설치, NegPiP 가
+  앞 순서라 래퍼가 빠지면 다시 겁니다), 순정으로 가는 부정 프롬프트는 Forge 의 공용 캐시를 씁니다.
+- `qwen35_4b.safetensors`(또는 동봉 토크나이저, v1 이면 어댑터 파일)가 없으면 생성 **전에** 알아채
+  한 번 경고한 뒤 순정 Anima 로 진행합니다. infotext 에 `Anima 3.8B: off: …` 가 남습니다.
+- VRAM 이 모자라 Forge 가 Qwen3.5 를 일부만 올려도 동작합니다(일부 가중치가 CPU 에 남아도 계산 장치로
+  옮겨 씀). Qwen3.5 가 커넥터에 넘기는 층(7·15·23·31)은 여러 프롬프트에서 최대 |값| 35.5 로 측정돼
+  fp16 텍스트 인코더에서도 넘침이 없습니다.
+- 커넥터는 번들의 원본 `llm_adapter` 로 만든 **자기 사본**을 씁니다(텍스트 인코더와 같은 dtype, 약 +0.3 GiB
+  RAM). 그래서 LoRA 에 든 `llm_adapter` 가중치도 v2 경로에 적용되고, 샘플링 직전마다 그 패스의 LoRA 세트에
+  맞춥니다 — 텍스트 인코더와 같은 모듈을 둘이 제자리 패치하면
+  LoRA 가 두 번 적용될 수 있어 사본을 둡니다.
+- img2img 캔버스·ImageStitch 레퍼런스(Anima reference)를 순정과 똑같이 넘깁니다 — Feature 6 캐릭터
+  레퍼런스가 3.8B 에서도 레퍼런스를 씁니다.
+- SAM3 in-flight 인페인트 패스는 바깥 생성의 설치를 물려받아, 그 뒤에 도는 ADetailer 패스(같은 이미지나
+  배치의 다음 이미지)도 v2 로 돕니다. 다른 탭의 생성이 도중에 죽어 남은 설치는 다음 생성 시작 때 내립니다.
+- 체크포인트를 바꾸면 이전 모델을 붙잡지 않아 Forge 가 RAM 에서 비울 수 있습니다. Qwen3.5 는
+  체크포인트와 무관해 계속 캐시합니다(XYZ 로 3.8B 를 오갈 때 다시 읽지 않게).
+- LoRA·SAM3·ADetailer 와의 조합은 이 확장에서 함께 검증했습니다(ANIMA LoKr 3개 + SAM3
+  인페인트).
+
 ## 출처 / 크레딧 (Credits)
 
 이 확장은 아래 외부 프로젝트를 **그대로 가져와(vendored, shallow clone)** Forge에 통합합니다. 핵심 기능의 저작권은 각 원저자에게 있으며, 본 확장은 Forge 통합 레이어만 제공합니다. vendor 디렉터리는 저장소에 포함되지 않고 `install.py`가 첫 실행 시 자동으로 clone합니다.
@@ -569,6 +657,7 @@ DCW/RDC eval, DAVE/Modulation block hit, CNS noise call, Adaptive 실제 생략 
 | **LoRA Manager** (워크플로 4) | [willmiao/ComfyUI-Lora-Manager](https://github.com/willmiao/ComfyUI-Lora-Manager) | GPL-3.0 | `lora_manager_vendor/` |
 | **Anima Tile-Repair** (워크플로 3) | [kohya-ss/sd-scripts](https://github.com/kohya-ss/sd-scripts) (`anima_minimal_inference*`) | Apache-2.0 | `anima_vendor/` |
 | **Anima Character Reference / ReStyler** (워크플로 6) | [Anima ReStyler workflow](https://civitai.com/models/2803070/anima-restyler) · [원 아이디어 Reddit 게시물](https://www.reddit.com/r/StableDiffusion/s/0Az0DgoaKj) | 워크플로 페이지 조건 참고 | 동작을 Forge 네이티브 img2img/reference로 재구현 (vendor·코드 복사 없음) |
+| **Anima 3.8B (Qwen3.5 / v2)** (워크플로 7) | [GumGum10/forge-anima-3.8B](https://github.com/GumGum10/forge-anima-3.8B) (commit `59c27e5`) | MIT | `sam3ext/anima38/` 에 편입 (저장소에 포함, 수정 사항은 `THIRD_PARTY_NOTICES.md`) |
 | **Anima Safe PAG** (별도 기능) | [iljung1106/comfyui-anima-safe-pag](https://github.com/iljung1106/comfyui-anima-safe-pag) | 원 저장소 라이선스 참고 | 이식 (vendor 아님) |
 | **DCW / RDC / CWM / SMC** | [namemechan/ComfyUI-DCW](https://github.com/namemechan/ComfyUI-DCW) | GPL-3.0 | 수식 기반 Forge 재작성 (vendor 아님) |
 | **DAVE** | [daheekwon/DAVE](https://github.com/daheekwon/DAVE) · [sorryhyun/ComfyUI-Anima-DAVE](https://github.com/sorryhyun/ComfyUI-Anima-DAVE) | MIT | Forge block 재구현 (vendor 아님) |
@@ -599,45 +688,3 @@ LoRA Manager(GPL-3.0)는 vendor 그대로 실행하되, `lora_manager_core.py`�
 ## 라이선스
 
 본 확장(통합 레이어) 자체는 내부 사용. 단, 임베드한 LoRA Manager가 **GPL-3.0**이므로 재배포 시 GPL-3.0 조건을 따릅니다. (vendor 코드는 저장소에 포함되지 않으며 런타임에 clone됩니다.)
-
-## 워크플로 5: Anima 3.8B — Qwen3.5 / Semantic Connector v2 (편입)
-
-Anima-3.8B v1.1 체크포인트는 Qwen3.5-4B 의 의미 특징을 매 디노이징 스텝에 주입하는
-**Semantic Connector v2** 가중치를 파일 안에 담고 있습니다. Forge 본체는 그 190개 텐서를
-`Anima Unexpected: anima_v2_connector…` 로 버리기 때문에, 확장 없이는 텍스트 인코더에
-`Anima-3.8B-expanded_adapter` 나 `qwen35_4b` 를 넣어도 결과가 **한 픽셀도 바뀌지 않습니다**
-(같은 시드 A/B 실측). [GumGum10/forge-anima-3.8B](https://github.com/GumGum10/forge-anima-3.8B)
-(MIT) 의 런타임을 `sam3ext/anima38/` 로 편입해 이 확장 하나로 그 경로가 돕니다.
-
-### 필요 파일
-| 파일 | 위치 |
-| --- | --- |
-| `Anima-3.8B-v1.1.safetensors` (v2 번들) | `models/Stable-diffusion/` |
-| `qwen35_4b.safetensors` (4.8 GB) | `models/text_encoder/` (파일명에 `qwen35_4b` 가 들어가면 자동 발견) |
-| `qwen_3_06b_base.safetensors`, `qwen_image_vae.safetensors` | 순정 Anima 그대로 |
-
-### 사용
-1. 체크포인트로 v2 번들을 고르고, VAE/텍스트 인코더는 순정 Anima 처럼 `qwen_image_vae` +
-   `qwen_3_06b_base` 를 선택합니다. (v1.1 번들에는 어댑터가 내장돼 있어 별도 어댑터 파일은
-   필요 없습니다.)
-2. 그냥 생성합니다 — 번들은 safetensors metadata 로 판별해 **아코디언이 접혀 있어도 자동**으로
-   켜집니다. 콘솔에 `[Anima38] active — v2 bundle` 이 찍힙니다.
-3. 선택: **Anima 3.8B (Qwen3.5 / v2)** 아코디언의 *Use adapter on negative prompt* 를 켜면
-   부정 프롬프트도 같은 경로를 탑니다(기본은 순정 인코더).
-4. 구형 v1(베이스 + 별도 `Anima-3.8B-expanded_adapter.safetensors`)은 아코디언을 켜고
-   어댑터·강도를 고릅니다.
-
-### API
-`alwayson_scripts["Anima 3.8B (Qwen3.5 / v2)"]` 에 위치 인자 목록
-`[enabled, adapter, strength, negative, negative_strength]` 또는 SAM3 처럼 dict 하나
-`{"args": [{"enabled": true, "negative": false}]}` 를 보낼 수 있습니다. v2 번들은 인자를
-안 보내도 켜집니다. 끄려면 아코디언의 **Bypass** 체크박스 또는 `{"args": [{"bypass": true}]}`.
-- **NegPiP 와 함께 쓸 수 있다 (설치 순서 무관).** v2 조건은 Forge 네이티브 계약(줄마다 텐서 하나)을 지키고 run id 는 마지막 토큰 행의 마커로 실어 보내므로 `get_learned_conditioning` 을 감싸는 확장이 있어도 죽지 않는다. NegPiP 이 우리 아래에 깔리는 순서에서는 NegPiP 의 가중치 마스킹을 우리가 대신 적용해 어느 순서에서도 결과가 같다. 패치는 생성이 끝나도 자리에 남되 꺼진 상태로 투명하게 위임하므로, 두 확장이 서로 다른 순서로 해제해도 사고가 없다.
-
-### 동작·한계
-- 두 인코더는 순차로 돌고 결과를 RAM 으로 옮긴 뒤 해제됩니다. 커넥터는 샘플링 모델의 일부로
-  Forge 가 관리하며(오프로딩 가능) 생성이 끝나면 전부 원복됩니다.
-- `qwen35_4b.safetensors` 가 없거나 런타임이 못 뜨면 생성을 죽이지 않고 한 번 경고한 뒤
-  순정 Anima 로 진행합니다.
-- LoRA·SAM3·ADetailer 와의 조합은 이 확장에서 함께 검증했습니다(ANIMA LoKr 3개 + SAM3
-  인페인트). 생성 파라미터에 `Anima 3.8B architecture/bundle` 이 기록됩니다.

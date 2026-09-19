@@ -22,7 +22,8 @@ class RMSNorm(nn.Module):
     def forward(self, x):
         y = x.float()
         y = y * torch.rsqrt(y.pow(2).mean(-1, keepdim=True) + self.eps)
-        y = y * self.weight.float()
+        # 부분 로드(VRAM 부족)에선 Forge ops 가 아닌 이 가중치가 CPU 에 남는다 — 입력 장치로 옮겨 쓴다
+        y = y * self.weight.to(device=y.device, dtype=torch.float32)
         return y.to(dtype=x.dtype)
 
 
@@ -36,7 +37,7 @@ class Qwen35RMSNorm(nn.Module):
     def forward(self, x):
         y = x.float()
         y = y * torch.rsqrt(y.pow(2).mean(-1, keepdim=True) + self.eps)
-        y = y * (1.0 + self.weight.float())
+        y = y * (1.0 + self.weight.to(device=y.device, dtype=torch.float32))
         return y.to(dtype=x.dtype)
 
 

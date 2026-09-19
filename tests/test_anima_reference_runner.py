@@ -182,8 +182,10 @@ class _ProcessingDouble:
 class _FakeForge:
     """Just enough of Forge for run_anima_reference, swapped into sys.modules."""
 
-    def __init__(self, model, process=None):
+    def __init__(self, model, process=None, selected=None):
         self.model = model
+        self.selected = selected   # what forge_model_reload() loads (None: nothing new)
+        self.reloads = 0
         self.built = []
         self.saved = []
         self.state = _FakeState()
@@ -217,11 +219,21 @@ class _FakeForge:
         images.save_image = save_image
         scripts = types.ModuleType("modules.scripts")
         scripts.scripts_data = [types.SimpleNamespace(script_class=self.stitch)]
+        sd_models = types.ModuleType("modules.sd_models")
+
+        def forge_model_reload():
+            self.reloads += 1
+            if self.selected is not None:
+                shared.sd_model = self.selected
+            return shared.sd_model, self.selected is not None
+
+        sd_models.forge_model_reload = forge_model_reload
         for name, module in (
             ("shared", shared),
             ("processing", processing),
             ("images", images),
             ("scripts", scripts),
+            ("sd_models", sd_models),
         ):
             setattr(package, name, module)
         inpaint = types.ModuleType("sam3ext.inpaint_core")
@@ -239,12 +251,15 @@ class _FakeForge:
             "modules.processing": processing,
             "modules.images": images,
             "modules.scripts": scripts,
+            "modules.sd_models": sd_models,
             "sam3ext.inpaint_core": inpaint,
         }
 
-    def run(self, request):
+    def run(self, request, *, pass_model=True):
         with mock.patch.dict(sys.modules, self._modules()):
-            return run_anima_reference(request, sd_model=self.model)
+            if pass_model:
+                return run_anima_reference(request, sd_model=self.model)
+            return run_anima_reference(request)   # the UI handler's call
 
 
 def _request(**overrides):
@@ -288,6 +303,26 @@ class ReferenceRunnerBehaviourTests(unittest.TestCase):
         forge.run(_request(eta=0.5, s_min_uncond=0.25))
         p = forge.built[0]
         self.assertEqual((p.eta, p.s_min_uncond), (0.5, 0.25))
+
+    def test_lazily_loaded_checkpoint_is_loaded_before_the_anima_check(self):
+        # Right after a Forge restart shared.sd_model is FakeInitialModel until
+        # the first generation loads the selected checkpoint.
+        forge = _FakeForge(object(), selected=_Anima())
+        forge.run(_request(), pass_model=False)
+        self.assertEqual(forge.reloads, 1)
+        self.assertIs(forge.built[0].sd_model, forge.selected)
+
+    def test_selected_checkpoint_wins_over_the_stale_loaded_one(self):
+        # The dropdown now points at a non-Anima checkpoint; the old Anima is still in memory.
+        forge = _FakeForge(_Anima(), selected=object())
+        with self.assertRaisesRegex(RuntimeError, "Anima"):
+            forge.run(_request(), pass_model=False)
+        self.assertEqual(forge.built, [])
+
+    def test_explicit_model_skips_the_reload(self):
+        forge = _FakeForge(_Anima(), selected=object())
+        forge.run(_request())
+        self.assertEqual(forge.reloads, 0)
 
     def test_non_anima_model_is_rejected_before_sampling(self):
         forge = _FakeForge(object())
@@ -494,7 +529,7 @@ class ReferenceAnima38Tests(unittest.TestCase):
             ],
         )
         self.assertEqual(result.diagnostics["anima38"], "v2 bundle")
-        self.assertEqual(p.extra_generation_params["Reference Anima 3.8B"], "v2 bundle")
+        self.assertEqual(p.extra_generation_params["Reference Anima38"], "v2 bundle")
 
     def test_non_bundle_model_runs_natively(self):
         runtime = _FakeAnima38(v2=False)

@@ -263,6 +263,7 @@ def build_i2i(p, image: Image.Image, args: dict[str, Any]) -> StableDiffusionPro
     p2._sam3_base_scheduler = version_args.get("scheduler", getattr(p, "scheduler", None))
     p2.scripts, p2.script_args = script_filter(p)
     p2._sam3_inner = True
+    p2._sam3_outer = p   # Anima 3.8B 스크립트가 바깥 생성의 설치를 물려받는 표시
     p2.all_hr_prompts = [""]
     p2.all_hr_negative_prompts = [""]
     return p2

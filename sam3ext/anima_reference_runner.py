@@ -519,6 +519,16 @@ def run_anima_reference(
 
     from .inpaint_core import build_standalone_i2i, pause_total_tqdm
 
+    if sd_model is None:
+        # Forge loads the selected checkpoint lazily in process_images: right
+        # after a restart shared.sd_model is a FakeInitialModel placeholder, and
+        # after a dropdown change it is still the previous model. Do that load
+        # first so the Anima check sees the selected checkpoint (it returns
+        # immediately when that checkpoint is already loaded).
+        from modules import sd_models
+
+        sd_models.forge_model_reload()
+
     model = sd_model or getattr(shared, "sd_model", None)
     if model is None:
         raise RuntimeError("No Forge model is loaded.")
@@ -594,7 +604,7 @@ def run_anima_reference(
                         anima38_runtime, anima38_error, p2, model
                     )
                     anima38_installed = anima38_label == "v2 bundle"
-                    p2.extra_generation_params["Reference Anima 3.8B"] = anima38_label
+                    p2.extra_generation_params["Reference Anima38"] = anima38_label
 
                     processed = None
                     try:
