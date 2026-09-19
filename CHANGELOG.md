@@ -5,6 +5,11 @@
 
 ## Unreleased
 
+- **SAM3 빠른 버튼(🎯)**: txt2img 갤러리 ✨(hires fix) 옆에서 선택한 이미지에 지금 SAM3 설정을 바로
+  돌립니다. ✨ 와 같은 규칙(지금 txt2img 설정 + 그 이미지의 시드, 결과 배치는 Forge 의 hires button gallery
+  insert 설정)이며, SAM3 아코디언이 꺼져 있어도 돌고 다른 후처리는 돌리지 않습니다. 결과는 `-sam3` 접미어로
+  저장하고 infotext 에 SAM3 설정과 `SAM3 quick: True` 를 붙입니다. 버튼은 ✨ 의 입력·출력·진행 표시를 그대로
+  씁니다(`sam3ext/quick_button.py`).
 - **Anima 3.8B 보강**:
   - Feature 6 가 3.8B 에서 `Inference tensors do not track version counter` 로 죽던 문제 — txt2img 가
     inference_mode 안에서 만든 커넥터 가중치를 밖에서 옮기면 버전 카운터 없는 파라미터가 되던 것을,

@@ -264,6 +264,10 @@ def build_i2i(p, image: Image.Image, args: dict[str, Any]) -> StableDiffusionPro
     p2.scripts, p2.script_args = script_filter(p)
     p2._sam3_inner = True
     p2._sam3_outer = p   # Anima 3.8B 스크립트가 바깥 생성의 설치를 물려받는 표시
+    if getattr(p, "_sam3_quick", False):
+        from .quick_button import apply_quick_pass_settings
+
+        apply_quick_pass_settings(p, p2, seed)   # 🎯 빠른 버튼 — 시드·Override 설정·ADetailer
     p2.all_hr_prompts = [""]
     p2.all_hr_negative_prompts = [""]
     return p2

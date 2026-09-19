@@ -28,6 +28,7 @@ from sam3ext.anima_core import anima_available
 from sam3ext.core import find_checkpoint_options, unload_sam3, write_artifacts
 from sam3ext.inpaint_core import apply_prompt_sr, copy_prompt, run_inpaint_passes
 from sam3ext.notebook_store import register_notebook_routes
+from sam3ext import quick_button as sam3_quick
 from sam3ext.ui import WebuiButtons, sam3_ui
 from sam3ext.ui_anima import AnimaPanel, build_anima_panel, handle_anima_click
 from sam3ext.ui_anima_reference import (
@@ -211,6 +212,11 @@ def on_app_started_services(demo, app):
     guarded = guard_sampler_app_started_callbacks(script_callbacks.callback_map)
     if guarded:
         print(f"[SAM3] guarded late sampler app-start callbacks: {guarded}")
+    if sam3_quick_button is not None and not sam3_quick_wired:
+        print(
+            "[-] SAM3: quick button could not find the hires-fix button wiring; it stays inactive.",
+            file=sys.stderr,
+        )
     removed = prune_stale_sampler_load_targets(demo)
     total = sum(removed.values())
     if total:
@@ -461,6 +467,9 @@ class Sam3MaskScript(scripts.Script):
             exclude_prompt=str(args.get("sam3_exclude_prompt") or ""),
         )
 
+        # 🎯 빠른 버튼이 결과를 판단한다(마스크 없음 / Mask only / 인페인트) — 이미지 객체 비교로는 알 수 없다
+        p._sam3_mask_found = bool(np.any(np.asarray(result.mask)))
+
         if args.get("sam3_save_artifacts"):
             seed = None
             if hasattr(p, "all_seeds") and getattr(p, "all_seeds", None):
@@ -510,6 +519,10 @@ txt2img_html_info_component = None
 txt2img_generation_info_component = None
 txt2img_width_component = None
 txt2img_height_component = None
+# SAM3 빠른 버튼(🎯): ✨(txt2img_upscale) 옆에 만들고, ✨ 의 click 이 등록된 뒤 같은 입력으로 연결한다.
+txt2img_upscale_button = None
+sam3_quick_button = None
+sam3_quick_wired: bool = False
 refine_panel: RefinePanel | None = None
 anima_panel: AnimaPanel | None = None
 anima_reference_panel: AnimaReferencePanel | None = None
@@ -770,11 +783,41 @@ def _wire_anima_panel(
     )
 
 
+def _create_sam3_quick_button():
+    try:
+        from modules.ui_components import ToolButton
+
+        return ToolButton(
+            sam3_quick.BUTTON_ICON,
+            elem_id=sam3_quick.BUTTON_ELEM_ID,
+            tooltip=sam3_quick.BUTTON_TOOLTIP,
+        )
+    except Exception:
+        print(f"[-] SAM3: failed to create the quick button:\n{traceback.format_exc()}", file=sys.stderr)
+        return None
+
+
+def _wire_sam3_quick_button() -> None:
+    """✨ 의 click 이 txt2img Blocks 에 등록되면(그 뒤 만들어지는 엑스트라 네트워크 UI 컴포넌트 때) 한 번 연결한다."""
+    global sam3_quick_wired
+    if sam3_quick_wired or sam3_quick_button is None or txt2img_upscale_button is None:
+        return
+    dependency = sam3_quick.find_click_dependency(Context.root_block, txt2img_upscale_button)
+    if dependency is None:
+        return
+    sam3_quick_wired = True
+    try:
+        sam3_quick.wire_quick_button(sam3_quick_button, dependency)
+    except Exception:
+        print(f"[-] SAM3: failed to wire the quick button:\n{traceback.format_exc()}", file=sys.stderr)
+
+
 def on_after_component(component, **kwargs):
     global txt2img_submit_button, img2img_submit_button
     global txt2img_gallery_component, txt2img_prompt_component, txt2img_neg_prompt_component
     global txt2img_html_info_component, txt2img_generation_info_component
     global txt2img_width_component, txt2img_height_component
+    global txt2img_upscale_button, sam3_quick_button
     global refine_panel
 
     # Gradio rebuilds a component at *request* time whenever a handler returns
@@ -805,6 +848,7 @@ def on_after_component(component, **kwargs):
     if component._id not in Context.root_block.default_config.blocks:
         return
 
+    _wire_sam3_quick_button()
     elem_id = kwargs.get("elem_id")
     if elem_id == "txt2img_generate":
         txt2img_submit_button = component
@@ -814,6 +858,10 @@ def on_after_component(component, **kwargs):
         txt2img_prompt_component = component
     elif elem_id == "txt2img_neg_prompt":
         txt2img_neg_prompt_component = component
+    elif elem_id == "txt2img_upscale":
+        # ✨ 는 갤러리 아래 버튼 줄의 마지막 — 지금 만들면 그 오른쪽에 붙는다
+        txt2img_upscale_button = component
+        sam3_quick_button = _create_sam3_quick_button()
     elif elem_id == "txt2img_gallery":
         txt2img_gallery_component = component
     elif elem_id == "txt2img_width":

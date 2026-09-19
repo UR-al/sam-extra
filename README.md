@@ -77,6 +77,21 @@ t2i가 끝나면 SAM3가 마스킹 → 인페인트 → 결과가 원본 이미�
 - `,` — OR 머지 (한 마스크로 합침)
 - `/` — 분리된 인페인트 패스 (예: `face / hand` → 얼굴 인페인트 후 손 인페인트)
 
+### 🎯 빠른 버튼 — 이미 만든 이미지에 바로 돌리기
+
+txt2img 갤러리 아래 ✨(hires fix) 버튼 오른쪽의 **🎯** 는 선택한 이미지에 지금 SAM3 설정을 바로 돌립니다.
+규칙은 ✨ 와 같습니다: 지금 txt2img 화면 설정(프롬프트·샘플러 등)으로 돌리고 시드는 그 이미지의 시드
+(Forge 설정 *txt2img upscale same seed*), 결과는 Forge 설정 *hires button gallery insert* 대로 원본 자리를
+바꾸거나 원본 뒤에 끼웁니다.
+
+- SAM3 아코디언의 Enable 이 꺼져 있어도 돕니다 — 버튼을 누른 것 자체가 요청입니다. 다른 후처리(ADetailer,
+  하이레스)는 돌리지 않습니다.
+- 결과는 outputs 에 `-sam3` 접미어로 저장되고(Forge 의 자동 저장 설정을 따름), infotext 는 원본 뒤에 SAM3 설정과
+  `SAM3 quick: True` 가 붙습니다.
+- 마스크를 못 찾거나 모드가 Mask only 면 갤러리는 그대로 두고 infotext 칸에 알립니다. 그리드·컨트롤 이미지는
+  ✨ 처럼 거절합니다. txt2img 의 Override 설정(Clip skip 등)도 ✨ 처럼 인페인트에 적용됩니다.
+- Forge 가 ✨ 연결 방식을 바꾸면 버튼이 연결되지 않고 콘솔에 경고만 남습니다(생성에는 영향 없음).
+
 ---
 
 ## 워크플로 2: Refine 패널 (post-generation)
