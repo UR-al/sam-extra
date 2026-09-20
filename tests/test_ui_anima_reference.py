@@ -504,5 +504,164 @@ class WiringTests(unittest.TestCase):
         self.assertIs(run.inputs[-1], panel.txt2img_height_fallback)
 
 
+class ReferenceModeUiTests(unittest.TestCase):
+    def test_the_mode_radio_defaults_to_the_existing_path(self):
+        panel = _panel()
+        self.assertEqual(panel.mode.value, "i2i")
+        self.assertEqual([choice[1] for choice in panel.mode.choices], ["i2i", "ipa"])
+
+    def test_the_ipa_group_starts_hidden_and_the_i2i_groups_visible(self):
+        panel = _panel()
+        self.assertFalse(panel.ipa_group.visible)
+        self.assertTrue(panel.i2i_group.visible)
+        self.assertTrue(panel.i2i_expert_group.visible)
+
+    def test_switching_mode_swaps_which_groups_are_visible(self):
+        i2i, i2i_expert, ipa = ui.mode_visibility("ipa")
+        self.assertFalse(i2i["visible"])
+        self.assertFalse(i2i_expert["visible"])
+        self.assertTrue(ipa["visible"])
+        i2i, i2i_expert, ipa = ui.mode_visibility("i2i")
+        self.assertTrue(i2i["visible"])
+        self.assertTrue(i2i_expert["visible"])
+        self.assertFalse(ipa["visible"])
+
+    def test_the_new_keys_are_appended_so_saved_ui_config_stays_valid(self):
+        self.assertEqual(REFERENCE_ARG_KEYS[0], "reference_image")
+        self.assertEqual(REFERENCE_ARG_KEYS[1], "keep_scope")
+        self.assertEqual(
+            REFERENCE_ARG_KEYS[-8:],
+            (
+                "mode",
+                "ipa_strength",
+                "ipa_ref_size",
+                "ipa_separate_cfg",
+                "ipa_cfg_scale",
+                "ipa_siglip_layer",
+                "ipa_gray_null",
+                "ipa_use_lora",
+            ),
+        )
+
+    def test_ipa_values_reach_the_request(self):
+        panel = _panel()
+        values = _defaults(
+            panel,
+            mode="ipa",
+            ipa_strength=0.6,
+            ipa_ref_size=768,
+            ipa_separate_cfg=True,
+            ipa_cfg_scale=5.5,
+            ipa_siglip_layer=3,
+            ipa_gray_null=True,
+            ipa_use_lora=False,
+        )
+        request, _detected, _warnings = _map(values)
+        self.assertEqual(request.mode, "ipa")
+        self.assertEqual(request.ipa.strength, 0.6)
+        self.assertEqual(request.ipa.ref_size, 768)
+        self.assertTrue(request.ipa.separate_cfg)
+        self.assertEqual(request.ipa.cfg_scale, 5.5)
+        self.assertEqual(request.ipa.siglip_layer, 3)
+        self.assertTrue(request.ipa.gray_null)
+        self.assertFalse(request.ipa.use_lora)
+        request.validate()
+
+    def test_the_default_panel_still_maps_to_the_i2i_path(self):
+        panel = _panel()
+        request, _detected, _warnings = _map(_defaults(panel))
+        self.assertEqual(request.mode, "i2i")
+        self.assertEqual(request.ipa.strength, 1.0)
+
+    def test_an_unknown_mode_falls_back_instead_of_raising(self):
+        panel = _panel()
+        request, _detected, _warnings = _map(_defaults(panel, mode="magic"))
+        self.assertEqual(request.mode, "i2i")
+
+
+class IpaStatusTests(unittest.TestCase):
+    def _status(self, **diagnostics):
+        from sam3ext.anima_ipa.options import IpaOptions
+        from sam3ext.anima_reference_runner import ReferenceGenerationRequest
+
+        request = ReferenceGenerationRequest(
+            reference_image=Image.new("RGB", (64, 64)),
+            mode="ipa",
+            ipa=IpaOptions(strength=0.8),
+        )
+        result = ReferenceGenerationResult(
+            prepared=None,
+            outputs=(
+                ReferenceGenerationOutput(
+                    target_image=Image.new("RGB", (8, 8)),
+                    generated_canvas=Image.new("RGB", (8, 8)),
+                    infotext="Seed: 5",
+                    seed=5,
+                ),
+            ),
+            diagnostics={"mode": "ipa", "ipa_strength": 0.8, **diagnostics},
+        )
+        return ui.format_reference_status(
+            result, request, DetectedLoras(edit="AnimeEditV2", extend=None), [], "gallery"
+        )
+
+    def test_the_ipa_status_talks_about_the_adapter_not_the_edit_lora(self):
+        text = self._status()
+        self.assertIn("IP-Adapter", text)
+        self.assertIn("0.8", text)
+        self.assertNotIn("Edit LoRA", text)
+
+    def test_two_pass_is_called_out_because_it_doubles_the_cost(self):
+        self.assertIn("2배", self._status(ipa_separate_cfg=True))
+
+    def test_an_interrupted_ipa_run_still_says_so(self):
+        self.assertIn("중단", self._status(interrupted=True))
+
+    def test_a_block_lineage_mapping_is_shown_with_its_caveat(self):
+        """매핑을 안 알려 주면 결과가 이상할 때 사용자가 강도부터 의심한다."""
+        text = self._status(model_blocks=52, ipa_adapter_blocks=28)
+        self.assertIn("28블록 → 52블록", text)
+        self.assertIn("미검증", text)
+        self.assertIn("강도", text)
+
+    def test_the_same_depth_says_nothing_about_mapping(self):
+        text = self._status(model_blocks=28, ipa_adapter_blocks=28)
+        self.assertNotIn("계보", text)
+        self.assertNotIn("미검증", text)
+
+
+class IpaDownloadButtonTests(unittest.TestCase):
+    def test_a_complete_install_hides_the_button(self):
+        runtime = mock.Mock()
+        runtime.missing_files.return_value = []
+        _status, update = ui.handle_ipa_download(runtime=runtime)
+        self.assertFalse(update["visible"])
+        runtime.download.assert_not_called()
+
+    def test_a_busy_runtime_keeps_the_button_and_says_so(self):
+        runtime = mock.Mock()
+        runtime.missing_files.return_value = ["x.safetensors"]
+        runtime.download.return_value = False
+        status, update = ui.handle_ipa_download(runtime=runtime)
+        self.assertIn("받는 중", status)
+        self.assertTrue(update["visible"])
+
+    def test_a_failed_download_keeps_the_button_visible(self):
+        runtime = mock.Mock()
+        runtime.missing_files.return_value = ["x.safetensors"]
+        runtime.download.side_effect = OSError("network down")
+        status, update = ui.handle_ipa_download(runtime=runtime)
+        self.assertIn("OSError", status)
+        self.assertTrue(update["visible"])
+
+    def test_a_good_download_hides_the_button(self):
+        runtime = mock.Mock()
+        runtime.missing_files.return_value = ["x.safetensors"]
+        runtime.download.return_value = True
+        status, update = ui.handle_ipa_download(runtime=runtime)
+        self.assertFalse(update["visible"])
+        self.assertIn("받았습니다", status)
+
+
 if __name__ == "__main__":
     unittest.main()

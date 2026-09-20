@@ -128,5 +128,14 @@ class SamplingAndFallbackTests(unittest.TestCase):
         self.assertEqual(choose_fallback_index(0, -1, []), -1)
 
 
+class ModeConstantTests(unittest.TestCase):
+    def test_modes_are_plain_strings(self):
+        from sam3ext.anima_reference_recipe import MODE_I2I, MODE_IPA, MODES
+
+        self.assertEqual(MODE_I2I, "i2i")
+        self.assertEqual(MODE_IPA, "ipa")
+        self.assertEqual(MODES, (MODE_I2I, MODE_IPA))
+
+
 if __name__ == "__main__":
     unittest.main()

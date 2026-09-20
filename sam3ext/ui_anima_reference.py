@@ -19,6 +19,9 @@ from .anima_reference_recipe import (
     KEEP_OUTFIT,
     KEEP_SCOPES,
     KEEP_STYLE,
+    MODE_I2I,
+    MODE_IPA,
+    MODES,
     WARN_EXTEND_MISSING,
     DetectedLoras,
     SamplingSettings,
@@ -36,7 +39,10 @@ from .anima_reference_runner import (
     ReferenceGenerationResult,
     run_anima_reference,
 )
+from .anima_ipa.options import IpaOptions
+from .anima_ipa.paths import TOTAL_BYTES_LABEL
 from .coerce import as_float, as_int
+from .panel_container import ACCORDION, panel_container
 from .ui_refine import (
     _coerce_gallery_item_to_pil,
     _plaintext_to_html,
@@ -84,14 +90,73 @@ def list_installed_lora_names(*, refresh: bool = False) -> list[str]:
     )
 
 
+def _ipa_missing() -> list[str]:
+    """없는 IPA 가중치 이름. 확인이 실패해도 패널 만들기를 막지 않는다."""
+    try:
+        from .anima_ipa.runtime import shared_runtime
+
+        return shared_runtime().missing_files()
+    except Exception:
+        return ["unknown"]
+
+
+def mode_visibility(mode: str):
+    """(위쪽 i2i 묶음, 전문가란 i2i 묶음, IPA 묶음) 표시 업데이트."""
+    is_ipa = str(mode) == MODE_IPA
+    return (
+        gr.update(visible=not is_ipa),
+        gr.update(visible=not is_ipa),
+        gr.update(visible=is_ipa),
+    )
+
+
+IPA_MISSING_MESSAGE = (
+    f"IP-Adapter 모델이 없습니다 — <b>모델 받기 ({TOTAL_BYTES_LABEL})</b> 를 눌러 주세요."
+)
+
+
+def handle_ipa_download(*, runtime=None):
+    """전문가란의 '모델 받기'. 받는 동안 생성 대기열을 잠그지 않는다."""
+    if runtime is None:
+        from .anima_ipa.runtime import shared_runtime
+
+        runtime = shared_runtime()
+    if not runtime.missing_files():
+        return "IP-Adapter 모델이 이미 있습니다.", gr.update(visible=False)
+    try:
+        if not runtime.download():
+            return "이미 받는 중입니다.", gr.update(visible=True)
+    except Exception as exc:
+        return (
+            f"모델 받기 실패 — {type(exc).__name__}: {exc}",
+            gr.update(visible=True),
+        )
+    return (
+        "모델을 받았습니다. 이제 IP-Adapter 방식을 쓸 수 있습니다.",
+        gr.update(visible=False),
+    )
+
+
 @dataclass
 class AnimaReferencePanel:
-    accordion: gr.Accordion
+    container: gr.Blocks   # 아코디언(단독) 또는 칼럼(선택 이미지 탭 안)
     selected_index_state: gr.Number
     txt2img_width_fallback: gr.Number
     txt2img_height_fallback: gr.Number
     reference_image: gr.Image
     load_selected_button: gr.Button
+    mode: gr.Radio
+    i2i_group: gr.Group
+    i2i_expert_group: gr.Group
+    ipa_group: gr.Group
+    ipa_strength: gr.Slider
+    ipa_ref_size: gr.Slider
+    ipa_separate_cfg: gr.Checkbox
+    ipa_cfg_scale: gr.Slider
+    ipa_siglip_layer: gr.Slider
+    ipa_gray_null: gr.Checkbox
+    ipa_use_lora: gr.Checkbox
+    ipa_download_button: gr.Button
     keep_scope: gr.Radio
     candidate_count: gr.Slider
     prompt: gr.Textbox
@@ -154,6 +219,16 @@ REFERENCE_ARG_KEYS: tuple[str, ...] = (
     "seed",
     "negative_prompt",
     "save_debug_images",
+    # 새 항목은 반드시 끝에 붙인다 — 저장된 ui-config 값과 _split_inputs 의 위치 계산이
+    # 기존 순서에 걸려 있다.
+    "mode",
+    "ipa_strength",
+    "ipa_ref_size",
+    "ipa_separate_cfg",
+    "ipa_cfg_scale",
+    "ipa_siglip_layer",
+    "ipa_gray_null",
+    "ipa_use_lora",
 )
 
 # main prompt, main negative, generation_info, txt2img width, txt2img height
@@ -163,6 +238,8 @@ _REFERENCE_EXTRA_INPUTS = 5
 def build_anima_reference_panel(
     samplers: list[str],
     schedulers: list[str],
+    *,
+    container: str = ACCORDION,
 ) -> AnimaReferencePanel:
     """Render Feature 6: one image in, everything else from the recipe."""
 
@@ -180,11 +257,9 @@ def build_anima_reference_panel(
         scheduler_choices[0],
     )
 
-    with gr.Accordion(
-        "Feature 6 — Anima Character Reference",
-        open=False,
-        elem_id="sam3_anima_reference_panel",
-    ) as accordion:
+    with panel_container(
+        container, "Feature 6 — Anima Character Reference", "sam3_anima_reference_panel"
+    ) as container:
         selected_index_state = gr.Number(
             value=-1, precision=0, visible=False,
             elem_id="sam3_anima_reference_selected_index",
@@ -219,12 +294,19 @@ def build_anima_reference_panel(
                     "📋 선택한 T2I 이미지 가져오기",
                     elem_id="sam3_anima_reference_load_selected",
                 )
-                keep_scope = gr.Radio(
-                    choices=list(_KEEP_SCOPE_LABEL_TO_VALUE),
-                    value="정체성",
-                    label=_LABEL + "유지 범위",
-                    elem_id="sam3_anima_reference_keep_scope",
+                mode = gr.Radio(
+                    choices=[("이어붙이기", MODE_I2I), ("IP-Adapter", MODE_IPA)],
+                    value=MODE_I2I,
+                    label=_LABEL + "방식",
+                    elem_id="sam3_anima_reference_mode",
                 )
+                with gr.Group() as i2i_group:
+                    keep_scope = gr.Radio(
+                        choices=list(_KEEP_SCOPE_LABEL_TO_VALUE),
+                        value="정체성",
+                        label=_LABEL + "유지 범위",
+                        elem_id="sam3_anima_reference_keep_scope",
+                    )
                 candidate_count = gr.Slider(
                     label=_LABEL + "후보 수",
                     value=2, minimum=1, maximum=16, step=1,
@@ -274,38 +356,117 @@ def build_anima_reference_panel(
                     value=1088, minimum=64, maximum=4096, step=8,
                     elem_id="sam3_anima_reference_output_height",
                 )
-            composite_megapixels = gr.Slider(
-                label=_LABEL + "캔버스 메가픽셀",
-                value=1.4, minimum=0.5, maximum=4.0, step=0.05,
-                elem_id="sam3_anima_reference_megapixels",
-            )
-            with gr.Row():
-                edit_lora_strength = gr.Slider(
-                    label=_LABEL + "Edit LoRA 강도",
-                    value=0.72, minimum=0.0, maximum=2.0, step=0.01,
-                    elem_id="sam3_anima_reference_edit_strength",
+            with gr.Group(visible=False) as ipa_group:
+                gr.Markdown(
+                    "IP-Adapter 는 참조 이미지를 SigLIP2 로 읽어 Anima 블록에 직접 넣습니다. "
+                    "캔버스가 없어 구도가 자유롭습니다. 위쪽 크기·샘플러·시드 설정은 그대로 "
+                    f"쓰이고, 가중치 {TOTAL_BYTES_LABEL} 가 필요합니다."
                 )
-                extend_lora_enabled = gr.Checkbox(
-                    value=False,
-                    label=_LABEL + "Extend LoRA 사용",
-                    elem_id="sam3_anima_reference_extend_enabled",
+                with gr.Row():
+                    ipa_strength = gr.Slider(
+                        label=_LABEL + "IP 강도",
+                        value=1.0, minimum=0.0, maximum=2.0, step=0.05,
+                        elem_id="sam3_reference_ipa_strength",
+                    )
+                    ipa_ref_size = gr.Slider(
+                        label=_LABEL + "참조 해상도",
+                        value=512, minimum=224, maximum=1024, step=16,
+                        elem_id="sam3_reference_ipa_ref_size",
+                    )
+                with gr.Row():
+                    ipa_separate_cfg = gr.Checkbox(
+                        value=False,
+                        label=_LABEL + "IP 강도 따로 조절 (샘플링 2배 느림)",
+                        elem_id="sam3_reference_ipa_separate_cfg",
+                    )
+                    ipa_cfg_scale = gr.Slider(
+                        label=_LABEL + "IP CFG (따로 조절할 때만)",
+                        value=4.0, minimum=1.0, maximum=10.0, step=0.05,
+                        elem_id="sam3_reference_ipa_cfg_scale",
+                    )
+                with gr.Row():
+                    ipa_siglip_layer = gr.Slider(
+                        label=_LABEL + "SigLIP 레이어 (-1 = 마지막)",
+                        value=-1, minimum=-1, maximum=24, step=1,
+                        elem_id="sam3_reference_ipa_siglip_layer",
+                    )
+                    ipa_gray_null = gr.Checkbox(
+                        value=False,
+                        label=_LABEL + "회색 이미지를 null 로",
+                        elem_id="sam3_reference_ipa_gray_null",
+                    )
+                    ipa_use_lora = gr.Checkbox(
+                        value=True,
+                        label=_LABEL + "어댑터 LoRA 사용",
+                        elem_id="sam3_reference_ipa_use_lora",
+                    )
+                ipa_download_button = gr.Button(
+                    f"모델 받기 ({TOTAL_BYTES_LABEL})",
+                    size="sm",
+                    visible=bool(_ipa_missing()),
+                    elem_id="sam3_reference_ipa_download",
                 )
-                extend_lora_strength = gr.Slider(
-                    label=_LABEL + "Extend LoRA 강도",
-                    value=0.4, minimum=0.0, maximum=2.0, step=0.01,
-                    elem_id="sam3_anima_reference_extend_strength",
+
+            with gr.Group() as i2i_expert_group:
+                composite_megapixels = gr.Slider(
+                    label=_LABEL + "캔버스 메가픽셀",
+                    value=1.4, minimum=0.5, maximum=4.0, step=0.05,
+                    elem_id="sam3_anima_reference_megapixels",
                 )
-            with gr.Row():
-                prefix_text = gr.Textbox(
-                    value="split screen, multiple views",
-                    label=_LABEL + "앞머리 문구",
-                    elem_id="sam3_anima_reference_prefix_text",
+                with gr.Row():
+                    edit_lora_strength = gr.Slider(
+                        label=_LABEL + "Edit LoRA 강도",
+                        value=0.72, minimum=0.0, maximum=2.0, step=0.01,
+                        elem_id="sam3_anima_reference_edit_strength",
+                    )
+                    extend_lora_enabled = gr.Checkbox(
+                        value=False,
+                        label=_LABEL + "Extend LoRA 사용",
+                        elem_id="sam3_anima_reference_extend_enabled",
+                    )
+                    extend_lora_strength = gr.Slider(
+                        label=_LABEL + "Extend LoRA 강도",
+                        value=0.4, minimum=0.0, maximum=2.0, step=0.01,
+                        elem_id="sam3_anima_reference_extend_strength",
+                    )
+                with gr.Row():
+                    prefix_text = gr.Textbox(
+                        value="split screen, multiple views",
+                        label=_LABEL + "앞머리 문구",
+                        elem_id="sam3_anima_reference_prefix_text",
+                    )
+                    prefix_strength = gr.Slider(
+                        label=_LABEL + "앞머리 가중치",
+                        value=1.2, minimum=0.0, maximum=3.0, step=0.05,
+                        elem_id="sam3_anima_reference_prefix_strength",
+                    )
+                with gr.Row():
+                    fill_mode = gr.Radio(
+                        choices=list(_FILL_MODE_LABEL_TO_VALUE),
+                        value="원본 (단색 그대로)",
+                        label=_LABEL + "빈 칸 채우기",
+                        elem_id="sam3_anima_reference_fill_mode",
+                    )
+                    target_color = gr.ColorPicker(
+                        value="#000000",
+                        label=_LABEL + "빈 칸 색",
+                        elem_id="sam3_anima_reference_target_color",
+                    )
+                preview_button = gr.Button(
+                    "🧩 캔버스 / 마스크 미리보기",
+                    elem_id="sam3_anima_reference_preview",
                 )
-                prefix_strength = gr.Slider(
-                    label=_LABEL + "앞머리 가중치",
-                    value=1.2, minimum=0.0, maximum=3.0, step=0.05,
-                    elem_id="sam3_anima_reference_prefix_strength",
-                )
+                with gr.Row():
+                    preview_canvas = gr.Image(
+                        label=_LABEL + "캔버스 미리보기",
+                        interactive=False,
+                        elem_id="sam3_anima_reference_preview_canvas",
+                    )
+                    preview_mask = gr.Image(
+                        label=_LABEL + "마스크 미리보기",
+                        interactive=False,
+                        elem_id="sam3_anima_reference_preview_mask",
+                    )
             follow_forge_preset = gr.Checkbox(
                 value=False,
                 label=_LABEL + "Forge Anima img2img 프리셋 따르기 (켜면 아래 샘플링 값 무시)",
@@ -341,18 +502,6 @@ def build_anima_reference_panel(
                     elem_id="sam3_anima_reference_shift",
                 )
             with gr.Row():
-                fill_mode = gr.Radio(
-                    choices=list(_FILL_MODE_LABEL_TO_VALUE),
-                    value="원본 (단색 그대로)",
-                    label=_LABEL + "빈 칸 채우기",
-                    elem_id="sam3_anima_reference_fill_mode",
-                )
-                target_color = gr.ColorPicker(
-                    value="#000000",
-                    label=_LABEL + "빈 칸 색",
-                    elem_id="sam3_anima_reference_target_color",
-                )
-            with gr.Row():
                 seed = gr.Number(
                     value=-1,
                     precision=0,
@@ -377,21 +526,6 @@ def build_anima_reference_panel(
                 label=_LABEL + "디버그 이미지 저장 (생성 캔버스·입력 캔버스·마스크)",
                 elem_id="sam3_anima_reference_save_debug",
             )
-            preview_button = gr.Button(
-                "🧩 캔버스 / 마스크 미리보기",
-                elem_id="sam3_anima_reference_preview",
-            )
-            with gr.Row():
-                preview_canvas = gr.Image(
-                    label=_LABEL + "캔버스 미리보기",
-                    interactive=False,
-                    elem_id="sam3_anima_reference_preview_canvas",
-                )
-                preview_mask = gr.Image(
-                    label=_LABEL + "마스크 미리보기",
-                    interactive=False,
-                    elem_id="sam3_anima_reference_preview_mask",
-                )
 
     return AnimaReferencePanel(
         **{
@@ -467,7 +601,22 @@ def request_from_values(
         warnings.append(WARN_EXTEND_MISSING)
     debug = bool(keyed.get("save_debug_images", False))
 
+    mode = str(keyed.get("mode") or MODE_I2I)
+    if mode not in MODES:
+        mode = MODE_I2I
+    ipa = IpaOptions(
+        strength=as_float(keyed.get("ipa_strength"), 1.0),
+        ref_size=as_int(keyed.get("ipa_ref_size"), 512),
+        separate_cfg=bool(keyed.get("ipa_separate_cfg", False)),
+        cfg_scale=as_float(keyed.get("ipa_cfg_scale"), 4.0),
+        siglip_layer=as_int(keyed.get("ipa_siglip_layer"), -1),
+        gray_null=bool(keyed.get("ipa_gray_null", False)),
+        use_lora=bool(keyed.get("ipa_use_lora", True)),
+    )
+
     request = ReferenceGenerationRequest(
+        mode=mode,
+        ipa=ipa,
         reference_image=reference_image,
         canvas=ReferenceCanvasConfig(
             output_width=width,
@@ -629,6 +778,45 @@ def _reference_error(gallery_value, message: str):
     )
 
 
+def _format_ipa_status(
+    result: ReferenceGenerationResult,
+    request: ReferenceGenerationRequest,
+    warnings: list[str],
+    source: str,
+    diagnostics: dict[str, Any],
+) -> str:
+    """IPA 결과 상태줄 — 캔버스도 Edit LoRA 도 없으므로 다른 것을 말한다."""
+    parts = [
+        f"{len(result.outputs)}장 생성",
+        f"레퍼런스: {_SOURCE_LABELS.get(source, source)}",
+        f"IP-Adapter 강도 {float(diagnostics.get('ipa_strength', request.ipa.strength)):g}",
+        f"참조 {int(diagnostics.get('ipa_ref_size', request.ipa.ref_size))}px",
+    ]
+    if diagnostics.get("ipa_separate_cfg"):
+        parts.append("IP CFG 따로 (샘플링 2배)")
+    blocks = diagnostics.get("model_blocks")
+    parts.append(f"모델 {blocks}블록" if blocks else "모델 블록 수 확인 불가")
+    adapter_blocks = diagnostics.get("ipa_adapter_blocks")
+    if adapter_blocks and blocks and adapter_blocks != blocks:
+        # 안 알려 주면 결과가 이상할 때 매핑이 아니라 강도부터 의심하게 된다.
+        parts.append(
+            f"IP-Adapter {adapter_blocks}블록 → {blocks}블록 모델 "
+            "(블록 계보 매핑·미검증, 강도를 다시 잡으세요)"
+        )
+    if result.outputs:
+        parts.append("시드 " + ", ".join(str(item.seed) for item in result.outputs))
+    text = "<span style='color:#383'>" + html.escape(" · ".join(parts)) + "</span>"
+    if diagnostics.get("interrupted"):
+        text += "<br><span style='color:#c80'>중단되어 일부 후보만 생성했습니다.</span>"
+    if warnings:
+        text += (
+            "<br><span style='color:#c80'>⚠ "
+            + html.escape(" / ".join(warnings))
+            + "</span>"
+        )
+    return text
+
+
 def format_reference_status(
     result: ReferenceGenerationResult,
     request: ReferenceGenerationRequest,
@@ -637,6 +825,8 @@ def format_reference_status(
     source: str,
 ) -> str:
     diagnostics = dict(result.diagnostics or {})
+    if diagnostics.get("mode") == MODE_IPA:
+        return _format_ipa_status(result, request, warnings, source, diagnostics)
     parts = [
         f"{len(result.outputs)}장 생성",
         f"레퍼런스: {_SOURCE_LABELS.get(source, source)}",
@@ -847,13 +1037,15 @@ def handle_anima_reference_click(
         gallery_value, index, new_images, new_infotexts, info_json, "At end"
     )
     pin = gr.update(value=image) if source == "gallery" else gr.update()
+    # IPA 모드에는 캔버스도 마스크도 없다 — 미리보기 칸을 비운다.
+    prepared = result.prepared
     return (
         updated,
         format_reference_status(result, request, detected, warnings, source),
         _plaintext_to_html(new_infotexts[-1]),
         info_json_out,
-        result.prepared.canvas,
-        result.prepared.mask,
+        prepared.canvas if prepared is not None else None,
+        prepared.mask if prepared is not None else None,
         pin,
     )
 
@@ -909,6 +1101,18 @@ def wire_anima_reference_panel(
         width,
         height,
     ]
+
+    panel.mode.change(
+        fn=mode_visibility,
+        inputs=[panel.mode],
+        outputs=[panel.i2i_group, panel.i2i_expert_group, panel.ipa_group],
+        show_progress="hidden",
+    )
+    panel.ipa_download_button.click(
+        fn=handle_ipa_download,
+        inputs=[],
+        outputs=[panel.status, panel.ipa_download_button],
+    )
 
     panel.load_selected_button.click(
         fn=load_selected_reference,

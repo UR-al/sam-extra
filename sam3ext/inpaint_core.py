@@ -490,6 +490,59 @@ def build_standalone_i2i(
     return p2
 
 
+def build_standalone_t2i(
+    request,
+    *,
+    seed: int,
+    sd_model,
+    outpath_samples: str,
+    outpath_grids: str,
+):
+    """IPA 캐릭터 레퍼런스용 txt2img 잡.
+
+    캔버스가 없으므로 init 이미지도 마스크도 없다. 크기·샘플러·steps 는 요청에서 곧장 온다
+    (부모 ``p`` 가 없다). 스크립트 러너는 붙이지 않는다 — 다른 확장이 참조를 하나 더 끼워
+    넣거나 낡은 t2i 상태를 물고 있을 수 있다.
+    """
+    from modules.processing import StableDiffusionProcessingTxt2Img
+
+    p2 = StableDiffusionProcessingTxt2Img(
+        sd_model=sd_model,
+        outpath_samples=outpath_samples,
+        outpath_grids=outpath_grids,
+        prompt="",
+        negative_prompt="",
+        styles=[],
+        seed=int(seed),
+        subseed=-1,
+        subseed_strength=0,
+        seed_resize_from_h=0,
+        seed_resize_from_w=0,
+        sampler_name=str(request.sampler),
+        scheduler=str(request.scheduler),
+        batch_size=1,
+        n_iter=1,
+        steps=int(request.steps),
+        cfg_scale=float(request.cfg_scale),
+        width=int(request.canvas.output_width),
+        height=int(request.canvas.output_height),
+        restore_faces=False,
+        tiling=False,
+        extra_generation_params={},
+        # 결과는 우리가 저장한다(i2i 경로와 같은 규칙).
+        do_not_save_samples=True,
+        do_not_save_grid=True,
+    )
+    p2.cached_c = [None, None, None]
+    p2.cached_uc = [None, None, None]
+    p2.scripts = None
+    p2.script_args = None
+    p2._sam3_inner = True
+    p2.all_hr_prompts = [""]
+    p2.all_hr_negative_prompts = [""]
+    return p2
+
+
 def _find_sampler_script(runner):
     """Locate Forge's built-in ScriptSampler — the script whose ``setup(p)``
     method silently overwrites ``p.steps`` / ``p.sampler_name`` /

@@ -41,6 +41,48 @@ _HAS_FORGE_RUNTIME = (
 
 
 class ReferenceRequestTests(unittest.TestCase):
+    def test_the_default_mode_is_the_existing_split_screen_path(self):
+        request = ReferenceGenerationRequest(reference_image=Image.new("RGB", (8, 8)))
+        self.assertEqual(request.mode, "i2i")
+        request.validate()
+
+    def test_an_unknown_mode_is_refused(self):
+        request = ReferenceGenerationRequest(
+            reference_image=Image.new("RGB", (8, 8)), mode="magic"
+        )
+        with self.assertRaises(ValueError):
+            request.validate()
+
+    def test_ipa_options_are_validated_only_in_ipa_mode(self):
+        from sam3ext.anima_ipa.options import IpaOptions
+
+        bad = IpaOptions(ref_size=500)
+        # i2i 모드에서는 IPA 값을 보지 않는다.
+        ReferenceGenerationRequest(
+            reference_image=Image.new("RGB", (8, 8)), ipa=bad
+        ).validate()
+        with self.assertRaises(ValueError):
+            ReferenceGenerationRequest(
+                reference_image=Image.new("RGB", (8, 8)), mode="ipa", ipa=bad
+            ).validate()
+
+    def test_ipa_mode_drops_the_split_screen_prefix_and_edit_lora(self):
+        request = ReferenceGenerationRequest(
+            reference_image=Image.new("RGB", (8, 8)),
+            mode="ipa",
+            prompt="1girl, standing",
+            edit_lora_name="AnimeEditV2",
+        )
+        self.assertEqual(request.sampling_prompt, "1girl, standing")
+        # 이어붙이기 쪽 프롬프트는 그대로 남아 있다(모드만 다르다).
+        self.assertIn("split screen", request.internal_prompt)
+
+    def test_i2i_mode_still_samples_the_composed_prompt(self):
+        request = ReferenceGenerationRequest(
+            reference_image=Image.new("RGB", (8, 8)), prompt="1girl"
+        )
+        self.assertEqual(request.sampling_prompt, request.internal_prompt)
+
     def test_candidate_seed_preserves_random_and_steps_fixed_seed(self):
         self.assertEqual(candidate_seed(-1, 5, 3), -1)
         self.assertEqual(candidate_seed(100, 5, 3), 115)
@@ -179,6 +221,31 @@ class _ProcessingDouble:
         self.closed = True
 
 
+class _T2IProcessingDouble:
+    """IPA 경로가 만지는 txt2img processing 필드. ``sample()`` 은 Forge 가 부른다."""
+
+    def __init__(self, sd_model, request, on_sample=None):
+        self.sd_model = sd_model
+        self.request = request
+        self.on_sample = on_sample
+        self.prompt = ""
+        self.negative_prompt = ""
+        self.distilled_cfg_scale = 0.0
+        self.do_not_save_samples = True
+        self.do_not_save_grid = True
+        self.extra_generation_params = {}
+        self.all_seeds = [321]
+        self.sampled = 0
+        self.session_active_during_sample = None
+
+    def sample(self, *args, **kwargs):
+        self.sampled += 1
+        # 주입 컨텍스트 안에서 불리는지 여기서 확인한다(바깥에서 읽으면 이미 풀린 뒤다).
+        if self.on_sample is not None:
+            self.on_sample(self)
+        return "latent"
+
+
 class _FakeForge:
     """Just enough of Forge for run_anima_reference, swapped into sys.modules."""
 
@@ -189,6 +256,7 @@ class _FakeForge:
         self.built = []
         self.saved = []
         self.state = _FakeState()
+        self.on_sample = None       # IPA 테스트가 sample() 안에서 확인할 때 쓴다
         self.stitch = type("ImageStitch", (), {"cached_parameters": [1, 2]})
         self._process = process or self.processed_for
 
@@ -244,6 +312,15 @@ class _FakeForge:
             return p
 
         inpaint.build_standalone_i2i = build
+
+        def build_t2i(request, **kwargs):
+            p = _T2IProcessingDouble(
+                kwargs["sd_model"], request, on_sample=self.on_sample
+            )
+            self.built.append(p)
+            return p
+
+        inpaint.build_standalone_t2i = build_t2i
         inpaint.pause_total_tqdm = contextlib.nullcontext
         return {
             "modules": package,
@@ -584,6 +661,156 @@ class ReferenceAnima38Tests(unittest.TestCase):
         self.assertEqual(result.diagnostics["anima38"], "install failed (RuntimeError: boom)")
         self.assertIn("Anima 3.8B install failed", fake_stderr.getvalue())
         self.assertEqual(len(result.outputs), 1)
+
+
+class ReferenceIpaPathTests(unittest.TestCase):
+    """IPA 모드는 캔버스를 만들지 않고 txt2img 잡을 돌린다.
+
+    주의: ``mock.patch.dict(sys.modules, ...)`` 안에서 torch 를 처음 import 하면 인터프리터가
+    깨진다(이 파일 위쪽 ReferenceRunnerBehaviourTests.setUp 의 기록). 그래서 주입 세션은
+    통째로 가짜로 막는다 — 이 테스트는 배선만 본다.
+    """
+
+    def setUp(self):
+        self.entered = {"active": False}
+        self.sessions = []
+
+        @contextlib.contextmanager
+        def session(sd_model, image, options):
+            self.sessions.append(
+                {"sd_model": sd_model, "image": image, "options": options}
+            )
+            self.entered["active"] = True
+            try:
+                yield
+            finally:
+                self.entered["active"] = False
+
+        self.session_factory = session
+
+    def _record_during_sample(self, p):
+        p.session_active_during_sample = self.entered["active"]
+
+    def _process(self, p):
+        # Forge 가 하는 일: sample() 을 부른다. 주입은 그 안에서만 살아 있어야 한다.
+        p.sample()
+        return types.SimpleNamespace(
+            images=[Image.new("RGB", (64, 64), "blue")],
+            infotexts=["Seed: 321"],
+            info="",
+        )
+
+    def _run(self, model=None, **overrides):
+        from sam3ext.anima_ipa.options import IpaOptions
+
+        model = model or _Anima()
+        forge = _FakeForge(model, process=self._process)
+        forge.on_sample = self._record_during_sample
+        values = dict(
+            reference_image=Image.new("RGB", (512, 768), "red"),
+            mode="ipa",
+            ipa=IpaOptions(),
+            candidate_count=1,
+            save_target=False,
+            seed=7,
+        )
+        values.update(overrides)
+        request = ReferenceGenerationRequest(**values)
+        with mock.patch.object(runner_module, "_ipa_session", self.session_factory):
+            with mock.patch.dict(sys.modules, forge._modules()):
+                result = run_anima_reference(request, sd_model=model)
+        return forge, result
+
+    def test_no_canvas_is_built_and_the_result_is_not_cropped(self):
+        forge, result = self._run()
+        self.assertEqual(len(result.outputs), 1)
+        self.assertEqual(result.outputs[0].target_image.size, (64, 64))
+        self.assertIsNone(result.prepared, "IPA 에는 캔버스도 마스크도 없다")
+
+    def test_the_session_wraps_sampling(self):
+        forge, _ = self._run()
+        self.assertEqual(len(self.sessions), 1)
+        self.assertEqual(self.sessions[0]["image"].size, (512, 768))
+        self.assertTrue(forge.built[0].session_active_during_sample)
+        self.assertFalse(self.entered["active"], "잡이 끝나면 주입이 풀려야 한다")
+
+    def test_the_prompt_has_no_split_screen_prefix(self):
+        forge, _ = self._run(prompt="1girl, standing")
+        self.assertEqual(forge.built[0].prompt, "1girl, standing")
+
+    def test_the_infotext_records_the_mode_and_strength(self):
+        from sam3ext.anima_ipa.options import IpaOptions
+
+        forge, result = self._run(ipa=IpaOptions(strength=0.75))
+        params = forge.built[0].extra_generation_params
+        self.assertEqual(params["SAM3 Feature"], 6)
+        self.assertEqual(params["SAM3 Reference Mode"], "ipa")
+        self.assertEqual(params["SAM3 IPA Strength"], 0.75)
+        self.assertNotIn("SAM3 IPA CFG", params, "1-pass 에서는 IP CFG 가 의미 없다")
+        self.assertEqual(result.diagnostics.get("mode"), "ipa")
+
+    def test_two_pass_cfg_is_recorded_when_it_is_on(self):
+        from sam3ext.anima_ipa.options import IpaOptions
+
+        forge, _ = self._run(ipa=IpaOptions(separate_cfg=True, cfg_scale=5.5))
+        self.assertEqual(forge.built[0].extra_generation_params["SAM3 IPA CFG"], 5.5)
+
+    def test_candidates_get_stepped_seeds(self):
+        forge, result = self._run(candidate_count=3, seed=100, seed_step=5)
+        self.assertEqual(len(result.outputs), 3)
+        self.assertEqual(len(self.sessions), 3)
+
+    def test_a_non_anima_model_is_refused_before_any_job_runs(self):
+        model = types.SimpleNamespace(is_anima=False)
+        with self.assertRaises(RuntimeError) as caught:
+            self._run(model=model)
+        self.assertIn("Anima", str(caught.exception))
+
+    def test_a_block_lineage_mapping_is_recorded_where_the_user_can_see_it(self):
+        """28블록 어댑터가 52블록 모델에 얹히면 결과에 그 사실이 남아야 한다."""
+        model = _Anima()
+        model.forge_objects = types.SimpleNamespace(
+            unet=types.SimpleNamespace(
+                model=types.SimpleNamespace(
+                    diffusion_model=types.SimpleNamespace(blocks=[None] * 52)
+                )
+            )
+        )
+
+        @contextlib.contextmanager
+        def session(sd_model, image, options):
+            yield 28        # 실제 런타임은 어댑터 깊이를 내놓는다
+
+        forge = _FakeForge(model, process=self._process)
+        forge.on_sample = self._record_during_sample
+        request = ReferenceGenerationRequest(
+            reference_image=Image.new("RGB", (64, 64)), mode="ipa", candidate_count=1,
+            save_target=False,
+        )
+        with mock.patch.object(runner_module, "_ipa_session", session):
+            with mock.patch.dict(sys.modules, forge._modules()):
+                result = run_anima_reference(request, sd_model=model)
+
+        self.assertEqual(forge.built[0].extra_generation_params["SAM3 IPA Blocks"], "28→52")
+        self.assertEqual(result.diagnostics.get("ipa_adapter_blocks"), 28)
+        self.assertEqual(result.diagnostics.get("model_blocks"), 52)
+
+    def test_the_same_depth_leaves_no_mapping_note(self):
+        forge, result = self._run()
+        self.assertNotIn("SAM3 IPA Blocks", forge.built[0].extra_generation_params)
+
+    def test_an_interrupt_is_reported_in_the_diagnostics(self):
+        model = _Anima()
+        forge = _FakeForge(model, process=self._process)
+        forge.state.interrupted = True
+        request = ReferenceGenerationRequest(
+            reference_image=Image.new("RGB", (64, 64)), mode="ipa", candidate_count=2
+        )
+        with mock.patch.object(runner_module, "_ipa_session", self.session_factory):
+            with mock.patch.dict(sys.modules, forge._modules()):
+                result = run_anima_reference(request, sd_model=model)
+        self.assertTrue(result.diagnostics.get("interrupted"))
+        self.assertEqual(result.outputs, ())
 
 
 if __name__ == "__main__":

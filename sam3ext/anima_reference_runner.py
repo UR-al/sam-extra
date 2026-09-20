@@ -30,6 +30,7 @@ from typing import Any, Iterator
 
 from PIL import Image
 
+from .anima_ipa.options import IpaOptions
 from .anima_reference_core import (
     PreparedReferenceCanvas,
     ReferenceCanvasConfig,
@@ -37,6 +38,7 @@ from .anima_reference_core import (
     crop_reference_result,
     prepare_reference_canvas,
 )
+from .anima_reference_recipe import MODE_I2I, MODE_IPA, MODES
 
 
 @dataclass(frozen=True)
@@ -77,6 +79,10 @@ class ReferenceGenerationRequest:
     candidate_count: int = 2
     native_reference_enabled: bool = True
 
+    # "i2i" = 기존 split-screen 캔버스, "ipa" = IP-Adapter 주입
+    mode: str = MODE_I2I
+    ipa: IpaOptions = field(default_factory=IpaOptions)
+
     # Recorded in the infotext so GPU A/B runs can be compared.
     keep_scope: str = "identity"
     sampling_source: str = "recipe"
@@ -88,6 +94,10 @@ class ReferenceGenerationRequest:
 
     def validate(self) -> "ReferenceGenerationRequest":
         self.canvas.validate()
+        if self.mode not in MODES:
+            raise ValueError(f"Unsupported reference mode: {self.mode!r}")
+        if self.mode == MODE_IPA:
+            self.ipa.validate()
         image = self.reference_image
         if image is None or image.width < 1 or image.height < 1:
             raise ValueError("A non-empty reference image is required.")
@@ -141,6 +151,16 @@ class ReferenceGenerationRequest:
         return self
 
     @property
+    def sampling_prompt(self) -> str:
+        """샘플러에 실제로 들어가는 프롬프트.
+
+        IPA 는 캔버스가 없으므로 split-screen 접두사도 편집 LoRA 도 붙이지 않는다.
+        """
+        if self.mode == MODE_IPA:
+            return str(self.prompt or "")
+        return self.internal_prompt
+
+    @property
     def internal_prompt(self) -> str:
         return compose_reference_prompt(
             self.prompt,
@@ -166,8 +186,9 @@ class ReferenceGenerationOutput:
 
 @dataclass(frozen=True)
 class ReferenceGenerationResult:
-    prepared: PreparedReferenceCanvas
-    outputs: tuple[ReferenceGenerationOutput, ...]
+    # IPA 모드에는 캔버스도 마스크도 없으므로 ``prepared`` 가 None 이다.
+    prepared: PreparedReferenceCanvas | None = None
+    outputs: tuple[ReferenceGenerationOutput, ...] = ()
     diagnostics: dict[str, Any] = field(default_factory=dict)
 
 
@@ -502,6 +523,13 @@ def _restore_anima38(runtime: Any, processing: Any) -> None:
         )
 
 
+def _ipa_session(sd_model, image, options):
+    """IP-Adapter 주입 세션. 테스트에서 통째로 갈아끼울 수 있게 얇게 감싼다."""
+    from .anima_ipa.runtime import shared_runtime
+
+    return shared_runtime().session(sd_model, image, options)
+
+
 def run_anima_reference(
     request: ReferenceGenerationRequest,
     *,
@@ -512,6 +540,13 @@ def run_anima_reference(
     """Run Feature 6 through Forge's native Anima img2img/reference path."""
 
     request.validate()
+    if request.mode == MODE_IPA:
+        return _run_ipa_reference(
+            request,
+            sd_model=sd_model,
+            outpath_samples=outpath_samples,
+            outpath_grids=outpath_grids,
+        )
     prepared = prepare_reference_canvas(request.reference_image, request.canvas)
 
     from modules import shared
@@ -721,10 +756,181 @@ def run_anima_reference(
         prepared=prepared,
         outputs=tuple(outputs),
         diagnostics={
+            "mode": MODE_I2I,
             "target_panel": panel,
             "upscale": upscale,
             "model_blocks": model_blocks,
             "interrupted": interrupted,
             "anima38": anima38_label,
+        },
+    )
+
+
+def _run_ipa_reference(
+    request: ReferenceGenerationRequest,
+    *,
+    sd_model: Any = None,
+    outpath_samples: str | None = None,
+    outpath_grids: str | None = None,
+) -> ReferenceGenerationResult:
+    """IP-Adapter 방식: 캔버스 없이 txt2img 를 돌리고 샘플링만 주입으로 감싼다.
+
+    주입은 ``p.sample()`` 안에서만 산다. Forge 가 ``sample()`` 첫머리에서 패처를 갈아끼우기
+    때문에(modules/processing.py:1542) 그 직전에 끼워 넣어야 하고, 잡이 끝나면 저절로 풀린다.
+    """
+    from modules import shared
+    from modules.processing import process_images
+
+    from .inpaint_core import build_standalone_t2i, pause_total_tqdm
+
+    if sd_model is None:
+        # i2i 경로와 같은 이유: 재시작 직후 shared.sd_model 은 자리만 잡은 가짜다.
+        from modules import sd_models
+
+        sd_models.forge_model_reload()
+
+    model = sd_model or getattr(shared, "sd_model", None)
+    if model is None:
+        raise RuntimeError("No Forge model is loaded.")
+    if not _is_anima_engine(model):
+        raise RuntimeError(
+            "IP-Adapter 방식은 Anima 전용입니다. Anima 체크포인트를 먼저 불러오세요."
+        )
+
+    model_blocks = _model_block_count(model)
+    sample_path = outpath_samples or getattr(
+        shared.opts, "outdir_txt2img_samples", "outputs/txt2img-images"
+    )
+    grid_path = outpath_grids or getattr(
+        shared.opts, "outdir_txt2img_grids", "outputs/txt2img-grids"
+    )
+
+    outputs: list[ReferenceGenerationOutput] = []
+    # 주입 세션이 알려 주는 어댑터 깊이(모델과 다르면 블록 계보 매핑이 걸린 것이다).
+    seen_adapter_blocks: list[int] = []
+    candidate_count = int(request.candidate_count)
+    if shared.state.job_count < 0:
+        shared.state.job_count = candidate_count
+    else:
+        shared.state.job_count += candidate_count
+    shared.state.job = "Anima Character Reference"
+
+    interrupted = False
+    try:
+        with pause_total_tqdm():
+            for index in range(candidate_count):
+                if shared.state.interrupted or shared.state.skipped:
+                    interrupted = True
+                    break
+                seed = candidate_seed(request.seed, request.seed_step, index)
+                shared.state.job = (
+                    f"Anima Reference (IP-Adapter) {index + 1}/{candidate_count}"
+                )
+                shared.state.textinfo = (
+                    f"Anima Reference: candidate {index + 1}/{candidate_count} - sampling"
+                )
+
+                p2 = build_standalone_t2i(
+                    request,
+                    seed=seed,
+                    sd_model=model,
+                    outpath_samples=sample_path,
+                    outpath_grids=grid_path,
+                )
+                p2.prompt = request.sampling_prompt
+                p2.negative_prompt = str(request.negative_prompt or "")
+                p2.distilled_cfg_scale = float(request.shift)
+                p2.extra_generation_params.update(
+                    {
+                        "SAM3 Feature": 6,
+                        "SAM3 Reference Mode": MODE_IPA,
+                        "SAM3 IPA Strength": float(request.ipa.strength),
+                        "SAM3 IPA Ref Size": int(request.ipa.ref_size),
+                    }
+                )
+                if request.ipa.separate_cfg:
+                    p2.extra_generation_params["SAM3 IPA CFG"] = float(
+                        request.ipa.cfg_scale
+                    )
+
+                original_sample = p2.sample
+
+                def sample_with_ipa(*args, _original=original_sample, _p=p2, **kwargs):
+                    with _ipa_session(
+                        _p.sd_model, request.reference_image, request.ipa
+                    ) as adapter_blocks:
+                        # 깊이가 다르면 블록 계보 매핑이 걸린 것이다 — 결과에 남긴다.
+                        if adapter_blocks and model_blocks and adapter_blocks != model_blocks:
+                            seen_adapter_blocks.append(int(adapter_blocks))
+                            _p.extra_generation_params["SAM3 IPA Blocks"] = (
+                                f"{int(adapter_blocks)}→{model_blocks}"
+                            )
+                        return _original(*args, **kwargs)
+
+                p2.sample = sample_with_ipa
+
+                try:
+                    processed = process_images(p2)
+                    if shared.state.interrupted or shared.state.skipped:
+                        # 멈춘 잡은 절반만 디노이즈된 그림을 준다 — 후보로 세지 않는다.
+                        interrupted = True
+                        break
+                    if processed is None or not processed.images:
+                        raise RuntimeError(
+                            "Forge returned no image for the reference job."
+                        )
+
+                    target = processed.images[0].convert("RGB")
+                    infotext = _infotext_from_processed(processed)
+                    actual_seed = seed
+                    try:
+                        if getattr(p2, "all_seeds", None):
+                            actual_seed = int(p2.all_seeds[0])
+                    except Exception:
+                        pass
+                    if request.save_target:
+                        _save_image(
+                            target,
+                            outpath=sample_path,
+                            seed=actual_seed,
+                            prompt=p2.prompt,
+                            infotext=infotext,
+                            processing=p2,
+                            suffix="",
+                        )
+                    outputs.append(
+                        ReferenceGenerationOutput(
+                            target_image=target,
+                            # 캔버스가 없다 — 생성물이 곧 결과다.
+                            generated_canvas=target,
+                            infotext=infotext,
+                            seed=actual_seed,
+                        )
+                    )
+                except Exception:
+                    print(
+                        "[-] Anima Character Reference (IP-Adapter) failed:\n"
+                        f"{traceback.format_exc()}",
+                        file=sys.stderr,
+                    )
+                    raise
+                finally:
+                    close = getattr(p2, "close", None)
+                    if callable(close):
+                        close()
+    finally:
+        shared.state.textinfo = ""
+
+    return ReferenceGenerationResult(
+        prepared=None,
+        outputs=tuple(outputs),
+        diagnostics={
+            "mode": MODE_IPA,
+            "model_blocks": model_blocks,
+            "ipa_adapter_blocks": seen_adapter_blocks[-1] if seen_adapter_blocks else None,
+            "interrupted": interrupted,
+            "ipa_strength": float(request.ipa.strength),
+            "ipa_ref_size": int(request.ipa.ref_size),
+            "ipa_separate_cfg": bool(request.ipa.separate_cfg),
         },
     )

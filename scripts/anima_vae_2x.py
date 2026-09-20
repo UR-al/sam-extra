@@ -45,6 +45,8 @@ import gradio as gr
 
 from modules import scripts
 
+from sam3ext import layout_lanes
+
 try:
     import torch
     import torch.nn.functional as F
@@ -308,6 +310,12 @@ def _resolve_vae_path(name: str) -> str | None:
 
 
 class AnimaVAE2x(scripts.Script):
+    @property
+    def section(self):
+        # Forge 는 사용자 섹션을 설정값 칼럼(#txt2img_settings) 안에 만든다 → 1열 "ANIMA 튜닝" 자리.
+        # 설정(sam3_layout_sections)을 끄거나 img2img 면 None 이라 예전과 똑같이 스크립트 컨테이너로 간다.
+        return layout_lanes.anima_section(bool(getattr(self, "is_img2img", False)))
+
     sorting_priority = -26  # just under the guidance block, above the log toggles
 
     def title(self):
@@ -330,6 +338,7 @@ class AnimaVAE2x(scripts.Script):
                 label="Enable VAE 2x decode",
                 value=False,
                 elem_id="anima_vae2x_enable",
+                elem_classes=["sam3-on"],
             )
             vae_file = gr.Dropdown(
                 label="spacepxl 2x VAE (12ch decoder)",

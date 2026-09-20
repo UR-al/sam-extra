@@ -21,6 +21,13 @@ class AppearanceThemeTests(unittest.TestCase):
         cls.tokens = (ROOT / "tokens.css").read_text(encoding="utf-8")
         cls.design = (ROOT / "design.md").read_text(encoding="utf-8")
 
+    def test_layout_sections_option_is_registered(self):
+        """txt2img 섹션 정리를 끄는 스위치. 값(기본 True)은 tests/test_layout_lanes.py 가 함께 본다."""
+        self.assertIn("OPT_LAYOUT_SECTIONS", self.python)
+        self.assertIn("shared.opts.add_option(\n        OPT_LAYOUT_SECTIONS,", self.python)
+        self.assertIn("txt2img 섹션 정리", self.python)
+        self.assertIn("sam3_lanes=off", self.python)
+
     def test_settings_registers_all_requested_theme_choices(self):
         self.assertIn('OPT_APPEARANCE_THEME = "sam3_appearance_theme"', self.python)
         self.assertIn("script_callbacks.on_ui_settings(on_ui_settings)", self.python)

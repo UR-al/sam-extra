@@ -13,6 +13,8 @@ from dataclasses import dataclass
 from typing import Any
 
 import gradio as gr
+
+from .panel_container import ACCORDION, panel_container
 import numpy as np
 from PIL import Image
 
@@ -55,7 +57,7 @@ class RefinePanel:
     later wiring (we wire the click handler in scripts/!sam3.py because the
     runtime callable depends on Forge's shared state)."""
 
-    accordion: gr.Accordion
+    container: gr.Blocks   # 아코디언(단독) 또는 칼럼(선택 이미지 탭 안)
     selected_index_state: gr.Number  # hidden frontend slot — JS shim fills it
     detect_prompt: gr.Textbox
     exclude_prompt: gr.Textbox
@@ -243,6 +245,8 @@ def build_refine_panel(
     samplers: list[str],
     schedulers: list[str],
     checkpoint_choices: list[str],
+    *,
+    container: str = ACCORDION,
 ) -> RefinePanel:
     """Render the Refine accordion. Must be called inside an open
     ``gr.Blocks`` context that is a sibling of ``txt2img_gallery``."""
@@ -251,7 +255,7 @@ def build_refine_panel(
     cn_modules = _controlnet_module_choices()
     cn_module_default = _default_cn_module(cn_modules)
 
-    with gr.Accordion("SAM3 Refine (post-generation)", open=False, elem_id="sam3_refine_panel") as acc:
+    with panel_container(container, "SAM3 Refine (post-generation)", "sam3_refine_panel") as acc:
         # Hidden Number (not gr.State) so the `_js` shim on the Refine button
         # can address this slot reliably: Gradio's _js handler only receives
         # frontend components in its args array — gr.State is server-side and
@@ -584,7 +588,7 @@ def build_refine_panel(
         status = gr.HTML(value="", elem_id="sam3_refine_status")
 
     return RefinePanel(
-        accordion=acc,
+        container=acc,
         selected_index_state=selected_index_state,
         detect_prompt=detect_prompt,
         exclude_prompt=exclude_prompt,

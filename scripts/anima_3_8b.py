@@ -35,6 +35,8 @@ import gradio as gr
 
 from modules import scripts
 
+from sam3ext import layout_lanes
+
 try:
     from modules.ui_components import InputAccordion
 except Exception:  # pragma: no cover - 옛 Forge 는 InputAccordion 이 없다
@@ -256,8 +258,21 @@ def _adapter_choices() -> list[str]:
     return choices or [DEFAULT_ADAPTER]
 
 
+LEGACY_SORTING_PRIORITY = 260209301   # 원본과 같은 값 — UI 순서만 정한다(실행 순서는 로드 순서)
+
+
 class Anima38Script(scripts.Script):
-    sorting_priority = 260209301   # 원본과 같은 값 — UI 순서만 정한다(실행 순서는 로드 순서, NegPiP 는 어느 순서든 동작)
+    @property
+    def sorting_priority(self):
+        # 섹션이 켜지면 ANIMA 튜닝 묶음의 맨 앞으로, 꺼지면 예전 자리(맨 아래)로.
+        return layout_lanes.anima_priority(bool(getattr(self, "is_img2img", False)), LEGACY_SORTING_PRIORITY)
+
+    @property
+    def section(self):
+        # Forge 는 사용자 섹션을 설정값 칼럼(#txt2img_settings) 안에 만든다 → 1열 "ANIMA 튜닝" 자리.
+        # 설정(sam3_layout_sections)을 끄거나 img2img 면 None 이라 예전과 똑같이 스크립트 컨테이너로 간다.
+        return layout_lanes.anima_section(bool(getattr(self, "is_img2img", False)))
+
 
     def __init__(self):
         super().__init__()

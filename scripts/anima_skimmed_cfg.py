@@ -39,6 +39,8 @@ import gradio as gr
 
 from modules import script_callbacks, scripts, shared
 
+from sam3ext import layout_lanes
+
 try:
     import torch
 except Exception:  # pragma: no cover - torch is always present under Forge
@@ -328,6 +330,12 @@ def _prepend_post_cfg_function(unet, function=_post_cfg) -> None:
 
 
 class AnimaSkimmedCFG(scripts.Script):
+    @property
+    def section(self):
+        # Forge 는 사용자 섹션을 설정값 칼럼(#txt2img_settings) 안에 만든다 → 1열 "ANIMA 튜닝" 자리.
+        # 설정(sam3_layout_sections)을 끄거나 img2img 면 None 이라 예전과 똑같이 스크립트 컨테이너로 간다.
+        return layout_lanes.anima_section(bool(getattr(self, "is_img2img", False)))
+
     # Larger sorting_priority appears further down. This places the accordion
     # directly under Anima Detail Daemon (-29) and above Anima Safe PAG (-27).
     # Runtime hook precedence does NOT rely on this value;
@@ -352,6 +360,7 @@ class AnimaSkimmedCFG(scripts.Script):
                 label="Enable Skimmed CFG",
                 value=False,
                 elem_id="anima_skim_enable",
+                elem_classes=["sam3-on"],
             )
             skimming_cfg = gr.Slider(
                 label="Skimming CFG (되돌릴 기준 스케일 · -1 = 현재 CFG 사용)",

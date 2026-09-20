@@ -51,6 +51,8 @@ import gradio as gr
 
 from modules import script_callbacks, scripts
 
+from sam3ext import layout_lanes
+
 try:
     import numpy as np
 except Exception:  # pragma: no cover
@@ -293,6 +295,12 @@ def _as_bool(value, default: bool) -> bool:
 
 
 class AnimaDetailDaemon(scripts.Script):
+    @property
+    def section(self):
+        # Forge 는 사용자 섹션을 설정값 칼럼(#txt2img_settings) 안에 만든다 → 1열 "ANIMA 튜닝" 자리.
+        # 설정(sam3_layout_sections)을 끄거나 img2img 면 None 이라 예전과 똑같이 스크립트 컨테이너로 간다.
+        return layout_lanes.anima_section(bool(getattr(self, "is_img2img", False)))
+
     # Sits directly under the SAM3 mask accordion (-30) in the SAM3 extension
     # block (lower sorting_priority = higher up). The sigma callback is global
     # and order-independent, so processing early is safe.
@@ -317,6 +325,7 @@ class AnimaDetailDaemon(scripts.Script):
                 label="Enable Detail Daemon",
                 value=False,
                 elem_id="anima_dd_enable",
+                elem_classes=["sam3-on"],
             )
             # Labels double as ui-config.json keys; they changed with the
             # amount scale so the old saved -1..1 slider range is not reapplied.

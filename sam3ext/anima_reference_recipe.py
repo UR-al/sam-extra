@@ -16,6 +16,12 @@ KEEP_IDENTITY = "identity"
 KEEP_OUTFIT = "outfit"
 KEEP_STYLE = "style"
 KEEP_SCOPES: tuple[str, ...] = (KEEP_IDENTITY, KEEP_OUTFIT, KEEP_STYLE)
+
+# 캐릭터 레퍼런스의 두 방식. "i2i" 는 참조와 빈 칸을 한 캔버스에 놓는 ReStyler 방식이고,
+# "ipa" 는 참조를 SigLIP2 로 읽어 Anima 블록에 넣는 IP-Adapter 방식이다.
+MODE_I2I = "i2i"
+MODE_IPA = "ipa"
+MODES: tuple[str, ...] = (MODE_I2I, MODE_IPA)
 # Provisional until the GPU A/B; the ReStyler v1.2 example image also carries
 # a second AnimeEditV2 entry at 0.8.
 OUTFIT_EDIT_STRENGTH = 0.8

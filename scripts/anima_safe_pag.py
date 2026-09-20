@@ -72,6 +72,8 @@ from pathlib import Path
 import gradio as gr
 
 from modules import script_callbacks, scripts
+
+from sam3ext import layout_lanes
 try:
     from modules import shared
 except ImportError:  # standalone/unit-test loader
@@ -2140,6 +2142,12 @@ def _clear_extra_generation_params(p) -> None:
 
 
 class AnimaSafePAG(scripts.Script):
+    @property
+    def section(self):
+        # Forge 는 사용자 섹션을 설정값 칼럼(#txt2img_settings) 안에 만든다 → 1열 "ANIMA 튜닝" 자리.
+        # 설정(sam3_layout_sections)을 끄거나 img2img 면 None 이라 예전과 똑같이 스크립트 컨테이너로 간다.
+        return layout_lanes.anima_section(bool(getattr(self, "is_img2img", False)))
+
     # sorting_priority still governs the accordion position. Current Forge Neo
     # accidentally defines process_before_every_sampling twice; the later raw
     # alwayson_scripts loop wins and ignores this priority for execution.
@@ -2170,6 +2178,7 @@ class AnimaSafePAG(scripts.Script):
                 label="Enable Perturbation Guidance",
                 value=False,
                 elem_id="anima_safe_pag_enable",
+                elem_classes=["sam3-on", "sam3-on--pag"],
             )
             gr.Markdown(
                 "#### PAG / SEG — Attention perturbation\n"
@@ -2269,6 +2278,7 @@ class AnimaSafePAG(scripts.Script):
                 label="Enable SLG (skip layers)",
                 value=False,
                 elem_id="anima_safe_pag_slg_enable",
+                elem_classes=["sam3-on", "sam3-on--slg"],
             )
             slg_scale = gr.Slider(
                 label="SLG guidance scale",
@@ -2302,6 +2312,7 @@ class AnimaSafePAG(scripts.Script):
                 label="Enable APG (실험 · CFG > 1)",
                 value=False,
                 elem_id="anima_safe_pag_apg_enable",
+                elem_classes=["sam3-on", "sam3-on--apg"],
             )
             apg_autooff = gr.Checkbox(
                 label="APG 켜지면 PAG rescale 자동 끄기 (이중 크기보정 방지)",
@@ -2345,6 +2356,7 @@ class AnimaSafePAG(scripts.Script):
                 label="Enable Adaptive Guidance (combined-batch에서만 후반 uncond 생략)",
                 value=False,
                 elem_id="anima_safe_pag_adg_enable",
+                elem_classes=["sam3-on", "sam3-on--adg"],
             )
             adg_start = gr.Slider(
                 label="Skip after (이 지점 이후 uncond 생략)",
@@ -2384,6 +2396,7 @@ class AnimaSafePAG(scripts.Script):
                 label="Enable DCW",
                 value=False,
                 elem_id="anima_guidance_dcw_enable",
+                elem_classes=["sam3-on", "sam3-on--dcw"],
             )
             with gr.Row():
                 dcw_lambda_low = gr.Slider(
@@ -2408,6 +2421,7 @@ class AnimaSafePAG(scripts.Script):
                     "EMA로 억제합니다. DCW와 독립적으로 켤 수 있습니다."
                 ),
                 elem_id="anima_guidance_rdc_enable",
+                elem_classes=["sam3-on", "sam3-on--rdc"],
             )
             rdc_tau = gr.Slider(
                 label="RDC tau (EMA 기억 구간)",
@@ -2444,6 +2458,7 @@ class AnimaSafePAG(scripts.Script):
                 value=False,
                 info="alpha low·high가 모두 0이면 켜도 표준 CFG와 같습니다.",
                 elem_id="anima_guidance_cwm_enable",
+                elem_classes=["sam3-on", "sam3-on--cwm"],
             )
             with gr.Row():
                 cwm_alpha_low = gr.Slider(
@@ -2483,6 +2498,7 @@ class AnimaSafePAG(scripts.Script):
                     "CWM과 함께 켜면 SMC → CWM 순서로 실행됩니다."
                 ),
                 elem_id="anima_guidance_smc_master_enable",
+                elem_classes=["sam3-on", "sam3-on--smc"],
             )
             smc_preset = gr.Dropdown(
                 label="SMC preset",
@@ -2530,12 +2546,14 @@ class AnimaSafePAG(scripts.Script):
                     value="Preserve incoming",
                     info="호환 문제나 이미지 붕괴가 생기면 Preserve incoming으로 되돌리세요.",
                     elem_id="anima_guidance_cfg_mode",
+                    elem_classes=["sam3-on-radio"],
                 )
                 experimental_stack = gr.Checkbox(
                     label="Experimental stack: SMC → APG → CWM (legacy 단축)",
                     value=False,
                     info="세 토글을 모두 켜는 것과 같습니다. 새 토글을 쓰면 필요 없습니다.",
                     elem_id="anima_guidance_experimental_stack",
+                    elem_classes=["sam3-on", "sam3-on--apg", "sam3-on--smc", "sam3-on--cwm"],
                 )
                 smc_enabled = gr.Checkbox(
                     label="Enable SMC (legacy)",
@@ -2545,6 +2563,7 @@ class AnimaSafePAG(scripts.Script):
                         "Off여도 Custom lambda/k로 SMC가 활성화됩니다."
                     ),
                     elem_id="anima_guidance_smc_enable",
+                    elem_classes=["sam3-on", "sam3-on--smc"],
                 )
 
             gr.Markdown("#### DAVE — Anima diversity · block DC attenuation")
@@ -2552,6 +2571,7 @@ class AnimaSafePAG(scripts.Script):
                 label="Enable DAVE",
                 value=False,
                 elem_id="anima_guidance_dave_enable",
+                elem_classes=["sam3-on", "sam3-on--dave"],
             )
             dave_strength = gr.Slider(
                 label="DAVE strength",
@@ -2581,6 +2601,7 @@ class AnimaSafePAG(scripts.Script):
                 label="Enable CNS-inspired Wavelet Noise",
                 value=False,
                 elem_id="anima_guidance_cns_enable",
+                elem_classes=["sam3-on", "sam3-on--cns"],
             )
             cns_strength = gr.Slider(
                 label="CNS strength",
@@ -2614,6 +2635,7 @@ class AnimaSafePAG(scripts.Script):
                 label="Enable Anima Modulation Guidance (CLIP-L)",
                 value=False,
                 elem_id="anima_mod_guidance_enable",
+                elem_classes=["sam3-on", "sam3-on--mod"],
             )
             mod_clip_model = gr.Dropdown(
                 label="CLIP-L model (models/text_encoder)",

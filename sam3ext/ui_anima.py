@@ -14,6 +14,8 @@ from typing import Any
 
 import gradio as gr
 
+from .panel_container import ACCORDION, panel_container
+
 from .coerce import as_float, as_int
 from .anima_core import (
     AnimaTileRepairArgs,
@@ -39,7 +41,7 @@ from .ui_refine import _coerce_gallery_item_to_pil, _plaintext_to_html
 
 @dataclass
 class AnimaPanel:
-    accordion: gr.Accordion
+    container: gr.Blocks   # 아코디언(단독) 또는 칼럼(선택 이미지 탭 안)
     selected_index_state: gr.Number
     # Models
     lllite_model: gr.Dropdown
@@ -158,7 +160,7 @@ _as_int = as_int
 # ---------------------------------------------------------------------------
 
 
-def build_anima_panel() -> AnimaPanel:
+def build_anima_panel(*, container: str = ACCORDION) -> AnimaPanel:
     """Render the Anima Tile-Repair accordion. Must be called inside an open
     ``gr.Blocks`` context that is a sibling of ``txt2img_gallery``.
 
@@ -173,10 +175,8 @@ def build_anima_panel() -> AnimaPanel:
     vae_choices = list_vae_choices()
     lora_choices = list_lora_choices()
 
-    with gr.Accordion(
-        "SAM3 — Anima Tile-Repair (post-generation)",
-        open=False,
-        elem_id="sam3_anima_panel",
+    with panel_container(
+        container, "SAM3 — Anima Tile-Repair (post-generation)", "sam3_anima_panel"
     ) as acc:
         # Hidden Number — JS shim writes the gallery selection here.
         # gr.State would shift positional args, so we use Number(visible=False)
@@ -460,7 +460,7 @@ def build_anima_panel() -> AnimaPanel:
         status = gr.HTML(value="", elem_id="sam3_anima_status")
 
     return AnimaPanel(
-        accordion=acc,
+        container=acc,
         selected_index_state=selected_index_state,
         lllite_model=lllite_model,
         dit_override=dit_override,

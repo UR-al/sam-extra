@@ -157,7 +157,10 @@ def sam3_ui(is_img2img: bool, buttons: WebuiButtons):
     with gr.Accordion(SAM3_NAME, open=False, elem_id=eid("accordion")):
         with gr.Row():
             with gr.Column(scale=3):
-                w.sam3_enable = gr.Checkbox(label="Enable SAM3", value=False, elem_id=eid("enable"))
+                w.sam3_enable = gr.Checkbox(
+                    label="Enable SAM3", value=False, elem_id=eid("enable"),
+                    elem_classes=["sam3-on"],
+                )
             with gr.Column(scale=5):
                 gr.Markdown("SAM3 local mask refinement")
             with gr.Column(scale=1, min_width=180):

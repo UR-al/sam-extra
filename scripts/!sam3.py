@@ -28,7 +28,7 @@ from sam3ext.anima_core import anima_available
 from sam3ext.core import find_checkpoint_options, unload_sam3, write_artifacts
 from sam3ext.inpaint_core import apply_prompt_sr, copy_prompt, run_inpaint_passes
 from sam3ext.notebook_store import register_notebook_routes
-from sam3ext import quick_button as sam3_quick
+from sam3ext import layout_lanes, quick_button as sam3_quick, ui_dock
 from sam3ext import ui_tipo
 from sam3ext.ui import WebuiButtons, sam3_ui
 from sam3ext.ui_anima import AnimaPanel, build_anima_panel, handle_anima_click
@@ -259,61 +259,8 @@ class Sam3MaskScript(scripts.Script):
                 i2i_button=img2img_submit_button,
             ),
         )
-        # v0.8.1: render the Anima Tile-Repair accordion as a SIBLING of the
-        # SAM3 mask accordion (same t2i scripts column). Previously the panel
-        # was rendered in on_after_component into the gallery sidebar group
-        # next to Refine — but the user wanted it directly below SAM3, which
-        # is the alwayson-scripts area, so it has to be created here inside
-        # the script's ui() callback while the same gr.Blocks context is open.
-        #
-        # Only render on t2i: i2i has no Refine/Anima companion panel either.
-        # anima_panel is intentionally NOT added to the returned components
-        # list — it's wired through its own button.click in on_after_component
-        # so its widgets don't pollute the SAM3 alwayson script_args.
-        #
-        # Gate on anima_build_attempted rather than `anima_panel is None`: the API
-        # re-runs every script's ui() inside a throwaway `with gr.Blocks()`
-        # (modules/api/api.py, init_default_script_args) after create_ui() has
-        # finished. If the real build above had raised, that pass would rebuild the
-        # panel into the throwaway and leave anima_panel holding components that
-        # belong to no live Blocks — permanently dead for the process.
-        global anima_panel, anima_build_attempted
-        global anima_reference_panel, anima_reference_build_attempted
-        if not is_img2img and not anima_build_attempted and anima_available():
-            anima_build_attempted = True
-            try:
-                anima_panel = build_anima_panel()
-            except Exception:
-                error = traceback.format_exc()
-                print(
-                    f"[-] SAM3: failed to render Anima panel:\n{error}",
-                    file=sys.stderr,
-                )
-        elif not is_img2img and not anima_available():
-            print(
-                "[-] SAM3: anima_vendor/ not present; Tile-Repair panel "
-                "skipped. Re-run install.py to clone kohya-ss/sd-scripts.",
-                file=sys.stderr,
-            )
-
-        # Feature 6 uses Forge Neo's native Anima reference/img2img path and
-        # therefore does not depend on the optional anima_vendor checkout.
-        # Like the Tile-Repair panel, it is a sibling accordion whose widgets
-        # are wired separately and do not enter this always-on script's args.
-        if not is_img2img and not anima_reference_build_attempted:
-            anima_reference_build_attempted = True
-            try:
-                anima_reference_panel = build_anima_reference_panel(
-                    [s.name for s in _all_samplers],
-                    [s.label for s in _all_schedulers],
-                )
-            except Exception:
-                error = traceback.format_exc()
-                print(
-                    "[-] SAM3: failed to render Feature 6 Anima Reference "
-                    f"panel:\n{error}",
-                    file=sys.stderr,
-                )
+        # v0.22: Tile-Repair 와 캐릭터 레퍼런스는 갤러리 밑 "선택 이미지" 탭에서 만든다(sam3ext/ui_dock.py).
+        # 여기서 만들지 않으므로 API 가 ui() 를 throwaway Blocks 에서 다시 불러도 죽은 컴포넌트가 생기지 않는다.
 
         self.infotext_fields = [(components[0], "SAM3 Enable"), *infotext_fields]
         return components
@@ -532,16 +479,9 @@ tipo_wired: bool = False
 refine_panel: RefinePanel | None = None
 anima_panel: AnimaPanel | None = None
 anima_reference_panel: AnimaReferencePanel | None = None
-# Set True the first time Sam3MaskScript.ui() tries to build the Anima panel,
-# whether or not it succeeded, so the API's throwaway-Blocks ui() pass can't retry.
-anima_build_attempted: bool = False
-anima_reference_build_attempted: bool = False
-# Set True the first time on_after_component wires the Anima panel's click
-# chain. Distinct from `anima_panel is None` because the panel is created
-# in Sam3MaskScript.ui() (alwayson script ui callback) but wiring needs the
-# gallery component captured later via on_after_component.
-anima_wired: bool = False
-anima_reference_wired: bool = False
+# v0.22: 세 패널은 갤러리 밑 "선택 이미지" 탭에서 함께 만든다(sam3ext/ui_dock.py). 예전에 쓰던 일회성 플래그
+# 네 개(build_attempted / wired) 대신, 화면 하나당 한 번만 만들고 패널마다 한 번만 연결하도록 이 상태가 기억한다.
+dock_state = ui_dock.DockState()
 
 
 # JS shim: replace the placeholder selected_index slot (index 1 in the inputs
@@ -858,7 +798,7 @@ def on_after_component(component, **kwargs):
     global txt2img_width_component, txt2img_height_component
     global txt2img_upscale_button, sam3_quick_button
     global tipo_button, tipo_panel
-    global refine_panel
+    global refine_panel, anima_panel, anima_reference_panel
 
     # Gradio rebuilds a component at *request* time whenever a handler returns
     # gr.update() for it — blocks.py postprocess_data does
@@ -915,44 +855,72 @@ def on_after_component(component, **kwargs):
         txt2img_height_component = component
     elif elem_id == "html_info_txt2img":
         txt2img_html_info_component = component
-    elif elem_id == "generation_info_txt2img":
-        # Render the Refine panel right after generation_info Textbox so all
-        # the components we need to wire as outputs (gallery, html_info,
-        # generation_info) are already captured. The panel lands inside the
-        # same hidden gr.Group as the infotext bits, but its accordion is
-        # visible itself.
-        txt2img_generation_info_component = component
-        if refine_panel is not None or txt2img_gallery_component is None:
+    elif elem_id == "download_files_txt2img":
+        # 갤러리 버튼 줄 바로 뒤, 생성 정보 그룹(overflow:hidden) 밖 — 선택 이미지 탭을 여기에 만든다
+        # (modules/ui_common.py:190-228).
+        if not dock_state.needs_build(Context.root_block):
             return
-        if txt2img_html_info_component is None:
+        try:
+            panels = ui_dock.build_selected_image_dock(
+                [s.name for s in _all_samplers],
+                [s.label for s in _all_schedulers],
+                find_checkpoint_options(),
+                anima_ok=anima_available(),
+            )
+            dock_state.mark_built(panels, Context.root_block)
+            refine_panel = panels.refine
+            anima_panel = panels.anima
+            anima_reference_panel = panels.reference
+        except Exception:
+            error = traceback.format_exc()
+            print(f"[-] SAM3: failed to build the selected-image dock:\n{error}", file=sys.stderr)
+    elif elem_id == "generation_info_txt2img":
+        # 여기서는 연결만 한다. 패널은 위의 download_files 분기에서 이미 만들었고(없으면 예비로 만든다),
+        # 연결에 필요한 갤러리·infotext 컴포넌트가 이 시점에 모두 잡혀 있다.
+        txt2img_generation_info_component = component
+        try:
+            import modules.scripts as _scripts
+
+            layout_lanes.tag_runner(_scripts.scripts_txt2img)
+        except Exception:
+            error = traceback.format_exc()
+            print(f"[-] SAM3: failed to tag script slots:\n{error}", file=sys.stderr)
+        if txt2img_gallery_component is None or txt2img_html_info_component is None:
             print(
-                "[-] SAM3: html_info_txt2img not captured yet — skipping Refine panel render.",
+                "[-] SAM3: gallery/html_info not captured yet — skipping panel wiring.",
                 file=sys.stderr,
             )
             return
-        try:
-            samplers = [s.name for s in _all_samplers]
-            schedulers = [s.label for s in _all_schedulers]
-            checkpoints = find_checkpoint_options()
-            refine_panel = build_refine_panel(samplers, schedulers, checkpoints)
-            _wire_refine_panel(
-                refine_panel,
-                txt2img_gallery_component,
-                txt2img_prompt_component,
-                txt2img_neg_prompt_component,
-                txt2img_html_info_component,
-                txt2img_generation_info_component,  # local reference; not None at this point
-            )
-        except Exception:
-            error = traceback.format_exc()
-            print(f"[-] SAM3: failed to render Refine panel:\n{error}", file=sys.stderr)
-
-        # v0.8.1: the Anima panel is now created inside Sam3MaskScript.ui()
-        # (alongside the SAM3 mask accordion). Here we only wire its click
-        # chain — we need the t2i gallery / generation_info components that
-        # this callback captures.
-        global anima_wired
-        if anima_panel is not None and not anima_wired:
+        if dock_state.needs_build(Context.root_block):   # 예비: download_files 훅이 없었거나 실패한 경우
+            try:
+                panels = ui_dock.build_selected_image_dock(
+                    [s.name for s in _all_samplers],
+                    [s.label for s in _all_schedulers],
+                    find_checkpoint_options(),
+                    anima_ok=anima_available(),
+                )
+                dock_state.mark_built(panels, Context.root_block)
+                refine_panel = panels.refine
+                anima_panel = panels.anima
+                anima_reference_panel = panels.reference
+            except Exception:
+                error = traceback.format_exc()
+                print(f"[-] SAM3: failed to build the dock (fallback):\n{error}", file=sys.stderr)
+        if dock_state.needs_wire("refine", refine_panel):
+            try:
+                _wire_refine_panel(
+                    refine_panel,
+                    txt2img_gallery_component,
+                    txt2img_prompt_component,
+                    txt2img_neg_prompt_component,
+                    txt2img_html_info_component,
+                    txt2img_generation_info_component,
+                )
+                dock_state.mark_wired("refine")
+            except Exception:
+                error = traceback.format_exc()
+                print(f"[-] SAM3: failed to wire Refine panel:\n{error}", file=sys.stderr)
+        if dock_state.needs_wire("anima", anima_panel):
             try:
                 _wire_anima_panel(
                     anima_panel,
@@ -960,19 +928,11 @@ def on_after_component(component, **kwargs):
                     txt2img_html_info_component,
                     txt2img_generation_info_component,
                 )
-                anima_wired = True
+                dock_state.mark_wired("anima")
             except Exception:
                 error = traceback.format_exc()
-                print(
-                    f"[-] SAM3: failed to wire Anima panel:\n{error}",
-                    file=sys.stderr,
-                )
-
-        global anima_reference_wired
-        if (
-            anima_reference_panel is not None
-            and not anima_reference_wired
-        ):
+                print(f"[-] SAM3: failed to wire Anima panel:\n{error}", file=sys.stderr)
+        if dock_state.needs_wire("reference", anima_reference_panel):
             try:
                 wire_anima_reference_panel(
                     anima_reference_panel,
@@ -985,7 +945,7 @@ def on_after_component(component, **kwargs):
                     height=txt2img_height_component,
                     selected_index_js=_SELECTED_INDEX_JS,
                 )
-                anima_reference_wired = True
+                dock_state.mark_wired("reference")
             except Exception:
                 error = traceback.format_exc()
                 print(

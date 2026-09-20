@@ -10,6 +10,8 @@ import gradio as gr
 
 from modules import script_callbacks, shared
 
+from sam3ext.layout_lanes import OPT_LAYOUT_SECTIONS
+
 
 OPT_APPEARANCE_THEME = "sam3_appearance_theme"
 OPT_FAST_DROPDOWN_VISIBLE_CHOICES = "sam3_fast_dropdown_visible_choices"
@@ -40,6 +42,17 @@ def on_ui_settings() -> None:
             gr.Dropdown,
             {"choices": list(APPEARANCE_THEME_CHOICES)},
             section=section,
+        ),
+    )
+    shared.opts.add_option(
+        OPT_LAYOUT_SECTIONS,
+        shared.OptionInfo(
+            True,
+            "txt2img 섹션 정리(켜진 기능·고정·더 보기) — Forge 재시작 후 적용",
+            gr.Checkbox,
+            section=section,
+        ).info(
+            "끄면 Forge 기본 순서로 돌아갑니다. 한 페이지에서만 끄려면 주소 끝에 ?sam3_lanes=off 를 붙이세요."
         ),
     )
     shared.opts.add_option(
