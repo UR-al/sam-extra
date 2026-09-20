@@ -29,6 +29,7 @@ from sam3ext.core import find_checkpoint_options, unload_sam3, write_artifacts
 from sam3ext.inpaint_core import apply_prompt_sr, copy_prompt, run_inpaint_passes
 from sam3ext.notebook_store import register_notebook_routes
 from sam3ext import quick_button as sam3_quick
+from sam3ext import ui_tipo
 from sam3ext.ui import WebuiButtons, sam3_ui
 from sam3ext.ui_anima import AnimaPanel, build_anima_panel, handle_anima_click
 from sam3ext.ui_anima_reference import (
@@ -523,6 +524,11 @@ txt2img_height_component = None
 txt2img_upscale_button = None
 sam3_quick_button = None
 sam3_quick_wired: bool = False
+# TIPO 프롬프트 확장: 🪄 는 스타일 적용 버튼(txt2img_style_apply) 옆, 설정 칸은 스타일 줄 아래. 프롬프트·가로·세로가 다
+# 잡힌 뒤 한 번 연결한다.
+tipo_button = None
+tipo_panel = None
+tipo_wired: bool = False
 refine_panel: RefinePanel | None = None
 anima_panel: AnimaPanel | None = None
 anima_reference_panel: AnimaReferencePanel | None = None
@@ -797,6 +803,39 @@ def _create_sam3_quick_button():
         return None
 
 
+def _create_tipo_button():
+    try:
+        return ui_tipo.create_tipo_button()
+    except Exception:
+        print(f"[-] SAM3: failed to create the TIPO button:\n{traceback.format_exc()}", file=sys.stderr)
+        return None
+
+
+def _build_tipo_panel():
+    try:
+        from sam3ext.tipo.runtime import shared_runtime
+
+        return ui_tipo.build_tipo_panel(model_missing=bool(shared_runtime().missing_files()))
+    except Exception:
+        print(f"[-] SAM3: failed to build the TIPO panel:\n{traceback.format_exc()}", file=sys.stderr)
+        return None
+
+
+def _wire_tipo() -> None:
+    global tipo_wired
+    if tipo_wired or tipo_button is None or tipo_panel is None:
+        return
+    if txt2img_prompt_component is None or txt2img_width_component is None or txt2img_height_component is None:
+        return
+    tipo_wired = True
+    try:
+        ui_tipo.wire_tipo(
+            tipo_button, tipo_panel, txt2img_prompt_component, txt2img_width_component, txt2img_height_component,
+        )
+    except Exception:
+        print(f"[-] SAM3: failed to wire the TIPO button:\n{traceback.format_exc()}", file=sys.stderr)
+
+
 def _wire_sam3_quick_button() -> None:
     """✨ 의 click 이 txt2img Blocks 에 등록되면(그 뒤 만들어지는 엑스트라 네트워크 UI 컴포넌트 때) 한 번 연결한다."""
     global sam3_quick_wired
@@ -818,6 +857,7 @@ def on_after_component(component, **kwargs):
     global txt2img_html_info_component, txt2img_generation_info_component
     global txt2img_width_component, txt2img_height_component
     global txt2img_upscale_button, sam3_quick_button
+    global tipo_button, tipo_panel
     global refine_panel
 
     # Gradio rebuilds a component at *request* time whenever a handler returns
@@ -849,6 +889,7 @@ def on_after_component(component, **kwargs):
         return
 
     _wire_sam3_quick_button()
+    _wire_tipo()
     elem_id = kwargs.get("elem_id")
     if elem_id == "txt2img_generate":
         txt2img_submit_button = component
@@ -858,6 +899,10 @@ def on_after_component(component, **kwargs):
         txt2img_prompt_component = component
     elif elem_id == "txt2img_neg_prompt":
         txt2img_neg_prompt_component = component
+    elif elem_id == "txt2img_style_apply":
+        tipo_button = _create_tipo_button()   # 도구 줄에서 스타일 적용 버튼 오른쪽
+    elif elem_id == "txt2img_styles_row":
+        tipo_panel = _build_tipo_panel()      # 스타일 줄(Row)이 만들어진 직후 — 같은 열에서 그 아래에 붙는다
     elif elem_id == "txt2img_upscale":
         # ✨ 는 갤러리 아래 버튼 줄의 마지막 — 지금 만들면 그 오른쪽에 붙는다
         txt2img_upscale_button = component

@@ -18,6 +18,8 @@ Adaptive Guidance · Detail Daemon)를 제공합니다.
 기능마다 구현 방식과 검증 수준이 다르므로, 사용 전에 반드시 아래 **[구현·검증 상태](#구현검증-상태)**와
 **[상세 가이드](docs/GUIDANCE.md)**를 확인하세요.
 
+**TIPO 프롬프트 확장 (🪄)** — txt2img 프롬프트를 TIPO-v2.1 로 확장해 태그·설명을 덧붙입니다(아래 별도 기능 참고).
+
 그리고 **Anima VAE 2x** (v0.9.14+, 실험) — spacepxl 2x Wan-VAE 파인튜닝을 디코더로 써서
 speckle↓·skin/hair 정리(`scripts/anima_vae_2x.py`). Qwen/Wan VAE latent 공유로 Anima에도 적용.
 
@@ -663,6 +665,45 @@ Forge 가 읽지 못해 이전 버전은 `Anima 3.8B …` 대신 `Anima38 …` �
 - LoRA·SAM3·ADetailer 와의 조합은 이 확장에서 함께 검증했습니다(ANIMA LoKr 3개 + SAM3
   인페인트).
 
+## 별도 기능: TIPO 프롬프트 확장 (🪄)
+
+txt2img 도구 줄(붙여넣기·지우기·스타일 적용 버튼)의 **🪄** 를 누르면
+[TIPO-v2.1-1B-A200M](https://huggingface.co/KBlueLeaf/TIPO-v2.1-1B-A200M)(KBlueLeaf)이 지금 프롬프트를 읽고 어울리는
+태그나 설명 문장을 덧붙여 프롬프트 칸에 다시 씁니다. 결과를 보고 고친 뒤 생성하면 됩니다. 설정은 스타일 줄 아래
+**TIPO 프롬프트 확장** 칸에 있습니다.
+
+### 처음 쓸 때
+- 칸의 **모델 받기(1.98 GB)** 를 누르면 HF 에서 고정 버전(revision `f5a3185…`)을 `models/TIPO/TIPO-v2.1-1B-A200M/` 에
+  받습니다. 누르기 전에는 아무것도 받지 않습니다.
+- 새로 설치하는 패키지는 없습니다 — 모델 코드는 확장 안에 들어 있고(원작자 공개 코드 그대로) Forge 의 transformers 로 돕니다.
+
+### 설정
+| 칸 | 뜻 |
+| --- | --- |
+| 확장 방식 | 태그만 / 태그+설명(기본) / 설명만 |
+| 길이 | 짧게 / 보통(기본) / 길게 |
+| 새 작가·캐릭터·작품 허용 | 기본 꺼짐 — 켜면 TIPO 가 새 캐릭터·작품·작가(`@` 를 붙여서)도 넣을 수 있습니다 |
+| 장치 | GPU(기본) / CPU — GPU 는 누를 때만 약 2 GB 를 올렸다가 끝나면 내립니다. 여유 VRAM 이 3 GB 보다 적으면 그 회차는 CPU 로 돕니다. 쉴 때는 RAM 에 약 2 GB 로 둡니다. 마지막으로 고른 장치는 브라우저가 기억합니다 |
+| 시드 | -1 이면 누를 때마다 다른 결과, 숫자면 같은 결과 |
+| ↩ 되돌리기 | 마지막 확장 전 프롬프트로 |
+
+### 규칙
+- **적어 둔 텍스트는 한 글자도 바꾸지 않습니다**(가중치·LoRA·순서 그대로). 새 태그는 그 뒤에 캐릭터 → 작품 → @작가 → 일반
+  순서로 붙고, 설명 문장은 새 줄에 붙습니다.
+- Anima 에 맞게 밑줄은 공백으로, 괄호는 `\(` `\)` 로 이스케이프합니다(그대로 두면 가중치로 읽힙니다).
+- 품질·등급·시대·메타 태그는 적어 둔 것만 둡니다 — TIPO 가 낸 `great quality`·`newest`·`highres` 등은 버립니다. 이미 `1girl`
+  처럼 인원수를 적었으면 TIPO 가 낸 다른 인원수 태그도 버립니다. `(smile:1.2)`·`((smile))`·`(@작가:0.8)` 처럼 가중치를 준 것도
+  같은 태그로 보고 다시 붙이지 않습니다.
+- 문장(쉼표가 들어간 문장 포함)은 TIPO 에 태그로 넘기지 않습니다.
+- 토큰 한도에서 멈춰 끝이 잘렸으면 잘린 태그와 끝나지 않은 문장은 버리고, 상태 줄에 그렇게 알려 줍니다.
+- 적어 둔 품질(`masterpiece` 등)·`year 2025`(→ 시대)·등급(`explicit` → `nsfw, explicit`, 여럿이면 가장 센 것)·`@작가`·캐릭터·
+  작품·메타는 TIPO 에 조건으로 넘깁니다. 캐릭터·작품·메타 구분은 tagcomplete 확장의 danbooru CSV 를 씁니다(없으면 `@작가` 만
+  알아봅니다).
+- 확장은 Forge 생성 대기열 안에서 돕니다 — 생성 중에 누르면 그 생성이 끝난 뒤 돕니다. 기다리는 동안 프롬프트를 고쳤으면
+  결과를 넣지 않고 상태 줄에 알려 줍니다(고친 내용을 덮어쓰지 않게).
+- **모델 받기**는 한 번에 하나만 돕니다 — 받는 중에 다른 창에서 또 누르면 바로 알려 주고 다시 받지 않습니다. 새로 고친 뒤
+  상태 줄이 예전 내용이면 🪄 나 **모델 받기**를 한 번 누르면 맞춰집니다.
+
 ## 출처 / 크레딧 (Credits)
 
 이 확장은 아래 외부 프로젝트를 **그대로 가져와(vendored, shallow clone)** Forge에 통합합니다. 핵심 기능의 저작권은 각 원저자에게 있으며, 본 확장은 Forge 통합 레이어만 제공합니다. vendor 디렉터리는 저장소에 포함되지 않고 `install.py`가 첫 실행 시 자동으로 clone합니다.
@@ -673,6 +714,7 @@ Forge 가 읽지 못해 이전 버전은 `Anima 3.8B …` 대신 `Anima38 …` �
 | **Anima Tile-Repair** (워크플로 3) | [kohya-ss/sd-scripts](https://github.com/kohya-ss/sd-scripts) (`anima_minimal_inference*`) | Apache-2.0 | `anima_vendor/` |
 | **Anima Character Reference / ReStyler** (워크플로 6) | [Anima ReStyler workflow](https://civitai.com/models/2803070/anima-restyler) · [원 아이디어 Reddit 게시물](https://www.reddit.com/r/StableDiffusion/s/0Az0DgoaKj) | 워크플로 페이지 조건 참고 | 동작을 Forge 네이티브 img2img/reference로 재구현 (vendor·코드 복사 없음) |
 | **Anima 3.8B (Qwen3.5 / v2)** (워크플로 7) | [GumGum10/forge-anima-3.8B](https://github.com/GumGum10/forge-anima-3.8B) (commit `59c27e5`) | MIT | `sam3ext/anima38/` 에 편입 (저장소에 포함, 수정 사항은 `THIRD_PARTY_NOTICES.md`) |
+| **TIPO 프롬프트 확장** (별도 기능) | [KBlueLeaf/TIPO-v2.1-1B-A200M](https://huggingface.co/KBlueLeaf/TIPO-v2.1-1B-A200M) · 모델 코드 [KohakUwULLM](https://github.com/KohakuBlueleaf/KohakUwULLM) | 가중치 Kohaku License 1.0 · 코드 Apache-2.0 | `sam3ext/tipo/kohaku/` 에 모델 코드만 편입, 가중치는 사용자가 받을 때 HF 에서 |
 | **Anima Safe PAG** (별도 기능) | [iljung1106/comfyui-anima-safe-pag](https://github.com/iljung1106/comfyui-anima-safe-pag) | 원 저장소 라이선스 참고 | 이식 (vendor 아님) |
 | **DCW / RDC / CWM / SMC** | [namemechan/ComfyUI-DCW](https://github.com/namemechan/ComfyUI-DCW) | GPL-3.0 | 수식 기반 Forge 재작성 (vendor 아님) |
 | **DAVE** | [daheekwon/DAVE](https://github.com/daheekwon/DAVE) · [sorryhyun/ComfyUI-Anima-DAVE](https://github.com/sorryhyun/ComfyUI-Anima-DAVE) | MIT | Forge block 재구현 (vendor 아님) |

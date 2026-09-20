@@ -20,6 +20,16 @@
 - 상류의 `bundle_v2.py`(번들 제작 도구)와 `install.py` 는 포함하지 않았습니다.
 - `adapter.py`, `qwen35.py`, `semantic_v2.py`, `tokenizer.py` 는 상류와 같습니다.
 
+## TIPO-v2.1-1B-A200M model code (Apache-2.0) and weights (Kohaku License 1.0)
+
+`sam3ext/tipo/kohaku/configuration_kohaku.py`, `modeling_kohaku.py` 는
+[KBlueLeaf/TIPO-v2.1-1B-A200M](https://huggingface.co/KBlueLeaf/TIPO-v2.1-1B-A200M)
+(revision `f5a318524a4ab30cdbbf51816cf406170f454e65`) 의 무수정 사본으로,
+[KohakUwULLM](https://github.com/KohakuBlueleaf/KohakUwULLM) 의 `src/kohakuwullm/export/hf/` 파일과 같습니다
+(Apache-2.0, Copyright Shih-Ying Yeh / KohakuBlueleaf). 모델 가중치는 **Kohaku License 1.0** 으로 공개돼 있으며 이 저장소에
+포함하지 않습니다 — 사용자가 **모델 받기**를 누를 때 HF 에서 받습니다. 가중치를 재배포하려면 그 라이선스 사본과 고지가
+필요합니다.
+
 ## Qwen3.5-4B tokenizer (Apache-2.0)
 
 `assets/qwen35_tokenizer/tokenizer.json`, `tokenizer_config.json` 은
