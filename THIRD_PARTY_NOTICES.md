@@ -89,6 +89,16 @@ Apache-2.0 으로 명시합니다. 이 확장의 GPL-3.0-only 라이선스는 �
 (Copyright (c) 2024 Sahand Ahmadian — sd-webui-detail-daemon, Copyright (c) 2024 Jonseed — ComfyUI-Detail-Daemon)
 이며 MIT 고지 전문은 이 문서 끝에 있습니다. 이 확장의 GPL-3.0-only 라이선스는 이 코드의 상류 조건을 대체하지 않습니다.
 
+## Anima Safe PAG — 적용 구간·번호 파싱 (MIT)
+
+`sam3ext/guidance/sigma_window.py` 는 [iljung1106/comfyui-anima-safe-pag](https://github.com/iljung1106/comfyui-anima-safe-pag)
+(commit `905b0107d1f924fc6acbcac3b6a879b566ff671c`) 의 `__init__.py` 9-34줄(`_sigma_to_float`·`_sigma_active`·
+`_percent_range_to_sigmas`)을 옮긴 것입니다. 달라진 곳은 모델 대신 `percent_to_sigma` 함수를 받는 것과, torch 없이 도는
+텐서 판별 하나입니다. `scripts/anima_safe_pag.py` 의 `_parse_blocks`·`_parse_attention_heads` 는 같은 파일 37-64줄처럼
+역범위를 뒤집고, scale 범위 0~100 은 201줄을 따릅니다. 대조 테스트 `tests/test_anima_safe_pag_origin.py` 는 9-64줄을 그대로
+담고 있습니다. 원 라이선스는 MIT(Copyright (c) 2026, 저장소 LICENSE 에 이름 없음)이며 MIT 고지 전문은 이 문서 끝에
+있습니다. 나머지 PAG 구현(배치 확장·어텐션 패치·post-CFG)은 아래 표처럼 Forge 훅으로 다시 작성한 것입니다.
+
 ## 코드를 편입하지 않은 재구현 (참고 출처)
 
 아래 기능은 상류 코드를 파일째 가져오지 않고 이 확장 코드로 다시 작성했습니다. 전체 목록(DCW·CNS·DAVE·Modulation
@@ -97,13 +107,14 @@ Guidance 등)은 README 의 출처 / 크레딧 절과 [docs/GUIDANCE.md](docs/GU
 
 | 기능 | 이 확장 파일 | 원저작 출처 | 원 라이선스 | 형태 |
 |---|---|---|---|---|
-| Anima Safe PAG | `scripts/anima_safe_pag.py` | [iljung1106/comfyui-anima-safe-pag](https://github.com/iljung1106/comfyui-anima-safe-pag) (ComfyUI 노드), PAG 논문 [arXiv:2403.17377](https://arxiv.org/abs/2403.17377) | 미확인 | Anima 배치 확장·블록 선택을 이식하고 Forge 훅으로 다시 작성 |
+| Anima Safe PAG | `scripts/anima_safe_pag.py` | [iljung1106/comfyui-anima-safe-pag](https://github.com/iljung1106/comfyui-anima-safe-pag) (ComfyUI 노드), PAG 논문 [arXiv:2403.17377](https://arxiv.org/abs/2403.17377) | MIT | Anima 배치 확장·블록 선택을 이식하고 Forge 훅으로 다시 작성(적용 구간·파싱은 위 절처럼 편입) |
 
 ## MIT License 전문
 
 `sam3ext/anima38/`(Copyright (c) 2026 GumGum10 contributors), `assets/bpe_simple_vocab_16e6.txt.gz`(Copyright (c) 2021
 OpenAI), `scripts/anima_detail_daemon.py` 의 Detail Daemon 코드(Copyright (c) 2024 Sahand Ahmadian, Copyright (c) 2024
-Jonseed)에 적용되는 조건입니다. 저작권 줄은 위 각 절의 것을 넣어 읽습니다.
+Jonseed), `sam3ext/guidance/sigma_window.py` 와 PAG 대조 테스트의 Anima Safe PAG 코드(Copyright (c) 2026)에 적용되는
+조건입니다. 저작권 줄은 위 각 절의 것을 넣어 읽습니다.
 
 ```text
 MIT License

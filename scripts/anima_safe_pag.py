@@ -96,6 +96,7 @@ from sam3ext.guidance.modulation import (
     prepare_block_modulations,
 )
 from sam3ext.guidance.runtime import GuidanceRuntime
+from sam3ext.guidance.sigma_window import percent_range_to_sigmas, sigma_active
 try:
     from guidance_diagnostics import guidance_diagnostics_enabled
 except ImportError:  # standalone/unit-test loader without extension root on sys.path
@@ -158,7 +159,19 @@ _STATE: dict = {
     "rescale": 0.20,      # std-matching rescale factor
     "rescale_mode": "full",  # full=CFG+guidance, partial=cond+guidance std source
     "start": 0.0,         # start percent of sampling
-    "end": 0.7,           # end percent of sampling
+    # End percent of sampling, cut at the Adaptive Guidance start when ADG runs
+    # with keep-every 0. Step-fraction gate of SEG/SLG, and of PAG without a
+    # predictor.
+    "end": 0.7,
+    # PAG's window: upstream converts the percents with the model's
+    # percent_to_sigma once and tests every model call's sigma against it, both
+    # ends inclusive (origin: iljung1106/comfyui-anima-safe-pag@905b0107
+    # :__init__.py:15-34, sam3ext/guidance/sigma_window.py). Set at attach time
+    # from predictor.percent_to_sigma and the *requested* percents — ADG's cut
+    # is its own skip branch in the wrapper, not a sigma bound. None → no
+    # predictor (or no PAG), step-percent fallback.
+    "sigma_hi": None,     # sigma at the start percent (upper bound)
+    "sigma_lo": None,     # sigma at the requested end percent (lower bound)
     "total": 20,          # total steps this pass
     "step": 0,            # current step counter
     # A sampling step may invoke the model wrapper more than once when Forge
@@ -195,6 +208,9 @@ _STATE: dict = {
     "split_cond_calls": 0,
     "split_uncond_calls": 0,
     "control_blocked_calls": 0,
+    # This pass's p.extra_generation_params, so the wrapper can record the
+    # ControlNet guard (INFOTEXT_CONTROLNET_GUARD) when it actually blocks.
+    "guard_params": None,
     "wrapper_fallbacks": 0,
     "requested_pert": False,
     "requested_apg": False,
@@ -239,6 +255,13 @@ OPT_PREFIX_DEDUP = "sam3_guidance_pag_prefix_dedup"
 OPT_SEG_SEPARABLE = "sam3_guidance_seg_separable_blur"
 INFOTEXT_PREFIX_DEDUP = "Anima PAG prefix dedup"
 INFOTEXT_SEG_SEPARABLE = "Anima SEG separable blur"
+# ControlNet 가드(호스트 차이): 원본 노드는 ControlNet 과 함께 PAG 를 돌리지만 이 확장은
+# ControlNet 이 붙은 호출에서 PAG/SEG/SLG 를 쉰다. 실제로 막힌 패스에만 적는다(설명용,
+# 붙여넣기 때 되돌릴 설정은 없다).
+INFOTEXT_CONTROLNET_GUARD = "Anima Perturbation ControlNet guard"
+INFOTEXT_CONTROLNET_GUARD_VALUE = (
+    "PAG/SEG/SLG skipped while ControlNet is active (Forge guard; the ComfyUI node does not skip)"
+)
 
 _EXTRA_GENERATION_PARAM_KEYS = (
     "Anima Perturbation Guidance",
@@ -252,6 +275,7 @@ _EXTRA_GENERATION_PARAM_KEYS = (
     "Anima Modulation Guidance",
     INFOTEXT_PREFIX_DEDUP,
     INFOTEXT_SEG_SEPARABLE,
+    INFOTEXT_CONTROLNET_GUARD,
 )
 
 
@@ -511,7 +535,13 @@ def _gaussian_blur_2d(img, sigma: float, separable: bool = True):
 
 
 def _parse_attention_heads(spec: str, n: int) -> set:
-    """Parse an optional attention-head list; an empty value selects all."""
+    """Parse an optional attention-head list; an empty value selects all.
+
+    Reversed ranges are swapped like upstream ('7-4' → 4..7; origin:
+    iljung1106/comfyui-anima-safe-pag@905b0107:__init__.py:44-51, 61-64).
+    Invalid parts are skipped instead of raising (host policy: never fail the
+    generation over a text field).
+    """
     if n <= 0:
         return set()
     spec = (spec or "").strip()
@@ -525,8 +555,9 @@ def _parse_attention_heads(spec: str, n: int) -> set:
             a, _, b = part.partition("-")
             try:
                 start, end = int(a), int(b)
-                if start <= end:
-                    out.update(range(start, end + 1))
+                if end < start:
+                    start, end = end, start
+                out.update(range(start, end + 1))
             except ValueError:
                 pass
         else:
@@ -1470,8 +1501,98 @@ def _pct_now() -> float:
 
 
 def _percent_in_range() -> bool:
+    """Step-fraction window ``start <= pct <= end`` (``end`` cut by ADG).
+
+    The gate SEG and SLG have always used — they are not part of the safe-pag
+    original (parity plan §0.3 item 9, out of scope), so PAG's sigma window
+    does not move them — and PAG's fallback without a predictor.
+    """
     pct = _pct_now()
     return _STATE["start"] <= pct <= _STATE["end"]
+
+
+def _pag_in_range(sigma) -> bool:
+    """PAG window test for the current model call.
+
+    Upstream gates by sigma (origin: iljung1106/comfyui-anima-safe-pag@905b0107
+    :__init__.py:15-22, 280): the bounds come from the model's own
+    ``percent_to_sigma`` and the value is the sigma of this call, so a
+    second-order sampler's extra evaluations and img2img's shortened schedule
+    are placed exactly as upstream places them. ``sigma`` is the ``timestep``
+    Forge passes to the model wrapper and the pre-CFG hook — KModel.apply_model
+    treats it as the sampler sigma. Without bounds (no predictor) the old
+    step-fraction gate is the fallback. DAVE/ADG keep using ``_pct_now``; a
+    step Adaptive Guidance skips never reaches this gate (the wrapper's ADG
+    branch runs first), so the bounds carry no ADG cut.
+    """
+    sigma_hi, sigma_lo = _STATE.get("sigma_hi"), _STATE.get("sigma_lo")
+    if sigma_hi is None or sigma_lo is None or sigma is None:
+        return _percent_in_range()
+    try:
+        return sigma_active(sigma, sigma_hi, sigma_lo)
+    except Exception:
+        return _percent_in_range()
+
+
+def _attn_rows_in_range(sigma) -> bool:
+    """Does this call get PAG/SEG weak rows? PAG: sigma window; SEG: step fraction."""
+    if not (_STATE["attn_method"] and float(_STATE["attn_scale"]) > 0
+            and _STATE["attn_targets"]):
+        return False
+    if _STATE["attn_method"] == "pag":
+        return _pag_in_range(sigma)
+    return _percent_in_range()
+
+
+def _slg_rows_in_range() -> bool:
+    """Does this call get SLG weak rows? Step fraction, as before the PAG window."""
+    return (bool(_STATE["slg_on"]) and float(_STATE["slg_scale"]) > 0
+            and bool(_STATE["slg_targets"]) and _percent_in_range())
+
+
+def _pert_in_range(sigma) -> bool:
+    """Does any enabled perturbation add weak rows to this model call?"""
+    return _attn_rows_in_range(sigma) or _slg_rows_in_range()
+
+
+def _sigma_window_text() -> str:
+    """Infotext/log form of PAG's gate: 'hi-lo' sigmas, or the fallback."""
+    sigma_hi, sigma_lo = _STATE.get("sigma_hi"), _STATE.get("sigma_lo")
+    if sigma_hi is None or sigma_lo is None:
+        return "step-fraction"
+    return f"{float(sigma_hi):.4f}-{float(sigma_lo):.4f}"
+
+
+def _note_control_guard() -> None:
+    """Write the ControlNet-guard infotext for the pass that was blocked."""
+    params = _STATE.get("guard_params")
+    if isinstance(params, dict):
+        params[INFOTEXT_CONTROLNET_GUARD] = INFOTEXT_CONTROLNET_GUARD_VALUE
+
+
+def _pag_sigma_window(unet, start: float, end: float):
+    """PAG's ``(sigma_hi, sigma_lo)`` for a percent window, or ``(None, None)``.
+
+    Upstream converts once, when the node patches the model (origin
+    :__init__.py:25-34, 229-233). Forge applies the shift (``set_shift``) before
+    ``process_before_every_sampling``, and clones share the predictor, so the
+    attach-time conversion sees the schedule this pass samples with — the same
+    ``real_model.predictor.percent_to_sigma`` Forge's own ControlNet uses
+    (backend/sampling/sampling_function.py:385).
+    """
+    predictor = getattr(getattr(unet, "model", None), "predictor", None)
+    percent_to_sigma = getattr(predictor, "percent_to_sigma", None)
+    if not callable(percent_to_sigma):
+        return None, None
+    try:
+        sigma_hi, sigma_lo, _start, _end = percent_range_to_sigmas(
+            percent_to_sigma, start, end,
+        )
+        return float(sigma_hi), float(sigma_lo)
+    except Exception as exc:
+        _log(f"percent_to_sigma failed ({type(exc).__name__}: {exc}) — "
+             "PAG window falls back to the step fraction.")
+        return None, None
 
 
 def _adg_should_skip() -> bool:
@@ -1525,7 +1646,7 @@ class _ConditionAggregation:
 def _prepare_condition_aggregation(model, cond, uncond, x, timestep, model_options):
     """Keep the exact Forge weights/regions for compositional weak predictions."""
     _STATE.pop("condition_aggregation", None)
-    if not _STATE["on"] or not _percent_in_range() or not cond:
+    if not _STATE["on"] or not _pert_in_range(timestep) or not cond:
         return model, cond, uncond, x, timestep, model_options
     if len(cond) == 1 and not any(key in cond[0] for key in ("area", "mask")):
         return model, cond, uncond, x, timestep, model_options
@@ -1696,16 +1817,17 @@ def _model_wrapper_inner(apply_model, w):
             out_full.index_copy_(0, uidx, out_c)  # uncond := cond
             return out_full
 
-        if (_STATE["on"] and _percent_in_range()
-                and c.get("control") is not None):
+        # Each weak row keeps its own window: PAG the sigma window, SEG/SLG the
+        # step fraction (see _attn_rows_in_range/_slg_rows_in_range).
+        attn_on = bool(_STATE["on"]) and _attn_rows_in_range(ts)
+        slg_on = bool(_STATE["on"]) and _slg_rows_in_range()
+        if (attn_on or slg_on) and c.get("control") is not None:
+            # Host guard (upstream does not have it): Forge's ControlNet control
+            # tensors are sized for the real batch, not the appended weak rows,
+            # so PAG/SEG/SLG stay off for this call. Recorded in the infotext.
             _STATE["control_blocked_calls"] += 1
-        if not _STATE["on"] or not _percent_in_range() or c.get("control") is not None:
+            _note_control_guard()
             return apply_model(x, ts, **c)
-
-        attn_on = bool(_STATE["attn_method"]) and float(_STATE["attn_scale"]) > 0 \
-            and bool(_STATE["attn_targets"])
-        slg_on = bool(_STATE["slg_on"]) and float(_STATE["slg_scale"]) > 0 \
-            and bool(_STATE["slg_targets"])
         if not attn_on and not slg_on:
             return apply_model(x, ts, **c)
 
@@ -2304,6 +2426,9 @@ def _parse_blocks(spec: str, n: int) -> set:
     block in the later half (14-27), which multiplied a soft perturbation into
     a destructive one. Keep the safe single-block default and clamp it for
     smaller compatible models.
+
+    Reversed ranges are swapped like upstream ('20-18' → {18, 19, 20};
+    origin: iljung1106/comfyui-anima-safe-pag@905b0107:__init__.py:44-51).
     """
     spec = (spec or "").strip()
     if not spec:
@@ -2315,7 +2440,10 @@ def _parse_blocks(spec: str, n: int) -> set:
         if "-" in part:
             a, _, b = part.partition("-")
             try:
-                out.update(range(int(a), int(b) + 1))
+                start, end = int(a), int(b)
+                if end < start:
+                    start, end = end, start
+                out.update(range(start, end + 1))
             except ValueError:
                 pass
         else:
@@ -2637,7 +2765,14 @@ def _clear_extra_generation_params(p) -> None:
     params = getattr(p, "extra_generation_params", None)
     if not isinstance(params, dict):
         return
+    # Forge runs this hook again for the hires pass on the same ``p``
+    # (modules/processing.py:1453 is_hr_pass, :1546). The ControlNet guard is
+    # a record of a pass that was blocked: a base pass blocked by a "Low res
+    # only" control must keep it through an unblocked hires pass.
+    hires = bool(getattr(p, "is_hr_pass", False))
     for key in _EXTRA_GENERATION_PARAM_KEYS:
+        if hires and key == INFOTEXT_CONTROLNET_GUARD:
+            continue
         params.pop(key, None)
 
 
@@ -2690,7 +2825,10 @@ class AnimaSafePAG(scripts.Script):
                 "기본은 **공식 경로**입니다: PAG는 value-only, SEG는 실제 H·W query에 "
                 "Gaussian blur를 적용합니다. Strength=1이면 원 기법의 전체 perturbation, "
                 "기본 0.75는 Anima Safe PAG의 부드러운 권장값입니다. `None`은 SLG만 "
-                "사용할 때 선택하세요."
+                "사용할 때 선택하세요.\n\n"
+                "⚠️ **ControlNet이 켜진 생성에서는 PAG/SEG/SLG를 적용하지 않습니다** "
+                "(Forge 전용 안전장치 — 원본 ComfyUI 노드는 끄지 않음). 이때 결과 "
+                "infotext에 `Anima Perturbation ControlNet guard`가 남습니다."
             )
             attn_method = gr.Radio(
                 label="Attention perturbation method",
@@ -2701,7 +2839,8 @@ class AnimaSafePAG(scripts.Script):
             )
             scale = gr.Slider(
                 label="Attn Scale — PAG / SEG guidance scale (cond−weak 배율)",
-                minimum=0.0, maximum=15.0, step=0.1, value=4.0,
+                # 원본 노드 scale 범위 0~100 (iljung1106/comfyui-anima-safe-pag@905b0107:__init__.py:201)
+                minimum=0.0, maximum=100.0, step=0.1, value=4.0,
                 info="이미지가 찢어지거나 배경·구도가 과하게 변하면 이 값을 먼저 낮추세요.",
                 elem_id="anima_safe_pag_scale",
             )
@@ -2745,7 +2884,10 @@ class AnimaSafePAG(scripts.Script):
             gr.Markdown(
                 "#### 공통 적용 범위·보정 — PAG / SEG / SLG\n"
                 "아래 Start·End·Rescale은 **활성화한 모든 perturbation에 공통 적용**됩니다. "
-                "SLG를 끈 상태에서도 PAG/SEG에 그대로 적용됩니다."
+                "SLG를 끈 상태에서도 PAG/SEG에 그대로 적용됩니다. **PAG**는 원본 노드처럼 "
+                "퍼센트를 모델 스케줄의 σ로 바꿔(`percent_to_sigma`) 현재 σ가 그 사이일 때 "
+                "켭니다 — 스텝 수·스케줄러·img2img denoise가 달라도 같은 σ 구간입니다. "
+                "**SEG/SLG**는 원본 PAG 노드에 없는 기능이라 예전처럼 스텝 비율로 잽니다."
             )
             with gr.Row():
                 start_percent = gr.Slider(
@@ -3310,7 +3452,8 @@ class AnimaSafePAG(scripts.Script):
             slg_on=False, slg_targets=set(), active=0,
             wrapper_calls=0, weak_steps=0, applied_steps=0, apg_steps=0,
             adg_skipped_steps=0, combined_calls=0, split_cond_calls=0,
-            split_uncond_calls=0, control_blocked_calls=0,
+            split_uncond_calls=0, control_blocked_calls=0, guard_params=None,
+            sigma_hi=None, sigma_lo=None,
             wrapper_fallbacks=0, requested_pert=False, requested_apg=False,
             requested_adg=False, requested_cfg_mode="preserve",
             requested_cfg_stack=False, requested_smc=False,
@@ -3614,7 +3757,9 @@ class AnimaSafePAG(scripts.Script):
         # Gradio sliders constrain interactive values, but XYZ axes accept
         # arbitrary strings (including NaN/Inf). Keep the same safe domains
         # when values arrive through XYZ or an API client.
-        scale = _finite_clamp(scale, 0.0, 15.0, 4.0)
+        # Upstream scale range 0..100 (origin: iljung1106/comfyui-anima-safe-pag
+        # @905b0107:__init__.py:201) — XYZ/API values above the old cap of 15 pass.
+        scale = _finite_clamp(scale, 0.0, 100.0, 4.0)
         legacy_strength = _finite_clamp(
             legacy_strength, 0.0, 1.0, 0.75
         )
@@ -3951,6 +4096,19 @@ class AnimaSafePAG(scripts.Script):
             )
 
         if pert_ok:
+            # PAG's window: sigmas of the requested percent range on this
+            # pass's own schedule, like the node's patch() does. Not the ADG
+            # cut: that is a step fraction (not a sigma percent) and ADG's own
+            # skip branch already drops PAG on the steps it skips. SEG/SLG keep
+            # the step-fraction gate (start..effective_end).
+            sigma_hi = sigma_lo = None
+            if attn_method == "pag" and attn_targets:
+                sigma_hi, sigma_lo = _pag_sigma_window(
+                    unet, requested_start, requested_end,
+                )
+                if sigma_hi is None:
+                    _log("no predictor.percent_to_sigma — the PAG window "
+                         "falls back to the step fraction.")
             _STATE.update(
                 on=True, attn_method=(attn_method if attn_targets else None),
                 attn_scale=scale, strength=strength, legacy_attn=legacy_attn,
@@ -3960,6 +4118,7 @@ class AnimaSafePAG(scripts.Script):
                 slg_targets=slg_targets, rescale=rescale,
                 rescale_mode=rescale_mode,
                 start=requested_start, end=effective_end,
+                sigma_hi=sigma_hi, sigma_lo=sigma_lo,
                 requested_start=requested_start, requested_end=requested_end,
                 range_mode=range_mode,
                 active=0, attn_raw=None, slg_raw=None, cond_raw=None,
@@ -4024,9 +4183,14 @@ class AnimaSafePAG(scripts.Script):
                     + f"; requested_range={_STATE['requested_start']:.2f}-"
                       f"{_STATE['requested_end']:.2f}"
                     + f"; effective_range={_STATE['start']:.2f}-{_STATE['end']:.2f}"
+                    # PAG only: SEG/SLG are gated by effective_range.
+                    + (f"; pag_sigma_window={_sigma_window_text()}"
+                       if _STATE["attn_method"] == "pag" else "")
                     + f"; range_mode={_STATE['range_mode']}"
                     + f"; rescale={rescale}({rescale_mode})"
                 )
+                # The wrapper writes INFOTEXT_CONTROLNET_GUARD here if it blocks.
+                _STATE["guard_params"] = p.extra_generation_params
                 # 결과를 미세하게 바꾸는 설정(재현성). 붙여넣기 때 같은 Forge 설정으로
                 # 돌아가도록 OptionInfo(infotext=...) 이름·"True"/"False" 로 적는다.
                 p.extra_generation_params[INFOTEXT_PREFIX_DEDUP] = str(
@@ -4100,6 +4264,7 @@ class AnimaSafePAG(scripts.Script):
                 f"slg={_STATE['slg_on']}:{sorted(slg_targets)} scale={slg_scale} "
                 f"range={_STATE['requested_start']:.2f}-{_STATE['requested_end']:.2f}"
                 f"→{_STATE['start']:.2f}-{_STATE['end']:.2f}"
+                f" pag_sigma={_sigma_window_text()}"
                 f"({_STATE['range_mode']}) "
                 f"rescale={'auto-off' if (_APG['on'] and apg_autooff) else rescale}"
                 f"({rescale_mode}) "
@@ -4371,6 +4536,8 @@ class AnimaSafePAG(scripts.Script):
         _STATE["split_cond_calls"] = 0
         _STATE["split_uncond_calls"] = 0
         _STATE["control_blocked_calls"] = 0
+        _STATE["guard_params"] = None
+        _STATE["sigma_hi"] = _STATE["sigma_lo"] = None
         _STATE["wrapper_fallbacks"] = 0
         _STATE["requested_pert"] = False
         _STATE["requested_apg"] = False
