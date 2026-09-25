@@ -8,7 +8,9 @@
 v0.21.2 이후 쌓인 큰 업데이트입니다. Anima 3.8B(Qwen3.5 / Semantic Connector v2) 런타임을 들여왔고, 캐릭터 레퍼런스 패널(이어붙이기 · IP-Adapter
 방식)이 생겼습니다. Anima LoRA 는 Base 1.0(28)·2.9B(40)·3.8B(52) 사이를 자동으로 옮기고, DoRA 합치는 방식을 고를 수 있습니다. 그 밖에 TIPO 프롬프트
 확장(🪄)·SAM3 빠른 버튼(🎯)·txt2img 섹션 정리가 추가됐고, SAM3·가이던스·3.8B 생성 시간을 줄였습니다 — 대부분은 결과가 픽셀 단위로 같고, PAG/SEG 의 두 가지 최적화만 잔
-디테일이 달라집니다(설정으로 끌 수 있음). 이 확장 전체의 라이선스는 이제 **GPL-3.0-only** 입니다.
+디테일이 달라집니다(설정으로 끌 수 있음). 가이던스(Detail Daemon·Safe PAG·Skimmed CFG·DCW(+a)·DAVE·CNS)와 Tile-Repair 는 가져온 원본 ComfyUI
+노드·sd-scripts 와 같은 값·범위·적용 구간으로 맞춰 같은 설정에서도 결과가 달라지고, Tile-Repair HTTP API 와 Notebook 메모장이 생겼습니다. 이 확장 전체의 라이선스는
+이제 **GPL-3.0-only** 입니다.
 
 괄호 표시: (결과 변화) = v0.21.2 와 같은 설정·시드에서 이미지가 달라짐, (결과 같음) = 이미지 동일, (새 기능) = v0.21.2 에 없던 기능이라 비교 대상 없음, 토글 = 끌 수
 있는 설정이 있음(뒤에 기본값), 토글 없음 = 끌 수 없음.
@@ -20,7 +22,11 @@ v0.21.2 이후 쌓인 큰 업데이트입니다. Anima 3.8B(Qwen3.5 / Semantic C
   - PAG/SEG/SLG 앞쪽 블록 중복 계산 건너뛰기, SEG blur 1D 두 번 — 구도는 같고 잔 디테일만 다릅니다. 끄려면 Settings → **SAM Extra Guidance** 의
     두 설정을 끄세요. infotext 키 `Anima PAG prefix dedup`·`Anima SEG separable blur` 가 없는 예전 infotext 를 붙여 넣으면 현재
     설정(켬)으로 렌더되므로, 예전 이미지를 그대로 재현하려면 둘 다 끄세요.
-  - Detail Daemon 강도가 원본·ComfyUI 기준(×0.1)으로 돌아왔습니다. 예전과 같은 강도는 amount × 10 입니다.
+  - 가이던스를 가져온 원본 ComfyUI 노드와 같게 맞췄습니다(토글 없음). Detail Daemon·Safe PAG·Skimmed CFG·DCW(+a)·DAVE·CNS 의 기본값·범위·적용
+    구간(σ 기준)이 원본과 같아져, v0.21.2 는 물론 이전 v0.30 개발 빌드와도 같은 설정에서 이미지가 달라질 수 있습니다. Detail Daemon 은 강도가 ×0.1 이라
+    v0.21.2 와 같은 강도는 amount × 10 이고, **Hires Pass** 를 켜지 않으면 hires 패스에는 걸리지 않습니다(v0.21.2 는 두 패스 모두). 기본값은 DCW λ
+    0.10/0.02 → 0.05/0.01, CWM α 0.30/0.15 → 0, CNS gamma scale 3.0 → 2.0 이고, RDC 는 tau 기본 0(끔)입니다. API 에서 생략한
+    위치 인자도 새 기본값을 씁니다(Custom SMC k 인자 27 은 0.20 → 0.10).
   - SMC/APG/CWM 은 CFG 1 에서 건너뛰고, Safe PAG 의 APG + rescale 자동 끄기도 CFG 1 에서는 적용하지 않습니다(토글 없음). Safe PAG 확장 배치가 OOM
     나면 그 생성의 남은 스텝·배치에서 PAG/SEG/SLG 를 끕니다.
   - SAM3: 인페인트 패스가 의도한 시드를 쓰고, SAM3 를 쓴 뒤의 다른 생성에서 fp32 행렬곱이 더 이상 TF32 로 돌지 않습니다(버그 수정, 토글 없음). API/XYZ 에서 생략한
@@ -30,9 +36,25 @@ v0.21.2 이후 쌓인 큰 업데이트입니다. Anima 3.8B(Qwen3.5 / Semantic C
   - 일부 블록만 담은(sparse) Anima LoRA 는 판정 블록 수가 현재 모델과 다르면 순정 Forge 처럼 추측 변환하지 않고 건너뜁니다. 순정처럼 하려면 Settings → **SAM
     Extra LoRA** → `sam3_anima_sparse_lora_forge_guess` 를 켜세요.
   - 3.8B v2 번들 체크포인트는 Qwen3.5 커넥터가 자동으로 켜집니다. 끄려면 `Anima 3.8B (Qwen3.5 / v2)` 아코디언의 Bypass.
+  - Tile-Repair 는 sd-scripts 원본처럼 원본 비율을 지키는 Short Side 슬라이더·디코드(uint8 버림)·빈 네거티브를 쓰고, SAM3 ControlNet 에 Tile &
+    Repair LLLite 를 고르면 preprocessor 가 늘 `None` 이 됩니다(토글 없음).
 - 메모리: 3.8B 는 생성 사이 VRAM 에 최대 약 6~8 GB 를 남기고(`sam3_anima38_keep_resident`), SAM3 'Unload after' 는 모델을 RAM 에 약
   3.4 GB 로 보관합니다(`sam3_unload_keep_in_ram`). 3.8B 샘플링 중에는 커넥터 fp32 상주 (`sam3_anima38_connector_fp32`, VRAM 약
   +1.5 GB, 여유가 있을 때만)와 run 캐시(`sam3_anima38_connector_run_cache`, 최대 512 MB)도 씁니다. 넷 다 기본 켬이고 끌 수 있습니다.
+- 업데이트 뒤 첫 시작 때 `ui-config.json` 을 한 번 옮깁니다(Guidance 아코디언 슬라이더, Skimmed CFG `Flip at`, Tile-Repair 네거티브). Forge 는 저장된 슬라이더 값·범위를
+  라벨로 다시 적용해서, 라벨이 그대로인 슬라이더에 예전 기본값·범위가 되살아나기 때문입니다. 예전 기본값 그대로인 값만 원본 기본값으로 바꾸고(DCW λ low 0.10 → 0.05·high
+  0.02 → 0.01, CWM α low 0.30·high 0.15 → 0, 예전 Enable RDC 가 꺼진 채 저장된 RDC tau 0.15 → 0), 예전 범위 저장값(PAG Attn
+  Scale 최대 15, DCW λ high ±0.5, CWM α 최대 1, CNS strength step 0.01·gamma power 최소 0.05, Skimmed CFG `Flip at` step 0.05)은
+  지웁니다. Tile-Repair 패널은 예전 Width·Height 슬라이더 키가 남은 설치만 그 키를 지우고, 네거티브가 예전 기본값 `blurry, low quality` 그대로면
+  sd-scripts 기본값인 빈 칸으로 바꿉니다. 사용자가 바꾼 값은 남깁니다 —
+  새 범위 밖이면 범위로 맞추고(DCW λ high ±0.3, CNS gamma power 0.1 이상), 예전 라벨로 저장된 CNS gamma scale 은 새 라벨로 옮기며, Enable RDC
+  를 끈 채 바꿔 둔 RDC tau 도 남으므로 이제 Enable DCW 를 켜면 RDC 가 함께 돕니다(끄려면 tau 0). 바꾸기 전 파일은 같은 폴더에
+  `ui-config.json.bak-anima-guidance-<날짜-시각>` 으로 복사하고, 새 파일은 임시 파일을 거쳐 한 번에 바꿔 씁니다. 바꾼 항목은 콘솔 `[AnimaSafePAG]
+  ui-config.json migrated …` 아래 줄마다 나오고, 바꿀 것이 없으면 파일을 건드리지 않습니다. Detail Daemon Amount 는 라벨이 바뀌어 예전
+  저장값이 적용되지 않으므로 대상이 아닙니다.
+- Forge 를 `--api` 또는 `--nowebui` 와 `--api-auth` 로 띄우면 이 확장의 Tile &
+  Repair(`/sam-extra/tile-repair…`)·Notebook·메모(`/sam3-notebook…`) 경로에도 `/sdapi` 와 같은 HTTP Basic 인증이 걸립니다. 이 경로를
+  부르는 스크립트·앱은 자격 증명을 보내야 하고(없거나 틀리면 401), `--gradio-auth` 로그인도 켜져 있으면 둘 다 필요합니다.
 
 ### Anima 3.8B (Qwen3.5 / Semantic Connector v2)
 
@@ -130,7 +152,7 @@ v0.21.2 이후 쌓인 큰 업데이트입니다. Anima 3.8B(Qwen3.5 / Semantic C
     strength`·`[DoRA] Weak copy scope`(cost 0.8 — 바깥 루프로 가서 칸마다 다시 합치지 않음), API `alwayson_scripts["DoRA
     Inference Mode"]` 를 지원합니다.
 
-### 가이던스 (PAG · SEG · APG · CFG · Detail Daemon · DCW · RDC)
+### 가이던스 (PAG · SEG · APG · CFG · Skimmed CFG · Detail Daemon · DCW · RDC · DAVE · CNS)
 
 - **PAG/SEG/SLG: 첫 target 블록 앞의 weak 행 중복 계산 건너뛰기 (결과 변화, 토글, 기본 켬)**: 첫 target 블록(기본 18) 이전 블록은 cond/uncond 행만
   돌리고 weak 행 자리에는 cond 행 출력을 복사합니다. GPU 에서 PAG 한 장이 56.2 → 51.4 초였고, 다시 돌려도 결과가 같으며, 끈 것과 구도는 같고 잔 디테일만 다릅니다. 끄는
@@ -144,25 +166,81 @@ v0.21.2 이후 쌓인 큰 업데이트입니다. Anima 3.8B(Qwen3.5 / Semantic C
   1D 두 번으로 계산"(`sam3_guidance_seg_separable_blur`, 기본 켬). 공식 SEG 이고 0<sigma≤9999 인 생성의 infotext 에 `Anima SEG
   separable blur: True/False` 가 남습니다. 두 Guidance 키는 XYZ 칸 사이 정리 목록에도 들어 있습니다. 예전 이미지를 그대로 재현하려면 두 설정을 모두 끄세요.
 - **SMC / APG / CWM 은 CFG 1 에서 건너뜀 (결과 변화, 토글 없음)**: 레거시 CFG base mode·experimental stack 포함, CFG 1 이면 base 교체를
-  건너뛰고 Forge 의 원래 결과를 둡니다. 예전에는 APG(eta=0)가 출력을 거의 0(검정/회색 이미지)으로 만들고 CWM/SMC 도 임의로 재가중했습니다. 콘솔에 생성당 한 번 `CFG
-  base override (SMC/APG/CWM) skipped: cond_scale=1` 경고, 진단의 CFG base 판정은 `NO-OP` 입니다. CFG=1 판정은 Forge 가 넘기는
-  `cond_scale` 로 하고, 없을 때만 uncond 를 봅니다.
+  건너뛰고 Forge 의 원래 결과를 둡니다. 예전에는 APG(eta=0)가 출력을 거의 0(검정/회색 이미지)으로 만들고 CWM/SMC 도 임의로 재가중했습니다. 원본 DCW(+a) 는
+  SMC·CWM 을 CFG 1 에서도 돌리고 이 확장도 SMC·CWM 이 켜진 CFG 1 패스에는 원본처럼 `disable_cfg1_optimization` 을 걸지만, Forge 는 CFG 가 1
+  이면 negative prompt 를 인코딩하지 않아 uncond 가 없으므로 결국 건너뜁니다. 콘솔에 생성당 한 번 `CFG base override (<켜진 것>) skipped:
+  cond_scale=1` 경고, 진단의 CFG base 판정은 `NO-OP` 입니다. CFG=1 판정은 Forge 가 넘기는 `cond_scale` 로 하고, 없을 때만 uncond 를 봅니다.
 - **Safe PAG: CFG 1 에서 rescale 자동 끄기를 적용하지 않음 (결과 변화, 토글 없음)**: CFG 1 이라 APG 가 돌지 않는 스텝에서는 PAG rescale 도 그대로
   적용합니다. 그래서 APG + rescale 자동 끄기를 켠 CFG 1 생성은 결과가 달라지고, 이제 APG 를 끈 생성과 비트 단위로 같습니다. CFG > 1 은 같습니다. 첫 CFG 1 경고에
   이 점이 적히고, `disable_cfg1_optimization` 이 켜져 있으면 uncond 패스는 돌았지만 결과가 cond 예측 그대로라고 안내합니다.
 - **Safe PAG 확장 배치 OOM (결과 변화, 토글 없음)**: 실패한 forward 의 활성값을 놓은 뒤 폴백합니다. OOM 이면 캐시를 비우고 그 생성의 남은 스텝·hires 패스·남은
   배치에서 PAG/SEG/SLG 를 끕니다(예전에는 매 스텝 재시도). OOM 이 난 생성만 결과가 달라질 수 있고, 이때 hires·둘째 배치 이후 이미지의 infotext 에는 PAG 항목이 빠질
   수 있습니다.
+- **Safe PAG 를 원본 노드와 같게 (결과 변화, 토글 없음)**:
+  [iljung1106/comfyui-anima-safe-pag@905b0107](https://github.com/iljung1106/comfyui-anima-safe-pag) (MIT)
+  기준입니다. PAG 의 Start/End 는 원본처럼 모델 스케줄의 σ 로 바꿔(`percent_to_sigma`, 양 끝 포함) 모델 호출마다 현재 σ 로 판정합니다. 예전에는 한 스텝 늦게
+  오르는 Forge 스텝 비율을 써서, Anima(shift 3)의 기본 구간 0.0~0.7(σ 1.0~0.5625)이 simple 스케줄 20·28·30 스텝에서 원본의 15·20·22 스텝이
+  아니라 14·19·21 스텝에 걸렸습니다. 이제 스텝 수·스케줄러·img2img denoise 가 달라도 원본과 같은 σ 구간이고 2차 샘플러의 중간 평가도 σ 로 판정합니다(predictor 가
+  없는 모델만 예전 스텝 비율). SEG·SLG 는 원본 노드에 없는 기능이라 예전처럼 스텝 비율입니다. Attn Scale 상한을 15 → 100 으로 올렸고(슬라이더·API·XYZ),
+  블록·head 번호의 역범위(`20-18`)는 원본처럼 18~20 으로 읽습니다(예전에는 그 부분을 버림, SLG·DAVE 블록 칸도 같음). ControlNet 이 붙은 호출에서
+  PAG/SEG/SLG 를 쉬는 것은 원본에 없는 이 확장의 안전장치라, 실제로 막힌 패스의 infotext 에 `Anima Perturbation ControlNet guard` 를 남깁니다.
+  `Anima Perturbation Guidance` infotext 에는 PAG σ 창(`pag_sigma_window=`)이 붙습니다.
+- **Skimmed CFG 를 원본 노드와 같게 (결과 변화, 토글 없음)**:
+  [Extraltodeus/Skimmed_CFG@d8300583](https://github.com/Extraltodeus/Skimmed_CFG) 의 수식 함수를
+  `sam3ext/guidance/skimmed_cfg.py` 에 그대로 편입했습니다(Apache-2.0, 고지는 `THIRD_PARTY_NOTICES.md`). Start/End/Flip at 을
+  원본처럼 모델의 `percent_to_sigma` 로 σ 로 바꿔 `end σ < σ < start σ`(경계 제외)인 스텝만 깎습니다 — 예전에는 한 스텝 늦은 스텝 비율이었습니다. 그래서
+  flow 모델인 Anima 는 첫 스텝(σ 1)을 깎지 않고, start > end 면 예전처럼 바꿔 읽지 않고 아무 스텝도 깎지 않습니다. flip 규칙(flip 지점의 σ 보다 앞선 스텝에서
+  뒤집음)·깎는 순서도 원본대로이고, 원본에 없던 `nan_to_num` 은 뺐습니다. RescaleCFG·Dynamic Thresholding 처럼 등록된 `sampler_cfg_function`
+  은 버리지 않고 깎인 예측으로 다시 부르며, 없으면 Forge 처럼 `edit_strength` 를 반영한 선형 CFG 입니다. Flip at 슬라이더 step 은 0.05 → 0.01 이고,
+  `ui-config.json` 에 저장된 예전 step 은 첫 시작 때 한 번 지웁니다.
+- **DCW·CWM·SMC 를 원본 DCW(+a) 와 같게 (결과 변화, 토글 없음)**:
+  [namemechan/ComfyUI-DCW@66aaf9dd](https://github.com/namemechan/ComfyUI-DCW) 기준으로 기본값·범위를 맞췄습니다: DCW λ low
+  0.10 → 0.05(−0.5~0.5), λ high 0.02 → 0.01(범위 ±0.5 → ±0.3, step 0.001), CWM α low·high 0.30·0.15 → 0(범위 −1~1 →
+  −1~2, 원본 권장 시작값 low 0.1~0.3·high 0.1~0.2), SMC Custom λ 0.5~30(API·XYZ 값도 이 범위로 맞춤). CWM 은 원본처럼 α 가 0 이 아닐 때만
+  CFG 를 바꾸므로 새 기본값에서는 켜도 표준 CFG 와 같습니다. SMC/APG/CWM 의 CFG 배율은 원본 cfg 훅처럼 Forge 가 넘기는 `cond_scale`(다른 CFG 함수가 없으면
+  Forge 처럼 `edit_strength` 를 곱함)이고, incoming 결과를 최소제곱으로 맞춘 값은 진단(`[VERIFY]` 의 `w_fit`)과 비선형 CFG 경고에만 씁니다.
+  RescaleCFG·Dynamic Thresholding 처럼 다른 확장이 `sampler_cfg_function` 을 걸어 두면 원본처럼 SMC·CWM 만 비키고(경고 1회) 그 결과를 둡니다 —
+  APG·PAG/SEG/SLG·DCW/RDC 는 그대로 적용합니다. Adaptive Guidance 가 uncond 를 건너뛴 스텝에도 원본 post-CFG 훅처럼 DCW/RDC 를 적용하고, 그
+  스텝에서는 APG momentum 만 비우고 SMC 의 이전 오차는 유지합니다(예전에는 둘 다 비우고 DCW 도 건너뜀). infotext `Anima DCW` 는 DCW 가 실제로 돌 때(λ 가
+  0 이 아니거나 RDC 가 켜짐) 남습니다.
 - **DCW / CWM / SMC 명시적 ON/OFF**: Guidance 본문에 세 기능의 독립 체크박스를 두었습니다. SMC 는 고른 `Auto`/모델별/`Custom` 프리셋 값을 유지한 채
-  master 체크박스로 바로 A/B 할 수 있습니다. 기존 script argument 와 XYZ 축 정수 인덱스는 그대로 두고 새 입력을 맨 뒤에 붙였습니다.
-- **RDC 이식**: [namemechan/ComfyUI-DCW](https://github.com/namemechan/ComfyUI-DCW) 의 band-wise reverse drift
-  compensation 을 Forge post-CFG 경로에 다시 작성했습니다. DCW 와 Haar 변환을 공유하지만 따로 켤 수 있고, `tau`·`alpha LL`·`alpha HH` 를
-  UI/XYZ/infotext 에 모두 노출합니다. 생성마다 EMA 를 초기화하고 해상도가 바뀌면 다시 시작합니다.
-- **Detail Daemon 강도를 원본·ComfyUI 기준으로 (결과 변화, 토글 없음)**: 포크 때 빠졌던 muerrilla 원본의 고정 ×0.1 배율을 되살려 같은 amount 가
-  ComfyUI-Detail-Daemon 의 `detail_amount` 와 같은 결과를 냅니다. **예전과 같은 강도는 amount × 10** 이고, 이를 위해 슬라이더를 −1~1 → −5~5 로
-  넓혔습니다. 프리셋은 Amount 값을 채워 주는 버튼이 되어 슬라이더를 몰래 덮어쓰지 않습니다. 곡선이 한 스텝 밀리던 문제를 denoiser 호출 카운터로 고쳤고(Heun 등 2차 샘플러는 호출
-  수 기준), CFG 결합은 HiRes/Refiner 패스의 실제 CFG 를 씁니다. infotext 에 exponent·offset·fade·smooth·multiplier 까지 남깁니다. 라벨이
-  바뀌어 `ui-config.json` 에 저장된 예전 슬라이더 범위는 적용되지 않습니다.
+  master 체크박스로 바로 A/B 할 수 있습니다. CWM 은 원본처럼 α 가 0 이 아닐 때만 CFG 를 바꾸므로, 원본 기본값 0 에서는 켜도 결과가 같습니다. RDC 에는 따로 켜는
+  체크박스가 없습니다(아래). 기존 script argument 와 XYZ 축 정수 인덱스는 그대로 두고 새 입력을 맨 뒤에 붙였습니다.
+- **RDC 이식 (새 기능, 토글 tau, 기본 0 = 끔)**: [namemechan/ComfyUI-DCW](https://github.com/namemechan/ComfyUI-DCW) 의
+  band-wise reverse drift compensation 을 Forge post-CFG 경로에 다시 작성했습니다. 원본처럼 따로 켜는 스위치가 없고 **Enable DCW 가 켜져 있고
+  tau > 0** 일 때 DCW 의 Haar 변환 안에서 돕니다(DCW λ 를 둘 다 0 으로 두면 RDC 만). 이전 v0.30 개발 빌드의 Enable RDC 체크박스는 화면에서 뺐고, 그
+  script argument 자리(58)는 남아 API 가 False 를 보내면 RDC 를 끄며 XYZ `[Anima RDC] Enable` 도 False 일 때만 끕니다.
+  `tau`(0~0.5)·`alpha LL`(기본 0.03)·`alpha HH`(기본 0)를 UI/XYZ/infotext(`Anima RDC`)에 모두 노출하고, 생성마다 EMA 를 초기화하며
+  해상도가 바뀌면 다시 시작합니다.
+- **DAVE 를 원본 노드와 같게 (결과 변화, 토글 없음)**:
+  [sorryhyun/ComfyUI-Anima-DAVE@83143e8d](https://github.com/sorryhyun/ComfyUI-Anima-DAVE) (MIT) 의 초반 스텝 게이트를
+  `sam3ext/guidance/dave_gate.py` 로 옮겼습니다. 예전에는 한 스텝 늦은 Forge 스텝 비율이 tau 보다 작을 때 켰고, 이제 원본처럼 모델 호출의 σ 를 샘플러가 도는
+  σ 스케줄에서 찾아 그 스텝 번호가 `k = max(1, min(n, round(tau × n)))` 보다 작을 때 켭니다(tau 0.10 이면 20·25 스텝에서 첫 2 스텝, 28·30 스텝에서
+  첫 3 스텝). 스케줄에 없는 σ(2차 샘플러의 중간점)는 원본처럼 늘 켭니다. txt2img 는 σ 목록 전체, img2img·hires 는 Forge 와 같은 `steps − t_enc − 1`
+  칸부터 세고, ADetailer 내부 img2img·img2img-hires-fix 처럼 이 스크립트가 준비하지 않은 실행은 `on_cfg_denoiser` 로 그 실행을 알아내 자기 스텝 수로
+  끝에서 셉니다. σ 목록이 없는 DDIM·PLMS 는 Forge 스텝 위치로 판정합니다(한 스텝 늦음). 블록 칸을 비우면 원본 마스크와 같은 `8-18`, strength 0.001 이하는
+  원본처럼 아무것도 하지 않습니다.
+- **CNS 를 원본과 같게 (결과 변화, 토글 없음)**:
+  [namemechan/comfyui-cns_sampler_patch@42278b13](https://github.com/namemechan/comfyui-cns_sampler_patch) 의
+  `color_noise_wavelet` 을 `sam3ext/guidance/cns.py` 에 그대로 편입했습니다(GPL-3.0). Strength 가 1 보다 작으면 흰 노이즈와 `lerp` 로만
+  섞고 표준편차를 다시 맞추지 않습니다(원본처럼 조금 낮아짐). 재색칠 기준 `x_t` 는 post-CFG 입력 대신 원본처럼 샘플러 스텝 callback 의 `x`(그 스텝의 시작 상태)를 쓰고,
+  callback 을 감쌀 수 없는 샘플러에서만 예전처럼 post-CFG 입력을 씁니다(검증 로그 `x_t=callback|post_cfg`). 기본 Gamma scale 은 3.0 → 2.0,
+  범위도 원본대로입니다(Strength step 0.05, Gamma power 최소 0.1, Gamma scale 0.1~25 · step 0.1 — 원본 README 의 Anima +
+  euler_ancestral_cfg_pp 권장값 3.0 은 라벨에 적음). 이 스크립트가 붙은 패스의 샘플러가 도는 동안에만 색칠해, ADetailer 내부 img2img 같은 중첩 실행은 흰
+  노이즈 그대로입니다.
+- **Detail Daemon 을 ComfyUI-Detail-Daemon 과 같은 값으로 (결과 변화, 토글 없음)**:
+  [Jonseed/ComfyUI-Detail-Daemon@3394e44](https://github.com/Jonseed/ComfyUI-Detail-Daemon) 의 값과 σ 조회를 따르고, 노드가
+  다루지 않는 Forge 동작은 muerrilla 원본을 따릅니다. 강도는 `σ × max(1e-6, 1 − 스케줄 × 0.1 × CFG)` 이고 CFG 는 hires 패스에서도 늘
+  `p.cfg_scale` 입니다. 포크 때 빠졌던 ×0.1 을 되살려 같은 amount 가 노드의 `detail_amount` 와 같은 결과를 냅니다 — **v0.21.2 와 같은 강도는
+  amount × 10** 이고, 이를 위해 Amount 를 −1~1 → −5~5(기본 0.10)로 넓혔습니다. 원본에 없는 프리셋·Multiplier·CFG 결합 토글과 [0.05, 3] 클램프는
+  없앴습니다(API 위치 인자 1·10·12 자리는 남기고 읽지 않음). 스케줄 위치는 노드처럼 모델 호출마다 그 σ 를 샘플러가 도는 σ 목록에서 찾아(가장 가까운 칸, 칸 사이는 선형 보간)
+  정하므로 Forge 스텝 번호의 한 스텝 지연이 없고, 2차 샘플러의 중간 평가도 노드와 같은 곡선 값을 읽습니다. txt2img 는 σ 목록 전체, img2img·hires 는 Forge 와 같은
+  `steps − t_enc − 1` 칸부터 세고(`DDIM` 스케줄이 σ 를 스텝 수 + 2 개 내놓아도 맞음), ADetailer 내부 img2img·img2img-hires-fix 처럼 이
+  스크립트가 준비하지 않은 실행은 그 실행의 스텝 수로 끝에서 셉니다. σ 목록이 없는 DDIM·PLMS 는 모델 호출 수로 셉니다. muerrilla 원본처럼 **Hires Pass**(새
+  체크박스, API 인자 13, 기본 끔)를 끄면 기본 패스에만, 켜면 hires 패스에만 걸리고(v0.21.2 는 두 패스 모두), DPM adaptive·HeunPP2 에서는 꺼집니다. σ 는
+  원본처럼 제자리에서 바꿔 NGMS·soft inpainting 도 바뀐 σ 를 봅니다. infotext `Anima Detail Daemon` 에
+  exponent·offset·fade·smooth·hires 까지 남깁니다. Amount 라벨이 바뀌어 `ui-config.json` 에 저장된 v0.21.2 의 Amount 값·범위는 적용되지
+  않습니다(기본 0.10 으로 시작).
 
 ### SAM3
 
@@ -194,6 +272,12 @@ v0.21.2 이후 쌓인 큰 업데이트입니다. Anima 3.8B(Qwen3.5 / Semantic C
   인자 `keep_in_ram` 을 받습니다(인자 없는 호출은 그대로).
 - **In-flight 내부 패스에서 ADetailer 제외 (결과 변화, 토글 없음)**: 생성 중 SAM3 인페인트의 내부 패스에서 ADetailer 가 돌지 않습니다(🎯 와 같음). 바깥 생성의
   ADetailer 는 그대로 한 번 돕니다.
+- **SAM3 ControlNet 의 Anima LLLite 전처리 (결과 변화, 토글 없음)**: SAM3 인페인트 패스에 넣는 ControlNet 유닛이 Anima ControlNet-LLLite
+  이면 원본(kohya sd-scripts·ComfyUI-Anima-LLLite)처럼 제어 이미지를 그대로 받게 합니다. 채널 수와 Tile & Repair 여부는 모델 파일의 safetensors
+  헤더로 읽고, 못 읽으면 파일 이름으로 봅니다. Tile & Repair LLLite(3채널)는 preprocessor 를 늘 `None` 으로 바꾸고 — 기본 `inpaint_only` 가 고칠
+  영역을 비워 복구할 내용을 지웠습니다 — lineart·canny·depth 같은 다른 3채널 Anima LLLite 는 고른 preprocessor 를 쓰되 `inpaint_*` 만 `None`
+  으로, 4채널 인페인트 LLLite 는 예전처럼 `inpaint_*` 를 `None` 으로 바꿉니다. 바꿀 때마다 stderr 에 한 줄 남기고, Anima LLLite 가 아닌 모델(SDXL
+  `kohya_controllllite_*` 포함)은 건드리지 않습니다.
 - **SAM3 빠른 버튼(🎯)**: txt2img 갤러리 ✨(hires fix) 옆에서 선택한 이미지에 지금 SAM3 설정을 바로 돌립니다. ✨ 와 같은 규칙(지금 txt2img 설정 + 그 이미지의
   시드, 결과 배치는 Forge 의 hires button gallery insert 설정)이며 SAM3 아코디언이 꺼져 있어도 돌고 다른 후처리는 돌리지 않습니다. 결과는 `-sam3` 접미어로
   저장하고 infotext 에 SAM3 설정과 `SAM3 quick: True` 를 붙입니다.
@@ -227,14 +311,43 @@ v0.21.2 이후 쌓인 큰 업데이트입니다. Anima 3.8B(Qwen3.5 / Semantic C
   인코딩·VAE 디코드 구간은 중단 불가). Refine 이 실패해도 진행 문구가 진행 표시줄에 남지 않습니다.
 - **Tile-Repair 정리**: Text Encoder 자동 선택이 Qwen3 0.6B(예: `qwen_3_06b_base.safetensors`)만 고르고, 없으면 `Use Forge
   current` 가 기본입니다(예전에는 Qwen3-VL 등을 골라 크기 불일치로 죽었음). 제외 판정은 'vl'·'vlm'·'clip' 이 토큰일 때만입니다. 벤더에 전달된 적 없는 LLLite
-  Strength / Start % / End % 슬라이더를 뺐고(`SAM3 Anima LLLite Multiplier` 는 그대로), infotext 의 LLLite 항목은 `LLLite:
-  <model> (mult <x>)` 로 짧아졌습니다.
+  Strength / Start % / End % 슬라이더를 뺐고(Multiplier 만 남음 — 아래), infotext 의 LLLite 항목은 `LLLite: <model> (mult <x>)`
+  로 짧아졌습니다.
+- **Tile-Repair 를 sd-scripts 원본과 같게 (결과 변화, 토글 없음)**:
+  [kohya-ss/sd-scripts@690ea7f9](https://github.com/kohya-ss/sd-scripts) 추론과
+  [kohya-ss/ComfyUI-Anima-LLLite@b7495bd8](https://github.com/kohya-ss/ComfyUI-Anima-LLLite) 기준입니다. Width·Height
+  슬라이더(기본 1024×1024) 대신 **Short Side**(기본 1024) 하나로 원본 비율을 지키고, 긴 변은 비율을 따라 두 변 모두 32 의 배수로 내립니다(최소 256). 디코드는
+  sd-scripts 처럼 `(clamp(−1, 1) + 1) × 127.5` 를 uint8 로 잘라(예전에는 범위를 추정해 반올림) 픽셀 값이 1 씩 다를 수 있습니다. LLLite 목록에는
+  safetensors 헤더로 가려낸 3채널(RGB) Anima LLLite 만 나오고(4채널 인페인트 LLLite·다른 ControlNet·`.safetensors` 가 아닌 파일은 빠짐), 기본은
+  가장 새 Tile & Repair 파일(v20)입니다. Multiplier 는 ComfyUI-Anima-LLLite 의 strength 와 같은 −10~10(step 0.01, 기본 1.0)이고
+  라벨이 바뀌어 저장된 예전 0~2 범위는 적용되지 않습니다. 네거티브 기본값은 sd-scripts 처럼 빈 칸이고, `ui-config.json` 에 예전 기본값(`blurry, low
+  quality`)이 그대로 저장된 기존 설치는 첫 시작 때 한 번 빈 칸으로 옮깁니다(직접 적은 네거티브는 유지).
+- **Tile & Repair HTTP API (새 기능)**: `POST /sam-extra/tile-repair` 가 JSON 하나로 패널의 Tile-Repair 모드와 같은 실행을 합니다.
+  `image`(base64 PNG·JPEG·WebP, `data:` 접두어 가능)만 필수이고 나머지 키(`model`, `prompt`, `negative_prompt`, `steps`,
+  `cfg_scale`, `flow_shift`, `multiplier`, `short_side`, `seed`, `dit`, `text_encoder`, `vae`,
+  `unload_forge_before`)는 생략하면 패널 기본값(네거티브는 빈 칸)이며, 모르는 키는 400 으로 거절합니다. 결과는 base64 PNG(infotext 포함)·실제로 쓴
+  시드·크기입니다. `GET /sam-extra/tile-repair/options` 는 패널의 선택지·기본값·범위를, `POST /sam-extra/tile-repair/stop` 은 이 경로의
+  요청만 멈춥니다(패널 ⏹·txt2img 는 건드리지 않고, Forge 의 Interrupt 는 둘 다 멈춤). txt2img·패널과 같은 Forge 대기열에서 돌고, 입력은 디코드 64 MB·64
+  MP, 출력도 64 MP 까지입니다(가는 원본에 short side 를 주어 수십억 픽셀이 되는 요청은 400). 인증은 Notebook 경로와 같습니다(`--gradio-auth` 로그인,
+  Forge 가 API 를 띄울 때의 `--api-auth` HTTP Basic, 헤더 `X-SAM3-Notebook: 1`). LoRA 칸·PiD 모드·갤러리 삽입은 패널에만 있습니다. UR_IV
+  데스크톱 앱처럼 같은 출처에서 부르는 클라이언트용입니다.
 - **Anima VAE 2x 가 Anima 생성에서 실제로 돕니다**: 켜면 `TypeError: Cannot handle this data type` 로 생성이 죽던 문제를 고쳤습니다(순정과 같은
   5D 결과). decode 결과 모양이 맞지 않으면 `2x decode failed → stock decode: …` 를 남기고 순정 decode 로 폴백합니다. 12ch 디코더는 Forge 메모리
   관리로 decode 때만 올립니다. `--novram` 등으로 디코더가 GPU 에 못 올라가 실패하면 그 이유를 프로세스당 한 번만 안내하고 이후에는 조용히 순정 decode 로 넘어갑니다. 실제
   GPU 생성 확인은 아직입니다.
 - **빠른 드롭다운**: UI 업데이트마다 도는 스캔이 Gradio config 전체(약 5,600개)를 선형 탐색하던 것을 elem_id 인덱스 조회로 바꿨습니다(스캔 1회 약 5.7 ms 중
   4.3 ms 가 이 탐색이었음). 설정값(기본 60개)은 이제 전체 상한이 아니라 한 번에 더하는 개수라, 목록 끝까지 스크롤하면 다음 묶음을 그려 XYZ 축처럼 긴 목록도 끝까지 볼 수 있습니다.
+- **Notebook 메모장 (새 기능)**: Notebook 패널에 **프리셋 / 메모** 탭이 생겼습니다. 메모(제목 120자·본문 100,000자)는 입력을 멈추고 약 0.6 초 뒤 자동
+  저장되며, `notebook.json` 옆의 `memos.json`(기본 Forge 데이터 경로의 `sam-extra/memos.json`)에 따로 저장해 프리셋 저장의 revision 과 섞이지
+  않습니다. UR_IV 앱도 같은 메모를 `GET/PUT/DELETE /sam3-notebook/memos[/{id}]` 로 읽고 씁니다(Notebook 과 같은 인증·헤더). 저장·삭제는 메모마다
+  마지막으로 본 `updated_at` 을 함께 보내, 그사이 다른 곳에서 바뀐 메모를 덮어쓰거나 지우지 않고 409 를 받습니다 — 화면은 서버 쪽 메모를 그대로 두고 내 편집을 '(충돌 사본)'
+  새 메모로 남깁니다. 지운 메모는 동기화용 tombstone 으로 남고, 메모는 tombstone 포함 500개까지이며 넘치면 오래된 tombstone 부터 정리합니다. 저장 전 편집은 브라우저
+  탭마다 localStorage 초안으로 남아, 닫힌 탭의 초안은 다른 탭이 이어받습니다. 경로가 없으면(업데이트 뒤 재시작 전) 메모 탭에 Forge 를 다시 시작하라고 표시합니다.
+- **확장 HTTP 경로에 Forge `--api-auth` 적용**: Forge 가 `--api`·`--nowebui` 로 API 를 띄우고 `--api-auth` 가 있으면 Tile &
+  Repair(`/sam-extra/tile-repair…`)·Notebook(`/sam3-notebook`)·메모 경로에도 `/sdapi` 와 같은 HTTP Basic 인증을 겁니다(없거나 틀리면
+  401). `--gradio-auth` 로그인도 켜져 있으면 둘 다 필요합니다. `--api`·`--nowebui` 없이 준 `--api-auth` 는 Forge 에서처럼 아무것도 막지 않습니다.
+- **Forge 라이트박스 도구줄이 늘 보이던 문제 (버그 수정)**: 전역 테마(Settings → **SAM Extra Appearance**)를 켜면 테마 배경이 Forge 라이트박스의
+  도구줄(`.modalControls`, 이것도 `.gradio-container`)까지 칠해, 마우스를 올리지 않아도 바가 배경색으로 늘 보였습니다. 도구줄을 테마 배경에서 뺐습니다.
 
 ### 성능 (결과 같음)
 
@@ -254,9 +367,9 @@ v0.21.2 이후 쌓인 큰 업데이트입니다. Anima 3.8B(Qwen3.5 / Semantic C
 - **SAM3**: Detect/Exclude 토큰이 여러 개여도 이미지 백본은 이미지당 한 번만 돕니다. Mask Hull·Mask Outline Px (edge-aware)·작은 반경의 Mask
   Dilation 이 픽셀은 그대로 빨라졌습니다(성분이 많은 1536² Hull 1.1 초 → 약 0.006 초). 인페인트 패스마다 세 번 하던 `synchronize`+`empty_cache` 를
   한 번으로 줄였고, 아티팩트 overlay PNG 는 압축 레벨 2 로 저장합니다(픽셀 같음, 파일 약 9% 큼, 저장 약 0.27 → 0.11 초).
-- **가이던스**: Skimmed CFG 의 스텝당 GPU→CPU 동기화 8회를 없앴고, PAG/SEG 의 행·head 인덱스 텐서를 캐시합니다. 진단(guidance diagnostics)을 끄면
-  fit_error 와 PAG/SEG rel_delta 를 패스의 첫 스텝에서만 잽니다('비선형 CFG' 경고도 첫 스텝 기준, `fit_error=?` 로 찍힐 수 있음). 켜면 예전처럼 매 스텝
-  잽니다.
+- **가이던스**: PAG/SEG 의 행·head 인덱스 텐서를 캐시합니다. Skimmed CFG 의 스텝당 GPU→CPU 동기화를 없앴던 변경은 원본 수식을 그대로 편입하면서 되돌렸습니다(원본과
+  같은 불리언 마스크 인덱싱). 진단(guidance diagnostics)을 끄면 fit_error 와 PAG/SEG rel_delta 를 패스의 첫 스텝에서만 잽니다('비선형 CFG' 경고도 첫
+  스텝 기준, `fit_error=?` 로 찍힐 수 있음). 켜면 예전처럼 매 스텝 잽니다.
 
 ### 설치 · 라이선스 · 개발
 
@@ -270,16 +383,22 @@ v0.21.2 이후 쌓인 큰 업데이트입니다. Anima 3.8B(Qwen3.5 / Semantic C
   커밋 `303cca0`(1.2.0)으로 고정하고 판이 다르면 알립니다.
 - **라이선스를 GPL-3.0-only 로**: 확장 전체를 GNU GPL 3판만(SPDX `GPL-3.0-only`, 'or later' 없음)으로 배포합니다. 루트 `LICENSE` 를 추가하고
   README 라이선스 절·`THIRD_PARTY_NOTICES.md` 에 반영했으며, `package.json` 에 SPDX `GPL-3.0-only` 를 적고 README 의 '내부 사용' 문구를
-  뺐습니다. Safe PAG·Detail Daemon 원 라이선스는 '미확인', Skimmed CFG 는 LICENSE 없음으로 적었습니다(재배포 전 확인 필요).
+  뺐습니다. 원본 동등성 작업으로 편입한 상류 코드 — Skimmed CFG 수식(Apache-2.0), Detail Daemon 스케줄·σ 조회와 Safe PAG 적용 구간·번호 파싱, DAVE
+  초반 스텝 게이트(MIT), CNS 재색칠(GPL-3.0) — 와 대조 테스트용 ComfyUI-DCW 원본 사본(GPL-3.0)의 출처·커밋·고지를 `THIRD_PARTY_NOTICES.md` 에
+  적었습니다.
 - **새 설정 섹션**: **SAM Extra SAM3**(`sam3_mask`)·**SAM Extra Anima 3.8B**(`sam3_anima38`)·**SAM Extra LoRA**
   (`sam3_lora`)·**SAM Extra Guidance**(`sam3_guidance`)·**SAM Extra Character Reference**(`sam3_reference`) 가
   생겼습니다. README·docs 의 코드 불일치는 문서 쪽만 고쳤습니다.
 - **개발**: `requirements-dev.txt` 를 추가했고 CI 는 Python 3.13 + `unittest discover` 로 바뀌었습니다(실제 GitHub Actions 실행은
   미확인). 테스트 사이에 가짜 모듈이 남아 실행 순서에 따라 결과가 흔들리던 문제를 고쳤습니다.
-- **검증**: Python 단위 테스트 1100개 통과(skipped 2, CPU), jsdom 프런트엔드 테스트 40개 통과. GPU(RTX 5090) 확인 — 픽셀 동일: 성능 작업 뒤 3.8B
-  기준 이미지 재렌더, 3.8B 커넥터 fp32·run 캐시, TF32 수정, SAM3 인페인트 시드 수정, IP-Adapter 잡 뒤의 txt2img. 구도 같고 잔 디테일만 다름: PAG 앞쪽
-  블록 중복 제거(56.2 → 51.4 초), SEG separable blur. 비교·동작 확인: IP-Adapter lineage 정책, IP-Adapter 의 3.8B 커넥터. 아직 GPU 로
-  확인하지 않은 것: Safe PAG CFG 1 변경, VAE 2x, 부분 LoRA 추측 변환, 이어붙이기 권장 LoRA 화질 A/B. 그 밖에 GPU 결과를 적지 않은 항목은 CPU 단위 테스트로만
+- **검증**: Python 단위 테스트 1422개 통과(skipped 2, CPU, `python -m unittest discover -s tests -t .`), jsdom 프런트엔드 테스트
+  57개 통과(`npm test`). GPU(RTX 5090) 확인 — 픽셀 동일: 성능 작업 뒤 3.8B 기준 이미지 재렌더, 3.8B 커넥터 fp32·run 캐시, TF32 수정, SAM3
+  인페인트 시드 수정, IP-Adapter 잡 뒤의 txt2img. 구도 같고 잔 디테일만 다름: PAG 앞쪽 블록 중복 제거(56.2 → 51.4 초), SEG separable blur.
+  비교·동작 확인: IP-Adapter lineage 정책, IP-Adapter 의 3.8B 커넥터. 이 GPU 측정은 모두 원본 동등성 작업 전의 코드에서 잰 것입니다. 아직 GPU 로 확인하지
+  않은 것: Safe PAG CFG 1 변경, VAE 2x, 부분 LoRA 추측 변환, 이어붙이기 권장 LoRA 화질 A/B, 그리고 원본 동등성 작업 전체(Detail Daemon·Safe
+  PAG·Skimmed CFG·DCW(+a)·RDC·DAVE·CNS·Tile-Repair·SAM3 LLLite 전처리) — 이것은 원본 코드를 테스트 안에 그대로 두고 같은 입력의 결과를 비교하는
+  CPU 단위 테스트(`tests/test_*_origin.py`, `test_skimmed_cfg.py`)로만 확인했습니다. Tile & Repair API·Notebook
+  메모장·`--api-auth` 적용·ui-config 이전·라이트박스 수정도 단위 테스트(메모장은 jsdom 포함)로 확인했습니다. 그 밖에 GPU 결과를 적지 않은 항목은 CPU 단위 테스트로만
   확인했습니다.
 
 ## v0.21.2 — 레거시 콘솔 인코딩에서 로그가 생성을 죽이던 문제 + CI 연결

@@ -3242,7 +3242,8 @@ def _make_pag_xyz_axis() -> None:
 
 
 def _migrate_saved_ui_config() -> None:
-    """Carry an existing ui-config.json over the PAG/DCW(+a)/CNS parity changes (one-time).
+    """Carry an existing ui-config.json over the PAG/DCW(+a)/CNS, Skimmed CFG and
+    Tile-Repair parity changes (one-time).
 
     The PAG scale/DCW/RDC/CWM labels are the ui-config keys and did not change, so
     Forge's UiLoadsave would reapply the old PAG scale maximum 15, the old RDC tau 0.15
@@ -3260,7 +3261,8 @@ def _migrate_saved_ui_config() -> None:
     changes = migrate_ui_config_file(path, script_file=Path(__file__).name)
     if changes:
         _log(
-            "ui-config.json migrated to the upstream PAG/DCW(+a)/CNS defaults/ranges:\n  "
+            "ui-config.json migrated to the upstream PAG/DCW(+a)/CNS/Skimmed CFG/Tile-Repair "
+            "defaults/ranges:\n  "
             + "\n  ".join(changes)
         )
 

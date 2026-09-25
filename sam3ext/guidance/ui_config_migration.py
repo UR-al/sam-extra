@@ -1,4 +1,5 @@
-"""One-time ``ui-config.json`` migration for the PAG scale, DCW(+a) and CNS sliders of the Anima Guidance suite.
+"""One-time ``ui-config.json`` migration for the PAG scale, DCW(+a) and CNS sliders of the Anima Guidance suite,
+the Skimmed CFG ``Flip at`` slider and the Tile-Repair panel's negative prompt.
 
 Forge's ``UiLoadsave`` (``modules/ui_loadsave.py:37-110``) reapplies every saved slider
 ``value``/``minimum``/``maximum``/``step`` keyed by
@@ -36,6 +37,14 @@ Rules (user decision: new defaults = the originals, values a user set stay):
   ``… (Anima 시작값 3.0)`` keys would never apply again): every legacy-label key is removed, and
   a saved value other than the old default 3.0 moves to the new label (clamped to [.1, 25]),
   so only the untouched old default falls back to upstream's 2.0.
+* Skimmed CFG (``customscript/anima_skimmed_cfg.py/…``) — the ``Flip at`` slider kept its label
+  but its step went .05 -> .01 (the vendored original, Extraltodeus/Skimmed_CFG@d8300583). A saved
+  legacy step .05 gets the slider's saved bounds dropped; the saved value stays.
+* Tile-Repair panel (``sam3ext/ui_anima.py``, not a script: keys are ``txt2img/<label>/<field>``)
+  — only when the keys of the replaced ``SAM3 Anima Width``/``Height`` sliders are still there
+  (the short-side slider took their place, so Forge never reads them again): they are removed,
+  and ``SAM3 Anima Negative`` still at the old default ``blurry, low quality`` becomes sd-scripts'
+  ``""`` (anima_minimal_inference.py ``--negative_prompt``). A negative the user typed stays.
 
 Every rule is keyed on a legacy marker that the migration itself removes, so a value the user
 saves afterwards is never touched again. Pure Python, no Gradio or Forge import.
@@ -53,6 +62,9 @@ __all__ = [
     "CNS_GAMMA_SCALE_LABEL",
     "PAG_SCALE_LABEL",
     "SCRIPT_FILE",
+    "SKIMMED_FLIP_LABEL",
+    "SKIMMED_SCRIPT_FILE",
+    "TILE_REPAIR_NEGATIVE_LABEL",
     "TABS",
     "migrate_ui_settings",
     "migrate_ui_config_file",
@@ -99,10 +111,28 @@ _CNS_GAMMA_SCALE_OLD_DEFAULT = 3.0
 _CNS_GAMMA_SCALE_BOUNDS = (0.1, 25.0)  # upstream gamma_scale min/max (:425-426)
 _SLIDER_FIELDS = ("visible", "value") + _RANGE_FIELDS
 
+# Skimmed CFG's own script (scripts/anima_skimmed_cfg.py); same label before and after the
+# parity change, legacy step from forge_sam3_extension@4d0028e:scripts/anima_skimmed_cfg.py:399-403.
+SKIMMED_SCRIPT_FILE = "anima_skimmed_cfg.py"
+SKIMMED_FLIP_LABEL = "Flip at (%) · 0 = 사용 안 함"
+_SKIMMED_FLIP_LEGACY_STEP = 0.05
+
+# The Tile-Repair panel sits on the txt2img tab. Pre-parity values from
+# forge_sam3_extension@4d0028e:sam3ext/ui_anima.py (negative default, Width/Height sliders).
+TILE_REPAIR_TAB = "txt2img"
+TILE_REPAIR_NEGATIVE_LABEL = "SAM3 Anima Negative"
+_TILE_REPAIR_NEGATIVE_OLD_DEFAULT = "blurry, low quality"
+_TILE_REPAIR_LEGACY_LABELS = ("SAM3 Anima Width", "SAM3 Anima Height")
+
 
 def _key(tab: str, label: str, field: str, script_file: str) -> str:
     """The key ``UiLoadsave.add_component`` builds for a script control."""
     return f"customscript/{script_file}/{tab}/{label}/{field}"
+
+
+def _panel_key(tab: str, label: str, field: str) -> str:
+    """The key ``UiLoadsave.add_block`` builds for a control outside a script."""
+    return f"{tab}/{label}/{field}"
 
 
 def _number(value):
@@ -242,6 +272,39 @@ def _migrate_cns(settings, tab, script_file, changes) -> None:
     changes.append(f"{where}: saved {value:g} -> {CNS_GAMMA_SCALE_LABEL} = {carried:g}")
 
 
+def _migrate_skimmed(settings, tab, changes) -> None:
+    if _same(
+        settings.get(_key(tab, SKIMMED_FLIP_LABEL, "step", SKIMMED_SCRIPT_FILE)),
+        _SKIMMED_FLIP_LEGACY_STEP,
+    ):
+        _drop_bounds(settings, tab, SKIMMED_FLIP_LABEL, SKIMMED_SCRIPT_FILE, changes)
+
+
+def _migrate_tile_repair(settings, changes) -> None:
+    tab = TILE_REPAIR_TAB
+    legacy = [
+        _panel_key(tab, label, field)
+        for label in _TILE_REPAIR_LEGACY_LABELS
+        for field in _SLIDER_FIELDS
+        if _panel_key(tab, label, field) in settings
+    ]
+    if not legacy:
+        return
+    for key in legacy:
+        del settings[key]
+    changes.append(
+        f"{tab}/SAM3 Anima Width·Height: removed the keys of the replaced sliders "
+        "(the short-side slider keeps the source aspect ratio)"
+    )
+    negative_key = _panel_key(tab, TILE_REPAIR_NEGATIVE_LABEL, "value")
+    if settings.get(negative_key) == _TILE_REPAIR_NEGATIVE_OLD_DEFAULT:
+        settings[negative_key] = ""
+        changes.append(
+            f"{tab}/{TILE_REPAIR_NEGATIVE_LABEL}: old default "
+            f"{_TILE_REPAIR_NEGATIVE_OLD_DEFAULT!r} -> sd-scripts default ''"
+        )
+
+
 def migrate_ui_settings(
     settings: MutableMapping,
     *,
@@ -250,12 +313,16 @@ def migrate_ui_settings(
 ) -> List[str]:
     """Migrate a loaded ui-config mapping in place; returns one line per change."""
     changes: List[str] = []
+    tabs = tuple(tabs)
     for tab in tabs:
         _migrate_pag(settings, tab, script_file, changes)
         _migrate_rdc(settings, tab, script_file, changes)
         _migrate_dcw(settings, tab, script_file, changes)
         _migrate_cwm(settings, tab, script_file, changes)
         _migrate_cns(settings, tab, script_file, changes)
+        _migrate_skimmed(settings, tab, changes)
+    if TILE_REPAIR_TAB in tabs:
+        _migrate_tile_repair(settings, changes)
     return changes
 
 

@@ -790,8 +790,9 @@ Modulation Guidance를 쓰려면 768차원 CLIP-L safetensors를
 - SMC는 ComfyUI-DCW와 같은 `Off / Auto / SD1.5·2 / SDXL / SD3·3.5 / Flux /
   Qwen-Image / Cosmos·Wan / Custom` 프리셋을 제공합니다. `Auto`에서 Forge `Anima`는
   `Cosmos / Wan (lambda 6.0, k 0.20)`으로 판별되며, 직접 수치는 `Custom`에서만 사용됩니다.
-- CFG base가 켜지면 incoming에서 `w_eff`를 복원해 Forge의 `edit_strength`를 보존하고, 비선형 fit
-  오차가 크면 경고합니다.
+- CFG base의 배율은 원본 DCW(+a) cfg 훅처럼 Forge가 넘기는 `cond_scale`이고, 다른 CFG 함수가 없으면 Forge처럼
+  `edit_strength`를 곱해 보존합니다. incoming을 최소제곱으로 맞춘 값은 진단(`w_fit`)과 비선형 fit 경고에만 씁니다.
+  RescaleCFG처럼 다른 확장이 `sampler_cfg_function`을 걸어 두면 원본처럼 SMC·CWM만 비킵니다(경고 1회).
 - Skimmed CFG는 별도 스크립트(별도 아코디언)이며 CFG base보다 **먼저** 실행되고, skim 결과를
   Forge의 예측 tensor에 다시 써서 이후 SMC/APG/CWM·PAG delta·DCW가 모두 그 위에서
   동작합니다. Forge의 중복 메서드 정의로 `sorting_priority`가 실제 실행에서 무시되는 문제를
@@ -799,9 +800,10 @@ Modulation Guidance를 쓰려면 768차원 CLIP-L safetensors를
 - `Legacy CFG base mode` 아코디언의 라디오와 `Experimental stack`은 구버전 호환용이며
   위 토글과 OR로 합쳐집니다.
 - CWM `alpha high > +0.15`는 Anima 16채널 latent에서 캐릭터 분리를 만들 수 있어 UI 경고가 뜹니다.
-- DCW와 RDC도 각각 별도 토글입니다. RDC는 DCW의 Haar pass를 공유하는 step 간 EMA 보정이며,
-  `tau=0.15`, `alpha LL=0.03`, `alpha HH=0`을 시작값으로 제공합니다. HH는 텍스처가
-  뭉개질 수 있어 기본 0입니다.
+- RDC는 DCW의 Haar pass를 공유하는 step 간 EMA 보정입니다. 원본 ComfyUI-DCW처럼 따로 켜는 스위치가 없고
+  **Enable DCW가 켜져 있고 `tau > 0`**일 때만 돕니다. 기본값은 `tau=0`(끔), `alpha LL=0.03`, `alpha HH=0`이며
+  HH는 텍스처가 뭉개질 수 있어 기본 0입니다. DCW·CWM·CNS 기본값도 원본과 같습니다(DCW λ 0.05/0.01, CWM α 0,
+  CNS gamma scale 2.0).
 - UI와 XYZ의 **Attn Scale**은 같은 값이며 attention 점수가 아니라
   `scale × (cond − weak)` 보정 배율입니다.
 - PAG/SEG 공통 `Perturbation strength` 기본은 `0.75`, `1.0`이면 전체 perturbation입니다.
@@ -1010,18 +1012,17 @@ txt2img 도구 줄(붙여넣기·지우기·스타일 적용 버튼)의 **🪄**
 | **Anima Character Reference / ReStyler** (워크플로 6) | [Anima ReStyler workflow](https://civitai.com/models/2803070/anima-restyler) · [원 아이디어 Reddit 게시물](https://www.reddit.com/r/StableDiffusion/s/0Az0DgoaKj) | 워크플로 페이지 조건 참고 | 동작을 Forge 네이티브 img2img/reference로 재구현 (vendor·코드 복사 없음) |
 | **Anima 3.8B (Qwen3.5 / v2)** (워크플로 7) | [GumGum10/forge-anima-3.8B](https://github.com/GumGum10/forge-anima-3.8B) (commit `59c27e5`) | MIT | `sam3ext/anima38/` 에 편입 (저장소에 포함, 수정 사항은 `THIRD_PARTY_NOTICES.md`) |
 | **TIPO 프롬프트 확장** (별도 기능) | [KBlueLeaf/TIPO-v2.1-1B-A200M](https://huggingface.co/KBlueLeaf/TIPO-v2.1-1B-A200M) · 모델 코드 [KohakUwULLM](https://github.com/KohakuBlueleaf/KohakUwULLM) | 가중치 Kohaku License 1.0 · 코드 Apache-2.0 | `sam3ext/tipo/kohaku/` 에 모델 코드만 편입, 가중치는 사용자가 받을 때 HF 에서 |
-| **Anima Safe PAG** (별도 기능) | [iljung1106/comfyui-anima-safe-pag](https://github.com/iljung1106/comfyui-anima-safe-pag) | 미확인 | Anima 배치·블록 선택을 이식 (vendor 아님) |
+| **Anima Safe PAG** (별도 기능) | [iljung1106/comfyui-anima-safe-pag](https://github.com/iljung1106/comfyui-anima-safe-pag) (commit `905b0107`) | MIT | Anima 배치·블록 선택을 이식, σ 적용 구간·번호 파싱 편입(`sam3ext/guidance/sigma_window.py`) |
 | **DCW / RDC / CWM / SMC** | [namemechan/ComfyUI-DCW](https://github.com/namemechan/ComfyUI-DCW) | GPL-3.0 | 수식 기반 Forge 재작성 (vendor 아님) |
-| **DAVE** | [daheekwon/DAVE](https://github.com/daheekwon/DAVE) · [sorryhyun/ComfyUI-Anima-DAVE](https://github.com/sorryhyun/ComfyUI-Anima-DAVE) | MIT | Forge block 재구현 (vendor 아님) |
+| **DAVE** | [daheekwon/DAVE](https://github.com/daheekwon/DAVE) · [sorryhyun/ComfyUI-Anima-DAVE](https://github.com/sorryhyun/ComfyUI-Anima-DAVE) (commit `83143e8d`) | MIT | 초반 스텝 게이트 편입(`sam3ext/guidance/dave_gate.py`), block 계산은 Forge 재구현 |
 | **CNS-inspired Wavelet Noise** | [namemechan/comfyui-cns_sampler_patch](https://github.com/namemechan/comfyui-cns_sampler_patch) | GPL-3.0 | `color_noise_wavelet` 편입(`sam3ext/guidance/cns.py`), Forge 훅은 재작성 |
 | **Anima Modulation Guidance** | [Anzhc/Anima-Mod-Guidance-ComfyUI-Node](https://github.com/Anzhc/Anima-Mod-Guidance-ComfyUI-Node) · [quickjkee/modulation-guidance](https://github.com/quickjkee/modulation-guidance) · [yresearch/cosmos-pooled](https://huggingface.co/yresearch/cosmos-pooled) | MIT(코드 선언) / 자산 모델 카드 | Forge block 재작성 (vendor 아님) |
 | **Skimmed CFG** (별도 기능) | [Extraltodeus/Skimmed_CFG](https://github.com/Extraltodeus/Skimmed_CFG) | Apache-2.0 | 수식·σ 게이트 편입(`sam3ext/guidance/skimmed_cfg.py`), Forge 훅 |
 | **Detail Daemon** (별도 기능) | [muerrilla/sd-webui-detail-daemon](https://github.com/muerrilla/sd-webui-detail-daemon) (commit `1947999`) · [Jonseed/ComfyUI-Detail-Daemon](https://github.com/Jonseed/ComfyUI-Detail-Daemon) (commit `3394e44`) | MIT | schedule·σ 조회 함수 편입(`scripts/anima_detail_daemon.py`), Forge 훅 |
 | SAM3 검출 | Meta [facebook/sam3](https://huggingface.co/facebook/sam3) ([facebookresearch/sam3](https://github.com/facebookresearch/sam3)) | SAM License(Meta) | `sam3` PyPI 패키지 (저장소에 포함하지 않음) |
 
-'미확인' 은 원 저장소의 라이선스를 이 확장에서 아직 확인하지 못했다는 뜻입니다. 저장소에 함께 들어 있는 제3자
-파일(`sam3ext/anima38/`, TIPO 모델 코드, `assets/` 의 Qwen3.5 토크나이저·CLIP BPE 어휘)과 편입한 상류 함수(Skimmed
-CFG, Detail Daemon)의 출처와 라이선스는
+저장소에 함께 들어 있는 제3자 파일(`sam3ext/anima38/`, TIPO 모델 코드, `assets/` 의 Qwen3.5 토크나이저·CLIP BPE
+어휘)과 편입한 상류 함수(Skimmed CFG, Detail Daemon, Safe PAG 적용 구간, DAVE 게이트, CNS 재색칠)의 출처와 라이선스는
 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) 에 있습니다.
 
 원저자분들께 감사드립니다. 각 프로젝트의 라이선스 전문은 vendor 디렉터리의 `LICENSE` 파일을 참고하세요.
@@ -1067,5 +1068,5 @@ LoRA Manager(GPL-3.0)는 vendor 그대로 실행하되, `lora_manager_core.py`�
 - 사용자가 따로 받는 모델 가중치(SAM3, TIPO, IP-Adapter, Modulation Guidance 어댑터 등)는 이 라이선스의 대상이 아니며
   각 모델 배포처의 조건을 따릅니다.
 - Skimmed CFG 는 상류(Apache-2.0)의 수식 함수를, Detail Daemon 은 상류(MIT, muerrilla·Jonseed)의 schedule·σ 조회
-  함수를 그대로 편입했습니다(고지는 THIRD_PARTY_NOTICES.md). 위 출처 표에서 라이선스가 '미확인' 인 Safe PAG(이식)는
-  원 저장소의 조건을 아직 확인하지 못했습니다 — 재배포 전에 확인이 필요합니다.
+  함수를, Safe PAG·DAVE 는 상류(MIT)의 적용 구간·번호 파싱과 초반 스텝 게이트를, CNS 는 상류(GPL-3.0)의
+  `color_noise_wavelet` 을 그대로 편입했습니다(고지는 THIRD_PARTY_NOTICES.md).

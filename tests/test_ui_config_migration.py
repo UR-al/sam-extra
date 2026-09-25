@@ -395,5 +395,88 @@ class UiConfigMigrationTests(unittest.TestCase):
         self.assertIn("ui-config migration failed", log.call_args_list[0].args[0])
 
 
+
+EXTENSION_ROOT = Path(__file__).resolve().parents[1]
+SKIM = f"customscript/{migration.SKIMMED_SCRIPT_FILE}"
+FLIP = migration.SKIMMED_FLIP_LABEL
+NEGATIVE = f"txt2img/{migration.TILE_REPAIR_NEGATIVE_LABEL}/value"
+
+
+def _skimmed_legacy(tab):
+    # forge_sam3_extension@4d0028e:scripts/anima_skimmed_cfg.py:399-403 as Forge saved it.
+    return {f"{SKIM}/{tab}/{FLIP}/{field}": value for field, value in (
+        ("visible", True), ("value", 0.3), ("minimum", 0.0), ("maximum", 1.0), ("step", 0.05))}
+
+
+def _tile_repair_legacy(negative="blurry, low quality"):
+    # forge_sam3_extension@4d0028e:sam3ext/ui_anima.py as Forge saved it on the txt2img tab.
+    saved = {NEGATIVE: negative, "txt2img/SAM3 Anima Negative/visible": True}
+    for label in ("SAM3 Anima Width", "SAM3 Anima Height"):
+        for field, value in (("visible", True), ("value", 1024), ("minimum", 256),
+                             ("maximum", 4096), ("step", 32)):
+            saved[f"txt2img/{label}/{field}"] = value
+    return saved
+
+
+class OtherPanelMigrationTests(unittest.TestCase):
+    """Skimmed CFG ``Flip at`` bounds and the Tile-Repair negative default (plain dict rules)."""
+
+    def test_labels_and_new_values_are_the_extension_sources(self):
+        skimmed = (EXTENSION_ROOT / "scripts" / "anima_skimmed_cfg.py").read_text(encoding="utf-8")
+        flip = skimmed[skimmed.index(f'label="{FLIP}"'):][:200]
+        self.assertIn("step=0.01", flip)
+        panel = (EXTENSION_ROOT / "sam3ext" / "ui_anima.py").read_text(encoding="utf-8")
+        negative = panel[panel.index(f'label="{migration.TILE_REPAIR_NEGATIVE_LABEL}"'):][:120]
+        self.assertIn('value=""', negative)
+        for label in ("SAM3 Anima Width", "SAM3 Anima Height"):
+            self.assertNotIn(f'label="{label}"', panel)   # replaced: the old keys are never read
+
+    def test_skimmed_legacy_step_drops_the_bounds_and_keeps_the_value(self):
+        saved = {**_skimmed_legacy("txt2img"), **_skimmed_legacy("img2img")}
+        changes = migration.migrate_ui_settings(saved)
+        self.assertEqual(len(changes), 2)
+        for tab in migration.TABS:
+            with self.subTest(tab=tab):
+                for field in ("minimum", "maximum", "step"):
+                    self.assertNotIn(f"{SKIM}/{tab}/{FLIP}/{field}", saved)
+                self.assertEqual(saved[f"{SKIM}/{tab}/{FLIP}/value"], 0.3)
+        self.assertEqual(migration.migrate_ui_settings(saved), [])
+
+    def test_skimmed_new_step_is_untouched(self):
+        saved = _skimmed_legacy("txt2img")
+        saved[f"{SKIM}/txt2img/{FLIP}/step"] = 0.01
+        before = dict(saved)
+        self.assertEqual(migration.migrate_ui_settings(saved), [])
+        self.assertEqual(saved, before)
+
+    def test_tile_repair_old_default_negative_becomes_empty_once(self):
+        saved = _tile_repair_legacy()
+        changes = migration.migrate_ui_settings(saved)
+        self.assertEqual(saved[NEGATIVE], "")
+        self.assertFalse([key for key in saved if "Anima Width" in key or "Anima Height" in key])
+        self.assertEqual(len(changes), 2)
+        # Saved on purpose afterwards: the marker is gone, so it stays.
+        saved[NEGATIVE] = "blurry, low quality"
+        self.assertEqual(migration.migrate_ui_settings(saved), [])
+        self.assertEqual(saved[NEGATIVE], "blurry, low quality")
+
+    def test_tile_repair_user_negative_stays(self):
+        saved = _tile_repair_legacy("lowres, jpeg artifacts")
+        changes = migration.migrate_ui_settings(saved)
+        self.assertEqual(saved[NEGATIVE], "lowres, jpeg artifacts")
+        self.assertEqual(len(changes), 1)   # only the replaced slider keys
+
+    def test_tile_repair_without_the_legacy_sliders_is_untouched(self):
+        saved = {NEGATIVE: "blurry, low quality"}
+        self.assertEqual(migration.migrate_ui_settings(saved), [])
+        self.assertEqual(saved[NEGATIVE], "blurry, low quality")
+
+    def test_tile_repair_step_only_runs_for_the_txt2img_tab(self):
+        saved = _tile_repair_legacy()
+        self.assertEqual(migration.migrate_ui_settings(saved, tabs=iter(["img2img"])), [])
+        self.assertEqual(migration.migrate_ui_settings(saved, tabs=iter(["txt2img"]))[-1:],
+                         ["txt2img/SAM3 Anima Negative: old default 'blurry, low quality' -> sd-scripts default ''"])
+
+
 if __name__ == "__main__":
     unittest.main()

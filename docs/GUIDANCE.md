@@ -14,6 +14,10 @@ SAM3 처리 모듈은 초기화하지 않고 `sam3ext.guidance`의 경량 수학
 > 2026-07-24 추가된 Anima Modulation Guidance는 실제 권장 CLIP-L과 공식 170 MB
 > 어댑터의 로드·투영 및 Forge block AdaLN 주입을 검증했습니다. 이 릴리즈에서는 실제
 > checkpoint 이미지 A/B까지 완료했다는 뜻은 아닙니다.
+>
+> 2026-09-25~26 원본 동등성 작업(PAG σ 적용 구간, Skimmed CFG, DCW(+a)·RDC, DAVE, CNS, Detail Daemon을
+> 원본 ComfyUI 노드의 값·범위·적용 구간과 같게)은 원본 코드와 결과를 비교하는 CPU 단위 테스트로만
+> 확인했고, 아직 GPU 이미지로 다시 확인하지 않았습니다. 아래 2026-07-23 검증 로그는 그 전 코드의 것입니다.
 
 ## 구성
 
@@ -24,12 +28,15 @@ SAM3 처리 모듈은 초기화하지 않고 `sam3ext.guidance`의 경량 수학
 | `sam3ext/guidance/haar.py` | 4D/5D·홀수 크기 공용 Haar DWT/IDWT |
 | `sam3ext/guidance/cwm_smc.py` | CWM·SMC CFG base |
 | `scripts/anima_skimmed_cfg.py` | Skimmed CFG anti-burn (독립 스크립트·아코디언) |
+| `sam3ext/guidance/skimmed_cfg.py` | Skimmed CFG 수식·σ 게이트(원본 편입, Apache-2.0) |
+| `sam3ext/guidance/sigma_window.py` | PAG σ 적용 구간(원본 Safe PAG 노드의 판정 편입) |
 | `sam3ext/guidance/dcw.py` | post-CFG wavelet correction |
 | `sam3ext/guidance/dave.py` | Anima block DC attenuation |
 | `sam3ext/guidance/dave_gate.py` | DAVE 초반 스텝 게이트(원본 노드의 σ 스케줄 판정) |
 | `sam3ext/guidance/cns.py` | 기존 sampler noise의 wavelet 재색칠(원본 `color_noise_wavelet` 편입) |
 | `sam3ext/guidance/modulation.py` | 보조 CLIP-L·공식 어댑터 로드와 block AdaLN 투영 |
 | `scripts/anima_detail_daemon.py` | 별도 Detail Daemon 기능 |
+| `sam3ext/guidance/ui_config_migration.py` | 원본 기본값·범위로 바뀐 슬라이더의 `ui-config.json` 1회 이전 |
 
 ## 실제 처리 순서
 
@@ -42,7 +49,7 @@ shared.state.sampling_step / sampling_steps (한 스텝 지연 — 아래 참고
   → post-CFG #1: Skimmed CFG (활성 시 항상 명시적으로 맨 앞)
   → post-CFG #2: Guidance Suite
       1. CNS x_t 폴백 저장(기본 출처는 sampler step callback)
-      2. ADG skip이면 APG/SMC state reset 후 incoming 유지
+      2. ADG skip이면 APG momentum만 비우고 3·4 건너뜀(SMC 상태 유지, incoming = cond)
       3. CFG base 토글(SMC → APG → CWM, 켜진 것만)
       4. PAG/SEG/SLG delta 가산
       5. DCW / RDC
@@ -54,21 +61,24 @@ shared.state.sampling_step / sampling_steps (한 스텝 지연 — 아래 참고
 - step 비율은 wrapper 호출 횟수가 아니라 Forge의 `shared.state.sampling_step`을 읽습니다. low-VRAM 분할,
   regional conditioning, 2차 sampler가 범위 계산을 오염시키지 않습니다. 다만 Forge는 이 값을 그 스텝의 모델 호출
   **뒤**에 올리므로, 이 값을 쓰는 SEG/SLG·Adaptive Guidance의 Start/End 구간은 **한 스텝 늦게** 판정됩니다
-  (20 steps에서 5%만큼). PAG, DAVE, Detail Daemon은 원본 ComfyUI 노드처럼 모델 호출의 σ로 구간이나 스케줄 위치를
-  정해 이 지연이 없으므로, 같은 % 값이어도 시작 스텝이 하나 어긋날 수 있습니다.
+  (20 steps에서 5%만큼). PAG, Skimmed CFG, DAVE, Detail Daemon은 원본 ComfyUI 노드처럼 모델 호출의 σ로 구간이나
+  스케줄 위치를 정해 이 지연이 없으므로, 같은 % 값이어도 시작 스텝이 하나 어긋날 수 있습니다.
 - Perturbation Guidance(PAG/SEG/SLG)는 cond 행 사본(weak 행)을 배치에 덧붙여 한 forward로 돌리므로, 켜 둔
   구간에서는 샘플링 배치가 cond/uncond에 weak 행만큼 커져 활성 VRAM과 스텝 시간이 늘어납니다(PAG 하나면 대략 1.5배
   행 수, 첫 target 블록 앞은 `sam3_guidance_pag_prefix_dedup`이 줄여 줌).
 - `model_function_wrapper`는 하나만 둘 수 있습니다. 다른 확장이 이미 wrapper를 달아 두었으면 Suite가 그 생성 동안
   자기 것으로 덮어쓰고 콘솔에 한 번 알립니다(`another extension already installed a unet model_function_wrapper …`).
   그 확장의 wrapper 기능은 그 생성에서 빠집니다.
-- CFG base를 바꾸는 모드는 Forge의 incoming 결과에서 `w_eff`를 최소제곱으로 복원하므로
-  `edit_strength`가 소실되지 않습니다. custom/nonlinear CFG의 fit 오차가 크면 경고합니다.
+- CFG base를 바꾸는 모드의 배율은 원본 DCW(+a) cfg 훅처럼 Forge가 넘기는 `cond_scale`이고, 다른 CFG 함수가 없으면
+  Forge의 선형 CFG처럼 `edit_strength`를 곱하므로 `edit_strength`가 소실되지 않습니다. incoming 결과를 최소제곱으로
+  맞춘 값은 진단용(`[VERIFY]`의 `w_fit`)이며, custom/nonlinear CFG의 fit 오차가 크면 경고합니다.
 
 ## 1. PAG / SEG / SLG
 
 후반 블록의 약한 예측을 만들고 `scale × (cond − weak)`를 incoming CFG 결과에 더합니다.
-Anima 엔진 전용이며 ControlNet이 전달된 호출에서는 충돌 방지를 위해 쉬어 갑니다.
+Anima 엔진 전용이며 ControlNet이 전달된 호출에서는 충돌 방지를 위해 쉬어 갑니다. 이 ControlNet 가드는 원본
+ComfyUI 노드에는 없는 이 확장의 안전장치이며, 실제로 막힌 패스의 infotext에 `Anima Perturbation ControlNet guard`가
+남습니다.
 
 | 방식 | 현재 기본 동작 | 상태 |
 |---|---|---|
@@ -88,16 +98,25 @@ UI의 **Attn Scale**과 XYZ의 `[Anima Pert] Attn Scale`은 같은 값입니다.
 |---|---:|---|
 | Enable Perturbation Guidance | off | 전체 perturbation 토글 |
 | Attention method | PAG | PAG / SEG / None |
-| Attn Scale (PAG / SEG guidance scale) | 4.0 | `cond − weak` guidance 배율 |
+| Attn Scale (PAG / SEG guidance scale) | 4.0 | `cond − weak` guidance 배율. 범위 0–100(원본 노드와 같음, XYZ·API도 같은 범위) |
 | Perturbation strength | 0.75 | 공식 PAG→value / SEG→blurred query 보간, `1=전체` |
 | SEG Gaussian sigma | 100 | `>9999`는 spatially uniform query |
 | Legacy strength | 0.75 | Legacy 모드에서만 사용 |
-| Attention blocks | `18` | 빈칸도 안전 기본 `18` |
-| Attention heads | 빈칸 | 빈칸=전체, `0,2,4-7` 형식으로 일부 head만 선택 |
+| Attention blocks | `18` | 빈칸도 안전 기본 `18`. `20-18` 같은 역범위는 원본처럼 18–20으로 읽음(SLG·DAVE 블록 칸도 같음) |
+| Attention heads | 빈칸 | 빈칸=전체, `0,2,4-7` 형식으로 일부 head만 선택. 역범위는 블록과 같이 뒤집어 읽음 |
 | SLG enable / scale / blocks | off / 3.0 / `18` | layer-skip weak 예측 |
-| Start / End | 0.0 / 0.7 | 공통 적용 구간 |
+| Start / End | 0.0 / 0.7 | 공통 적용 구간. PAG는 σ 기준, SEG/SLG는 스텝 비율(아래) |
 | Rescale | 0.20 | PAG 보정량만 std 보정 |
 | Rescale mode | `full` | `full`=incoming CFG+guidance, `partial`=cond+guidance 기준 |
+
+PAG의 Start/End는 원본 노드([iljung1106/comfyui-anima-safe-pag@905b0107](https://github.com/iljung1106/comfyui-anima-safe-pag),
+MIT)처럼 붙일 때 모델의 `percent_to_sigma`로 σ 창을 한 번 만들고(0–1로 자르고, 뒤집혀 있으면 바꿈), 모델 호출마다
+현재 σ가 그 사이(양 끝 포함)인지 봅니다(`sam3ext/guidance/sigma_window.py`). 스텝 수·스케줄러·img2img denoise가
+달라도 같은 σ 구간이고 2차 sampler의 중간 평가도 σ로 판정합니다. 예를 들어 Anima(shift 3)의 기본 0.0–0.7은
+σ 1.0–0.5625라 simple 스케줄 20·28·30 steps에서 원본과 같이 15·20·22 steps에 걸립니다(예전 스텝 비율 판정은
+14·19·21). predictor가 없는 모델에서만 스텝 비율로 돌아갑니다. SEG와 SLG는 원본 PAG 노드에 없는 기능이라 계속
+Forge 스텝 비율(한 스텝 늦음)로 잽니다. infotext `Anima Perturbation Guidance`에 PAG σ 창이
+`pag_sigma_window=<상한>-<하한>`으로 남습니다.
 
 PAG 자체를 A/B 할 때는 `Rescale=0`, SLG/APG/ADG off로 두어야 원인을 분리할 수 있습니다.
 
@@ -134,6 +153,18 @@ MaHiRo/RescaleCFG/custom CFG를 쓰는 경우 먼저 전부 끈 상태로 비교
 적용 순서상 SMC는 error를 먼저 다듬고, APG는 그 error를 재투영하며, CWM은 마지막에
 대역별 배율을 적용합니다. APG가 켜져 있으면 CFG 배율은 APG가 이미 반영하므로 CWM은
 배율 1.0으로 그 결과 위에서 동작합니다.
+
+SMC·CWM은 원본 DCW(+a) ([namemechan/ComfyUI-DCW@66aaf9dd](https://github.com/namemechan/ComfyUI-DCW))의 cfg 훅과
+같게 동작합니다.
+
+- CFG 배율은 Forge가 넘기는 `cond_scale`입니다. 다른 CFG 함수가 없으면 Forge의 선형 CFG처럼 `edit_strength`를
+  곱합니다. incoming 결과를 `uncond + w × (cond − uncond)`로 최소제곱 맞춘 값은 진단용이라 `[VERIFY]`의
+  `w_fit`·`fit`와 비선형 CFG 경고에만 쓰입니다.
+- Enable CWM은 alpha low·high 중 하나라도 0이 아닐 때만 CFG를 바꿉니다(원본 `cwm_alpha_active`). 원본 기본값 0에서는
+  켜도 표준 CFG와 같습니다.
+- RescaleCFG·Dynamic Thresholding처럼 다른 확장이 `sampler_cfg_function`을 걸어 두면 원본처럼 SMC·CWM만 비키고
+  (콘솔 경고 1회) 그 확장의 CFG 결과를 둡니다. APG는 그래도 결과를 교체하고, PAG/SEG/SLG·DCW/RDC도 그대로
+  적용됩니다.
 
 `Legacy CFG base mode` 아코디언의 라디오와 `Experimental stack` 체크박스는 구버전
 호환용으로만 남아 있습니다. 저장된 infotext·API 호출·XYZ 그리드가 그대로 동작하도록
@@ -175,20 +206,25 @@ MaHiRo/RescaleCFG/custom CFG를 쓰는 경우 먼저 전부 끈 상태로 비교
 - `Enable APG` 체크박스는 이제 다른 토글과 무관하게 독립적으로 동작합니다.
 - `eta=1`, `norm=0`, `momentum=0`이면 표준 선형 CFG로 환원됩니다.
 - APG는 이 확장에서는 post-CFG denoised 공간 구현입니다. reference 구현과 픽셀 동일하지 않습니다.
-- **CFG > 1 전용**입니다. CFG=1(Forge가 넘기는 `cond_scale`로 판정)이면 SMC·APG·CWM을 모두 건너뛰고 콘솔에 한 번
-  경고하며, 이때는 PAG rescale 자동 끄기도 적용하지 않습니다(APG를 끈 생성과 같은 결과).
-- ADG가 uncond를 생략하는 순간 APG momentum과 SMC state를 즉시 비웁니다.
+- **CFG > 1 전용**입니다. CFG=1(Forge가 넘기는 `cond_scale`로 판정)이면 APG를 건너뛰고 콘솔에 한 번 경고하며,
+  이때는 PAG rescale 자동 끄기도 적용하지 않습니다(APG를 끈 생성과 같은 결과).
+- 원본 DCW(+a)는 SMC·CWM을 CFG 1에서도 돌리고, 이 확장도 SMC·CWM이 켜진 CFG 1 패스에는 원본처럼
+  `disable_cfg1_optimization`을 겁니다. 하지만 Forge는 CFG가 1이면 negative prompt를 인코딩하지 않아 uncond가
+  없으므로 그때는 SMC·CWM도 건너뜁니다(같은 경고 1회, 켜진 것만 이름이 적힘). CFG가 1이 아닌 패스에서 Forge의
+  'Ignore Negative Prompt during Early Steps'·NGMS가 negative를 건너뛴 스텝도 그대로 negative 없이 둡니다.
+- ADG가 uncond를 생략한 스텝에서는 APG momentum만 비웁니다. SMC의 이전 오차는 원본처럼 샘플링 한 번 동안
+  이어지므로 지우지 않습니다.
 
 ### CWM / SMC
 
 | 필드 | 기본값 | 주의 |
 |---|---:|---|
-| CWM alpha low | 0.30 | 초반 LL 대역 CFG 변화 |
-| CWM alpha high | 0.15 | 후반 HH 대역 CFG 변화 |
+| CWM alpha low | 0.0 | 초반 LL 대역 CFG 변화. 범위 −1–2, 원본 권장 시작 0.1–0.3 |
+| CWM alpha high | 0.0 | 후반 HH 대역 CFG 변화. 범위 −1–2, 원본 권장 시작 0.1–0.2 |
 | Enable SMC | off | 프리셋 값을 유지한 채 SMC master ON/OFF |
 | SMC preset | `Auto` | master가 켜졌을 때 모델군을 감지해 upstream 값을 선택 |
-| Custom lambda | 6.0 | `Custom`에서만 사용, UI 범위 0.5–30.0 |
-| Custom k | 0.10 | `Custom`에서만 사용, UI 범위 0–5.0. API 위치 인자가 짧아 이 칸(인덱스 27)이 빠지면 0.20 |
+| Custom lambda | 6.0 | `Custom`에서만 사용, 범위 0.5–30.0(API·XYZ 값도 이 범위로 맞춤) |
+| Custom k | 0.10 | `Custom`에서만 사용, 범위 0–5.0. API 위치 인자가 짧아 이 칸(인덱스 27)이 빠져도 0.10 |
 
 SMC 프리셋과 Auto 감지는
 [namemechan/ComfyUI-DCW](https://github.com/namemechan/ComfyUI-DCW)의 공개 계약을
@@ -225,14 +261,18 @@ CFG·perturbation 뒤 마지막에 live `x_t`와 denoised 예측의 Haar 대역 
 band_out = band_x0 + lambda_band(sigma) × channel_weight × (band_xt − band_x0)
 ```
 
-기본은 off, `lambda low=0.10`, `lambda high=0.02`입니다. 둘 다 0이면 bitwise identity
-fast-path입니다. 4D/5D latent와 홀수 H/W를 지원하며 dtype을 보존합니다. Anima flow sigma는
-`sigma/(sigma+1)` 최대치가 낮으므로 다른 EDM 예제와 수치 체감이 다를 수 있습니다.
+기본은 off, `lambda low=0.05`(범위 −0.5–0.5, step 0.005), `lambda high=0.01`(범위 −0.3–0.3, step 0.001)입니다.
+원본 DCW(+a) ([namemechan/ComfyUI-DCW@66aaf9dd](https://github.com/namemechan/ComfyUI-DCW))의 기본값·범위입니다.
+둘 다 0이고 RDC도 꺼져 있으면 bitwise identity fast-path입니다. 4D/5D latent와 홀수 H/W를 지원하며 dtype을
+보존합니다. Anima flow sigma는 `sigma/(sigma+1)` 최대치가 낮으므로 다른 EDM 예제와 수치 체감이 다를 수 있습니다.
+원본 post-CFG 훅처럼 모든 모델 평가에 적용하므로, Adaptive Guidance가 uncond를 건너뛴 스텝(incoming이 cond 예측)에도
+DCW/RDC가 걸립니다.
 
 RDC는 같은 Haar 분해 결과의 각 대역에 generation-local EMA를 유지해 여러 step에 걸친
-구도·포즈 drift를 되돌립니다. 이 확장에서는 upstream의 `tau=0` 비활성 계약에 더해 명시적
-`Enable RDC`를 제공하므로, 슬라이더 값을 유지한 채 A/B할 수 있고 DCW 순간 보정을 끈 채
-RDC만 켤 수도 있습니다.
+구도·포즈 drift를 되돌립니다. 원본처럼 따로 켜는 스위치가 없습니다. **Enable DCW가 켜져 있고 tau > 0**일 때만
+DCW 보정 안에서 돌고, tau 기본값 0은 끔입니다. DCW lambda를 둘 다 0으로 두면 RDC만 쓸 수 있습니다. 예전
+`Enable RDC` 체크박스는 화면에서 뺐지만 script argument 58 자리는 남아 있어, API가 `False`를 보내면 RDC를 끄고
+`True`나 생략이면 위 규칙을 따릅니다. XYZ `[Anima RDC] Enable`도 `False`일 때만 끕니다.
 
 ```text
 beta = 1 - exp(-abs(sigma_norm_prev - sigma_norm_now) / tau)
@@ -240,11 +280,11 @@ ema_new = (1 - beta) * ema_prev + beta * band_now
 band_out = band_now - alpha * (band_now - ema_new)
 ```
 
-| 필드 | UI 시작값 | 주의 |
+| 필드 | 기본값 | 주의 |
 |---|---:|---|
-| RDC tau | 0.15 | 0이면 수학적으로 no-op. 작을수록 짧은 기억, 클수록 초기 구도 고착 가능 |
-| RDC alpha LL | 0.03 | 권장 시작 0.02–0.05. 포즈·구조가 굳으면 낮춤 |
-| RDC alpha HH | 0.0 | 기본 0 권장. 필요해도 0.01 이하부터, 높으면 텍스처 흐림 |
+| RDC tau | 0.0 | 0 = RDC 끔(원본 기본). 범위 0–0.5. 0.05–0.10은 빠른 반응(짧은 기억), 0.2–0.3은 느리고 부드러운 보정, 클수록 초기 구도 고착 가능 |
+| RDC alpha LL | 0.03 | 범위 0–0.3. 권장 시작 0.02–0.05. 포즈·구조가 굳으면 낮춤 |
+| RDC alpha HH | 0.0 | 범위 0–0.1. 기본 0 권장. 필요해도 0.01 이하부터, 높으면 텍스처 흐림 |
 
 첫 스텝과 해상도/device가 바뀐 첫 스텝은 EMA 기준만 seed하고 보정하지 않습니다. 새 sampling
 pass가 시작될 때 상태를 비워 hires pass나 다음 생성으로 누출하지 않습니다.
@@ -267,6 +307,9 @@ out = x − strength × mean(x, token/spatial axes)
     `sigmas[steps - t_enc - 1:]`부터 돕니다. 이 시작 칸은 샘플링 직전에 Forge의 `setup_img2img_steps`로 구합니다.
     끝에서 `스텝 수 + 1`칸을 세는 방식은 쓰지 않습니다. `DDIM` 스케줄 타입은 24·28·30·32 steps에서 σ를
     `스텝 수 + 2`개 내놓아서, 끝에서 세면 첫 σ가 빠지고 켜지는 구간이 한 스텝 길어집니다.
+  - DAVE는 `postprocess`까지 붙어 있어 ADetailer의 내부 img2img나 img2img-hires-fix처럼 이 스크립트가 준비하지
+    않은 샘플링에도 걸립니다. 그런 실행은 `on_cfg_denoiser`로 지금 도는 요청을 알아내, 위 시작 칸 대신 그 실행의
+    `스텝 수 + 1`칸을 끝에서 셉니다(원본 노드도 detailer가 넘긴 그 실행의 σ로 판정합니다).
   - `n`을 그 스텝 수로 두고 `k = max(1, min(n, round(tau × n)))`, 스텝 번호가 `k`보다 작을 때 켭니다.
     tau 0.10이면 20·25 steps는 0-1, 28·30 steps는 0-2, 50 steps는 0-4입니다(파이썬 `round`라 25 steps는 2.5→2).
   - 스케줄에 없는 σ(2차 sampler의 중간점, s_churn)는 원본처럼 0번 스텝으로 보고 **항상 켭니다**.
@@ -351,14 +394,53 @@ dpmpp_2s_ancestral·dpmpp_sde의 중간점이나 인페인트의 섞인 latent�
 
 - 기본 off, `Skip after=0.5`
 - low-VRAM이 cond/uncond를 따로 호출하면 생략할 수 없어 속도 차이가 없습니다.
-- 생략 스텝에서는 perturbation도 쉬고 APG/SMC state를 비웁니다.
+- 생략 스텝에서는 perturbation과 CFG base(SMC·APG·CWM)도 쉬고 APG momentum만 비웁니다(SMC의 이전 오차는 유지).
+  DCW/RDC는 원본 post-CFG 훅처럼 그 스텝에도 적용됩니다.
 - `Keep every N`은 생략 구간에서도 N번째 스텝마다 uncond를 유지합니다.
 - 특정 속도 향상률은 보장하지 않습니다. 검증 로그의 `SKIPPED-UNCOND`로 실제 생략을 확인하세요.
 
 ## 8. Detail Daemon
 
 별도 `Anima Detail Daemon` 아코디언의 sigma schedule 기능입니다. Guidance Suite의 CFG base와는
-별도이며, 모든 모델에서 동작합니다. 자세한 필드는 UI 설명을 따르세요.
+별도이며, 추가 forward 없이 sampler σ만 바꿔 모든 모델에서 동작합니다. 값·범위·σ 조회는 ComfyUI 노드
+[Jonseed/ComfyUI-Detail-Daemon@3394e44](https://github.com/Jonseed/ComfyUI-Detail-Daemon)와 같고, 노드가 다루지 않는
+Forge 동작(hires 패스, 지원하지 않는 sampler)은 [muerrilla/sd-webui-detail-daemon](https://github.com/muerrilla/sd-webui-detail-daemon)을
+따릅니다. 스케줄 함수는 두 원본(MIT)에서 그대로 가져왔습니다(고지는 `THIRD_PARTY_NOTICES.md`).
+
+```text
+sigma' = sigma × max(1e-6, 1 − schedule(sigma) × 0.1 × CFG)
+```
+
+- CFG는 hires 패스에서도 늘 `p.cfg_scale`입니다. 양수 amount는 σ를 낮춰 디테일을 늘리고 음수는 매끈하게 합니다.
+  0이거나 끄면 아무것도 바꾸지 않습니다. 배율의 아래쪽은 1e-6에서 막고 위쪽 상한은 없습니다(원본과 같음).
+- `schedule`은 샘플러가 도는 스텝 수만큼 만든 곡선입니다. 모델 호출마다 그 σ를 샘플러의 σ 목록에서 찾아(가장
+  가까운 칸, 칸 사이는 선형 보간, 목록 범위 밖이면 적용 안 함) 값을 읽으므로 Forge 스텝 번호의 한 스텝 지연이 없고,
+  2차 sampler의 중간 평가도 노드와 같은 값을 읽습니다.
+- σ 목록은 Forge의 `sampling_sigmas`입니다. txt2img는 목록 전체, img2img와 hires는 Forge와 같은
+  `sigmas[steps - t_enc - 1:]`부터 셉니다(DAVE와 같은 규칙이라 `DDIM` 스케줄 타입이 σ를 `스텝 수 + 2`개 내놓아도
+  맞습니다). 콜백은 `postprocess`까지 켜져 있어 ADetailer 내부 img2img·img2img-hires-fix처럼 이 스크립트가 준비하지
+  않은 실행에도 걸리고, 그런 실행은 그 실행의 `스텝 수 + 1`칸을 끝에서 셉니다. σ 목록을 내놓지 않는 DDIM·PLMS
+  sampler는 muerrilla처럼 모델 호출 수로 위치를 셉니다.
+- **Hires Pass**를 끄면(기본) 기본 패스에만, 켜면 hires 패스에만 적용합니다(muerrilla와 같음). DPM adaptive·HeunPP2
+  sampler에서는 생성 전체에서 꺼집니다.
+- σ는 muerrilla처럼 제자리에서 바꿔 Forge의 NGMS 판정·soft inpainting도 바뀐 σ를 봅니다.
+
+| 필드 | 기본값 | 범위 · step |
+|---|---:|---|
+| Enable Detail Daemon | off | |
+| Hires Pass | off | off = 기본 패스만, on = hires 패스만 |
+| Detail amount | 0.10 | −5–5 · 0.01 (노드 `detail_amount`와 같은 값) |
+| Start / End | 0.2 / 0.8 | 0–1 · 0.01 |
+| Bias | 0.5 | 0–1 · 0.01 |
+| Exponent | 1.0 | 0–10 · 0.05 |
+| Start / End offset | 0.0 / 0.0 | −1–1 · 0.01 |
+| Fade | 0.0 | 0–1 · 0.05 |
+| Smooth | on | 코사인 스무딩 |
+
+원본에 없는 프리셋·Multiplier·CFG 결합 토글은 없습니다. 예전 API 호출이 어긋나지 않도록 위치 인자 1(preset)·
+10(multiplier)·12(cfg_couple) 자리는 숨긴 채 남겨 두고 읽지 않으며, Hires Pass는 인자 13입니다. XYZ는
+`[Detail Daemon]` Enable·Amount·Start·End·Bias, infotext는 `Anima Detail Daemon`(amount·range·bias·exponent·offset·
+fade·smooth·hires)입니다.
 
 ## 조합 원칙
 
@@ -381,7 +463,8 @@ dpmpp_2s_ancestral·dpmpp_sde의 중간점이나 인페인트의 섞인 latent�
 - `[Anima APG]`, `[Anima AdaptiveG]`
 - `[Anima CFG]`: Base Mode, Experimental Stack
 - `[Anima CWM]`, `[Anima SMC]`
-- `[Anima DCW]`, `[Anima RDC]`, `[Anima DAVE]`, `[Anima CNS]`
+- `[Anima DCW]`, `[Anima RDC]`, `[Anima DAVE]`, `[Anima CNS]` — `[Anima RDC] Enable`은 예전 RDC 스위치 자리라
+  `False`일 때만 RDC를 끄고, `True`면 `Enable DCW + tau > 0` 규칙을 따릅니다
 - `[Anima Mod]`: Enable, Direction Weight, Start/End Block
 - `[Anima Skim]`(Skimmed CFG, 7축): Enable, Skimming CFG, Full Skim Negative, Disable Flipping Filter, Start, End,
   Flip At
@@ -405,7 +488,13 @@ Anima CNS Wavelet Noise
 Anima Modulation Guidance
 Anima PAG prefix dedup      (PAG/SEG/SLG 켤 때)
 Anima SEG separable blur    (공식 SEG blur 를 쓸 때)
+Anima Perturbation ControlNet guard  (ControlNet 가드로 PAG/SEG/SLG 가 막힌 패스)
+Anima Skimmed CFG           (별도 스크립트)
+Anima Detail Daemon         (별도 스크립트)
 ```
+
+`Anima DCW`는 DCW가 실제로 돌 때(lambda가 0이 아니거나 RDC가 켜짐), `Anima RDC`는 RDC가 켜졌을 때(Enable DCW +
+tau > 0) 남습니다. `Anima Perturbation Guidance`에는 PAG σ 창(`pag_sigma_window=`)이 함께 적힙니다.
 
 확장 목록 아래 `Anima Reference-Latent PoC (debug / 안전)`에서
 `Log Guidance verification summary`를 잠시 켜면 다음을 확인할 수 있습니다.
@@ -414,7 +503,7 @@ Anima SEG separable blur    (공식 SEG blur 를 쓸 때)
 [AnimaSafePAG] patched SelfCrossAttention.torch_attention_op (staticmethod) ✅
 [AnimaSafePAG] attention perturb active ✅ hits=... relative_raw_delta=...
 [AnimaSafePAG] [VERIFY] verdict: perturb=..., APG=..., Adaptive=...
-[AnimaSafePAG] [VERIFY] suite: attention=..., CFG=... (w_eff=..., fit=...),
+[AnimaSafePAG] [VERIFY] suite: attention=..., CFG=... (w_eff=..., w_fit=..., fit=...),
                                DCW=..., RDC=..., DAVE=..., CNS=..., Modulation=...
 ```
 
@@ -437,22 +526,53 @@ python -m unittest discover -s tests -v
 검증 범위는 attention staticmethod binding/weak-row 한정 변경, official SEG 실제 H/W,
 Haar 4D/5D·홀수 크기 round-trip, CWM/SMC/DCW/DAVE 중립값, RDC tau=0 identity와
 step/해상도 state reset, APG 표준 CFG 환원,
-SMC/CWM 비정상 수치 정리, ADG state flush, CNS 결정성·RNG 비소비·표준편차 보존,
+SMC/CWM 비정상 수치 정리, ADG state flush, CNS 결정성·RNG 비소비,
 Skimmed callback 실제 prepend 순서와 PAG scale 반응, CLIP adapter 수식·Forge Anima
 shape 추론·block AdaLN 무변이 주입, pass 종료 tensor 해제와 Notebook 자산
 구조를 포함합니다.
+
+원본 대조 테스트(`tests/test_anima_safe_pag_origin.py`, `test_skimmed_cfg.py`, `test_dcw_origin.py`,
+`test_dave_origin.py`, `test_cns_origin.py`, `test_detail_daemon_origin.py`)는 각 원본 노드의 해당 코드를 고정 커밋
+그대로 테스트 안에 두고(DCW·CNS는 `tests/_origin_*.py`) 같은 입력에서 이 확장과 결과를 비교합니다. 모두 CPU
+테스트이며 GPU 이미지 비교는 아닙니다. `test_ui_config_migration.py`는 아래 `ui-config.json` 이전 규칙을 검사합니다.
+
+## 저장된 UI 값 1회 이전 (`ui-config.json`)
+
+Forge는 UI를 만들 때 슬라이더의 값·최소·최대·step을 라벨 이름을 키로 `ui-config.json`에 저장해 두고 다음 시작에
+다시 적용합니다. 원본 동등성 작업에서 기본값·범위만 바뀌고 라벨은 그대로인 슬라이더는 예전 값이 되살아나므로,
+`on_before_ui`에서 UI를 만들기 전에 이 파일을 한 번 고칩니다(`sam3ext/guidance/ui_config_migration.py`, Guidance
+아코디언과 Skimmed CFG의 txt2img·img2img 슬라이더, txt2img 탭 Tile-Repair 패널의 네거티브).
+
+| 대상 | 바꾸는 것 |
+|---|---|
+| PAG Attn Scale | 저장된 최대가 예전 15이면 저장된 범위만 지움(값은 유지, 기본 4.0은 그대로) |
+| RDC | 예전 `Enable RDC` 저장값이 있을 때만: 끈 채로 저장된 tau가 예전 기본 0.15면 0으로. 사용자가 바꾼 tau는 유지(이제 Enable DCW를 켜면 RDC도 돔 — 끄려면 tau 0). 예전 스위치 키는 지움 |
+| DCW lambda | `lambda high`에 예전 범위(±0.5, step 0.005)가 저장돼 있을 때만: 그 범위를 지우고, 예전 기본값 그대로인 low 0.10 → 0.05, high 0.02 → 0.01. ±0.3 밖의 high는 ±0.3으로 |
+| CWM alpha | 저장된 최대가 예전 1.0인 슬라이더만: 범위를 지우고, 예전 기본값 그대로인 low 0.30·high 0.15 → 0 |
+| CNS | strength의 예전 step 0.01, gamma power의 예전 최소 0.05가 저장돼 있으면 범위를 지움(0.1 아래 gamma power는 0.1로). 라벨이 바뀐 gamma scale은 예전 라벨 키를 지우고, 예전 기본 3.0이 아닌 값만 새 라벨로 옮김(0.1–25로 맞춤) |
+| Skimmed CFG Flip at | 저장된 step이 예전 0.05이면 저장된 범위를 지움(값은 유지, 새 step 0.01) |
+| Tile-Repair 네거티브 | 예전 `SAM3 Anima Width`·`Height` 슬라이더 키가 남아 있을 때만: 그 키를 지우고, 네거티브가 예전 기본값 `blurry, low quality` 그대로면 sd-scripts 기본값 빈 칸으로. 직접 적은 네거티브는 유지 |
+
+바꿀 것이 있으면 원본을 같은 폴더의 `ui-config.json.bak-anima-guidance-<날짜-시각>`으로 먼저 복사하고, 새 내용은
+임시 파일(`ui-config.json.tmp-anima-guidance`)에 쓴 뒤 한 번에 바꿔 넣습니다. 바꾼 항목은 콘솔
+`[AnimaSafePAG] ui-config.json migrated to the upstream PAG/DCW(+a)/CNS/Skimmed CFG/Tile-Repair defaults/ranges:`
+아래에 줄마다 나옵니다.
+모든 규칙은 이전이 스스로 지우는 예전 표지(저장된 예전 범위·예전 스위치 키)에 걸려 있어, 그 뒤에 사용자가 저장한 값은
+다시 건드리지 않습니다. 파일이 없거나 읽을 수 없으면 그대로 둡니다.
+
+Detail Daemon 슬라이더는 이 이전의 대상이 아닙니다. Amount는 라벨이 바뀌어 v0.21.2의 저장값이 적용되지 않습니다.
 
 ## 크레딧
 
 | 기능 | 참고 프로젝트/논문 | 구현 형태 |
 |---|---|---|
-| PAG | [iljung1106/comfyui-anima-safe-pag](https://github.com/iljung1106/comfyui-anima-safe-pag), [PAG 논문](https://arxiv.org/abs/2403.17377) | Forge 이식 + strength/head/rescale mode |
+| PAG | [iljung1106/comfyui-anima-safe-pag](https://github.com/iljung1106/comfyui-anima-safe-pag) (MIT), [PAG 논문](https://arxiv.org/abs/2403.17377) | Forge 이식 + strength/head/rescale mode, σ 적용 구간·번호 파싱 편입(`sam3ext/guidance/sigma_window.py`, 고지는 THIRD_PARTY_NOTICES.md) |
 | SEG | [SusungHong/SEG-SDXL](https://github.com/SusungHong/SEG-SDXL), [SEG 논문](https://arxiv.org/abs/2408.00760) | Anima H/W용 재구현 |
 | SLG | Stability AI SD3.5 / Wan 커뮤니티 구현 | Forge block wrapper |
 | APG | [MythicalChu/ComfyUI-APG_ImYourCFGNow](https://github.com/MythicalChu/ComfyUI-APG_ImYourCFGNow), [APG 논문](https://arxiv.org/abs/2410.02416) | post-CFG 재구현 |
 | DCW/RDC/CWM/SMC | [namemechan/ComfyUI-DCW](https://github.com/namemechan/ComfyUI-DCW) (GPL-3.0) | 공개 수식 기반 Forge 재작성, vendor 아님 |
 | Skimmed CFG | [Extraltodeus/Skimmed_CFG](https://github.com/Extraltodeus/Skimmed_CFG) (Apache-2.0) | 수식·σ 게이트 편입(`sam3ext/guidance/skimmed_cfg.py`), Forge post-CFG 훅 |
-| DAVE | [daheekwon/DAVE](https://github.com/daheekwon/DAVE) (MIT), [ComfyUI-Anima-DAVE](https://github.com/sorryhyun/ComfyUI-Anima-DAVE) (MIT), [논문](https://arxiv.org/abs/2606.06813) | block 수식 재구현 |
+| DAVE | [daheekwon/DAVE](https://github.com/daheekwon/DAVE) (MIT), [ComfyUI-Anima-DAVE](https://github.com/sorryhyun/ComfyUI-Anima-DAVE) (MIT), [논문](https://arxiv.org/abs/2606.06813) | 초반 스텝 게이트 편입(`sam3ext/guidance/dave_gate.py`, 고지는 THIRD_PARTY_NOTICES.md), block 수식 재구현 |
 | CNS | [namemechan/comfyui-cns_sampler_patch](https://github.com/namemechan/comfyui-cns_sampler_patch) (GPL-3.0), [논문](https://arxiv.org/abs/2605.30332) | `color_noise_wavelet` 편입(`sam3ext/guidance/cns.py`, 고지는 THIRD_PARTY_NOTICES.md), Forge noise 원천·callback 훅 |
 | Anima Modulation Guidance | [Anzhc/Anima-Mod-Guidance-ComfyUI-Node](https://github.com/Anzhc/Anima-Mod-Guidance-ComfyUI-Node) (MIT 선언), [quickjkee/modulation-guidance](https://github.com/quickjkee/modulation-guidance) (MIT), [yresearch/cosmos-pooled adapter](https://huggingface.co/yresearch/cosmos-pooled) | 공개 수식·어댑터 형식 기반 Forge block 재작성, vendor 아님 |
 | Detail Daemon | [muerrilla/sd-webui-detail-daemon](https://github.com/muerrilla/sd-webui-detail-daemon) (MIT), [Jonseed/ComfyUI-Detail-Daemon](https://github.com/Jonseed/ComfyUI-Detail-Daemon) (MIT) | schedule·σ 조회 함수 편입(고지는 THIRD_PARTY_NOTICES.md), Forge 훅 |
