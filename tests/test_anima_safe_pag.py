@@ -19,7 +19,7 @@ ROOT = Path(__file__).resolve().parents[1]
 def _load_pag_module():
     """Load the extension script without booting the full WebUI."""
     modules_stub = types.ModuleType("modules")
-    callbacks_stub = types.SimpleNamespace(on_before_ui=lambda fn: None)
+    callbacks_stub = types.SimpleNamespace(on_before_ui=lambda fn: None, on_cfg_denoiser=lambda fn: None)
 
     class Script:
         pass

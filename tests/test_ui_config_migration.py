@@ -1,8 +1,10 @@
-"""One-time ui-config.json migration for the DCW(+a) sliders (sam3ext/guidance/ui_config_migration.py).
+"""One-time ui-config.json migration for the PAG scale and DCW(+a) sliders (sam3ext/guidance/ui_config_migration.py).
 
 The DCW(+a) parity change moved five sliders to the upstream ranges/defaults
 (origin: namemechan/ComfyUI-DCW@66aaf9dd:dcw_node.py:636-667 lambda_l/lambda_h, :675-704
 alpha_l/alpha_h, :757-765 rdc_tau default 0.0) and hid the RDC switch, but kept the labels.
+The PAG parity change raised the Attn Scale maximum 15 -> 100 under the same label
+(origin: iljung1106/comfyui-anima-safe-pag@905b0107:__init__.py:201).
 Forge's real ``UiLoadsave`` (modules/ui_loadsave.py, loaded from the install below) reapplies
 the saved value/minimum/maximum/step per label, so these tests feed it a ui-config holding the
 pre-parity keys (the values an install saved before the change) and check what the UI and the
@@ -74,6 +76,9 @@ PREFIX = "customscript/anima_safe_pag.py"
 TAU = "RDC tau (EMA 기억 구간)"
 CWM_LOW = "CWM alpha low (초반 저주파 CFG)"
 CWM_HIGH = "CWM alpha high (후반 고주파 CFG)"
+# Same label before and after the scale-100 change (forge_sam3_extension@861ac02:
+# scripts/anima_safe_pag.py:2703 and now).
+PAG_SCALE = "Attn Scale — PAG / SEG guidance scale (cond−weak 배율)"
 
 # UI/script-argument index (scripts/anima_safe_pag.py ui()).
 ARG = {
@@ -107,12 +112,21 @@ def _legacy_tab(tab, *, dcw_low, dcw_high, cwm_low, cwm_high, rdc_on=False, tau=
     return settings
 
 
+def _legacy_pag_scale(tab, value):
+    """The PAG scale slider the pre-parity script saved (forge_sam3_extension@861ac02:
+    scripts/anima_safe_pag.py:2702-2707): same label, 0..15 step .1."""
+    return _slider(tab, PAG_SCALE, value, 0.0, 15.0, 0.1)
+
+
 def _installed_like():
     """The shape found in this install's ui-config.json: txt2img has user-set DCW
-    0.08/0.015 and CWM low 0.2, img2img still holds the old defaults."""
+    0.08/0.015, CWM low 0.2 and PAG scale 2, img2img still holds the old defaults;
+    both PAG scale sliders still carry the old maximum 15."""
     return {
         **_legacy_tab("txt2img", dcw_low=0.08, dcw_high=0.015, cwm_low=0.2, cwm_high=0.15),
+        **_legacy_pag_scale("txt2img", 2),
         **_legacy_tab("img2img", dcw_low=0.1, dcw_high=0.02, cwm_low=0.3, cwm_high=0.15),
+        **_legacy_pag_scale("img2img", 4.0),
     }
 
 
@@ -211,6 +225,57 @@ class UiConfigMigrationTests(unittest.TestCase):
         self.assertNotIn(f"{PREFIX}/txt2img/Enable RDC/visible", saved)
         self.assertEqual(self._rdc_on_after_ticking_enable_dcw("txt2img"), (True, 0.2))
 
+    def test_rdc_saved_off_keeps_a_user_set_tau(self):
+        """Only the old default tau 0.15 means "never touched" and moves to upstream's 0
+        (off). A tau the user set stays even with the old switch saved off (user decision:
+        saved values stay); the log says RDC now follows Enable DCW + tau."""
+        self._write(_legacy_tab(
+            "txt2img", dcw_low=0.1, dcw_high=0.02, cwm_low=0.3, cwm_high=0.15,
+            rdc_on=False, tau=0.27,
+        ))
+        changes = migration.migrate_ui_config_file(self.path)
+        saved = self._read()
+        self.assertEqual(saved[f"{PREFIX}/txt2img/{TAU}/value"], 0.27)
+        self.assertNotIn(f"{PREFIX}/txt2img/Enable RDC/value", saved)
+        self.assertNotIn(f"{PREFIX}/txt2img/Enable RDC/visible", saved)
+        self.assertTrue(
+            any(TAU in line and "0.27" in line and "Enable DCW" in line for line in changes),
+            changes,
+        )
+        self.assertEqual(self._rdc_on_after_ticking_enable_dcw("txt2img"), (True, 0.27))
+
+    # -- PAG scale ------------------------------------------------------------
+
+    def _pag_scale(self, tab):
+        inputs, _loadsave = self._forge_ui(tab)
+        return next(item for item in inputs if getattr(item, "label", None) == PAG_SCALE)
+
+    def test_pag_scale_reaches_the_upstream_maximum_and_keeps_the_saved_scale(self):
+        """Origin range 0..100 (iljung1106/comfyui-anima-safe-pag@905b0107:__init__.py:201).
+        Forge reapplies the saved maximum 15 under the unchanged label unless it is dropped;
+        the saved scale (user-set 2 / default 4) stays."""
+        self._write(_installed_like())
+        expected = {"txt2img": 2, "img2img": 4.0}
+        for tab, value in expected.items():
+            with self.subTest(tab=tab, migrated=False):
+                slider = self._pag_scale(tab)
+                self.assertEqual((slider.maximum, slider.value), (15.0, value))
+        changes = migration.migrate_ui_config_file(self.path)
+        self.assertTrue(any(PAG_SCALE in line for line in changes), changes)
+        for tab, value in expected.items():
+            with self.subTest(tab=tab, migrated=True):
+                slider = self._pag_scale(tab)
+                self.assertEqual(
+                    (slider.minimum, slider.maximum, slider.step, slider.value),
+                    (0.0, 100.0, 0.1, value),
+                )
+
+    def test_pag_scale_saved_with_the_new_maximum_is_untouched(self):
+        settings = _slider("txt2img", PAG_SCALE, 12.5, 0.0, 100.0, 0.1)
+        before = dict(settings)
+        self.assertEqual(migration.migrate_ui_settings(settings), [])
+        self.assertEqual(settings, before)
+
     # -- slider bounds / defaults ------------------------------------------
 
     def test_sliders_reach_the_upstream_bounds_and_old_defaults_move(self):
@@ -267,6 +332,8 @@ class UiConfigMigrationTests(unittest.TestCase):
         saved = self._read()
         self.assertEqual(saved[f"{PREFIX}/img2img/DCW lambda high/step"], 0.001)
         self.assertEqual(saved[f"{PREFIX}/img2img/{CWM_LOW}/maximum"], 2.0)
+        self.assertEqual(saved[f"{PREFIX}/img2img/{PAG_SCALE}/maximum"], 100.0)
+        self.assertEqual(saved[f"{PREFIX}/txt2img/{PAG_SCALE}/value"], 2)
 
         # The user now saves the old defaults and tau on purpose: left alone.
         saved[f"{PREFIX}/img2img/DCW lambda low/value"] = 0.1

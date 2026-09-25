@@ -35,7 +35,15 @@ reads the shared ``_DD`` state (set per sampling pass by the script's
 muerrilla (``params.sigma *= ...``), so the rest of ``CFGDenoiser.forward`` (the
 NGMS check, soft inpainting's ``MaskBlendArgs``) sees the adjusted sigma too.
 The sigma list comes from ``transformer_options['sampling_sigmas']``, which Forge
-sets before every k-diffusion run. The CompVis timestep samplers (DDIM, PLMS)
+sets before every k-diffusion run. That is Forge's whole list: txt2img walks all
+of it, img2img and the hires pass walk ``sigmas[steps - t_enc - 1:]``, so for the
+pass the script set up the node's list is taken from that start (Forge's own
+``setup_img2img_steps``), not counted back from the end — the ``DDIM`` schedule
+type returns more than ``steps + 1`` sigmas. The callback stays on until
+``postprocess`` (muerrilla's does too), so it also sees sampling runs made from
+``postprocess_image`` without this script's hook (ADetailer's inner img2img,
+img2img-hires-fix); those count their own ``denoiser.steps + 1`` sigmas back
+from the end. The CompVis timestep samplers (DDIM, PLMS)
 do not set it and have no ComfyUI counterpart; there the position falls back to
 muerrilla's model-call counter. Everything is guarded; on any error it leaves
 sigma untouched, so enabling this can never break a generation.
@@ -97,6 +105,8 @@ _DD: dict = {
     "sched": None,         # cached schedule array
     "sched_key": None,     # (steps, params…) the cache was built for
     "node": None,          # cached sigma lookup of this pass (see _node_lookup)
+    "offset": 0,           # where this pass starts in sampling_sigmas (_forge_sampling_offset)
+    "offset_p": None,      # the request ``offset`` was worked out for (see _run_offset)
 }
 
 # muerrilla's Detail Daemon scales the schedule by a fixed 0.1 before it touches
@@ -222,8 +232,48 @@ def get_dd_schedule(
     return torch.lerp(dd_schedule[idxlow], dd_schedule[idxhigh], ratio).item()
 
 
+def _is_img2img_request(p) -> bool:
+    """``p`` is a ``StableDiffusionProcessingImg2Img`` (or a subclass).
+
+    Checked by class name so the helper needs no ``modules.processing`` import."""
+    return any(
+        cls.__name__ == "StableDiffusionProcessingImg2Img"
+        for cls in type(p).__mro__
+    )
+
+
+def _forge_sampling_offset(p):
+    """Index in Forge's ``sampling_sigmas`` of the first sigma this pass samples.
+
+    txt2img's first pass walks the whole list (``KDiffusionSampler.sample``),
+    so the offset is 0. img2img and the hires pass walk
+    ``sigmas[steps - t_enc - 1:]`` (modules/sd_samplers_kdiffusion.py:145-148).
+    Their ``steps, t_enc`` come from Forge's own ``setup_img2img_steps`` with
+    the argument ``processing.py`` passes it: the hires pass uses
+    ``hr_second_pass_steps or steps`` (:1552), img2img uses None (:1920).
+    Returns None when the offset cannot be worked out; the run then counts back
+    like a run the script did not set up (``_run_offset``). It is not counted
+    back from the end with ``denoiser.steps`` otherwise, because
+    some schedulers (Forge's ``ddim_scheduler``) return more than
+    ``steps + 1`` sigmas. Same rule as DAVE's gate
+    (``scripts/anima_safe_pag.py`` ``_forge_sampling_offset``)."""
+    if getattr(p, "is_hr_pass", False):
+        requested = getattr(p, "hr_second_pass_steps", 0) or getattr(p, "steps", None)
+    elif _is_img2img_request(p):
+        requested = None
+    else:
+        return 0
+    try:
+        from modules import sd_samplers_common
+
+        steps, t_enc = sd_samplers_common.setup_img2img_steps(p, requested)
+        return int(steps) - int(t_enc) - 1
+    except Exception:
+        return None
+
+
 def _executed_sigmas(denoiser):
-    """Return ``(sampling_sigmas, sampler_steps)`` for this k-diffusion run, or None.
+    """Return Forge's ``sampling_sigmas`` for this k-diffusion run, or None.
 
     ComfyUI hands the node's sampler the sigmas it samples. Forge stores the
     whole list in ``transformer_options['sampling_sigmas']`` right before it
@@ -240,7 +290,30 @@ def _executed_sigmas(denoiser):
         return None
     if sigmas is None or len(sigmas) < 2:
         return None
-    return sigmas, int(getattr(denoiser, "steps", 0) or 0)
+    return sigmas
+
+
+def _run_offset(denoiser, src) -> int:
+    """Index in ``src`` of the first sigma this sampling run walks.
+
+    The start ``process_before_every_sampling`` worked out belongs to the
+    request it was given (``denoiser.p`` is that ``p`` for the pass's own
+    sampling, processing.py:1380/:1546/:1914). The callback is global and stays
+    on until ``postprocess``, like muerrilla's, so it also sees runs made from
+    ``postprocess_image`` without that hook: ADetailer's inner img2img (a new
+    ``p``) and img2img-hires-fix's ``sample_img2img(copy(p), ..., steps=...)``.
+    Those count the run's own ``denoiser.steps + 1`` (``launch_sampling(t_enc + 1)``)
+    sigmas back from the end, which is the list they walk whenever the scheduler
+    returns ``steps + 1`` sigmas; muerrilla also reads the run's own step counts.
+    """
+    offset = _DD["offset"]
+    pass_p = _DD["offset_p"]
+    if pass_p is not None and getattr(denoiser, "p", None) is pass_p and isinstance(offset, int):
+        return offset
+    sampler_steps = int(getattr(denoiser, "steps", 0) or 0)
+    if 0 < sampler_steps < len(src) - 1:
+        return len(src) - (sampler_steps + 1)
+    return 0
 
 
 def _node_lookup(denoiser):
@@ -250,18 +323,18 @@ def _node_lookup(denoiser):
     """
     if torch is None:
         return None
-    found = _executed_sigmas(denoiser)
-    if found is None:
+    src = _executed_sigmas(denoiser)
+    if src is None:
         return None
-    src, sampler_steps = found
+    offset = _run_offset(denoiser, src)
     cache = _DD["node"]
-    if cache is not None and cache["src"] is src and cache["steps"] == sampler_steps:
+    if cache is not None and cache["src"] is src and cache["offset"] == offset:
         return cache["lookup"]
     sigmas = src
-    if 0 < sampler_steps < len(src) - 1:
-        # img2img samples only the tail ``sigmas[steps - t_enc - 1:]``: its last
-        # t_enc + 2 entries, and launch_sampling(t_enc + 1) set denoiser.steps.
-        sigmas = src[len(src) - (sampler_steps + 1):]
+    if 0 < offset < len(src) - 1:
+        # img2img / hires walk ``sigmas[steps - t_enc - 1:]`` of Forge's list;
+        # the node is handed exactly the list its sampler walks.
+        sigmas = src[offset:]
     sched = _get_schedule(len(sigmas) - 1)
     # origin: Jonseed/ComfyUI-Detail-Daemon@3394e44:detail_daemon_node.py:282-288
     dd_schedule = torch.tensor(
@@ -272,7 +345,7 @@ def _node_lookup(denoiser):
     sigmas_cpu = sigmas.detach().clone().cpu()
     sigma_max, sigma_min = float(sigmas_cpu[0]), float(sigmas_cpu[-1]) + 1e-05
     lookup = (sigmas_cpu, dd_schedule, sigma_min, sigma_max)
-    _DD["node"] = {"src": src, "steps": sampler_steps, "lookup": lookup}
+    _DD["node"] = {"src": src, "offset": offset, "lookup": lookup}
     return lookup
 
 
@@ -556,6 +629,10 @@ class AnimaDetailDaemon(scripts.Script):
                 sched=None,       # force schedule rebuild for this pass
                 sched_key=None,
                 node=None,
+                # Where this pass's sampler starts in sampling_sigmas, and the
+                # request it was worked out for (other runs count back, _run_offset).
+                offset=_forge_sampling_offset(p),
+                offset_p=p,
             )
         except Exception as e:
             _DD["on"] = False
@@ -579,3 +656,4 @@ class AnimaDetailDaemon(scripts.Script):
     def postprocess(self, p, processed, *args):
         _DD["on"] = False
         _DD["node"] = None  # drop the sampler's sigma tensor
+        _DD["offset_p"] = None  # and the request

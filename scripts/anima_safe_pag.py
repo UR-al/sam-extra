@@ -105,6 +105,7 @@ from sam3ext.guidance.runtime import GuidanceRuntime
 from sam3ext.guidance.sigma_window import percent_range_to_sigmas, sigma_active
 from sam3ext.guidance.ui_config_migration import (
     CNS_GAMMA_SCALE_LABEL,
+    PAG_SCALE_LABEL,
     migrate_ui_config_file,
 )
 try:
@@ -458,8 +459,14 @@ _DAVE: dict = {
     "schedule_ok": True,
     # Where this pass's walked sigmas start in ``sampling_sigmas``
     # (_forge_sampling_offset): 0 for txt2img, steps - t_enc - 1 for
-    # img2img/hires, None = unknown (whole list). Set at every attach.
+    # img2img/hires, None = unknown (whole list). Set at every attach,
+    # together with the request it belongs to (``offset_p``).
     "offset": None,
+    "offset_p": None,
+    # The sampling run the next block calls belong to (_dave_run_callback):
+    # its request and ``launch_sampling`` step count (see _dave_offset).
+    "run_p": None,
+    "run_steps": 0,
 }
 
 _CNS: dict = {
@@ -1093,6 +1100,53 @@ def _sampler_publishes_sigmas(p) -> bool:
     return not bool(getattr(denoiser, "classic_ddim_eps_estimation", False))
 
 
+def _dave_run_callback(params) -> None:
+    """Remember which sampling run the coming block calls belong to.
+
+    Forge fires ``on_cfg_denoiser`` before every model call with the running
+    denoiser (modules/sd_samplers_cfg_denoiser.py:133-134): its ``p`` is the
+    request the sampler was given and its ``steps`` the ``launch_sampling``
+    count (sd_samplers_common.py). DAVE stays attached until ``postprocess``,
+    so runs made from ``postprocess_image`` without this script's
+    ``process_before_every_sampling`` (ADetailer's inner img2img,
+    img2img-hires-fix's ``sample_img2img(copy(p), ...)``) reach the blocks too."""
+    if not _DAVE.get("on"):
+        return
+    denoiser = getattr(params, "denoiser", None)
+    _DAVE["run_p"] = getattr(denoiser, "p", None)
+    try:
+        _DAVE["run_steps"] = int(getattr(denoiser, "steps", 0) or 0)
+    except (TypeError, ValueError):
+        _DAVE["run_steps"] = 0
+
+
+script_callbacks.on_cfg_denoiser(_dave_run_callback)
+
+
+def _dave_offset(schedule):
+    """Index in ``schedule`` of the first sigma the running sampling walks.
+
+    The attach-time offset (``_forge_sampling_offset``) belongs to the request
+    it was worked out for, the pass's own sampling. Any other run counts its own
+    ``launch_sampling`` steps + 1 sigmas back from the end — the list it walks
+    whenever the scheduler returns ``steps + 1`` sigmas; the original node, fed
+    that run's sigmas by a detailer, gates on them the same way. With no run
+    seen yet the attach-time offset stands."""
+    offset = _DAVE.get("offset")
+    pass_p = _DAVE.get("offset_p")
+    run_p = _DAVE.get("run_p")
+    if run_p is None or run_p is pass_p:
+        return offset
+    run_steps = int(_DAVE.get("run_steps") or 0)
+    try:
+        total = len(schedule)
+    except TypeError:
+        return None
+    if 0 < run_steps < total - 1:
+        return total - (run_steps + 1)
+    return 0
+
+
 def _dave_gate_open(args, kwargs) -> bool:
     """DAVE's early-step gate for this block call — the original node's gate.
 
@@ -1100,7 +1154,7 @@ def _dave_gate_open(args, kwargs) -> bool:
     sorryhyun/ComfyUI-Anima-DAVE@83143e8d:nodes.py:91-106, 199-208): the
     forward's sigma (Forge: ``transformer_options['sigmas']``) is looked up in
     the schedule the sampler walks — Forge's ``sampling_sigmas`` from the
-    attach-time offset on (``_forge_sampling_offset``) — and DAVE runs while
+    running sampling's offset on (``_dave_offset``) — and DAVE runs while
     its index is below ``k = max(1, min(n, round(tau·n)))``; an off-schedule sigma (a
     second-order midpoint) is step 0, so on. ``ForwardGateCache`` shares the
     lookup across the pooled blocks of one forward. Forge's timestep samplers
@@ -1113,11 +1167,12 @@ def _dave_gate_open(args, kwargs) -> bool:
         step, total = _sampling_position()
         return dave_step_gate(step, total, tau)
     options = _block_transformer_options(args, kwargs) or {}
+    schedule = options.get("sampling_sigmas")
     return _DAVE["gate"].active(
         tau,
-        options.get("sampling_sigmas"),
+        schedule,
         options.get("sigmas"),
-        _DAVE.get("offset"),
+        _dave_offset(schedule),
     )
 
 
@@ -3187,11 +3242,12 @@ def _make_pag_xyz_axis() -> None:
 
 
 def _migrate_saved_ui_config() -> None:
-    """Carry an existing ui-config.json over the DCW(+a)/CNS parity change (one-time).
+    """Carry an existing ui-config.json over the PAG/DCW(+a)/CNS parity changes (one-time).
 
-    The DCW/RDC/CWM labels are the ui-config keys and did not change, so Forge's
-    UiLoadsave would reapply the old RDC tau 0.15 (while the removed RDC switch's
-    saved False no longer applies), the old slider bounds and the old 2x defaults.
+    The PAG scale/DCW/RDC/CWM labels are the ui-config keys and did not change, so
+    Forge's UiLoadsave would reapply the old PAG scale maximum 15, the old RDC tau 0.15
+    (while the removed RDC switch's saved False no longer applies), the old slider
+    bounds and the old 2x defaults.
     The CNS strength/gamma power bounds would come back the same way, and the
     renamed CNS gamma scale would drop a value the user saved under its old label.
     on_before_ui runs before ui.create_ui() builds UiLoadsave (webui.py,
@@ -3204,7 +3260,7 @@ def _migrate_saved_ui_config() -> None:
     changes = migrate_ui_config_file(path, script_file=Path(__file__).name)
     if changes:
         _log(
-            "ui-config.json migrated to the upstream DCW(+a)/CNS defaults/ranges:\n  "
+            "ui-config.json migrated to the upstream PAG/DCW(+a)/CNS defaults/ranges:\n  "
             + "\n  ".join(changes)
         )
 
@@ -3325,7 +3381,9 @@ class AnimaSafePAG(scripts.Script):
                 elem_id="anima_safe_pag_method",
             )
             scale = gr.Slider(
-                label="Attn Scale — PAG / SEG guidance scale (cond−weak 배율)",
+                # Same label as the pre-parity 0~15 slider: the saved maximum 15 is
+                # dropped once by _migrate_saved_ui_config.
+                label=PAG_SCALE_LABEL,
                 # 원본 노드 scale 범위 0~100 (iljung1106/comfyui-anima-safe-pag@905b0107:__init__.py:201)
                 minimum=0.0, maximum=100.0, step=0.1, value=4.0,
                 info="이미지가 찢어지거나 배경·구도가 과하게 변하면 이 값을 먼저 낮추세요.",
@@ -3961,7 +4019,10 @@ class AnimaSafePAG(scripts.Script):
             dcw_steps=0,
             rdc_steps=0,
         )
-        _DAVE.update(on=False, targets=set(), steps=0, offset=None)
+        _DAVE.update(
+            on=False, targets=set(), steps=0, offset=None, offset_p=None,
+            run_p=None, run_steps=0,
+        )
         _CNS.update(
             on=False, warned=False, capture="post_cfg", callback_seen=False,
             scope="pass",
@@ -4640,6 +4701,9 @@ class AnimaSafePAG(scripts.Script):
             gate=ForwardGateCache(),
             schedule_ok=_sampler_publishes_sigmas(p),
             offset=_forge_sampling_offset(p),
+            offset_p=p,
+            run_p=None,
+            run_steps=0,
         )
         if not mod_ok:
             _MOD.update(
@@ -5090,7 +5154,10 @@ class AnimaSafePAG(scripts.Script):
             dcw_steps=0,
             rdc_steps=0,
         )
-        _DAVE.update(on=False, targets=set(), steps=0, offset=None)
+        _DAVE.update(
+            on=False, targets=set(), steps=0, offset=None, offset_p=None,
+            run_p=None, run_steps=0,
+        )
         _CNS.update(
             on=False, warned=False, capture="post_cfg", callback_seen=False,
             scope="pass",

@@ -25,12 +25,15 @@ Software. THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND.
 """
 from __future__ import annotations
 
+import ast
+import copy
 import importlib.util
 import os
 import sys
 import types
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import numpy as np
 import torch
@@ -330,6 +333,57 @@ def flow_sigmas(steps, shift=3.0):
 
 
 # ---------------------------------------------------------------------------
+# Forge host code that decides which sigmas a pass walks, read from the Forge
+# checkout this extension lives in (not re-derived).
+# ---------------------------------------------------------------------------
+
+_FORGE = ROOT.parents[1]
+
+
+def _forge_function(relpath, name, namespace):
+    """One top-level function of the Forge checkout, executed in ``namespace``."""
+    source = (_FORGE / relpath).read_text(encoding="utf-8")
+    for node in ast.parse(source).body:
+        if isinstance(node, ast.FunctionDef) and node.name == name:
+            code = compile(ast.Module(body=[node], type_ignores=[]), str(_FORGE / relpath), "exec")
+            scope = dict(namespace)
+            exec(code, scope)  # noqa: S102 - Forge's own function body
+            return scope[name]
+    raise AssertionError(f"{name} not found in {relpath}")
+
+
+def _setup_img2img_steps(fix_steps=False):
+    # origin: Haoming02/sd-webui-forge-classic@e33f40e4:modules/sd_samplers_common.py:43-52
+    return _forge_function(
+        "modules/sd_samplers_common.py", "setup_img2img_steps",
+        {"opts": types.SimpleNamespace(img2img_fix_steps=fix_steps)},
+    )
+
+
+# origin: Haoming02/sd-webui-forge-classic@e33f40e4:modules/sd_schedulers.py:124-133
+# (ddim_scheduler, the "DDIM" schedule type; ComfyUI's "ddim_uniform" is the same list)
+_FORGE_DDIM = _forge_function("modules/sd_schedulers.py", "ddim_scheduler", {"torch": torch})
+
+
+def ddim_sigmas(steps, shift=3.0):
+    """Forge's DDIM schedule type on Anima's flow model sigmas (k_prediction.py:190-194)."""
+    t = torch.arange(1, 1001, 1) / 1000
+    inner = types.SimpleNamespace(sigmas=shift * t / (1 + (shift - 1) * t))
+    return _FORGE_DDIM(steps, float(inner.sigmas[0]), float(inner.sigmas[-1]), inner, "cpu")
+
+
+class StableDiffusionProcessingImg2Img(types.SimpleNamespace):
+    """Stands in for modules.processing.StableDiffusionProcessingImg2Img (matched by name)."""
+
+
+def _forge_modules(fix_steps=False):
+    """``modules`` with Forge's real ``setup_img2img_steps`` behind ``sd_samplers_common``."""
+    stub = types.ModuleType("modules")
+    stub.sd_samplers_common = types.SimpleNamespace(setup_img2img_steps=_setup_img2img_steps(fix_steps))
+    return stub
+
+
+# ---------------------------------------------------------------------------
 # Forge side: p, CFGDenoiser and CFGDenoiserParams as the callback sees them
 # ---------------------------------------------------------------------------
 
@@ -354,12 +408,12 @@ def _curve(args):
 
 
 def _p(cfg_scale=5.0, is_hr_pass=False, sampler_name="Euler", hr_cfg=2.0, refiner_cfg=None,
-       sampling_sigmas=None, **extra):
+       sampling_sigmas=None, request_cls=types.SimpleNamespace, **extra):
     # sd_samplers_kdiffusion.py:192/:246 — transformer_options["sampling_sigmas"] = sigmas
     unet = types.SimpleNamespace(model_options={"transformer_options": {}})
     if sampling_sigmas is not None:
         unet.model_options["transformer_options"]["sampling_sigmas"] = sampling_sigmas
-    return types.SimpleNamespace(
+    return request_cls(
         cfg_scale=cfg_scale, is_hr_pass=is_hr_pass, sampler_name=sampler_name, hr_cfg=hr_cfg,
         refiner_cfg=refiner_cfg, extra_generation_params={},
         sd_model=types.SimpleNamespace(forge_objects=types.SimpleNamespace(unet=unet)), **extra,
@@ -392,10 +446,18 @@ class ForgeDenoiser:
         return x
 
 
-def forge_run(p, args, sampler, sigmas_run, *, batch=2, calls_per_step=1, refiner_pass=False, classic=False):
-    """One Forge sampling pass: process_before_every_sampling, then the sampler's model calls."""
-    dd.AnimaDetailDaemon().process_before_every_sampling(p, *args)
-    steps = len(sigmas_run) - 1
+def forge_run(p, args, sampler, sigmas_run, *, batch=2, calls_per_step=1, refiner_pass=False, classic=False,
+              sampler_steps=None, forge_modules=None):
+    """One Forge sampling pass: process_before_every_sampling, then the sampler's model calls.
+
+    ``sampler_steps`` is what Forge's ``launch_sampling`` puts on the denoiser
+    (txt2img: the requested steps, img2img/hires: ``t_enc + 1``); by default the
+    number of steps in ``sigmas_run``. ``forge_modules`` stands in for Forge's
+    ``modules`` package while the pass is set up."""
+    patched = {} if forge_modules is None else {"modules": forge_modules}
+    with mock.patch.dict(sys.modules, patched):
+        dd.AnimaDetailDaemon().process_before_every_sampling(p, *args)
+    steps = len(sigmas_run) - 1 if sampler_steps is None else sampler_steps
     denoiser = ForgeDenoiser(p, steps=steps, total_steps=steps * calls_per_step,
                              refiner_pass=refiner_pass, classic=classic)
     sampler(denoiser, torch.zeros(batch, 1), sigmas_run)
@@ -585,15 +647,20 @@ class StrengthOriginTests(unittest.TestCase):
         self.assertAlmostEqual(call_count, 0.84567, places=5)
 
     def test_img2img_runs_the_tail_like_the_node(self):
-        # sample_img2img: sigma_sched = sigmas[steps - t_enc - 1:], launch_sampling(t_enc + 1), while
-        # transformer_options["sampling_sigmas"] keeps the full list. The node is handed the tail.
+        # sample_img2img: steps, t_enc = setup_img2img_steps(p, steps); sigma_sched = sigmas[steps - t_enc - 1:];
+        # launch_sampling(t_enc + 1), while transformer_options["sampling_sigmas"] keeps the full list
+        # (sd_samplers_kdiffusion.py:145-148, :192-195). The node is handed the tail.
         full = flow_sigmas(30)
-        for t_enc in (0, 1, 14, 28):
-            tail = full[30 - t_enc - 1:]
+        for denoise in (0.02, 0.05, 0.5, 0.95):
+            p = _p(cfg_scale=4.0, sampling_sigmas=full, request_cls=StableDiffusionProcessingImg2Img,
+                   steps=30, denoising_strength=denoise)
+            total, t_enc = _setup_img2img_steps()(p, None)
+            self.assertEqual(total, 30)
+            tail = full[total - t_enc - 1:]
             for name, (sampler, calls) in SECOND_ORDER.items():
                 with self.subTest(t_enc=t_enc, sampler=name):
-                    ours, _ = forge_run(_p(cfg_scale=4.0, sampling_sigmas=full), _args(amount=0.8), sampler, tail,
-                                        calls_per_step=calls)
+                    ours, _ = forge_run(p, _args(amount=0.8), sampler, tail, calls_per_step=calls,
+                                        sampler_steps=t_enc + 1, forge_modules=_forge_modules())
                     _assert_same_calls(self, ours, node_run(_args(amount=0.8), sampler, tail, cfg=4.0))
 
     def test_sigma_outside_the_sampled_range_is_untouched(self):
@@ -659,6 +726,176 @@ class StrengthOriginTests(unittest.TestCase):
                 expected = torch.ones(2)
                 expected *= 1 - sched[idx] * .1 * cfg
                 self.assertTrue(torch.equal(ours[call_idx], expected), (ours[call_idx], expected))
+
+
+class ForgeWalkedListTests(unittest.TestCase):
+    """The node is handed the list Forge's sampler walks, also when a scheduler returns extra sigmas.
+
+    Forge's DDIM schedule type returns ``steps + 2`` sigmas at 24/28/30/32 steps, so
+    ``launch_sampling``'s step count (``denoiser.steps``) is not ``len(sigmas) - 1``.
+    txt2img walks the whole list; img2img and hires walk it from ``steps - t_enc - 1``
+    (Forge's own ``setup_img2img_steps``), never counted back from the end."""
+
+    ARGS = _args(amount=0.8)
+    CFG = 4.0
+
+    def test_forge_ddim_schedule_type_returns_extra_sigmas(self):
+        for steps in (24, 28, 30, 32):
+            with self.subTest(steps=steps):
+                self.assertEqual(len(ddim_sigmas(steps)), steps + 2)
+
+    def test_txt2img_ddim_schedule_type_walks_the_whole_list(self):
+        # KDiffusionSampler.sample: sigmas = get_sigmas(p, steps), sampling_sigmas = sigmas,
+        # launch_sampling(steps, ...) — the sampler walks every sigma (sd_samplers_kdiffusion.py:204-252).
+        for steps in (24, 28, 30, 32):
+            full = ddim_sigmas(steps)
+            for name, (sampler, calls) in SECOND_ORDER.items():
+                with self.subTest(steps=steps, sampler=name):
+                    p = _p(cfg_scale=self.CFG, sampling_sigmas=full, steps=steps)
+                    ours, _ = forge_run(p, self.ARGS, sampler, full, calls_per_step=calls, sampler_steps=steps)
+                    _assert_same_calls(self, ours, node_run(self.ARGS, sampler, full, cfg=self.CFG))
+
+    def test_txt2img_ddim_28_schedule_value_at_step_10(self):
+        # Review case: DDIM schedule type, 28 steps → 30 sigmas, a 29-entry node schedule.
+        # Step 10 is schedule29[10] = 0.05 * 8 (amount 0.8); counting 28 + 1 sigmas back
+        # from the end dropped the first sigma and read a 28-entry curve instead.
+        full = ddim_sigmas(28)
+        p = _p(cfg_scale=self.CFG, sampling_sigmas=full, steps=28)
+        given, adjusted = _one_call(p, self.ARGS, full, full[10], sampler_steps=28)
+        sched29 = make_detail_daemon_schedule(29, 0.2, 0.8, 0.5, 0.8, 1.0, 0.0, 0.0, 0.0, True)
+        self.assertAlmostEqual(float(sched29[10]), 0.4, places=9)
+        expected = float(torch.tensor(sched29, dtype=torch.float32)[10])  # the node's float32 dd_schedule
+        self.assertTrue(torch.equal(adjusted, given * node_sigma_factor(expected, self.CFG)),
+                        (adjusted, given * node_sigma_factor(expected, self.CFG)))
+
+    def test_img2img_ddim_schedule_type_starts_where_forge_starts(self):
+        extra = 0
+        for steps, denoise in ((28, 0.5), (30, 0.6), (24, 0.75), (32, 0.35)):
+            for fix_steps in (False, True):
+                p = _p(cfg_scale=self.CFG, request_cls=StableDiffusionProcessingImg2Img,
+                       steps=steps, denoising_strength=denoise)
+                total, t_enc = _setup_img2img_steps(fix_steps)(p, None)  # processing.py:1920 passes no steps
+                full = ddim_sigmas(total)
+                extra += len(full) > total + 1
+                p.sd_model.forge_objects.unet.model_options["transformer_options"]["sampling_sigmas"] = full
+                walked = full[total - t_enc - 1:]
+                for name, (sampler, calls) in SECOND_ORDER.items():
+                    with self.subTest(steps=steps, denoise=denoise, fix_steps=fix_steps, sampler=name):
+                        ours, _ = forge_run(p, self.ARGS, sampler, walked, calls_per_step=calls,
+                                            sampler_steps=t_enc + 1, forge_modules=_forge_modules(fix_steps))
+                        _assert_same_calls(self, ours, node_run(self.ARGS, sampler, walked, cfg=self.CFG))
+        self.assertGreater(extra, 0)  # the cases include lists longer than steps + 1
+
+    def test_hires_pass_starts_where_forge_starts(self):
+        # processing.py:1552 — sample_img2img(..., steps=self.hr_second_pass_steps or self.steps)
+        args = _args(amount=0.8, hires=True)
+        for steps, hr_steps, denoise in ((28, 0, 0.5), (28, 10, 0.5), (30, 0, 0.4), (20, 28, 0.7)):
+            p = _p(cfg_scale=self.CFG, is_hr_pass=True, steps=steps, hr_second_pass_steps=hr_steps,
+                   denoising_strength=denoise)
+            total, t_enc = _setup_img2img_steps()(p, hr_steps or steps)
+            full = ddim_sigmas(total)
+            p.sd_model.forge_objects.unet.model_options["transformer_options"]["sampling_sigmas"] = full
+            walked = full[total - t_enc - 1:]
+            for name, (sampler, calls) in SECOND_ORDER.items():
+                with self.subTest(steps=steps, hr_steps=hr_steps, denoise=denoise, sampler=name):
+                    ours, _ = forge_run(p, args, sampler, walked, calls_per_step=calls,
+                                        sampler_steps=t_enc + 1, forge_modules=_forge_modules())
+                    _assert_same_calls(self, ours, node_run(args, sampler, walked, cfg=self.CFG))
+
+    def test_offset_is_forges_start_index(self):
+        cases = [
+            (_p(steps=28, denoising_strength=0.5), None, 0),  # txt2img first pass
+            (_p(request_cls=StableDiffusionProcessingImg2Img, steps=28, denoising_strength=0.5), None, None),
+            (_p(is_hr_pass=True, steps=28, hr_second_pass_steps=0, denoising_strength=0.5), 28, None),
+            (_p(is_hr_pass=True, steps=28, hr_second_pass_steps=10, denoising_strength=0.5), 10, None),
+        ]
+        for p, requested, expected in cases:
+            if expected is None:
+                total, t_enc = _setup_img2img_steps()(p, requested)
+                expected = total - t_enc - 1
+            with self.subTest(img2img=type(p).__name__, is_hr_pass=p.is_hr_pass):
+                with mock.patch.dict(sys.modules, {"modules": _forge_modules()}):
+                    self.assertEqual(dd._forge_sampling_offset(p), expected)
+
+    def test_without_forge_the_offset_is_unknown(self):
+        p = _p(request_cls=StableDiffusionProcessingImg2Img, steps=28, denoising_strength=0.5)
+        with mock.patch.dict(sys.modules, {"modules": types.ModuleType("modules")}):
+            self.assertIsNone(dd._forge_sampling_offset(p))
+
+
+class NestedRunTests(unittest.TestCase):
+    """Sampling runs this script's ``process_before_every_sampling`` did not set up.
+
+    The cfg-denoiser callback is global and stays on until ``postprocess``, like
+    muerrilla's (registered in ``process``, removed in ``postprocess``,
+    detail_daemon.py:256-272), so it also sees runs made from
+    ``postprocess_image`` (processing.py:1068, before ``postprocess`` at :1180):
+    ADetailer's inner img2img with only its selected scripts, and
+    img2img-hires-fix's ``sampler.sample_img2img(copy(p), ..., steps=self.steps)``
+    (img2img_hires_fix.py:95, :194, :201). The start index worked out for the
+    pass belongs to that pass's ``p``; these runs get the list they walk."""
+
+    CFG = 4.0
+
+    def _outer_pass(self, hires):
+        """The generation's own pass (txt2img 28 steps, or its hires pass) with DD on for it."""
+        args = _args(amount=0.8, hires=hires)
+        if hires:
+            p = _p(cfg_scale=self.CFG, is_hr_pass=True, steps=28, hr_second_pass_steps=0,
+                   denoising_strength=0.5)
+            total, t_enc = _setup_img2img_steps()(p, 28)
+            full = flow_sigmas(total)
+            p.sd_model.forge_objects.unet.model_options["transformer_options"]["sampling_sigmas"] = full
+            forge_run(p, args, euler, full[total - t_enc - 1:], sampler_steps=t_enc + 1,
+                      forge_modules=_forge_modules())
+        else:
+            full = flow_sigmas(28)
+            p = _p(cfg_scale=self.CFG, sampling_sigmas=full, steps=28)
+            forge_run(p, args, euler, full, sampler_steps=28, forge_modules=_forge_modules())
+        self.assertTrue(dd._DD["on"])
+        return p, args
+
+    def _nested_run(self, p, total, t_enc, sampler, calls):
+        """Forge's sample_img2img on ``p`` with no process_before_every_sampling of this script."""
+        full = flow_sigmas(total)
+        p.sd_model.forge_objects.unet.model_options["transformer_options"]["sampling_sigmas"] = full
+        walked = full[total - t_enc - 1:]
+        denoiser = ForgeDenoiser(p, steps=t_enc + 1, total_steps=(t_enc + 1) * calls)
+        sampler(denoiser, torch.zeros(2, 1), walked)
+        return denoiser.seen, walked
+
+    def test_adetailer_inner_img2img_walks_its_own_tail(self):
+        # ADetailer: a new StableDiffusionProcessingImg2Img through process_images →
+        # sample_img2img(self, ...) with no steps (processing.py:1920).
+        for hires in (False, True):
+            for steps, denoise in ((28, 0.4), (20, 0.4), (28, 0.3)):
+                for name, (sampler, calls) in SECOND_ORDER.items():
+                    with self.subTest(outer_hires=hires, steps=steps, denoise=denoise, sampler=name):
+                        _, args = self._outer_pass(hires)
+                        inner = _p(cfg_scale=self.CFG, request_cls=StableDiffusionProcessingImg2Img,
+                                   steps=steps, denoising_strength=denoise)
+                        total, t_enc = _setup_img2img_steps()(inner, None)
+                        ours, walked = self._nested_run(inner, total, t_enc, sampler, calls)
+                        _assert_same_calls(self, ours, node_run(args, sampler, walked, cfg=self.CFG))
+
+    def test_img2img_hires_fix_on_a_copy_walks_its_own_tail(self):
+        # img2img-hires-fix: self.p = copy(p); self.p.denoising_strength = ...;
+        # sampler.sample_img2img(self.p, ..., steps=self.steps) — steps given, so Forge
+        # uses int(steps / denoise) sigmas and walks the last steps + 1 of them.
+        for steps, denoise in ((28, 0.4), (12, 0.35), (20, 0.6)):
+            for name, (sampler, calls) in SECOND_ORDER.items():
+                with self.subTest(steps=steps, denoise=denoise, sampler=name):
+                    outer, args = self._outer_pass(False)
+                    fix = copy.copy(outer)
+                    fix.denoising_strength = denoise
+                    total, t_enc = _setup_img2img_steps()(fix, steps)
+                    ours, walked = self._nested_run(fix, total, t_enc, sampler, calls)
+                    _assert_same_calls(self, ours, node_run(args, sampler, walked, cfg=self.CFG))
+
+    def test_postprocess_drops_the_pass_request(self):
+        outer, _ = self._outer_pass(False)
+        dd.AnimaDetailDaemon().postprocess(outer, None)
+        self.assertIsNone(dd._DD["offset_p"])
 
 
 class InPlaceTests(unittest.TestCase):

@@ -99,6 +99,39 @@ def _app(pipeline=None, *, available=True, stop=None, choices=CHOICES):
     return app
 
 
+@contextlib.contextmanager
+def _forge_api_auth(value):
+    """Forge started with ``--api-auth value``: its loaded ``modules.shared.cmd_opts`` carries it.
+
+    Only this one ``sys.modules`` entry is swapped (``patch.dict`` would drop modules imported inside).
+    """
+
+    missing = object()
+    saved = sys.modules.get("modules.shared", missing)
+    sys.modules["modules.shared"] = types.SimpleNamespace(
+        cmd_opts=types.SimpleNamespace(api_auth=value, api=True, nowebui=False))
+    try:
+        yield
+    finally:
+        if saved is missing:
+            sys.modules.pop("modules.shared", None)
+        else:
+            sys.modules["modules.shared"] = saved
+
+
+def _gradio_login_app():
+    """A host with Gradio's ``/login_check`` (``--gradio-auth``); the test header stands in for the cookie."""
+
+    app = FastAPI()
+
+    @app.get("/login_check")
+    def login_check(x_test_auth: str | None = Header(default=None)):
+        if x_test_auth != "ok":
+            raise HTTPException(status_code=401, detail="Not authenticated")
+
+    return app
+
+
 class RegistrationTests(unittest.TestCase):
     def test_routes_are_registered_once_with_their_methods(self):
         app = FastAPI()
@@ -145,6 +178,62 @@ class RegistrationTests(unittest.TestCase):
             self.assertEqual(client.get(TILE_REPAIR_OPTIONS_PATH, headers=HEADERS).status_code, 401)
             ok = client.get(TILE_REPAIR_OPTIONS_PATH, headers={**HEADERS, "X-Test-Auth": "ok"})
             self.assertEqual(ok.status_code, 200)
+
+    def test_nowebui_api_auth_guards_every_route_like_sdapi(self):
+        # api_only_worker (--nowebui --api-auth): no Gradio login route, Forge's HTTP Basic guard only.
+        pipeline = _Pipeline()
+        stopped = []
+        with _forge_api_auth("user:secret,second:pass2"):
+            app = _app(pipeline, stop=lambda: stopped.append(1) or True)
+        with TestClient(app) as client:
+            for auth in (None, ("user", "wrong"), ("nobody", "secret"), ("second", "secret")):
+                with self.subTest(auth=auth):
+                    extra = {} if auth is None else {"auth": auth}
+                    refused = (
+                        client.get(TILE_REPAIR_OPTIONS_PATH, headers=HEADERS, **extra),
+                        client.post(TILE_REPAIR_API_PATH, headers=HEADERS, json={"image": png_b64()},
+                                    **extra),
+                        client.post(TILE_REPAIR_STOP_PATH, headers=HEADERS, **extra),
+                    )
+                    for response in refused:
+                        self.assertEqual(response.status_code, 401, response.text)
+                        self.assertEqual(response.headers["www-authenticate"], "Basic")
+            self.assertEqual((pipeline.calls, stopped), ([], []))
+
+            for auth in (("user", "secret"), ("second", "pass2")):
+                with self.subTest(auth=auth):
+                    self.assertEqual(
+                        client.get(TILE_REPAIR_OPTIONS_PATH, headers=HEADERS, auth=auth).status_code, 200)
+            run = client.post(TILE_REPAIR_API_PATH, headers=HEADERS, json={"image": png_b64()},
+                              auth=("user", "secret"))
+            self.assertEqual(run.status_code, 200, run.text)
+            stop = client.post(TILE_REPAIR_STOP_PATH, headers=HEADERS, auth=("user", "secret"))
+            self.assertEqual(stop.status_code, 200)
+        self.assertEqual((len(pipeline.calls), stopped), (1, [1]))
+
+    def test_api_auth_applies_in_addition_to_the_gradio_login(self):
+        app = _gradio_login_app()
+        with _forge_api_auth("user:secret"):
+            register_tile_repair_routes(app, choices_provider=lambda: CHOICES, execute=_Pipeline(),
+                                        available=lambda: True)
+        login = {**HEADERS, "X-Test-Auth": "ok"}
+        with TestClient(app) as client:
+            self.assertEqual(client.get(TILE_REPAIR_OPTIONS_PATH, headers=login).status_code, 401)
+            self.assertEqual(
+                client.get(TILE_REPAIR_OPTIONS_PATH, headers=HEADERS, auth=("user", "secret")).status_code,
+                401)
+            # A logged-in page whose browser also sends the --api-auth credentials (its Basic prompt).
+            self.assertEqual(
+                client.get(TILE_REPAIR_OPTIONS_PATH, headers=login, auth=("user", "secret")).status_code,
+                200)
+
+    def test_without_api_auth_no_basic_credentials_are_asked_for(self):
+        for value in (None, ""):
+            with self.subTest(api_auth=value):
+                with _forge_api_auth(value):
+                    app = _app()
+                with TestClient(app) as client:
+                    self.assertEqual(client.get(TILE_REPAIR_OPTIONS_PATH, headers=HEADERS).status_code, 200)
 
     def test_script_registers_the_routes_on_app_started(self):
         registered = []
@@ -324,6 +413,29 @@ class RunTests(unittest.TestCase):
                 self.assertEqual(response.status_code, 400, response.text)
                 self.assertTrue(response.json()["detail"])
                 self.assertEqual(pipeline.calls, [])
+
+    def test_an_output_over_64_mp_is_refused_before_anything_runs(self):
+        # 1x8192 is within the 64 MP source limit, but at the default short side 1024 the output
+        # would be 1024 x 8388608 (8.6 G pixels) — refused before any model load or Forge unload.
+        for size, output in (((1, 8192), "1024x8388608"), ((8192, 1), "8388608x1024")):
+            with self.subTest(size=size):
+                pipeline = _Pipeline()
+                response = self._post({"image": png_b64(size=size)}, pipeline)
+                self.assertEqual(response.status_code, 400, response.text)
+                self.assertIn(output, response.json()["detail"])
+                self.assertEqual(pipeline.calls, [])
+
+    def test_the_output_limit_uses_the_size_run_tile_repair_would_make(self):
+        # anima_core.tile_repair_size is what run_tile_repair hands the vendor as the output size.
+        self.assertEqual(anima_core.tile_repair_size(1, 64, 1024), (1024, 65536))
+        self.assertEqual(1024 * 65536, api.MAX_OUTPUT_PIXELS)               # exactly at the limit
+        self.assertEqual(parse_request({"image": png_b64(size=(1, 64))}, CHOICES).short_side, 1024)
+        with self.assertRaises(TileRepairRequestError) as refused:        # 1024 x 66560: over it
+            parse_request({"image": png_b64(size=(1, 65))}, CHOICES)
+        self.assertEqual(refused.exception.status, 400)
+        # A smaller short side brings the same source back under the limit.
+        self.assertEqual(
+            parse_request({"image": png_b64(size=(1, 65)), "short_side": 512}, CHOICES).short_side, 512)
 
     def test_non_object_and_invalid_json(self):
         with TestClient(_app()) as client:

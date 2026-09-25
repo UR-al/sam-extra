@@ -6,8 +6,8 @@ does not move on every keystroke.  The UR_IV desktop app syncs the same file
 over these routes, which is why every memo carries its own ``updated_at`` and
 deletions are kept as tombstones instead of being removed outright.
 
-Routes (same Gradio login guard and ``X-SAM3-Notebook: 1`` header as the
-Notebook routes):
+Routes (same login guards — Gradio's ``--gradio-auth`` and Forge's
+``--api-auth`` — and ``X-SAM3-Notebook: 1`` header as the Notebook routes):
 
 * ``GET    /sam3-notebook/memos``            live memos, newest first
   (``?include_deleted=1`` adds tombstones)
@@ -41,11 +41,11 @@ from starlette.concurrency import run_in_threadpool
 from .notebook_store import (
     _ID_RE,
     NOTEBOOK_API_PATH,
-    _gradio_auth_dependencies,
     _safe_id,
     _safe_text,
     _utc_now,
     default_notebook_path,
+    extension_auth_dependencies,
     require_same_origin_header,
 )
 
@@ -588,7 +588,7 @@ def register_memo_routes(
     dependencies = (
         list(auth_dependencies)
         if auth_dependencies is not None
-        else _gradio_auth_dependencies(app)
+        else extension_auth_dependencies(app)
     )
 
     async def list_memos(request: Request) -> JSONResponse:

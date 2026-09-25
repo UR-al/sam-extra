@@ -10,7 +10,7 @@ from unittest import mock
 from fastapi import FastAPI, Header, HTTPException
 from fastapi.testclient import TestClient
 
-from sam3ext import notebook_memos
+from sam3ext import notebook_memos, notebook_store
 from sam3ext.notebook_memos import (
     MAX_MEMOS,
     MEMO_API_PATH,
@@ -708,6 +708,40 @@ class MemoRouteTests(unittest.TestCase):
             ).status_code,
             200,
         )
+
+    def test_nowebui_api_auth_guards_the_memo_routes(self):
+        # --nowebui --api-auth: no Gradio login, Forge's HTTP Basic guard as on /sdapi.
+        # Registered through the Notebook (Forge's path) and on their own (default guards).
+        with mock.patch.object(
+            notebook_store, "_forge_api_auth_setting", return_value="user:secret"
+        ):
+            via_notebook = FastAPI()
+            register_notebook_routes(
+                via_notebook, NotebookStore(self.directory / "notebook.json")
+            )
+            alone = FastAPI()
+            register_memo_routes(alone, MemoStore(self.directory / "alone.json"))
+        memo = {"title": "", "text": ""}
+        for name, app in (("via notebook", via_notebook), ("alone", alone)):
+            with self.subTest(app=name):
+                client = self.client_for(app)
+                for auth in (None, ("user", "wrong")):
+                    extra = {} if auth is None else {"auth": auth}
+                    answers = (
+                        client.get(MEMO_API_PATH, headers=HEADERS, **extra),
+                        client.put(MEMO_API_PATH + "/memo-1", headers=HEADERS, json=memo, **extra),
+                        client.delete(MEMO_API_PATH + "/memo-1", headers=HEADERS, **extra),
+                    )
+                    self.assertEqual([answer.status_code for answer in answers], [401] * 3)
+                    self.assertEqual(answers[0].headers["www-authenticate"], "Basic")
+                ok = {"headers": HEADERS, "auth": ("user", "secret")}
+                self.assertEqual(client.get(MEMO_API_PATH, **ok).status_code, 200)
+                self.assertEqual(
+                    client.put(MEMO_API_PATH + "/memo-1", json=memo, **ok).status_code, 200
+                )
+                self.assertEqual(
+                    client.delete(MEMO_API_PATH + "/memo-1", **ok).status_code, 200
+                )
 
     def test_memo_registration_failure_keeps_notebook_routes(self):
         app = FastAPI()

@@ -7,8 +7,10 @@ the panel's ⏹ never interrupt each other's run. The panel needs 30 positional 
 plus gallery state; this route takes one JSON object, so the UR_IV desktop app (or any same-origin
 client) can use the feature. Registered once at app start by ``scripts/anima_tile_repair_api.py``.
 
-Routes — same guards as the Notebook routes (``notebook_store``): the Gradio login dependency when
-Forge runs with ``--gradio-auth`` (401) and the same-origin header ``X-SAM3-Notebook: 1`` (403):
+Routes — same guards as the Notebook routes (``notebook_store.extension_auth_dependencies``): the
+Gradio login dependency when Forge runs with ``--gradio-auth`` (401), Forge's own API auth (HTTP
+Basic, like ``/sdapi``) when it runs with ``--api-auth`` (401) — both when both are set — and the
+same-origin header ``X-SAM3-Notebook: 1`` (403):
 
 ``GET /sam-extra/tile-repair/options``
     ``{"version", "available", "models", "default_model", "dit", "text_encoder", "vae", "defaults",
@@ -31,7 +33,8 @@ with a silent default:
 ``multiplier``         default 1.0, -10..10 (sd-scripts ``--lllite_multiplier``; kohya
                        ComfyUI-Anima-LLLite ``strength``).
 ``short_side``         default 1024, 256..4096 — the output keeps the source aspect ratio
-                       (``anima_core.tile_repair_size``: shorter edge, multiples of 32).
+                       (``anima_core.tile_repair_size``: shorter edge, multiples of 32) and may be
+                       at most 64 MP (a 1x8192 source at 1024 would be 1024x8388608 → 400).
 ``seed``               default -1 = random; the seed actually used is returned.
 ``dit``                default ``"Use Forge current"``; otherwise one of the panel's DiT choices.
 ``text_encoder``       default: the panel's Qwen3 0.6B pick; otherwise one of its choices.
@@ -73,7 +76,7 @@ from fastapi.responses import JSONResponse
 from PIL import Image, PngImagePlugin
 from starlette.concurrency import run_in_threadpool
 
-from .notebook_store import _gradio_auth_dependencies, require_same_origin_header
+from .notebook_store import extension_auth_dependencies, require_same_origin_header
 
 logger = logging.getLogger(__name__)
 
@@ -85,6 +88,9 @@ API_VERSION = 1
 MAX_REQUEST_BYTES = 96 * 1024 * 1024        # base64 of the 64 MB image limit plus the other fields
 MAX_IMAGE_BYTES = 64 * 1024 * 1024
 MAX_SOURCE_PIXELS = 64 * 1024 * 1024        # 8192 x 8192
+# The output follows the source aspect ratio, so a thin source within the source limit could ask
+# for billions of pixels; the output gets the same 64 MP bound, checked before anything loads.
+MAX_OUTPUT_PIXELS = MAX_SOURCE_PIXELS
 MAX_PROMPT_CHARS = 20_000
 MAX_SEED = 2**63 - 1
 _SOURCE_FORMATS = frozenset({"PNG", "JPEG", "WEBP"})
@@ -289,7 +295,7 @@ class _InFlight:
 
 
 # ---------------------------------------------------------------------------
-# Request parsing (pure — no Forge, no torch)
+# Request parsing (pure — no Forge; the output size comes from anima_core.tile_repair_size)
 # ---------------------------------------------------------------------------
 
 
@@ -357,6 +363,20 @@ def decode_source_image(value: Any) -> Image.Image:
     return image
 
 
+def _check_output_size(source: Image.Image, short_side: int) -> None:
+    """Refuse an output over ``MAX_OUTPUT_PIXELS`` — the size ``run_tile_repair`` would make."""
+
+    from .anima_core import tile_repair_size
+
+    width, height = tile_repair_size(source.width, source.height, short_side)
+    if width * height > MAX_OUTPUT_PIXELS:
+        raise TileRepairRequestError(
+            f"output would be {width}x{height} (short_side {short_side} keeps the "
+            f"{source.width}x{source.height} source's aspect ratio) — at most 64 MP; "
+            "use a smaller short_side or crop the image"
+        )
+
+
 def parse_request(body: Any, choices: TileRepairChoices) -> TileRepairRequest:
     """Validate a JSON body against the panel's choices and bounds. Raises TileRepairRequestError."""
 
@@ -392,8 +412,10 @@ def parse_request(body: Any, choices: TileRepairChoices) -> TileRepairRequest:
         raise TileRepairRequestError("unload_forge_before must be true or false")
 
     numbers = {key: _number(body, key) for key in RANGES}
+    source = decode_source_image(body["image"])
+    _check_output_size(source, numbers["short_side"])
     return TileRepairRequest(
-        source=decode_source_image(body["image"]),
+        source=source,
         model=model,
         prompt=prompt,
         negative_prompt=negative,
@@ -501,7 +523,7 @@ def register_tile_repair_routes(
     execute = execute or run_panel_pipeline
     available = available or vendor_available
     stop = stop or stop_tile_repair
-    auth_dependencies = _gradio_auth_dependencies(app)
+    auth_dependencies = extension_auth_dependencies(app)
     in_flight = _InFlight()
 
     async def get_options(request: Request) -> JSONResponse:

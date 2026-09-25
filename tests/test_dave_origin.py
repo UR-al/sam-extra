@@ -531,6 +531,55 @@ class BlockWrapperGateTests(unittest.TestCase):
         self.assertEqual(applied, _origin_active(0.1, sampled, [_rows(s) for s in sampled[:-1]]))
         self.assertEqual(sum(applied), 2)
 
+    def _run_nested(self, pass_offset, inner_steps, inner_denoise, schedule=_simple_sigmas):
+        """A run the script did not attach for: ADetailer's inner img2img from ``postprocess_image``.
+
+        The attach set ``pass_offset`` for the outer request; the inner run brings its own
+        request and ``launch_sampling`` count through ``on_cfg_denoiser`` before its blocks run.
+        """
+        pag = self.pag
+        outer_p, inner_p = object(), object()
+        pag._DAVE.update(offset=pass_offset, offset_p=outer_p, run_p=None, run_steps=0)
+        full, sampled, _offset, sampling_steps = _forge_img2img(inner_steps, inner_denoise, schedule)
+        params = types.SimpleNamespace(denoiser=types.SimpleNamespace(p=inner_p, steps=sampling_steps))
+        pag._dave_run_callback(params)
+        applied = []
+        for i, sigma in enumerate(sampled[:-1]):
+            options = {"sampling_sigmas": full, "sigmas": _rows(sigma)}
+            applied.append(self._forward(options, state=_State(max(0, i - 1), sampling_steps))[0])
+        return applied, _origin_active(0.1, sampled, [_rows(s) for s in sampled[:-1]])
+
+    def test_adetailer_inner_run_walks_its_own_tail(self):
+        # What the outer pass's attach left: txt2img 0, an img2img/hires start, unknown (None).
+        for pass_offset in (0, 27, None):
+            for inner_steps, inner_denoise in ((28, 0.4), (20, 0.4), (28, 0.3)):
+                with self.subTest(pass_offset=pass_offset, inner=(inner_steps, inner_denoise)):
+                    applied, origin = self._run_nested(pass_offset, inner_steps, inner_denoise)
+                    self.assertEqual(applied, origin)
+                    self.assertTrue(applied[0], "the original runs DAVE on the inner run's first step")
+
+    def test_the_pass_own_run_keeps_the_attach_offset(self):
+        # Forge's "DDIM" type returns steps + 2 sigmas: counting back would miss the first one,
+        # so the pass's own sampling (denoiser.p is the attached p) keeps the attach offset.
+        pag = self.pag
+        outer_p = object()
+        full, sampled, offset, sampling_steps = _forge_img2img(28, 0.5, _ddim_sigmas)
+        pag._DAVE.update(offset=offset, offset_p=outer_p, run_p=None, run_steps=0)
+        pag._dave_run_callback(types.SimpleNamespace(
+            denoiser=types.SimpleNamespace(p=outer_p, steps=sampling_steps)))
+        self.assertEqual(pag._dave_offset(full), offset)
+        self.assertNotEqual(len(full) - (sampling_steps + 1), offset)
+        applied = self._run(full, sampled[:-1], sampling_steps, offset)
+        self.assertEqual(applied, _origin_active(0.1, sampled, [_rows(s) for s in sampled[:-1]]))
+
+    def test_run_callback_does_nothing_while_dave_is_off(self):
+        pag = self.pag
+        pag._DAVE.update(on=False, run_p=None, run_steps=0)
+        pag._dave_run_callback(types.SimpleNamespace(
+            denoiser=types.SimpleNamespace(p=object(), steps=12)))
+        self.assertIsNone(pag._DAVE["run_p"])
+        self.assertEqual(pag._DAVE["run_steps"], 0)
+
     def test_unknown_offset_uses_the_whole_list(self):
         sched = _simple_sigmas(25)
         applied = self._run(sched, sched[:-1], 25, None)

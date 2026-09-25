@@ -37,7 +37,8 @@ def _load(module_file: str, test_name: str):
     class Script:
         pass
 
-    modules_stub.script_callbacks = types.SimpleNamespace(on_before_ui=lambda fn: None)
+    modules_stub.script_callbacks = types.SimpleNamespace(
+        on_before_ui=lambda fn: None, on_cfg_denoiser=lambda fn: None)
     modules_stub.scripts = types.SimpleNamespace(
         Script=Script, AlwaysVisible=object(), scripts_data=[]
     )

@@ -1,4 +1,4 @@
-"""One-time ``ui-config.json`` migration for the DCW(+a) and CNS sliders of the Anima Guidance suite.
+"""One-time ``ui-config.json`` migration for the PAG scale, DCW(+a) and CNS sliders of the Anima Guidance suite.
 
 Forge's ``UiLoadsave`` (``modules/ui_loadsave.py:37-110``) reapplies every saved slider
 ``value``/``minimum``/``maximum``/``step`` keyed by
@@ -15,9 +15,14 @@ but kept the labels. Without this migration an install that already has a ui-con
 
 Rules (user decision: new defaults = the originals, values a user set stay):
 
-* RDC — only when the legacy ``Enable RDC/value`` key exists: a saved ``false`` sets the saved
-  tau to 0.0 (RDC was off; upstream's tau 0 is off), ``true`` keeps the tau. Both legacy
-  ``Enable RDC`` keys are removed, which also makes this step one-time.
+* PAG — the PAG parity change raised the ``Attn Scale`` maximum 15 -> 100 under the same label
+  (origin: iljung1106/comfyui-anima-safe-pag@905b0107:__init__.py:201). A saved maximum 15
+  gets the slider's saved bounds dropped; the saved scale stays (its default 4.0 did not change).
+* RDC — only when the legacy ``Enable RDC/value`` key exists: a saved ``false`` beside the old
+  default tau 0.15 sets the tau to 0.0 (RDC was off and the tau untouched; upstream's tau 0 is
+  off). A tau the user set stays even beside a saved ``false`` (the change log says RDC now
+  runs whenever Enable DCW is on), and ``true`` keeps the tau. Both legacy ``Enable RDC`` keys
+  are removed, which also makes this step one-time.
 * DCW — only when ``DCW lambda high`` still has a legacy bound (min -0.5, max 0.5 or step
   .005): its saved bounds are dropped (Forge then saves the new ones), a saved value equal to
   the old default 0.02 becomes 0.01 and anything outside ±0.3 is clamped like the server does;
@@ -46,6 +51,7 @@ from typing import Iterable, List, MutableMapping
 
 __all__ = [
     "CNS_GAMMA_SCALE_LABEL",
+    "PAG_SCALE_LABEL",
     "SCRIPT_FILE",
     "TABS",
     "migrate_ui_settings",
@@ -54,6 +60,12 @@ __all__ = [
 
 SCRIPT_FILE = "anima_safe_pag.py"
 TABS = ("txt2img", "img2img")
+
+# The script's slider label (imported by scripts/anima_safe_pag.py); unchanged by the
+# scale-100 parity change, so the old saved bounds would apply to it again.
+PAG_SCALE_LABEL = "Attn Scale — PAG / SEG guidance scale (cond−weak 배율)"
+# Pre-parity maximum (forge_sam3_extension@861ac02:scripts/anima_safe_pag.py:2702-2707).
+_PAG_SCALE_LEGACY_MAXIMUM = 15.0
 
 RDC_SWITCH_LABEL = "Enable RDC"
 RDC_TAU_LABEL = "RDC tau (EMA 기억 구간)"
@@ -67,6 +79,7 @@ _RANGE_FIELDS = ("minimum", "maximum", "step")
 # Pre-parity values of this extension (forge_sam3_extension@3522928:scripts/anima_safe_pag.py
 # :3050-3060 DCW, :3064-3076 RDC, :3112-3122 CWM) -> upstream values.
 _DCW_HIGH_LEGACY_BOUNDS = {"minimum": -0.5, "maximum": 0.5, "step": 0.005}
+_RDC_TAU_OLD_DEFAULT = 0.15
 _DCW_HIGH_LIMIT = 0.3  # upstream lambda_h min/max (dcw_node.py:650-667)
 _DCW_OLD_TO_NEW = {DCW_LOW_LABEL: (0.10, 0.05), DCW_HIGH_LABEL: (0.02, 0.01)}
 _CWM_LEGACY_MAXIMUM = 1.0
@@ -129,13 +142,29 @@ def _migrate_rdc(settings, tab, script_file, changes) -> None:
     switch = settings.pop(switch_key)
     settings.pop(_key(tab, RDC_SWITCH_LABEL, "visible", script_file), None)
     tau_key = _key(tab, RDC_TAU_LABEL, "value", script_file)
-    if switch is not True and tau_key in settings and not _same(settings[tau_key], 0.0):
-        changes.append(
-            f"{tab}/{RDC_TAU_LABEL}: {settings[tau_key]!r} -> 0.0 "
-            "(the old Enable RDC switch was saved off)"
-        )
-        settings[tau_key] = 0.0
+    tau = _number(settings.get(tau_key))
+    if switch is not True and tau is not None and not _same(tau, 0.0):
+        where = f"{tab}/{RDC_TAU_LABEL}"
+        if _same(tau, _RDC_TAU_OLD_DEFAULT):
+            settings[tau_key] = 0.0
+            changes.append(
+                f"{where}: old default {tau:g} -> upstream default 0 "
+                "(RDC off; the old Enable RDC switch was saved off)"
+            )
+        else:
+            changes.append(
+                f"{where}: kept the user-set {tau:g} although the old Enable RDC switch was "
+                "saved off; RDC now runs whenever Enable DCW is on (set tau 0 to keep it off)"
+            )
     changes.append(f"{tab}/{RDC_SWITCH_LABEL}: removed the legacy saved switch")
+
+
+def _migrate_pag(settings, tab, script_file, changes) -> None:
+    if _same(
+        settings.get(_key(tab, PAG_SCALE_LABEL, "maximum", script_file)),
+        _PAG_SCALE_LEGACY_MAXIMUM,
+    ):
+        _drop_bounds(settings, tab, PAG_SCALE_LABEL, script_file, changes)
 
 
 def _migrate_dcw(settings, tab, script_file, changes) -> None:
@@ -222,6 +251,7 @@ def migrate_ui_settings(
     """Migrate a loaded ui-config mapping in place; returns one line per change."""
     changes: List[str] = []
     for tab in tabs:
+        _migrate_pag(settings, tab, script_file, changes)
         _migrate_rdc(settings, tab, script_file, changes)
         _migrate_dcw(settings, tab, script_file, changes)
         _migrate_cwm(settings, tab, script_file, changes)
