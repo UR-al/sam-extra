@@ -62,6 +62,25 @@ def _load(module_file: str, test_name: str):
             sys.modules["modules"] = old
 
 
+class _DiscretePredictor:
+    """Skimmed CFG places its window with ``model.predictor.percent_to_sigma``.
+
+    An eps/v-style schedule (Forge ``k_prediction.Prediction``) maps 0% above
+    any sigma, so the sigma 1.0 used below lies inside the default window. (A
+    flow schedule maps 0% to exactly 1.0, a step upstream never skims.)
+    """
+
+    def percent_to_sigma(self, percent):
+        if percent <= 0.0:
+            return 999999999.9
+        if percent >= 1.0:
+            return 0.0
+        return 14.6 * (1.0 - percent)
+
+
+_DISCRETE_MODEL = types.SimpleNamespace(predictor=_DiscretePredictor())
+
+
 class GuidanceCompositionTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -228,6 +247,7 @@ class GuidanceCompositionTests(unittest.TestCase):
                     "input": live_input,
                     "sigma": torch.tensor([1.0]),
                     "cond_scale": 7.0,
+                    "model": _DISCRETE_MODEL,
                     "model_options": {},
                 }
             )

@@ -228,9 +228,16 @@ SAM3 인페인트 패스에 ControlNet 유닛 1개 주입. preprocessor에 따�
 
 CN Model 드롭다운은 기본 `models/ControlNet/` **+** `models/sam3/` 둘 다 스캔. SAM3 검출 체크포인트(`sam3*.*`)와 같은 폴더에 LLLite 인페인트 모델(`anima-lllite-inpainting-v2.safetensors` 등) 두면 자동으로 드롭다운 노출.
 
-### LLLite anima 인페인트 자동 호환
+### Anima LLLite 자동 호환
 
-`anima-lllite-inpainting-*` 모델은 4채널(RGB+mask) 입력이 필요. `inpaint_only` 같은 mask-stripping preprocessor와 조합하면 어설션 실패. **익스텐션이 자동 감지해서 preprocessor를 `None`으로 override** (stderr에 한 줄 로그). 사용자가 따로 신경 안 써도 됨.
+Anima ControlNet-LLLite 는 원본(kohya sd-scripts · ComfyUI-Anima-LLLite)처럼 **사용자가 준 제어 이미지**를 그대로 받는다. 채널 수는 모델 파일의 safetensors 헤더(`lllite.cond_in_channels`, 없으면 `lllite_conditioning1.conv1` 입력 채널, 그것도 없으면 원본 기본값 3)로 읽고, 헤더를 못 읽으면 파일 이름으로 추정한다. 3채널이 표준(lineart·canny·depth 등 모든 제어 종류)이고 4채널이 인페인트다. SAM3 CN 유닛의 제어 이미지는 인페인트 입력 이미지라, lineart·canny·depth LLLite 에서는 고른 preprocessor 가 그 맵을 만든다.
+
+- **Tile & Repair (3채널, 헤더 `modelspec.title` 에 `tile` — v1 `anima_tiled_lllite_v1`, v2 `anima_tile_multitask_v1`. 제목이 없으면 파일 이름 `animaTileRepair_*`)**: preprocessor 를 **항상 `None`** 으로 override. 기본값 `inpaint_only` 는 고칠 영역을 −1 로 비워(LLLite 입력으로는 −3) 복구할 내용을 지운다.
+- **그 밖의 3채널 Anima LLLite (lineart·canny·depth 등)**: 고른 preprocessor 를 그대로 쓴다. `inpaint_*` 만 `None` 으로 override — 원본 3채널은 마스크를 쓰지 않는데 `inpaint_*` 는 마스크 영역을 제어 이미지에서 비운다.
+- **4채널 인페인트 (`anima-lllite-inpainting-*`, RGB+mask)**: `inpaint_only` 같은 mask-stripping preprocessor와 조합하면 어설션 실패 → `inpaint_*` 를 `None` 으로 override.
+- Anima LLLite 가 아닌 모델(SDXL `kohya_controllllite_*` 포함)은 건드리지 않는다.
+
+override 할 때마다 stderr에 한 줄 로그. 사용자가 따로 신경 안 써도 됨. (Forge 내장 LLLite 는 3채널 cond 에 마스크를 곱해 마스크 밖 문맥을 검게 만든다 — 내장 코드의 호스트 차이라 그대로 둔다.)
 
 ### ⚠️ 옷 교체가 안 바뀌어 보일 때
 
@@ -363,7 +370,7 @@ Refine 처럼 Forge Generate 와 같은 대기열에서 돌고, 도는 동안 �
 | Anima DiT | `models/Stable-diffusion/ANIMA_*.safetensors` | "Use Forge current" 선택 시 현재 Forge sd_model 사용 |
 | Qwen3 0.6B Text Encoder | `models/text_encoder/qwen_3_06b_base.safetensors` 등 | **필수** — 드롭다운에서 골라야 함(`Use Forge current` 는 Anima용 TE 를 주지 못함). Qwen3-VL·Qwen3.5 파일은 크기가 달라 못 씀 |
 | Qwen-Image VAE | `models/VAE/qwen_image_vae.safetensors` | **필수** — 드롭다운에서 고름(Forge 에 따로 불러 둔 VAE 가 없으면 `Use Forge current` 는 실패) |
-| ControlNet-LLLite | `models/ControlNet/animaTileRepair_v10.safetensors` 등 | **필수** |
+| ControlNet-LLLite | `models/ControlNet/animaTileRepair_v20.safetensors` 등 | **필수** — 목록에는 safetensors 헤더로 가려낸 **3채널(RGB) Anima LLLite 파일만** 나옴(4채널 인페인트 LLLite·다른 ControlNet 은 이름과 상관없이 빠짐, 확장자는 `.safetensors` 만). 기본 선택은 가장 새 Tile & Repair 파일(v20) |
 | LoRA Stack (선택, 4칸) | `models/Lora/*.safetensors` | `models/Lora` 바로 아래 파일만 보이고 하위 폴더는 목록에 안 나옴 |
 
 ### VRAM 관리
@@ -372,7 +379,7 @@ Refine 처럼 Forge Generate 와 같은 대기열에서 돌고, 도는 동안 �
 
 ### 한계 / 알려진 제약
 
-- **단일 패스만 지원**: 큰 이미지를 작은 tile로 나눠 추론하는 tiling 루프는 구현돼 있지 않습니다(계획된 버전 없음). source 이미지를 width/height 슬라이더 크기로 한 번에 추론합니다.
+- **단일 패스만 지원**: 큰 이미지를 작은 tile로 나눠 추론하는 tiling 루프는 구현돼 있지 않습니다(계획된 버전 없음). source 이미지를 한 번에 추론합니다. 크기는 **SAM3 Anima Short Side** 슬라이더(기본 1024)가 짧은 변을 정하고, 긴 변은 source 비율을 따르며, 두 변 모두 32의 배수로 내림(최소 256)합니다.
 - **LLLite 는 Multiplier 하나만**: 벤더 쪽에 strength·시작/끝 스텝 개념이 없어 Multiplier 슬라이더만 있습니다.
 - **Sampler 선택 불가**: Anima는 Flow Matching only. `flow_shift` + `infer_steps` 만 sampling을 결정.
 - **Attention backend**: Windows 환경에서 `flash_attn` / `sageattention`은 빌드 어려움. vendor가 `torch` (SDPA) fallback으로 작동.
@@ -762,7 +769,7 @@ SAM3 처리와 분리된 opt-in 기능 모음입니다. Forge Neo 코어 파일�
 | **CNS-inspired** | 기존 seeded/Brownian noise를 live x_t 에너지로 재색칠 | Euler a noise call 확인. deterministic sampler에서는 inert |
 | **Anima Modulation Guidance** | 보조 CLIP-L 방향을 공개 어댑터로 block AdaLN에 가산 | 실제 CLIP/어댑터 로드·투영·주입 검증. 이미지 품질 A/B는 추가 필요 |
 | **Adaptive Guidance** | combined batch의 후반 uncond row 생략 | low-VRAM 분리 호출에서는 생략/속도 이득 없음 |
-| **Skimmed CFG** | 과포화를 만드는 성분만 낮은 CFG로 되돌림(anti-burn) | 상단 수식과 tensor 단위 일치 검증. **CFG>1 전용**, pre-CFG가 아닌 post-CFG 재구성 |
+| **Skimmed CFG** | 과포화를 만드는 성분만 낮은 CFG로 되돌림(anti-burn) | 원본 노드와 σ 구간·결과가 비트 단위로 같음(원본 수식 편입). **CFG>1 전용**, pre-CFG가 아닌 post-CFG 맨 앞에서 재구성 |
 | **Detail Daemon** | sigma schedule로 디테일 강도 조절 | 별도 opt-in 기능 |
 
 Modulation Guidance를 쓰려면 768차원 CLIP-L safetensors를
@@ -815,7 +822,7 @@ DCW/RDC eval, DAVE/Modulation block hit, CNS noise call, Adaptive 실제 생략 
 - 구현: `scripts/anima_safe_pag.py`, `sam3ext/guidance/`, `scripts/anima_detail_daemon.py`
 - 테스트: `tests/test_anima_attention_patch.py`, `tests/test_anima_safe_pag.py`,
   `tests/test_guidance_suite.py`, `tests/test_guidance_composition.py`, `tests/test_skimmed_cfg.py`,
-  `tests/test_modulation_guidance.py`, `tests/test_anima_detail_daemon.py`
+  `tests/test_modulation_guidance.py`, `tests/test_anima_detail_daemon.py`, `tests/test_detail_daemon_origin.py`
 - 상세 파라미터·처리 순서·XYZ·검증 로그·크레딧:
   **[docs/GUIDANCE.md](docs/GUIDANCE.md)**
 
@@ -1008,12 +1015,13 @@ txt2img 도구 줄(붙여넣기·지우기·스타일 적용 버튼)의 **🪄**
 | **DAVE** | [daheekwon/DAVE](https://github.com/daheekwon/DAVE) · [sorryhyun/ComfyUI-Anima-DAVE](https://github.com/sorryhyun/ComfyUI-Anima-DAVE) | MIT | Forge block 재구현 (vendor 아님) |
 | **CNS-inspired Wavelet Noise** | [namemechan/comfyui-cns_sampler_patch](https://github.com/namemechan/comfyui-cns_sampler_patch) | GPL-3.0 | sampler-noise 재작성 (vendor 아님) |
 | **Anima Modulation Guidance** | [Anzhc/Anima-Mod-Guidance-ComfyUI-Node](https://github.com/Anzhc/Anima-Mod-Guidance-ComfyUI-Node) · [quickjkee/modulation-guidance](https://github.com/quickjkee/modulation-guidance) · [yresearch/cosmos-pooled](https://huggingface.co/yresearch/cosmos-pooled) | MIT(코드 선언) / 자산 모델 카드 | Forge block 재작성 (vendor 아님) |
-| **Skimmed CFG** (별도 기능) | [Extraltodeus/Skimmed_CFG](https://github.com/Extraltodeus/Skimmed_CFG) | **LICENSE 파일 미공개**(편입 당시 기록, 이후 미재확인) | 공개 수식 기반 Forge 재작성 (vendor 아님) |
-| **Detail Daemon** (별도 기능) | [muerrilla/sd-webui-detail-daemon](https://github.com/muerrilla/sd-webui-detail-daemon) | 미확인 | schedule·sigma 수식 재구현 (vendor 아님) |
+| **Skimmed CFG** (별도 기능) | [Extraltodeus/Skimmed_CFG](https://github.com/Extraltodeus/Skimmed_CFG) | Apache-2.0 | 수식·σ 게이트 편입(`sam3ext/guidance/skimmed_cfg.py`), Forge 훅 |
+| **Detail Daemon** (별도 기능) | [muerrilla/sd-webui-detail-daemon](https://github.com/muerrilla/sd-webui-detail-daemon) (commit `1947999`) · [Jonseed/ComfyUI-Detail-Daemon](https://github.com/Jonseed/ComfyUI-Detail-Daemon) (commit `3394e44`) | MIT | schedule·σ 조회 함수 편입(`scripts/anima_detail_daemon.py`), Forge 훅 |
 | SAM3 검출 | Meta [facebook/sam3](https://huggingface.co/facebook/sam3) ([facebookresearch/sam3](https://github.com/facebookresearch/sam3)) | SAM License(Meta) | `sam3` PyPI 패키지 (저장소에 포함하지 않음) |
 
 '미확인' 은 원 저장소의 라이선스를 이 확장에서 아직 확인하지 못했다는 뜻입니다. 저장소에 함께 들어 있는 제3자
-파일(`sam3ext/anima38/`, TIPO 모델 코드, `assets/` 의 Qwen3.5 토크나이저·CLIP BPE 어휘)의 출처와 라이선스는
+파일(`sam3ext/anima38/`, TIPO 모델 코드, `assets/` 의 Qwen3.5 토크나이저·CLIP BPE 어휘)과 편입한 상류 함수(Skimmed
+CFG, Detail Daemon)의 출처와 라이선스는
 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) 에 있습니다.
 
 원저자분들께 감사드립니다. 각 프로젝트의 라이선스 전문은 vendor 디렉터리의 `LICENSE` 파일을 참고하세요.
@@ -1058,6 +1066,6 @@ LoRA Manager(GPL-3.0)는 vendor 그대로 실행하되, `lora_manager_core.py`�
   않으며 각자의 라이선스를 따릅니다.
 - 사용자가 따로 받는 모델 가중치(SAM3, TIPO, IP-Adapter, Modulation Guidance 어댑터 등)는 이 라이선스의 대상이 아니며
   각 모델 배포처의 조건을 따릅니다.
-- LICENSE 가 없는 Skimmed CFG 는 코드를 가져오지 않고 공개된 수식만 이 확장 코드로 다시 작성했습니다. 위 출처 표에서
-  라이선스가 '미확인' 인 Safe PAG(이식)·Detail Daemon(재구현)은 원 저장소의 조건을 아직 확인하지 못했습니다 —
-  재배포 전에 확인이 필요합니다.
+- Skimmed CFG 는 상류(Apache-2.0)의 수식 함수를, Detail Daemon 은 상류(MIT, muerrilla·Jonseed)의 schedule·σ 조회
+  함수를 그대로 편입했습니다(고지는 THIRD_PARTY_NOTICES.md). 위 출처 표에서 라이선스가 '미확인' 인 Safe PAG(이식)는
+  원 저장소의 조건을 아직 확인하지 못했습니다 — 재배포 전에 확인이 필요합니다.

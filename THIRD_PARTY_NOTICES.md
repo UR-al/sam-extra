@@ -64,6 +64,31 @@ Apache-2.0 으로 명시합니다. 이 확장의 GPL-3.0-only 라이선스는 �
 다시 열어 보지 않았습니다. MIT 고지 전문은 이 문서 끝에 있습니다. 이 확장의 GPL-3.0-only 라이선스는 이 파일의 상류 조건을
 대체하지 않습니다.
 
+## Skimmed_CFG (Apache-2.0)
+
+`sam3ext/guidance/skimmed_cfg.py` 의 `get_skimming_mask`, `skimmed_CFG` 는
+[Extraltodeus/Skimmed_CFG](https://github.com/Extraltodeus/Skimmed_CFG)
+(commit `d83005832ac42783adfd6f4ae96f6ef6406d1a74`) 의 `skimmed_CFG.py` 9-54줄을 바꾸지 않고 옮긴 것입니다. 같은 파일의
+`skim_sigmas`, `skim_active`, `flip_filter_at`, `skim_pair` 는 상류 `CFG_Skimming_Single_Scale_Pre_CFG` 노드의
+σ 계산과 `pre_cfg_patch` 본문(152-155줄, 160-197줄)을 함수로 나눈 것입니다. 조건, 순서, 부등호, 계산은 상류와 같고
+함수 경계만 이 확장이 새로 나눴습니다(Apache-2.0 4(b)의 변경 표시는 파일 머리 주석에 있습니다). 상류 저장소의
+`LICENSE` 는 Apache License 2.0 이며 NOTICE 파일은 없습니다. 이를 부르는 Forge 훅은 `scripts/anima_skimmed_cfg.py`
+입니다. 이 확장의 GPL-3.0-only 라이선스는 이 코드의 상류 조건을 대체하지 않습니다.
+
+## Detail Daemon (MIT)
+
+`scripts/anima_detail_daemon.py` 의 `_make_schedule` 은
+[muerrilla/sd-webui-detail-daemon](https://github.com/muerrilla/sd-webui-detail-daemon)
+(commit `19479998340831d7804fca8efd3f262b54b6373f`) 의 `scripts/detail_daemon.py` 309-338줄 `make_schedule` 과,
+그것을 옮긴 [Jonseed/ComfyUI-Detail-Daemon](https://github.com/Jonseed/ComfyUI-Detail-Daemon)
+(commit `3394e44afea04ed0188fb37b21f0d9952469766b`) 의 `detail_daemon_node.py` 25-67줄
+`make_detail_daemon_schedule` 을 옮긴 것입니다. 달라진 곳은 linspace 길이에 붙인 `max(0, …)` 가드 하나입니다. 같은
+파일의 `get_dd_schedule` 은 ComfyUI-Detail-Daemon `detail_daemon_node.py` 226-262줄을 바꾸지 않고 옮겼고, 콜백의 σ 조정
+(σ 목록·스케줄 텐서 구성, 범위 검사, `* 0.1 * cfg_scale`, `max(1e-06, …)`)은 같은 파일 282-296줄을 따릅니다. 대조
+테스트 `tests/test_detail_daemon_origin.py` 는 두 상류의 해당 코드를 그대로 담고 있습니다. 원 라이선스는 둘 다 MIT
+(Copyright (c) 2024 Sahand Ahmadian — sd-webui-detail-daemon, Copyright (c) 2024 Jonseed — ComfyUI-Detail-Daemon)
+이며 MIT 고지 전문은 이 문서 끝에 있습니다. 이 확장의 GPL-3.0-only 라이선스는 이 코드의 상류 조건을 대체하지 않습니다.
+
 ## 코드를 편입하지 않은 재구현 (참고 출처)
 
 아래 기능은 상류 코드를 파일째 가져오지 않고 이 확장 코드로 다시 작성했습니다. 전체 목록(DCW·CNS·DAVE·Modulation
@@ -73,13 +98,12 @@ Guidance 등)은 README 의 출처 / 크레딧 절과 [docs/GUIDANCE.md](docs/GU
 | 기능 | 이 확장 파일 | 원저작 출처 | 원 라이선스 | 형태 |
 |---|---|---|---|---|
 | Anima Safe PAG | `scripts/anima_safe_pag.py` | [iljung1106/comfyui-anima-safe-pag](https://github.com/iljung1106/comfyui-anima-safe-pag) (ComfyUI 노드), PAG 논문 [arXiv:2403.17377](https://arxiv.org/abs/2403.17377) | 미확인 | Anima 배치 확장·블록 선택을 이식하고 Forge 훅으로 다시 작성 |
-| Detail Daemon | `scripts/anima_detail_daemon.py` | [muerrilla/sd-webui-detail-daemon](https://github.com/muerrilla/sd-webui-detail-daemon) (A1111 확장) | 미확인 | schedule·sigma 조정 수식을 다시 구현(파일 머리 주석은 'self-contained fork' 로 표기) |
-| Skimmed CFG | `scripts/anima_skimmed_cfg.py` | [Extraltodeus/Skimmed_CFG](https://github.com/Extraltodeus/Skimmed_CFG) (ComfyUI 노드) | LICENSE 파일 미공개(편입 당시 기록, 이후 미재확인) | 공개된 수식만 post-CFG 로 다시 작성, 코드는 가져오지 않음 |
 
 ## MIT License 전문
 
-`sam3ext/anima38/`(Copyright (c) 2026 GumGum10 contributors)와 `assets/bpe_simple_vocab_16e6.txt.gz`(Copyright (c) 2021
-OpenAI)에 적용되는 조건입니다. 저작권 줄은 위 각 절의 것을 넣어 읽습니다.
+`sam3ext/anima38/`(Copyright (c) 2026 GumGum10 contributors), `assets/bpe_simple_vocab_16e6.txt.gz`(Copyright (c) 2021
+OpenAI), `scripts/anima_detail_daemon.py` 의 Detail Daemon 코드(Copyright (c) 2024 Sahand Ahmadian, Copyright (c) 2024
+Jonseed)에 적용되는 조건입니다. 저작권 줄은 위 각 절의 것을 넣어 읽습니다.
 
 ```text
 MIT License
@@ -103,4 +127,4 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-Apache-2.0 전문(TIPO 모델 코드, Qwen3.5 토크나이저)은 <https://www.apache.org/licenses/LICENSE-2.0> 에 있습니다.
+Apache-2.0 전문(TIPO 모델 코드, Qwen3.5 토크나이저, Skimmed_CFG 코드)은 <https://www.apache.org/licenses/LICENSE-2.0> 에 있습니다.

@@ -52,8 +52,8 @@ shared.state.sampling_step / sampling_steps (한 스텝 지연 — 아래 참고
 - `model_function_wrapper`와 `post_cfg_function`은 현재 `forge_objects.unet.clone()`에만 붙습니다.
 - step 비율은 wrapper 호출 횟수가 아니라 Forge의 `shared.state.sampling_step`을 읽습니다. low-VRAM 분할,
   regional conditioning, 2차 sampler가 범위 계산을 오염시키지 않습니다. 다만 Forge는 이 값을 그 스텝의 모델 호출
-  **뒤**에 올리므로, PAG/SEG/SLG·DAVE·Adaptive Guidance·Skimmed CFG의 Start/End 구간은 **한 스텝 늦게** 판정됩니다
-  (20 steps에서 5%만큼). Detail Daemon은 denoiser가 넘기는 자체 스텝 번호를 써서 이 지연이 없으므로, 두 기능의 %
+  **뒤**에 올리므로, PAG/SEG/SLG·DAVE·Adaptive Guidance의 Start/End 구간은 **한 스텝 늦게** 판정됩니다
+  (20 steps에서 5%만큼). Detail Daemon은 ComfyUI 노드처럼 모델 호출의 σ로 스케줄 위치를 찾아 이 지연이 없으므로, 두 기능의 %
   값이 같아도 시작 스텝은 하나 어긋날 수 있습니다.
 - Perturbation Guidance(PAG/SEG/SLG)는 cond 행 사본(weak 행)을 배치에 덧붙여 한 forward로 돌리므로, 켜 둔
   구간에서는 샘플링 배치가 cond/uncond에 weak 행만큼 커져 활성 VRAM과 스텝 시간이 늘어납니다(PAG 하나면 대략 1.5배
@@ -148,13 +148,16 @@ MaHiRo/RescaleCFG/custom CFG를 쓰는 경우 먼저 전부 끈 상태로 비교
 | Skimming CFG | 7.0 | 되돌릴 기준 스케일. `-1`이면 현재 CFG를 그대로 사용 |
 | Full skim negative | off | 네거티브를 0까지 skim. `-1`과 조합하면 upstream의 Clean Skim |
 | Disable flipping filter | off | 끄면 더 거칠어집니다 |
-| Start / End (%) | 0.0 / 1.0 | 적용 스텝 구간 |
-| Flip at (%) | 0.0 | 해당 지점 이전에서 필터를 뒤집습니다(0=사용 안 함) |
+| Start / End (%) | 0.0 / 1.0 | 적용 구간. 원본처럼 모델의 `percent_to_sigma`로 σ를 구해 `end σ < σ < start σ`(경계 제외)인 스텝만 skim. flow 모델(Anima)은 첫 스텝(σ=1)을 깎지 않고, start > end면 아무 스텝도 깎지 않습니다 |
+| Flip at (%) | 0.0 | 그 지점의 σ보다 큰(앞선) 스텝에서 필터를 뒤집습니다(0=사용 안 함) |
 
 - **CFG > 1 전용**입니다. CFG=1이거나 uncond가 없는 경로에서는 자동으로 건너뜁니다.
+- upstream([Extraltodeus/Skimmed_CFG](https://github.com/Extraltodeus/Skimmed_CFG), Apache-2.0)의 수식
+  함수를 `sam3ext/guidance/skimmed_cfg.py`에 그대로 편입했고, σ 구간·flip 규칙·깎는 순서도 원본 노드와 같습니다.
 - upstream은 ComfyUI **pre**-CFG 노드지만 Forge의 `sampler_pre_cfg_function`은 예측 이전의
-  conditioning을 받는 다른 계약이라, 같은 수식을 **post-CFG**에서 재구성합니다. Forge가
-  넘겨주는 `cond_denoised`/`uncond_denoised`/`input`/`cond_scale`이면 충분합니다.
+  conditioning을 받는 다른 계약이라, post-CFG 목록 맨 앞에서 예측을 깎은 뒤 Forge의 CFG 단계를 깎인 예측으로
+  다시 계산합니다. 등록된 `sampler_cfg_function`(RescaleCFG, Dynamic Thresholding 등)은 Forge 형식 인자로
+  다시 부르고, 없으면 Forge의 `edit_strength`를 반영한 선형 결합을 씁니다.
 - **SMC/APG/CWM과 동시에 사용할 수 있습니다.** upstream이 `conds_out`을 제자리에서 고쳐
   이후 전부가 skim된 예측을 보게 하는 것과 동일하게, 이 스크립트도 skim 결과를 Forge의
   예측 tensor에 다시 씁니다. Forge는 post-CFG 함수마다 args dict를 새로 만들지만 예측
@@ -423,11 +426,11 @@ shape 추론·block AdaLN 무변이 주입, pass 종료 tensor 해제와 Noteboo
 | SLG | Stability AI SD3.5 / Wan 커뮤니티 구현 | Forge block wrapper |
 | APG | [MythicalChu/ComfyUI-APG_ImYourCFGNow](https://github.com/MythicalChu/ComfyUI-APG_ImYourCFGNow), [APG 논문](https://arxiv.org/abs/2410.02416) | post-CFG 재구현 |
 | DCW/RDC/CWM/SMC | [namemechan/ComfyUI-DCW](https://github.com/namemechan/ComfyUI-DCW) (GPL-3.0) | 공개 수식 기반 Forge 재작성, vendor 아님 |
-| Skimmed CFG | [Extraltodeus/Skimmed_CFG](https://github.com/Extraltodeus/Skimmed_CFG) (LICENSE 파일 미공개) | 공개 수식 기반 Forge 재작성, vendor 아님 |
+| Skimmed CFG | [Extraltodeus/Skimmed_CFG](https://github.com/Extraltodeus/Skimmed_CFG) (Apache-2.0) | 수식·σ 게이트 편입(`sam3ext/guidance/skimmed_cfg.py`), Forge post-CFG 훅 |
 | DAVE | [daheekwon/DAVE](https://github.com/daheekwon/DAVE) (MIT), [ComfyUI-Anima-DAVE](https://github.com/sorryhyun/ComfyUI-Anima-DAVE) (MIT), [논문](https://arxiv.org/abs/2606.06813) | block 수식 재구현 |
 | CNS | [namemechan/comfyui-cns_sampler_patch](https://github.com/namemechan/comfyui-cns_sampler_patch) (GPL-3.0), [논문](https://arxiv.org/abs/2605.30332) | CNS-inspired 재작성, vendor 아님 |
 | Anima Modulation Guidance | [Anzhc/Anima-Mod-Guidance-ComfyUI-Node](https://github.com/Anzhc/Anima-Mod-Guidance-ComfyUI-Node) (MIT 선언), [quickjkee/modulation-guidance](https://github.com/quickjkee/modulation-guidance) (MIT), [yresearch/cosmos-pooled adapter](https://huggingface.co/yresearch/cosmos-pooled) | 공개 수식·어댑터 형식 기반 Forge block 재작성, vendor 아님 |
-| Detail Daemon | [muerrilla/sd-webui-detail-daemon](https://github.com/muerrilla/sd-webui-detail-daemon) | Forge 재구현 |
+| Detail Daemon | [muerrilla/sd-webui-detail-daemon](https://github.com/muerrilla/sd-webui-detail-daemon) (MIT), [Jonseed/ComfyUI-Detail-Daemon](https://github.com/Jonseed/ComfyUI-Detail-Daemon) (MIT) | schedule·σ 조회 함수 편입(고지는 THIRD_PARTY_NOTICES.md), Forge 훅 |
 
 원본 저장소를 통째로 포함하지 않았으며, Forge 연결과 상태 관리는 이 확장에서 별도로 작성했습니다.
 각 기법과 참조 코드의 저작권·라이선스는 원저자/원 저장소에 따릅니다.

@@ -27,6 +27,7 @@ from .anima_core import (
     list_te_choices,
     list_vae_choices,
     list_pid_checkpoints,
+    default_lllite_choice,
     default_te_choice,
     default_vae_choice,
     run_tile_repair,
@@ -62,9 +63,9 @@ class AnimaPanel:
     seed: gr.Number = None  # type: ignore[assignment]
     seed_random_button: gr.Button = None  # type: ignore[assignment]
     seed_pull_button: gr.Button = None  # type: ignore[assignment]
-    # Output sizing
-    width: gr.Slider = None  # type: ignore[assignment]
-    height: gr.Slider = None  # type: ignore[assignment]
+    # Output sizing — short side only; the long side follows the source
+    # aspect ratio (anima_core.tile_repair_size)
+    short_side: gr.Slider = None  # type: ignore[assignment]
     # LLLite — only the multiplier reaches the vendor (audit M14 removed the
     # Strength / Start % / End % sliders that were never passed anywhere)
     lllite_multiplier: gr.Slider = None  # type: ignore[assignment]
@@ -100,8 +101,7 @@ class AnimaPanel:
             self.cfg,
             self.flow_shift,
             self.seed,
-            self.width,
-            self.height,
+            self.short_side,
             self.lllite_multiplier,
             self.unload_forge_before,
             self.insert_mode,
@@ -130,8 +130,7 @@ ANIMA_ARG_KEYS: tuple[str, ...] = (
     "cfg",
     "flow_shift",
     "seed",
-    "width",
-    "height",
+    "short_side",
     "lllite_multiplier",
     "unload_forge_before",
     "insert_mode",
@@ -192,7 +191,9 @@ def build_anima_panel(*, container: str = ACCORDION) -> AnimaPanel:
             lllite_model = gr.Dropdown(
                 label="SAM3 Anima LLLite Model",
                 choices=lllite_choices,
-                value=lllite_choices[1] if len(lllite_choices) > 1 else "None",
+                # Only 3-channel LLLites are listed (header check); default is
+                # the newest Tile & Repair file (v20 over v10).
+                value=default_lllite_choice(lllite_choices),
                 type="value",
                 elem_id="sam3_anima_lllite",
             )
@@ -229,9 +230,10 @@ def build_anima_panel(*, container: str = ACCORDION) -> AnimaPanel:
                 elem_id="sam3_anima_positive",
             )
         with gr.Row():
+            # sd-scripts --negative_prompt default is "".
             negative = gr.Textbox(
                 label="SAM3 Anima Negative",
-                value="blurry, low quality",
+                value="",
                 lines=1,
                 elem_id="sam3_anima_negative",
             )
@@ -313,34 +315,32 @@ def build_anima_panel(*, container: str = ACCORDION) -> AnimaPanel:
             )
 
         # --- Output sizing ---------------------------------------------
+        # The source keeps its aspect ratio: this sets the short side, the
+        # long side follows, both rounded down to a multiple of 32 (min 256).
         with gr.Row():
-            width = gr.Slider(
-                label="SAM3 Anima Width",
+            short_side = gr.Slider(
+                label="SAM3 Anima Short Side (keeps source aspect ratio)",
                 minimum=256,
                 maximum=4096,
                 step=32,
                 value=1024,
-                elem_id="sam3_anima_width",
-            )
-            height = gr.Slider(
-                label="SAM3 Anima Height",
-                minimum=256,
-                maximum=4096,
-                step=32,
-                value=1024,
-                elem_id="sam3_anima_height",
+                elem_id="sam3_anima_short_side",
             )
 
         # --- LLLite ------------------------------------------------------
         # Only the multiplier exists on the vendor side
         # (networks/control_net_lllite_anima.set_multiplier); there is no
-        # strength or step schedule, so no sliders for them.
+        # strength or step schedule, so no sliders for them. Range is the
+        # kohya ComfyUI-Anima-LLLite strength input (-10..10, step .01,
+        # default 1.0 = sd-scripts --lllite_multiplier default). The label
+        # is also the ui-config.json key; it changed with the range so the
+        # old saved 0..2 / .05 bounds are not reapplied.
         with gr.Row():
             lllite_multiplier = gr.Slider(
-                label="SAM3 Anima LLLite Multiplier",
-                minimum=0.0,
-                maximum=2.0,
-                step=0.05,
+                label="SAM3 Anima LLLite Multiplier (-10 ~ 10)",
+                minimum=-10.0,
+                maximum=10.0,
+                step=0.01,
                 value=1.0,
                 elem_id="sam3_anima_lllite_multiplier",
             )
@@ -448,8 +448,7 @@ def build_anima_panel(*, container: str = ACCORDION) -> AnimaPanel:
         seed=seed,
         seed_random_button=seed_random_button,
         seed_pull_button=seed_pull_button,
-        width=width,
-        height=height,
+        short_side=short_side,
         lllite_multiplier=lllite_multiplier,
         unload_forge_before=unload_forge_before,
         insert_mode=insert_mode,
@@ -505,8 +504,7 @@ def _map_widget_values(values: tuple) -> AnimaTileRepairArgs:
         cfg=_as_float(keyed.get("cfg"), 3.5),
         flow_shift=_as_float(keyed.get("flow_shift"), 5.0),
         seed=_as_int(keyed.get("seed"), -1),
-        width=_as_int(keyed.get("width"), 1024),
-        height=_as_int(keyed.get("height"), 1024),
+        short_side=_as_int(keyed.get("short_side"), 1024),
         lllite_multiplier=_as_float(keyed.get("lllite_multiplier"), 1.0),
         unload_forge_before=bool(keyed.get("unload_forge_before", True)),
         insert_mode=str(keyed.get("insert_mode") or "After selected"),

@@ -382,20 +382,27 @@ def inject_controlnet_unit(p2: StableDiffusionProcessingImg2Img, cn_args: dict[s
     module_name = str(cn_args.get("sam3_cn_module", "inpaint_only"))
     model_name = str(cn_args.get("sam3_cn_model", "None"))
 
-    # LLLite anima inpaint variants take a 4-channel (RGB + mask) cond and
-    # need the mask tensor to survive preprocessing. ``inpaint_*`` preprocessors
-    # discard the mask (return None) and rewrite cond, which breaks the
-    # ``assert isinstance(mask, torch.Tensor)`` in the LLLite forward. Force a
-    # pass-through preprocessor in that case.
-    lower_model = model_name.lower()
-    if "lllite" in lower_model and "inpaint" in lower_model and module_name.startswith("inpaint"):
-        print(
-            f"[-] SAM3: LLLite inpaint model '{model_name}' is incompatible with "
-            f"preprocessor '{module_name}' (preprocessor strips the mask); "
-            f"overriding to 'None' so the mask reaches the LLLite forward.",
-            file=sys.stderr,
-        )
-        module_name = "None"
+    # Anima ControlNet-LLLite takes the control image as given, like the originals
+    # (kohya sd-scripts / ComfyUI-Anima-LLLite). Tile & Repair takes the image to
+    # repair → preprocessor "None" (inpaint_only would blank the region to -1).
+    # Other Anima LLLite (lineart/canny/depth…) keep the chosen preprocessor, which
+    # is what turns the inpaint image into their control map; only ``inpaint_*``
+    # becomes "None": 3-channel weights ignore the mask in the originals, and
+    # 4-channel inpaint weights need the mask tensor, which ``inpaint_*`` discard
+    # (``assert isinstance(mask, torch.Tensor)`` in the LLLite forward).
+    # Channels and Tile & Repair come from the safetensors header (torch-free),
+    # else the file name.
+    from .sam3_cn_lllite import anima_lllite, forced_cn_module
+
+    try:
+        model_path = _cn_state.controlnet_filename_dict.get(model_name)
+    except Exception:
+        model_path = None
+    module_name, override_reason = forced_cn_module(
+        module_name, anima_lllite(model_name, model_path), model_name
+    )
+    if override_reason:
+        print(f"[-] SAM3: {override_reason}", file=sys.stderr)
 
     sam3_unit = ControlNetUnit(
         enabled=True,

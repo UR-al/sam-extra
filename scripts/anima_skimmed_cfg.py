@@ -1,25 +1,46 @@
 """Skimmed CFG — anti-burn skimming of the cond/uncond predictions.
 
-Reimplemented for Forge from the public formulas of
-https://github.com/Extraltodeus/Skimmed_CFG (no LICENSE file is published in
-that repository, so nothing is vendored here — only the described maths are
-rewritten in this extension's own style, as with the other guidance sources
-credited in ``docs/GUIDANCE.md``).
+Port of the ``CFG_Skimming_Single_Scale_Pre_CFG`` node of
+https://github.com/Extraltodeus/Skimmed_CFG (commit d8300583, Apache-2.0). The
+upstream maths (``get_skimming_mask``/``skimmed_CFG``) are vendored unmodified
+in ``sam3ext/guidance/skimmed_cfg.py`` together with the node's sigma gate, flip
+rule and skim order; the notice is in ``THIRD_PARTY_NOTICES.md``.
 
-Upstream is a ComfyUI *pre*-CFG node: it rewrites ``conds_out`` in place before
-the CFG combine, which is why everything downstream of it — the combine itself
-and any further guidance — operates on the skimmed predictions. Forge's
-``sampler_pre_cfg_function`` has a different contract (it runs on the
-conditioning lists *before* the predictions exist), so the same maths are
-applied here from a post-CFG hook instead: Forge hands us ``cond_denoised``,
-``uncond_denoised``, ``input`` and ``cond_scale``, which is everything the
-skimming formula needs.
+Behaviour matches upstream:
 
-To keep upstream's composition semantics, the skimmed predictions are written
-back into Forge's own tensors in place. Forge rebuilds the post-CFG args dict
-per registered function but reuses the same prediction tensors, so later hooks
-(Safe PAG's SMC/APG/CWM base, the PAG/SEG/SLG delta, DCW) see the skim exactly
-as a ComfyUI graph would.
+* The start/end/flip percentages become sigmas through the sampling model's own
+  ``predictor.percent_to_sigma`` (ComfyUI: ``model_sampling.percent_to_sigma``)
+  and the current sigma is read from the hook args, not from a step counter. A
+  step is skimmed only when ``end_sigma < sigma < start_sigma`` (strict), so on
+  a flow model such as Anima the first step (sigma 1.0 = percent 0) is never
+  skimmed, and a reversed start/end skims nothing.
+* The filter is flipped while ``flip_at > 0 and sigma > flip_sigma``.
+* The negative is skimmed first, then the positive against the skimmed negative
+  at ``cond_scale - 1``; a negative prediction that is all zeros (Forge's CFG 1
+  path) is left alone.
+
+Host differences that remain:
+
+* Upstream is a ComfyUI *pre*-CFG node that rewrites ``conds_out`` before the
+  CFG combine. Forge's ``sampler_pre_cfg_function`` runs before the predictions
+  exist, so this script hooks the front of the post-CFG list instead, skims the
+  predictions, writes them back into Forge's tensors in place and re-runs
+  Forge's own CFG step on them: the registered ``sampler_cfg_function``
+  (RescaleCFG, Dynamic Thresholding, ...) with Forge's argument dict, otherwise
+  the linear combine with Forge's ``edit_strength``. That is what every later
+  consumer would have seen after an upstream pre-CFG rewrite. A registered
+  ``sampler_cfg_function`` therefore runs twice on skimmed steps (Forge's call
+  on the raw predictions is discarded).
+* CFG exactly 1 with the uncond pass forced on is skipped: upstream divides by
+  ``cond_scale - 1`` there.
+* The Skimming CFG slider allows -1 (use the live CFG) so one script covers the
+  Clean Skim and Timed flip presets; upstream's main node hides that behind the
+  preset nodes.
+
+Forge's post-CFG args are rebuilt per registered function but reuse the same
+prediction tensors, so the in-place write lets later hooks (Safe PAG's
+SMC/APG/CWM base, the PAG/SEG/SLG delta, DCW) see the skim exactly as a ComfyUI
+graph would.
 
 Forge Neo currently defines ``ScriptRunner.process_before_every_sampling``
 twice; the later definition iterates the raw ``alwayson_scripts`` list and
@@ -31,13 +52,14 @@ hires passes and script reloads cannot stack stale copies.
 
 from __future__ import annotations
 
+import math
 import sys
 import traceback
 from functools import partial
 
 import gradio as gr
 
-from modules import script_callbacks, scripts, shared
+from modules import script_callbacks, scripts
 
 from sam3ext import layout_lanes
 
@@ -45,6 +67,16 @@ try:
     import torch
 except Exception:  # pragma: no cover - torch is always present under Forge
     torch = None
+
+# Deliberately unguarded (like Safe PAG's sam3ext.guidance imports): if the
+# vendored maths cannot be imported, the script must fail to load with Forge's
+# traceback instead of leaving a checkbox that silently does nothing.
+from sam3ext.guidance.skimmed_cfg import (  # noqa: E402
+    flip_filter_at,
+    skim_active,
+    skim_pair,
+    skim_sigmas,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -62,6 +94,8 @@ _SKIM: dict = {
     "flip_at": 0.0,
     "steps": 0,
     "warned": False,
+    # (predictor, (start_sigma, end_sigma, flip_sigma)) for the current pass.
+    "sigmas": None,
 }
 
 _MIN_SCALE = 1e-6
@@ -172,108 +206,137 @@ def _skim_on_before_ui() -> None:
 script_callbacks.on_before_ui(_skim_on_before_ui)
 
 
-def _sampling_position() -> tuple[int, int]:
-    """Forge's authoritative 0-based sampler position (see anima_safe_pag)."""
-    try:
-        state = getattr(shared, "state", None)
-        step = int(getattr(state, "sampling_step"))
-        total = int(getattr(state, "sampling_steps"))
-        if total > 0:
-            return max(0, step), total
-    except Exception:
-        pass
-    return 0, 1
+def _warn_once(message: str) -> None:
+    if not _SKIM["warned"]:
+        _SKIM["warned"] = True
+        _log(message)
 
 
-def _pct_now() -> float:
-    step, total = _sampling_position()
-    return min(1.0, max(0.0, step / max(total - 1, 1)))
+def _gate_sigmas(model):
+    """``(start, end, flip)`` sigmas from the sampling model's own schedule.
 
-
-def _skim_predictions(x, target, reference, scale, skimming_scale, flip_filter):
-    """Return ``target`` with its 'burning' elements pulled toward ``skimming_scale``.
-
-    ``target``/``reference`` are denoised (x0) predictions and ``scale`` is the
-    CFG scale that would be applied to them, so
-    ``denoised = reference + scale * (target - reference)`` matches Forge's own
-    linear combine. Elements are skimmed only where the guidance pushes the
-    prediction further out along a direction it already agrees with — that is
-    the set upstream calls ``outer_influence``.
+    Upstream converts the percentages once, when the node patches the model
+    (after any shift node). Here the predictor comes from the post-CFG args —
+    the KModel Forge is sampling with, after Forge applied its shift — and the
+    conversion is cached for the pass. ``None`` when there is no predictor.
     """
-    if abs(float(scale)) < _MIN_SCALE:
-        return target  # CFG 1: the combine contributes nothing to skim
+    predictor = getattr(model, "predictor", None)
+    percent_to_sigma = getattr(predictor, "percent_to_sigma", None)
+    if not callable(percent_to_sigma):
+        return None
+    cached = _SKIM["sigmas"]
+    if cached is not None and cached[0] is predictor:
+        return cached[1]
+    sigmas = skim_sigmas(
+        percent_to_sigma,
+        float(_SKIM["start"]), float(_SKIM["end"]), float(_SKIM["flip_at"]),
+    )
+    _SKIM["sigmas"] = (predictor, sigmas)
+    start_sigma, end_sigma, flip_sigma = sigmas
+    flip_text = (
+        f", filter flipped while sigma > {flip_sigma:.4f}"
+        if float(_SKIM["flip_at"]) > 0 else ""
+    )
+    _log(
+        f"sigma window: skims while {end_sigma:.4f} < sigma < "
+        f"{start_sigma:.4f}{flip_text}"
+    )
+    return sigmas
 
-    denoised = reference + scale * (target - reference)
-    matching_pred_signs = (target - reference).sign() == target.sign()
-    matching_diff_after = target.sign() == denoised.sign()
-    outer_influence = matching_pred_signs & matching_diff_after
-    if not flip_filter:
-        outer_influence &= denoised.sign() == (denoised - x).sign()
 
-    # torch.where 로 고른다. 예전의 ``outer_influence.any()`` 확인과 불리언 마스크
-    # gather/scatter(skimmed[mask] = target[mask] - correction[mask])는 호출마다
-    # GPU→CPU 동기화를 4번 일으켰다. 원소별 계산이 같으므로 결과는 비트 단위로
-    # 같고, 마스크가 비어 있으면 target 과 같은 값이 그대로 나온다.
-    low_scale_denoised = reference + skimming_scale * (target - reference)
-    correction = (denoised - low_scale_denoised) / scale
-    return torch.where(outer_influence, target - correction, target)
+def _edit_strength(conds) -> float:
+    """Forge's ``edit_strength`` for the positive conds (1 when unknown)."""
+    if conds is None:
+        return 1.0
+    try:
+        return float(sum(
+            (item["strength"] if "strength" in item else 1) for item in conds
+        ))
+    except Exception:
+        return 1.0
+
+
+def _forge_cfg(args, cond_pred, uncond_pred):
+    """Forge's own CFG step, run on the given predictions.
+
+    Same branches and argument dict as ``sampling_function_inner`` in
+    ``backend/sampling/sampling_function.py``: a registered
+    ``sampler_cfg_function`` gets Forge's dict and its result is subtracted
+    from the input; otherwise the linear combine, scaled by ``edit_strength``
+    when the positive conds carry a strength.
+    """
+    x = args["input"]
+    cond_scale = args["cond_scale"]
+    model_options = args.get("model_options") or {}
+    if "sampler_cfg_function" in model_options:
+        cfg_args = {
+            "cond": x - cond_pred,
+            "uncond": x - uncond_pred,
+            "cond_scale": cond_scale,
+            "timestep": args.get("sigma"),
+            "input": x,
+            "sigma": args.get("sigma"),
+            "cond_denoised": cond_pred,
+            "uncond_denoised": uncond_pred,
+            "model": args.get("model"),
+            "model_options": model_options,
+        }
+        return x - model_options["sampler_cfg_function"](cfg_args)
+    edit_strength = _edit_strength(args.get("cond"))
+    if not math.isclose(edit_strength, 1.0):
+        return uncond_pred + (cond_pred - uncond_pred) * cond_scale * edit_strength
+    return uncond_pred + (cond_pred - uncond_pred) * cond_scale
 
 
 def _post_cfg(args):
-    """Recompute the CFG combine from skimmed predictions."""
+    """Skim the predictions (upstream pre-CFG patch) and redo Forge's CFG step."""
     denoised = args["denoised"]
     if not _SKIM["on"] or torch is None:
-        return denoised
-
-    pct = _pct_now()
-    if not (float(_SKIM["start"]) <= pct <= float(_SKIM["end"])):
         return denoised
 
     try:
         x = args["input"]
         cond = args["cond_denoised"]
         uncond = args["uncond_denoised"]
-        cond_scale = float(args.get("cond_scale", 1.0))
+        cond_scale = args["cond_scale"]
+        sigma = args["sigma"][0].item()
     except Exception:
         return denoised
 
-    if not torch.is_tensor(x) or not torch.is_tensor(cond):
+    if not (torch.is_tensor(x) and torch.is_tensor(cond)):
         return denoised
     if not torch.is_tensor(uncond) or uncond.shape != cond.shape:
-        return denoised  # CFG 1 / positive-only path has no uncond to skim
-    if abs(cond_scale - 1.0) < _MIN_SCALE:
-        if not _SKIM["warned"]:
-            _SKIM["warned"] = True
-            _log("CFG scale is 1 — skimming has nothing to correct; skipped.")
         return denoised
 
     try:
-        requested = float(_SKIM["skimming_cfg"])
-        practical_scale = cond_scale if requested < 0 else requested
+        sigmas = _gate_sigmas(args.get("model"))
+    except Exception as exc:
+        _warn_once(f"percent_to_sigma failed, skipped: {type(exc).__name__}: {exc}")
+        return denoised
+    if sigmas is None:
+        _warn_once("the sampling model has no predictor.percent_to_sigma — "
+                   "the sigma window cannot be placed; skipped.")
+        return denoised
+    start_sigma, end_sigma, flip_sigma = sigmas
+    if not skim_active(sigma, start_sigma, end_sigma):
+        return denoised
+    if not torch.any(uncond):
+        return denoised  # upstream: no negative prediction (CFG 1 path)
+    if abs(float(cond_scale) - 1.0) < _MIN_SCALE:
+        _warn_once("CFG scale is 1 — skimming would divide by zero; skipped.")
+        return denoised
 
-        flip_filter = bool(_SKIM["disable_flipping_filter"])
-        flip_at = float(_SKIM["flip_at"])
-        if flip_at > 0 and pct < flip_at:
-            flip_filter = not flip_filter
-
-        x_f = x.float()
-        cond_f = cond.float()
-        uncond_f = uncond.float()
-
-        # Upstream order: skim the negative against the positive first, then
-        # the positive against the freshly skimmed negative at ``scale - 1``.
-        uncond_skimmed = _skim_predictions(
-            x_f, uncond_f, cond_f, cond_scale,
-            0.0 if _SKIM["full_skim_negative"] else practical_scale,
+    try:
+        flip_filter = flip_filter_at(
+            sigma, bool(_SKIM["disable_flipping_filter"]),
+            float(_SKIM["flip_at"]), flip_sigma,
+        )
+        cond_skimmed, uncond_skimmed = skim_pair(
+            x, cond.clone(), uncond.clone(), cond_scale,
+            float(_SKIM["skimming_cfg"]), bool(_SKIM["full_skim_negative"]),
             flip_filter,
         )
-        cond_skimmed = _skim_predictions(
-            x_f, cond_f, uncond_skimmed, cond_scale - 1.0,
-            practical_scale, flip_filter,
-        )
-
-        result = uncond_skimmed + cond_scale * (cond_skimmed - uncond_skimmed)
-        result = torch.nan_to_num(result, nan=0.0, posinf=0.0, neginf=0.0)
+        result = _forge_cfg(args, cond_skimmed, uncond_skimmed)
 
         # Publish the skimmed predictions the way upstream's pre-CFG node does.
         # Forge rebuilds the args dict per post-CFG function but reuses the same
@@ -281,15 +344,13 @@ def _post_cfg(args):
         # so writing in place is what lets the rest of the suite — Safe PAG's
         # SMC/APG/CWM base, the PAG/SEG/SLG delta, DCW — compose on top of the
         # skim instead of rebuilding from the unskimmed originals.
-        cond.copy_(cond_skimmed.to(cond.dtype))
-        uncond.copy_(uncond_skimmed.to(uncond.dtype))
+        cond.copy_(cond_skimmed)
+        uncond.copy_(uncond_skimmed)
 
         _SKIM["steps"] += 1
-        return result.to(denoised.dtype)
+        return result
     except Exception as exc:  # keep the generation alive on any surprise
-        if not _SKIM["warned"]:
-            _SKIM["warned"] = True
-            _log(f"fallback (earlier guidance kept): {type(exc).__name__}: {exc}")
+        _warn_once(f"fallback (earlier guidance kept): {type(exc).__name__}: {exc}")
         return denoised
 
 
@@ -375,8 +436,12 @@ class AnimaSkimmedCFG(scripts.Script):
             )
             with gr.Accordion("Skimmed CFG Advanced (세부값)", open=False):
                 gr.Markdown(
-                    "**start/end**=적용 스텝 구간, **flip at**=지정 지점 이전에서 "
-                    "flipping filter를 뒤집어 초반 구도를 다르게 잡습니다(0=사용 안 함), "
+                    "**start/end**=적용 구간(%)입니다. 원본 노드와 같이 모델의 노이즈 "
+                    "스케줄로 %를 σ로 바꿔, σ가 start의 σ보다 작고 end의 σ보다 큰 "
+                    "스텝만 skim합니다(경계 제외). 그래서 스케줄러마다 해당 스텝이 "
+                    "다르고, Anima 같은 flow 모델에서는 첫 스텝(σ=1)을 깎지 않습니다. "
+                    "**flip at**=그 지점의 σ보다 앞선(σ가 큰) 스텝에서 flipping filter를 "
+                    "뒤집어 초반 구도를 다르게 잡습니다(0=사용 안 함), "
                     "**disable flipping filter**=필터를 아예 끄면 더 거칠어집니다."
                 )
                 disable_flipping_filter = gr.Checkbox(
@@ -397,8 +462,8 @@ class AnimaSkimmedCFG(scripts.Script):
                     )
                 flip_at = gr.Slider(
                     label="Flip at (%) · 0 = 사용 안 함",
-                    minimum=0.0, maximum=1.0, step=0.05, value=0.0,
-                    info="0.3 부근이 upstream 기본값입니다. 0에 가까울수록 부드럽습니다.",
+                    minimum=0.0, maximum=1.0, step=0.01, value=0.0,
+                    info="upstream Timed flip 노드의 기본값은 0.3입니다. 0에 가까울수록 부드럽습니다.",
                     elem_id="anima_skim_flip_at",
                 )
         return [
@@ -423,7 +488,7 @@ class AnimaSkimmedCFG(scripts.Script):
                     return cur
             return cur
 
-        _SKIM.update(on=False, steps=0, warned=False)
+        _SKIM.update(on=False, steps=0, warned=False, sigmas=None)
 
         try:
             enabled = bool(_arg(0, False))
@@ -435,10 +500,8 @@ class AnimaSkimmedCFG(scripts.Script):
             return
 
         try:
-            start = _xyz_num("start", float(_arg(4, 0.0)))
-            end = _xyz_num("end", float(_arg(5, 1.0)))
-            if end < start:
-                start, end = end, start
+            # Passed through as-is, like upstream: no swap (a reversed window
+            # skims nothing) and no clamp (percent_to_sigma saturates at 0/1).
             _SKIM.update(
                 on=True,
                 skimming_cfg=_xyz_num("skimming_cfg", float(_arg(1, 7.0))),
@@ -450,9 +513,9 @@ class AnimaSkimmedCFG(scripts.Script):
                     xyz.get("disable_flipping_filter", _arg(3, False)),
                     bool(_arg(3, False)),
                 ),
-                start=min(max(start, 0.0), 1.0),
-                end=min(max(end, 0.0), 1.0),
-                flip_at=min(max(_xyz_num("flip_at", float(_arg(6, 0.0))), 0.0), 1.0),
+                start=_xyz_num("start", float(_arg(4, 0.0))),
+                end=_xyz_num("end", float(_arg(5, 1.0))),
+                flip_at=_xyz_num("flip_at", float(_arg(6, 0.0))),
             )
         except Exception as exc:
             _SKIM["on"] = False
@@ -495,4 +558,4 @@ class AnimaSkimmedCFG(scripts.Script):
     def postprocess(self, p, processed, *args):
         if _SKIM["on"]:
             _log(f"skimmed steps={_SKIM['steps']}")
-        _SKIM.update(on=False, steps=0, warned=False)
+        _SKIM.update(on=False, steps=0, warned=False, sigmas=None)
