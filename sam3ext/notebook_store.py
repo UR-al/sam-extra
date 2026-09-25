@@ -313,8 +313,22 @@ def _gradio_auth_dependencies(app: Any) -> list[Any]:
     return []
 
 
+def require_same_origin_header(request: Request) -> None:
+    """Shared by the Notebook and memo routes (sam3ext/notebook_memos.py)."""
+
+    if request.headers.get("X-SAM3-Notebook") != "1":
+        raise HTTPException(
+            status_code=403,
+            detail="Missing same-origin Notebook request header",
+        )
+
+
 def register_notebook_routes(app: Any, store: NotebookStore | None = None) -> bool:
-    """Register same-origin GET/PUT Notebook routes exactly once."""
+    """Register same-origin GET/PUT Notebook routes exactly once.
+
+    The memo pad routes (``/sam3-notebook/memos``) are registered here too, so
+    ``scripts/!sam3.py`` keeps a single call.
+    """
 
     for route in getattr(app, "routes", ()):
         if getattr(route, "path", None) == NOTEBOOK_API_PATH:
@@ -322,13 +336,6 @@ def register_notebook_routes(app: Any, store: NotebookStore | None = None) -> bo
 
     notebook_store = store or NotebookStore()
     auth_dependencies = _gradio_auth_dependencies(app)
-
-    def require_same_origin_header(request: Request) -> None:
-        if request.headers.get("X-SAM3-Notebook") != "1":
-            raise HTTPException(
-                status_code=403,
-                detail="Missing same-origin Notebook request header",
-            )
 
     async def get_notebook(request: Request) -> JSONResponse:
         require_same_origin_header(request)
@@ -401,4 +408,8 @@ def register_notebook_routes(app: Any, store: NotebookStore | None = None) -> bo
         name="sam3-notebook-put",
         dependencies=auth_dependencies,
     )
+    # Imported here: notebook_memos imports this module's helpers.
+    from .notebook_memos import register_memo_routes_for_notebook
+
+    register_memo_routes_for_notebook(app, notebook_store, auth_dependencies)
     return True
