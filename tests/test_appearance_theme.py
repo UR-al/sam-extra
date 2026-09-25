@@ -129,6 +129,16 @@ class AppearanceThemeTests(unittest.TestCase):
             self.javascript,
         )
 
+    def test_theme_background_skips_the_lightbox_toolbar(self):
+        """Forge's lightbox toolbar is `<div class="modalControls gradio-container">`
+        and is meant to stay transparent until hovered. The page-background rule
+        for `.gradio-container` uses !important, so without an exclusion it
+        painted the toolbar solid and the bar never faded out."""
+        start = self.css.index("[data-sam3-theme] :where(.gradio-container")
+        selector = self.css[start:self.css.index("{", start)]
+        self.assertIn(":not(.modalControls)", selector)
+        self.assertNotIn("[data-sam3-theme] :where(.gradio-container) {", self.css)
+
     def test_custom_palettes_also_set_gradios_dark_class(self):
         """Every palette is dark, but a lot of Forge/Gradio CSS is gated on the
         `dark` class that Gradio only puts on document.body when its resolved

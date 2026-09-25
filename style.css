@@ -25,7 +25,9 @@
     scrollbar-color: var(--sam3-color-rule) var(--sam3-color-paper);
 }
 
-[data-sam3-theme] :where(.gradio-container) {
+/* Forge's lightbox toolbar is also `.gradio-container` (div.modalControls) and
+ * must stay transparent until hovered — keep it out of the page background. */
+[data-sam3-theme] :where(.gradio-container:not(.modalControls)) {
     color: var(--sam3-color-ink);
     background: var(--sam3-color-paper) !important;
     font-family: var(--sam3-font-body);
