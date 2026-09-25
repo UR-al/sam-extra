@@ -371,6 +371,11 @@ def _forge_api_auth_dependencies(api_auth: str | None) -> list[Any]:
 def extension_auth_dependencies(app: Any) -> list[Any]:
     """The login guards of every sam-extra route: Gradio's and Forge's API auth.
 
+    Every route sam-extra adds to Forge's app takes them — the Notebook, memo
+    (sam3ext/notebook_memos.py), Tile & Repair (sam3ext/tile_repair_api.py)
+    and LoRA Manager config/spawn (sam3ext/lora_manager_core.py) routes —
+    together with ``require_same_origin_header``.
+
     Gradio's ``/login_check`` (``--gradio-auth``) and Forge's ``--api-auth``
     guard both apply when the host has them. ``--nowebui`` has no Gradio
     login, so there ``--api-auth`` alone guards the routes, as it guards
@@ -385,7 +390,11 @@ def extension_auth_dependencies(app: Any) -> list[Any]:
 
 
 def require_same_origin_header(request: Request) -> None:
-    """Shared by the Notebook and memo routes (sam3ext/notebook_memos.py)."""
+    """Shared by the Notebook, memo, Tile & Repair and LoRA Manager routes.
+
+    Called first in each handler, after the ``extension_auth_dependencies``
+    guards and before the handler does anything else.
+    """
 
     if request.headers.get("X-SAM3-Notebook") != "1":
         raise HTTPException(

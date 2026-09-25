@@ -417,6 +417,10 @@ Manage 탭은 txt2img·img2img 의 extra-networks strip 에 하나씩 주입됩�
 전송하면 지금 활성 탭의 프롬프트에 바로 추가하거나 기존 LoRA 토큰을 교체합니다.
 페이지의 JS 는 숨은 Gradio 버튼 브리지로 설정 조회·서버 기동을 하며, 같은 내용을 HTTP 로도 여는
 `/sam3-lora/config`·`/sam3-lora/spawn` 라우트는 JS 가 쓰지 않습니다(외부 도구용으로 남아 있음).
+이 두 라우트는 Notebook·메모·Tile & Repair 경로와 같은 인증을 씁니다. 부르는 외부 도구는 헤더
+`X-SAM3-Notebook: 1` 을 보내야 하고(없으면 403 — 거절된 `/sam3-lora/spawn` 은 서버를 띄우지 않음),
+`--gradio-auth` 로그인이 켜져 있으면 로그인 쿠키를, Forge 를 `--api`·`--nowebui` 와 `--api-auth` 로
+띄웠으면 그 HTTP Basic 자격 증명도 보내야 합니다(없거나 틀리면 401).
 
 ### 의존성 자동 설치
 

@@ -53,8 +53,12 @@ v0.21.2 이후 쌓인 큰 업데이트입니다. Anima 3.8B(Qwen3.5 / Semantic C
   ui-config.json migrated …` 아래 줄마다 나오고, 바꿀 것이 없으면 파일을 건드리지 않습니다. Detail Daemon Amount 는 라벨이 바뀌어 예전
   저장값이 적용되지 않으므로 대상이 아닙니다.
 - Forge 를 `--api` 또는 `--nowebui` 와 `--api-auth` 로 띄우면 이 확장의 Tile &
-  Repair(`/sam-extra/tile-repair…`)·Notebook·메모(`/sam3-notebook…`) 경로에도 `/sdapi` 와 같은 HTTP Basic 인증이 걸립니다. 이 경로를
-  부르는 스크립트·앱은 자격 증명을 보내야 하고(없거나 틀리면 401), `--gradio-auth` 로그인도 켜져 있으면 둘 다 필요합니다.
+  Repair(`/sam-extra/tile-repair…`)·Notebook·메모(`/sam3-notebook…`)·LoRA Manager(`/sam3-lora/*`) 경로에도 `/sdapi` 와
+  같은 HTTP Basic 인증이 걸립니다. 이 경로를 부르는 스크립트·앱은 자격 증명을 보내야 하고(없거나 틀리면 401), `--gradio-auth` 로그인도 켜져
+  있으면 둘 다 필요합니다.
+- `/sam3-lora/config`·`/sam3-lora/spawn` 을 직접 부르는 외부 도구는 이제 다른 확장 경로처럼 헤더 `X-SAM3-Notebook: 1` 을 보내야
+  하고(없으면 403), `--gradio-auth` 가 켜져 있으면 로그인 쿠키도 필요합니다(없으면 401). 페이지의 Manage 탭은 Gradio 버튼 브리지를 써서
+  그대로 동작합니다.
 
 ### Anima 3.8B (Qwen3.5 / Semantic Connector v2)
 
@@ -346,6 +350,10 @@ v0.21.2 이후 쌓인 큰 업데이트입니다. Anima 3.8B(Qwen3.5 / Semantic C
 - **확장 HTTP 경로에 Forge `--api-auth` 적용**: Forge 가 `--api`·`--nowebui` 로 API 를 띄우고 `--api-auth` 가 있으면 Tile &
   Repair(`/sam-extra/tile-repair…`)·Notebook(`/sam3-notebook`)·메모 경로에도 `/sdapi` 와 같은 HTTP Basic 인증을 겁니다(없거나 틀리면
   401). `--gradio-auth` 로그인도 켜져 있으면 둘 다 필요합니다. `--api`·`--nowebui` 없이 준 `--api-auth` 는 Forge 에서처럼 아무것도 막지 않습니다.
+- **LoRA Manager HTTP 경로도 같은 인증**: `/sam3-lora/config`·`/sam3-lora/spawn` 에 Notebook·메모·Tile & Repair 경로와 같은
+  보호를 걸었습니다. 헤더 `X-SAM3-Notebook: 1` 이 없으면 403, `--gradio-auth` 로그인이나 (Forge 가 API 를 띄울 때) `--api-auth`
+  HTTP Basic 이 없거나 틀리면 401 이고, 거절된 `/sam3-lora/spawn` 은 매니저 서버를 띄우지 않습니다. 페이지의 Manage 탭은 Gradio 버튼
+  브리지를 써서 그대로 동작하고, 이 경로를 부르는 외부 도구는 헤더(와 자격 증명)를 보내야 합니다.
 - **Forge 라이트박스 도구줄이 늘 보이던 문제 (버그 수정)**: 전역 테마(Settings → **SAM Extra Appearance**)를 켜면 테마 배경이 Forge 라이트박스의
   도구줄(`.modalControls`, 이것도 `.gradio-container`)까지 칠해, 마우스를 올리지 않아도 바가 배경색으로 늘 보였습니다. 도구줄을 테마 배경에서 뺐습니다.
 
@@ -391,15 +399,15 @@ v0.21.2 이후 쌓인 큰 업데이트입니다. Anima 3.8B(Qwen3.5 / Semantic C
   생겼습니다. README·docs 의 코드 불일치는 문서 쪽만 고쳤습니다.
 - **개발**: `requirements-dev.txt` 를 추가했고 CI 는 Python 3.13 + `unittest discover` 로 바뀌었습니다(실제 GitHub Actions 실행은
   미확인). 테스트 사이에 가짜 모듈이 남아 실행 순서에 따라 결과가 흔들리던 문제를 고쳤습니다.
-- **검증**: Python 단위 테스트 1422개 통과(skipped 2, CPU, `python -m unittest discover -s tests -t .`), jsdom 프런트엔드 테스트
+- **검증**: Python 단위 테스트 1434개 통과(skipped 2, CPU, `python -m unittest discover -s tests -t .`), jsdom 프런트엔드 테스트
   57개 통과(`npm test`). GPU(RTX 5090) 확인 — 픽셀 동일: 성능 작업 뒤 3.8B 기준 이미지 재렌더, 3.8B 커넥터 fp32·run 캐시, TF32 수정, SAM3
   인페인트 시드 수정, IP-Adapter 잡 뒤의 txt2img. 구도 같고 잔 디테일만 다름: PAG 앞쪽 블록 중복 제거(56.2 → 51.4 초), SEG separable blur.
   비교·동작 확인: IP-Adapter lineage 정책, IP-Adapter 의 3.8B 커넥터. 이 GPU 측정은 모두 원본 동등성 작업 전의 코드에서 잰 것입니다. 아직 GPU 로 확인하지
   않은 것: Safe PAG CFG 1 변경, VAE 2x, 부분 LoRA 추측 변환, 이어붙이기 권장 LoRA 화질 A/B, 그리고 원본 동등성 작업 전체(Detail Daemon·Safe
   PAG·Skimmed CFG·DCW(+a)·RDC·DAVE·CNS·Tile-Repair·SAM3 LLLite 전처리) — 이것은 원본 코드를 테스트 안에 그대로 두고 같은 입력의 결과를 비교하는
   CPU 단위 테스트(`tests/test_*_origin.py`, `test_skimmed_cfg.py`)로만 확인했습니다. Tile & Repair API·Notebook
-  메모장·`--api-auth` 적용·ui-config 이전·라이트박스 수정도 단위 테스트(메모장은 jsdom 포함)로 확인했습니다. 그 밖에 GPU 결과를 적지 않은 항목은 CPU 단위 테스트로만
-  확인했습니다.
+  메모장·`--api-auth` 적용·LoRA Manager 경로 인증·ui-config 이전·라이트박스 수정도 단위 테스트(메모장은 jsdom 포함)로 확인했습니다. 그 밖에 GPU
+  결과를 적지 않은 항목은 CPU 단위 테스트로만 확인했습니다.
 
 ## v0.21.2 — 레거시 콘솔 인코딩에서 로그가 생성을 죽이던 문제 + CI 연결
 
