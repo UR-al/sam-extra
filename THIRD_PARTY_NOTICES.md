@@ -99,9 +99,42 @@ Apache-2.0 으로 명시합니다. 이 확장의 GPL-3.0-only 라이선스는 �
 담고 있습니다. 원 라이선스는 MIT(Copyright (c) 2026, 저장소 LICENSE 에 이름 없음)이며 MIT 고지 전문은 이 문서 끝에
 있습니다. 나머지 PAG 구현(배치 확장·어텐션 패치·post-CFG)은 아래 표처럼 Forge 훅으로 다시 작성한 것입니다.
 
+## ComfyUI-DCW — 대조 테스트용 원본 사본 (GPL-3.0)
+
+`tests/_origin_comfyui_dcw.py` 는 [namemechan/ComfyUI-DCW](https://github.com/namemechan/ComfyUI-DCW)
+(commit `66aaf9dddb03bad031c1e8443e255a811008e477`) 의 `dcw_node.py` 전체를 바꾸지 않고 옮긴 것입니다(머리 주석을 붙이고
+줄끝을 CRLF 에서 LF 로 바꿨을 뿐이며, 테스트가 SHA-256 을 고정합니다). `tests/test_dcw_origin.py` 가 대조 오라클로만 불러
+쓰고 확장 실행 코드는 이 파일을 import 하지 않습니다. 같은 테스트에는 ComfyUI(`comfyanonymous/ComfyUI@387f98aa`)
+`comfy/samplers.py` 592-605줄의 `cfg_function` 이 그대로 들어 있습니다. 두 원본 모두 이 확장과 같은 GPL-3.0 입니다. 실행
+코드의 DCW·RDC·CWM·SMC(`sam3ext/guidance/dcw.py`, `sam3ext/guidance/cwm_smc.py`)는 다시 작성한 구현이고, 기본값·범위·켜짐
+규칙·CFG 1 동작·외부 CFG 함수가 있을 때의 처리는 원본 `INPUT_TYPES` 와 `patch()` 를 따릅니다.
+
+## CNS Sampler Patch — 노이즈 재색칠 (GPL-3.0)
+
+`sam3ext/guidance/cns.py` 의 `color_noise_wavelet` 은
+[namemechan/comfyui-cns_sampler_patch](https://github.com/namemechan/comfyui-cns_sampler_patch)
+(commit `42278b138284f7a8685ef174af0a50fe03246dd0`) 의 `cns_sampler_patch.py` 160-288줄(`_subband_energy`,
+`color_noise_wavelet`)을 단계별로 옮긴 것입니다. 달라진 곳은 디버그 출력 블록을 뺀 것, Haar 도우미로 이 확장의
+`sam3ext/guidance/haar.py`(같은 계산)를 쓰는 것, `x_t` 를 노이즈와 같은 장치로 옮기는 것입니다. `tests/_origin_cns_sampler_patch.py`
+는 같은 파일 전체를 바꾸지 않고 옮긴 대조 오라클입니다(머리 주석을 붙이고 줄끝을 CRLF 에서 LF 로 바꿨을 뿐이며,
+`tests/test_cns_origin.py` 가 SHA-256 을 고정합니다). 원본은 이 확장과 같은 GPL-3.0 입니다. Forge 샘플러에 거는 부분(k-diffusion
+노이즈 원천 패치, `p.sampler.callback_state` 로 스텝 x 를 잡는 것)은 이 확장이 다시 작성한 것이고, 기본값·범위는 원본
+`INPUT_TYPES`(391-439줄)를 따릅니다.
+
+## Anima DAVE — 초반 스텝 게이트 (MIT)
+
+`sam3ext/guidance/dave_gate.py` 는 [sorryhyun/ComfyUI-Anima-DAVE](https://github.com/sorryhyun/ComfyUI-Anima-DAVE)
+(commit `83143e8d84768e25f72755ec00ea00ded07ee06e`) 의 `nodes.py` 91-106줄(`_current_step`)과 165-166줄·199-208줄(블록
+켜짐 기준과 tau 게이트)을 옮긴 것입니다. 달라진 곳은 σ 스케줄과 현재 σ 를 `transformer_options` 대신 인자로 받는 것,
+Forge 의 전체 σ 목록에서 실제로 도는 꼬리만 쓰는 것, σ 를 스케줄 dtype 으로 맞추는 것, 목록 입력용 파이썬 `isclose`,
+forward 마다 한 번만 찾는 캐시입니다. 기본 블록 `8-18` 은 같은 저장소의 `dave_alpha.npz` 마스크입니다. 대조 테스트
+`tests/test_dave_origin.py` 는 위 줄을 그대로 담고 있습니다. 원 라이선스는 MIT(Copyright (c) 2026 Seunghyun Ji)이며
+MIT 고지 전문은 이 문서 끝에 있습니다. DC 감쇠 계산(`sam3ext/guidance/dave.py`)과 블록 래퍼는 이 확장이 다시 작성한
+것입니다.
+
 ## 코드를 편입하지 않은 재구현 (참고 출처)
 
-아래 기능은 상류 코드를 파일째 가져오지 않고 이 확장 코드로 다시 작성했습니다. 전체 목록(DCW·CNS·DAVE·Modulation
+아래 기능은 상류 코드를 파일째 가져오지 않고 이 확장 코드로 다시 작성했습니다. 전체 목록(DCW·DAVE·Modulation
 Guidance 등)은 README 의 출처 / 크레딧 절과 [docs/GUIDANCE.md](docs/GUIDANCE.md) 의 크레딧 표에 있습니다. 라이선스를
 확인하지 못한 것은 '미확인' 으로 적습니다.
 
@@ -113,7 +146,8 @@ Guidance 등)은 README 의 출처 / 크레딧 절과 [docs/GUIDANCE.md](docs/GU
 
 `sam3ext/anima38/`(Copyright (c) 2026 GumGum10 contributors), `assets/bpe_simple_vocab_16e6.txt.gz`(Copyright (c) 2021
 OpenAI), `scripts/anima_detail_daemon.py` 의 Detail Daemon 코드(Copyright (c) 2024 Sahand Ahmadian, Copyright (c) 2024
-Jonseed), `sam3ext/guidance/sigma_window.py` 와 PAG 대조 테스트의 Anima Safe PAG 코드(Copyright (c) 2026)에 적용되는
+Jonseed), `sam3ext/guidance/sigma_window.py` 와 PAG 대조 테스트의 Anima Safe PAG 코드(Copyright (c) 2026),
+`sam3ext/guidance/dave_gate.py` 와 DAVE 대조 테스트의 Anima DAVE 코드(Copyright (c) 2026 Seunghyun Ji)에 적용되는
 조건입니다. 저작권 줄은 위 각 절의 것을 넣어 읽습니다.
 
 ```text

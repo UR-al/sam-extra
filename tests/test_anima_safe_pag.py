@@ -1003,9 +1003,16 @@ class AnimaSafePagTests(unittest.TestCase):
         self.assertNotIn("disable_cfg1_optimization", default)
 
         # disable_cfg1_optimization=True: uncond 는 계산됐지만 배율이 1 이다.
+        # SMC/CWM 은 원본 cfg 훅처럼 그대로 돌고, 건너뛰는 것은 APG 뿐이다.
+        p._CFG.update(cwm_on=False, apg_on=True)
+        p._APG.update(
+            on=True, eta=0.0, norm_threshold=15.0, momentum=0.0,
+            avg=None, last_sigma=None,
+        )
         args = self._cfg_one_args(cond, uncond)
         args["model_options"] = {"disable_cfg1_optimization": True}
         forced = warning(args)
+        self.assertIn("(APG) skipped", forced)
         self.assertIn("cond_scale=1", forced)
         self.assertIn("disable_cfg1_optimization", forced)
         self.assertNotIn("no uncond", forced)
@@ -1024,7 +1031,10 @@ class AnimaSafePagTests(unittest.TestCase):
             p._apply_cfg_base(self._cfg_one_args(cond), cond)
         self.assertIn("rescale", log.call_args.args[0])
 
-    def test_adaptive_skip_flushes_apg_and_smc_state(self):
+    def test_adaptive_skip_flushes_apg_momentum_but_keeps_smc_state(self):
+        """ADG cond-only steps clear APG momentum only. SMC's e_prev survives
+        like in upstream DCW(+a), which never drops it within a run
+        (namemechan/ComfyUI-DCW@66aaf9dd:dcw_node.py:486-507)."""
         p = self.pag
         p._STATE["on"] = False
         p._ADG.update(on=True, start=0.0, interval=0)
@@ -1033,7 +1043,8 @@ class AnimaSafePagTests(unittest.TestCase):
             avg=torch.ones(1, 1),
             last_sigma=1.0,
         )
-        p._RUNTIME.smc_prev = torch.ones(1, 1)
+        previous = torch.ones(1, 1)
+        p._RUNTIME.smc_prev = previous
 
         p._model_wrapper(
             self._fake_apply_model,
@@ -1047,7 +1058,7 @@ class AnimaSafePagTests(unittest.TestCase):
 
         self.assertIsNone(p._APG["avg"])
         self.assertIsNone(p._APG["last_sigma"])
-        self.assertIsNone(p._RUNTIME.smc_prev)
+        self.assertIs(p._RUNTIME.smc_prev, previous)
 
     def test_authoritative_step_clock_ignores_multiple_wrapper_calls(self):
         p = self.pag
@@ -1367,7 +1378,9 @@ class AnimaSafePagTests(unittest.TestCase):
             def clone(self):
                 return DummyUnet()
 
-            def set_model_sampler_post_cfg_function(self, function):
+            def set_model_sampler_post_cfg_function(
+                self, function, disable_cfg1_optimization=False
+            ):
                 self.post_cfg = function
 
         Anima = type("Anima", (), {})
@@ -1423,7 +1436,10 @@ class AnimaSafePagTests(unittest.TestCase):
         self.assertFalse(self.pag._CFG["smc_on"])
         self.assertNotIn("Anima CFG Orchestrator", request.extra_generation_params)
 
-    def test_rdc_can_run_without_instantaneous_dcw_correction(self):
+    def test_rdc_runs_only_inside_dcw_like_upstream(self):
+        """Upstream RDC has no own toggle and lives in the DCW hook, so it is
+        off while DCW is off; with DCW on and both lambdas 0 it runs alone
+        (namemechan/ComfyUI-DCW@66aaf9dd:dcw_node.py:817-819)."""
         class DummyUnet:
             def __init__(self):
                 self.post_cfg = None
@@ -1434,40 +1450,51 @@ class AnimaSafePagTests(unittest.TestCase):
             def set_model_sampler_post_cfg_function(self, function):
                 self.post_cfg = function
 
-        Anima = type("Anima", (), {})
-        model = Anima()
-        model.forge_objects = types.SimpleNamespace(unet=DummyUnet())
-        request = types.SimpleNamespace(
-            sd_model=model,
-            extra_generation_params={},
-            steps=20,
-        )
-        process = self.pag.AnimaSafePAG()
-        with gr.Blocks():
-            inputs = process.ui(False)
-        args = [component.value for component in inputs]
-        args[28] = False
-        args[58] = True
-        args[59] = 0.15
-        args[60] = 0.04
-        args[61] = 0.0
+        def run(dcw_enabled):
+            Anima = type("Anima", (), {})
+            model = Anima()
+            model.forge_objects = types.SimpleNamespace(unet=DummyUnet())
+            request = types.SimpleNamespace(
+                sd_model=model,
+                extra_generation_params={},
+                steps=20,
+            )
+            process = self.pag.AnimaSafePAG()
+            with gr.Blocks():
+                inputs = process.ui(False)
+            args = [component.value for component in inputs]
+            args[28] = dcw_enabled
+            args[29] = 0.0
+            args[30] = 0.0
+            args[58] = True
+            args[59] = 0.15
+            args[60] = 0.04
+            args[61] = 0.0
+            process.process_before_every_sampling(request, *args)
+            return request
 
-        process.process_before_every_sampling(request, *args)
+        request = run(False)
+        self.assertFalse(self.pag._DCW["on"])
+        self.assertFalse(self.pag._DCW["rdc_on"])
+        self.assertIsNone(request.sd_model.forge_objects.unet.post_cfg)
+        self.assertNotIn("Anima RDC", request.extra_generation_params)
 
+        request = run(True)
         self.assertTrue(self.pag._DCW["on"])
-        self.assertFalse(self.pag._DCW["dcw_on"])
         self.assertTrue(self.pag._DCW["rdc_on"])
         self.assertIsNotNone(request.sd_model.forge_objects.unet.post_cfg)
         self.assertIn("Anima RDC", request.extra_generation_params)
-        self.assertNotIn("Anima DCW", request.extra_generation_params)
 
-    def test_legacy_short_smc_call_keeps_historical_omitted_k_default(self):
+    def test_legacy_short_smc_call_uses_upstream_omitted_k_default(self):
         class DummyUnet:
             def clone(self):
                 return DummyUnet()
 
-            def set_model_sampler_post_cfg_function(self, function):
+            def set_model_sampler_post_cfg_function(
+                self, function, disable_cfg1_optimization=False
+            ):
                 self.post_cfg = function
+                self.cfg1_flag = disable_cfg1_optimization
 
         Anima = type("Anima", (), {})
         model = Anima()
@@ -1480,8 +1507,9 @@ class AnimaSafePagTests(unittest.TestCase):
         process = self.pag.AnimaSafePAG()
         with gr.Blocks():
             inputs = process.ui(False)
-        # v0.20 and older callers can stop before index 27. Selecting the
-        # legacy SMC radio must retain that contract's old k=0.20 fallback.
+        # v0.20 and older callers can stop before index 27. An omitted k
+        # falls back to the upstream smc_k default 0.1 (namemechan/
+        # ComfyUI-DCW@66aaf9dd:dcw_node.py:741-750), not the old 0.20.
         args = [component.value for component in inputs[:27]]
         args[22] = "SMC"
 
@@ -1491,8 +1519,9 @@ class AnimaSafePagTests(unittest.TestCase):
         self.assertEqual(self.pag._CFG["smc_preset"], "Custom")
         self.assertEqual(
             (self.pag._CFG["smc_lambda"], self.pag._CFG["smc_k"]),
-            (6.0, 0.20),
+            (6.0, 0.10),
         )
+        self.assertTrue(request.sd_model.forge_objects.unet.cfg1_flag)
 
     def test_guidance_ui_exposes_per_control_adjustment_hints(self):
         source = (ROOT / "scripts" / "anima_safe_pag.py").read_text(
@@ -1604,9 +1633,10 @@ class AnimaSafePagTests(unittest.TestCase):
         return first, second, fit_flags
 
     def test_fit_error_is_measured_only_for_diagnostics_or_first_step(self):
-        """fit_error only feeds a log line and the [VERIFY] summary, so after
-        the first evaluation of a pass it is skipped unless diagnostics are on;
-        the CFG base result itself must stay bit-identical."""
+        """The scale comes from cond_scale (upstream's cfg hook), so the
+        least-squares fit only feeds a log line and the [VERIFY] summary: after
+        the first evaluation of a pass it is not run at all unless diagnostics
+        are on; the CFG base result itself must stay bit-identical."""
         for toggles in (
             dict(apg_on=True), dict(cwm_on=True), dict(smc_on=True),
             dict(smc_on=True, apg_on=True, cwm_on=True),
@@ -1621,7 +1651,7 @@ class AnimaSafePagTests(unittest.TestCase):
                 self.assertTrue(torch.equal(on_first, off_first))
                 self.assertTrue(torch.equal(on_second, off_second))
                 self.assertEqual(on_flags, [True, True])
-                self.assertEqual(off_flags, [True, False])
+                self.assertEqual(off_flags, [True])
                 # First-step value survives for the (diagnostics-only) summary.
                 self.assertIsNotNone(self.pag._CFG["fit_error"])
 
@@ -1639,10 +1669,15 @@ class AnimaSafePagTests(unittest.TestCase):
         self.assertTrue(p._CFG["warned"])
         self.assertIn("fit_error=", log.call_args.args[0])
 
-        # An external sampler_cfg_function warns without needing fit_error.
+        # An external sampler_cfg_function that APG replaces warns without
+        # needing fit_error. (SMC/CWM step aside instead — test_dcw_origin.)
         self.setUp()
         cond, uncond, incoming = self._cfg_base_fixture()
-        p._CFG.update(cwm_on=True, fit_checked=True)
+        p._CFG.update(apg_on=True, fit_checked=True)
+        p._APG.update(
+            on=True, eta=0.4, norm_threshold=2.0, momentum=0.0,
+            avg=None, last_sigma=None,
+        )
         args = self._cfg_one_args(cond, uncond, cond_scale=4.0)
         args["model_options"] = {"sampler_cfg_function": object()}
         with mock.patch.object(p, "guidance_diagnostics_enabled",

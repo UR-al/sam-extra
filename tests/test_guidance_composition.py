@@ -140,6 +140,8 @@ class GuidanceCompositionTests(unittest.TestCase):
             mode="preserve", experimental_stack=False, warned=True,
             external_cfg_detected=False, steps=0,
             smc_on=smc, apg_on=False, cwm_on=cwm,
+            # Non-zero CWM alphas: the upstream default 0/0 is neutral CFG.
+            alpha_low=0.30, alpha_high=0.15,
         )
         p._DCW.update(
             on=dcw,

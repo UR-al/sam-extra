@@ -121,7 +121,9 @@ class ScriptSectionTests(unittest.TestCase):
 
 
 class OnClassTests(unittest.TestCase):
-    FEATURES = {"pag", "slg", "apg", "adg", "dcw", "rdc", "cwm", "smc", "dave", "cns", "mod"}
+    # RDC has no own switch any more (upstream: on when DCW is on and tau > 0),
+    # so it rides on the DCW badge.
+    FEATURES = {"pag", "slg", "apg", "adg", "dcw", "cwm", "smc", "dave", "cns", "mod"}
 
     def test_simple_enables_carry_sam3_on(self):
         sources = {

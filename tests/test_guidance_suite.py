@@ -301,8 +301,11 @@ class GuidanceMathTests(unittest.TestCase):
         self.assertAlmostEqual(
             float(first.std()), float(noise.std()), delta=1e-5
         )
-        self.assertAlmostEqual(
-            float(partial.std()), float(noise.std()), delta=1e-5
+        # Upstream mixes by plain lerp and does not renormalise the mix
+        # (namemechan/comfyui-cns_sampler_patch@42278b13:cns_sampler_patch.py
+        # :284-288); tests/test_cns_origin.py runs the upstream function.
+        torch.testing.assert_close(
+            partial, torch.lerp(noise, first, 0.5), rtol=0.0, atol=1e-6
         )
 
     def test_cns_recoloring_does_not_consume_rng(self):

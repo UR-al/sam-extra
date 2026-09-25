@@ -26,7 +26,8 @@ SAM3 처리 모듈은 초기화하지 않고 `sam3ext.guidance`의 경량 수학
 | `scripts/anima_skimmed_cfg.py` | Skimmed CFG anti-burn (독립 스크립트·아코디언) |
 | `sam3ext/guidance/dcw.py` | post-CFG wavelet correction |
 | `sam3ext/guidance/dave.py` | Anima block DC attenuation |
-| `sam3ext/guidance/cns.py` | 기존 sampler noise의 wavelet 재색칠 |
+| `sam3ext/guidance/dave_gate.py` | DAVE 초반 스텝 게이트(원본 노드의 σ 스케줄 판정) |
+| `sam3ext/guidance/cns.py` | 기존 sampler noise의 wavelet 재색칠(원본 `color_noise_wavelet` 편입) |
 | `sam3ext/guidance/modulation.py` | 보조 CLIP-L·공식 어댑터 로드와 block AdaLN 투영 |
 | `scripts/anima_detail_daemon.py` | 별도 Detail Daemon 기능 |
 
@@ -40,7 +41,7 @@ shared.state.sampling_step / sampling_steps (한 스텝 지연 — 아래 참고
   → attention: weak row에만 hard PAG 또는 Gaussian-query SEG
   → post-CFG #1: Skimmed CFG (활성 시 항상 명시적으로 맨 앞)
   → post-CFG #2: Guidance Suite
-      1. CNS용 live x_t 저장
+      1. CNS x_t 폴백 저장(기본 출처는 sampler step callback)
       2. ADG skip이면 APG/SMC state reset 후 incoming 유지
       3. CFG base 토글(SMC → APG → CWM, 켜진 것만)
       4. PAG/SEG/SLG delta 가산
@@ -52,9 +53,9 @@ shared.state.sampling_step / sampling_steps (한 스텝 지연 — 아래 참고
 - `model_function_wrapper`와 `post_cfg_function`은 현재 `forge_objects.unet.clone()`에만 붙습니다.
 - step 비율은 wrapper 호출 횟수가 아니라 Forge의 `shared.state.sampling_step`을 읽습니다. low-VRAM 분할,
   regional conditioning, 2차 sampler가 범위 계산을 오염시키지 않습니다. 다만 Forge는 이 값을 그 스텝의 모델 호출
-  **뒤**에 올리므로, PAG/SEG/SLG·DAVE·Adaptive Guidance의 Start/End 구간은 **한 스텝 늦게** 판정됩니다
-  (20 steps에서 5%만큼). Detail Daemon은 ComfyUI 노드처럼 모델 호출의 σ로 스케줄 위치를 찾아 이 지연이 없으므로, 두 기능의 %
-  값이 같아도 시작 스텝은 하나 어긋날 수 있습니다.
+  **뒤**에 올리므로, 이 값을 쓰는 SEG/SLG·Adaptive Guidance의 Start/End 구간은 **한 스텝 늦게** 판정됩니다
+  (20 steps에서 5%만큼). PAG, DAVE, Detail Daemon은 원본 ComfyUI 노드처럼 모델 호출의 σ로 구간이나 스케줄 위치를
+  정해 이 지연이 없으므로, 같은 % 값이어도 시작 스텝이 하나 어긋날 수 있습니다.
 - Perturbation Guidance(PAG/SEG/SLG)는 cond 행 사본(weak 행)을 배치에 덧붙여 한 forward로 돌리므로, 켜 둔
   구간에서는 샘플링 배치가 cond/uncond에 weak 행만큼 커져 활성 VRAM과 스텝 시간이 늘어납니다(PAG 하나면 대략 1.5배
   행 수, 첫 target 블록 앞은 `sam3_guidance_pag_prefix_dedup`이 줄여 줌).
@@ -256,8 +257,21 @@ Anima block 출력의 token/spatial 평균(DC)을 초반에 약하게 감쇠해 
 out = x − strength × mean(x, token/spatial axes)
 ```
 
-- 기본 off, `strength=0.30`, `tau=0.10`, blocks `8-18`
-- `tau=0`은 전 구간, 양수 tau는 초반 비율까지만 적용
+- 기본 off, `strength=0.30`, `tau=0.10`, blocks `8-18`. 블록 칸을 비우면 원본 마스크(`dave_alpha.npz`)와 같은
+  `8-18`입니다. strength가 0.001 이하이면 원본처럼 아무것도 하지 않습니다.
+- 켜지는 스텝은 원본 노드
+  ([sorryhyun/ComfyUI-Anima-DAVE@83143e8d](https://github.com/sorryhyun/ComfyUI-Anima-DAVE) `nodes.py` 91-106,
+  199-208줄, MIT)의 게이트를 그대로 따릅니다(`sam3ext/guidance/dave_gate.py`).
+  - 모델 호출의 σ를 샘플러가 실제로 도는 σ 스케줄에서 찾습니다(`isclose`, rtol 1e-4, atol 1e-6, 처음 맞는 칸).
+    Forge는 `sampling_sigmas`에 전체 목록을 둡니다. txt2img는 목록 전체를 돌고, img2img와 hires는 Forge와 같은
+    `sigmas[steps - t_enc - 1:]`부터 돕니다. 이 시작 칸은 샘플링 직전에 Forge의 `setup_img2img_steps`로 구합니다.
+    끝에서 `스텝 수 + 1`칸을 세는 방식은 쓰지 않습니다. `DDIM` 스케줄 타입은 24·28·30·32 steps에서 σ를
+    `스텝 수 + 2`개 내놓아서, 끝에서 세면 첫 σ가 빠지고 켜지는 구간이 한 스텝 길어집니다.
+  - `n`을 그 스텝 수로 두고 `k = max(1, min(n, round(tau × n)))`, 스텝 번호가 `k`보다 작을 때 켭니다.
+    tau 0.10이면 20·25 steps는 0-1, 28·30 steps는 0-2, 50 steps는 0-4입니다(파이썬 `round`라 25 steps는 2.5→2).
+  - 스케줄에 없는 σ(2차 sampler의 중간점, s_churn)는 원본처럼 0번 스텝으로 보고 **항상 켭니다**.
+  - `tau=0`이거나 σ 목록이 없으면 모든 스텝에서 켭니다. 단, σ 목록을 내놓지 않는 Forge의 timestep sampler(DDIM,
+    PLMS)는 원본에 대응이 없어 Forge 스텝 위치로 같은 `k`를 판정합니다(한 스텝 늦음).
 - cond/uncond/PAG weak 행 모두 같은 선형 변환을 받습니다.
 - forward hook을 사용하지 않고 기존 block wrapper 안에서 `original → DAVE → SLG restore` 순서를
   보장합니다.
@@ -306,14 +320,25 @@ Start block을 뒤로 옮기거나 적용 block 범위를 줄이세요. 반드�
 
 Euler a, ancestral, SDE처럼 sampler가 원본 noise sampler를 호출할 때만 동작합니다. 새 난수를
 생성하지 않고 **기존 seeded/Brownian 출력**을 live `x_t` Haar 에너지에 맞춰 재색칠하므로 RNG
-경로를 보존합니다. 최종 표준편차도 원본 noise와 맞춥니다.
+경로를 보존합니다. 재색칠 계산은 원본 [comfyui-cns_sampler_patch](https://github.com/namemechan/comfyui-cns_sampler_patch)
+(`42278b13`) 의 `color_noise_wavelet` 그대로입니다. 색칠한 노이즈는 원본 noise의 표준편차로 맞춘 뒤, Strength가
+1보다 작으면 흰 노이즈와 `lerp` 로만 섞고 다시 맞추지 않습니다(원본과 같이 표준편차가 조금 낮아집니다).
 
-| 필드 | 기본값 |
-|---|---:|
-| Enable CNS-inspired Wavelet Noise | off |
-| Strength | 1.0 |
-| Gamma power | 0.5 |
-| Gamma scale | 3.0 |
+`x_t` 는 원본처럼 sampler의 처음 x에서 시작해 스텝마다 callback의 `x`(그 스텝의 시작 상태)로 바뀝니다. Forge에서는
+`p.sampler.callback_state` 를 감싸 잡습니다. 감쌀 수 없는 sampler에서만 post-CFG의 `input` 을 대신 쓰는데, 이 값은
+dpmpp_2s_ancestral·dpmpp_sde의 중간점이나 인페인트의 섞인 latent일 수 있습니다. 검증 로그의 `x_t=callback|post_cfg`
+로 어느 쪽이었는지 보입니다.
+
+색칠은 이 스크립트가 붙은 pass의 sampler가 샘플링하는 동안(`p.sampler.launch_sampling` 안)에만 합니다. 원본이
+자기가 감싼 SAMPLER 하나에만 적용되는 것과 같아서, 이 스크립트를 빼고 만든 중첩 실행(ADetailer의 내부 img2img
+등)은 흰 노이즈 그대로입니다.
+
+| 필드 | 기본값 | 범위 · step (원본 INPUT_TYPES) |
+|---|---:|---|
+| Enable CNS-inspired Wavelet Noise | off | |
+| Strength | 1.0 | 0~1 · 0.05 |
+| Gamma power | 0.5 | 0.1~2 · 0.05 |
+| Gamma scale | 2.0 | 0.1~25 · 0.1 (원본 README: Anima + euler_ancestral_cfg_pp 권장 3.0) |
 
 결정론적 sampler가 noise sampler를 호출하지 않으면 자동 inert이며 검증 로그에
 `INERT(no ancestral/SDE noise call)`이 표시됩니다. Adaptive Guidance와 병용할 때는
@@ -428,7 +453,7 @@ shape 추론·block AdaLN 무변이 주입, pass 종료 tensor 해제와 Noteboo
 | DCW/RDC/CWM/SMC | [namemechan/ComfyUI-DCW](https://github.com/namemechan/ComfyUI-DCW) (GPL-3.0) | 공개 수식 기반 Forge 재작성, vendor 아님 |
 | Skimmed CFG | [Extraltodeus/Skimmed_CFG](https://github.com/Extraltodeus/Skimmed_CFG) (Apache-2.0) | 수식·σ 게이트 편입(`sam3ext/guidance/skimmed_cfg.py`), Forge post-CFG 훅 |
 | DAVE | [daheekwon/DAVE](https://github.com/daheekwon/DAVE) (MIT), [ComfyUI-Anima-DAVE](https://github.com/sorryhyun/ComfyUI-Anima-DAVE) (MIT), [논문](https://arxiv.org/abs/2606.06813) | block 수식 재구현 |
-| CNS | [namemechan/comfyui-cns_sampler_patch](https://github.com/namemechan/comfyui-cns_sampler_patch) (GPL-3.0), [논문](https://arxiv.org/abs/2605.30332) | CNS-inspired 재작성, vendor 아님 |
+| CNS | [namemechan/comfyui-cns_sampler_patch](https://github.com/namemechan/comfyui-cns_sampler_patch) (GPL-3.0), [논문](https://arxiv.org/abs/2605.30332) | `color_noise_wavelet` 편입(`sam3ext/guidance/cns.py`, 고지는 THIRD_PARTY_NOTICES.md), Forge noise 원천·callback 훅 |
 | Anima Modulation Guidance | [Anzhc/Anima-Mod-Guidance-ComfyUI-Node](https://github.com/Anzhc/Anima-Mod-Guidance-ComfyUI-Node) (MIT 선언), [quickjkee/modulation-guidance](https://github.com/quickjkee/modulation-guidance) (MIT), [yresearch/cosmos-pooled adapter](https://huggingface.co/yresearch/cosmos-pooled) | 공개 수식·어댑터 형식 기반 Forge block 재작성, vendor 아님 |
 | Detail Daemon | [muerrilla/sd-webui-detail-daemon](https://github.com/muerrilla/sd-webui-detail-daemon) (MIT), [Jonseed/ComfyUI-Detail-Daemon](https://github.com/Jonseed/ComfyUI-Detail-Daemon) (MIT) | schedule·σ 조회 함수 편입(고지는 THIRD_PARTY_NOTICES.md), Forge 훅 |
 

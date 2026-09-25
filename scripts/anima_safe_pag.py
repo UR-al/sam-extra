@@ -89,6 +89,12 @@ from sam3ext.guidance.cwm_smc import (
     resolve_smc_preset,
 )
 from sam3ext.guidance.dave import apply_dave
+from sam3ext.guidance.dave_gate import (
+    DEFAULT_BLOCKS as DAVE_DEFAULT_BLOCKS,
+    ForwardGateCache,
+    attenuation_active as dave_attenuation_active,
+    step_gate as dave_step_gate,
+)
 from sam3ext.guidance.dcw import apply_dcw
 from sam3ext.guidance.modulation import (
     clear_modulation_caches,
@@ -97,6 +103,10 @@ from sam3ext.guidance.modulation import (
 )
 from sam3ext.guidance.runtime import GuidanceRuntime
 from sam3ext.guidance.sigma_window import percent_range_to_sigmas, sigma_active
+from sam3ext.guidance.ui_config_migration import (
+    CNS_GAMMA_SCALE_LABEL,
+    migrate_ui_config_file,
+)
 try:
     from guidance_diagnostics import guidance_diagnostics_enabled
 except ImportError:  # standalone/unit-test loader without extension root on sys.path
@@ -387,21 +397,30 @@ _CFG: dict = {
     # OR-ed into the toggles above by _cfg_base_flags().
     "mode": "preserve",  # preserve | apg | cwm | smc | smc+cwm
     "experimental_stack": False,
-    "alpha_low": 0.30,
-    "alpha_high": 0.15,
+    # Upstream DCW(+a) defaults: alpha_l/alpha_h 0.0 (neutral), smc_k 0.1
+    # (origin: namemechan/ComfyUI-DCW@66aaf9dd:dcw_node.py:675-704, 738-747).
+    "alpha_low": 0.0,
+    "alpha_high": 0.0,
     "smc_preset": "Off",
     "smc_resolved_preset": "Off",
     "smc_lambda": 6.0,
     "smc_k": 0.10,
     "steps": 0,
     "fit_error": None,
+    # CFG scale the base override uses: ``args["cond_scale"]`` like the
+    # upstream cfg hook (× Forge's edit_strength, see _cfg_scale_from_args).
     "effective_scale": None,
+    # Least-squares fit of the incoming CFG result — diagnostics only.
+    "fit_scale": None,
     "external_cfg_detected": False,
     "warned": False,
-    # CFG 1 guard: Forge skips the uncond pass at cond_scale≈1, so there is no
-    # CFG error for SMC/APG/CWM to reshape; log that skip once per generation.
+    # Another extension registered ``sampler_cfg_function`` (RescaleCFG,
+    # Dynamic Thresholding…): SMC/CWM step aside like upstream, warned once.
+    "external_cfg_warned": False,
+    # CFG 1 guard: without disable_cfg1_optimization Forge skips the uncond
+    # pass at cond_scale≈1; APG is always skipped there. Log once per generation.
     "cfg1_warned": False,
-    # 이번 post-CFG 호출에서 CFG 1 가드로 SMC/APG/CWM 을 건너뛰었는가(스텝마다
+    # 이번 post-CFG 호출에서 CFG 1 가드로 APG 를 건너뛰었는가(스텝마다
     # _apply_cfg_base 가 다시 씀). 건너뛴 스텝은 APG 가 돌지 않았으므로 PAG
     # rescale 자동 끄기(apg_autooff_rescale)도 적용하지 않는다.
     "base_skipped": False,
@@ -414,8 +433,9 @@ _DCW: dict = {
     "on": False,
     "dcw_on": False,
     "rdc_on": False,
-    "lambda_low": 0.10,
-    "lambda_high": 0.02,
+    # Upstream defaults (origin: namemechan/ComfyUI-DCW@66aaf9dd:dcw_node.py:636-667).
+    "lambda_low": 0.05,
+    "lambda_high": 0.01,
     "steps": 0,
     "dcw_steps": 0,
     "rdc_steps": 0,
@@ -430,14 +450,43 @@ _DAVE: dict = {
     "tau": 0.10,
     "targets": set(),
     "steps": 0,
+    # Early-step gate (sam3ext/guidance/dave_gate.py): one sigma lookup per
+    # forward, shared by the pooled blocks. Replaced at every attach.
+    "gate": ForwardGateCache(),
+    # False for Forge's CompVis timestep samplers, which publish no
+    # ``sampling_sigmas`` (see _sampler_publishes_sigmas).
+    "schedule_ok": True,
+    # Where this pass's walked sigmas start in ``sampling_sigmas``
+    # (_forge_sampling_offset): 0 for txt2img, steps - t_enc - 1 for
+    # img2img/hires, None = unknown (whole list). Set at every attach.
+    "offset": None,
 }
 
 _CNS: dict = {
     "on": False,
+    # Upstream defaults (origin: namemechan/comfyui-cns_sampler_patch@42278b13
+    # :cns_sampler_patch.py:391-439 INPUT_TYPES).
     "strength": 1.0,
     "gamma_power": 0.5,
-    "gamma_scale": 3.0,
+    "gamma_scale": 2.0,
     "warned": False,
+    # Where the live x_t comes from this pass (_install_cns_x_capture):
+    # "callback" = the sampler's step callback like upstream, "post_cfg" =
+    # fallback when the sampler has no wrappable callback_state.
+    "capture": "post_cfg",
+    # True once the wrapped callback has recorded an x in this pass.
+    "callback_seen": False,
+    # Which sampler runs get colored noise (_install_cns_sampler_scope):
+    # "sampler" = only while the attached pass's p.sampler is sampling, like
+    # upstream, whose node returns a new SAMPLER that hands its CNS noise
+    # sampler to that one call or patches kds only until a finally
+    # (origin: namemechan/comfyui-cns_sampler_patch@42278b13:
+    # cns_sampler_patch.py:544-608); a nested run of a p without this script
+    # (ADetailer's filtered img2img) stays white. "pass" = fallback for a
+    # sampler whose launch_sampling cannot be wrapped: while CNS is on.
+    "scope": "pass",
+    # True while the wrapped launch_sampling of the attached sampler runs.
+    "live": False,
 }
 
 _MOD: dict = {
@@ -983,6 +1032,95 @@ def _run_dedup_block(idx: int, orig_forward, plan):
     return out
 
 
+# Forge Anima ``Block.forward`` 의 transformer_options 위치(backend/nn/anima.py).
+# Forge 는 키워드로 넘기지만 Comfy 계열 포크는 위치 인자로 넘길 수 있다.
+_BLOCK_OPTIONS_POSITION = 6
+
+
+def _block_transformer_options(args, kwargs):
+    options = kwargs.get("transformer_options")
+    if options is None and len(args) > _BLOCK_OPTIONS_POSITION:
+        options = args[_BLOCK_OPTIONS_POSITION]
+    return options if isinstance(options, dict) else None
+
+
+def _is_img2img_request(p) -> bool:
+    """Is ``p`` a ``StableDiffusionProcessingImg2Img`` (or a subclass of it)?
+
+    Checked by class name so the helper needs no ``modules.processing`` import."""
+    return any(
+        cls.__name__ == "StableDiffusionProcessingImg2Img"
+        for cls in type(p).__mro__
+    )
+
+
+def _forge_sampling_offset(p):
+    """Index in Forge's ``sampling_sigmas`` of the first sigma this pass samples.
+
+    txt2img's first pass walks the whole list (``KDiffusionSampler.sample``),
+    so the offset is 0. img2img and the hires pass walk
+    ``sigmas[steps - t_enc - 1:]`` (modules/sd_samplers_kdiffusion.py:145-148).
+    Their ``steps, t_enc`` come from Forge's own ``setup_img2img_steps`` with
+    the argument ``processing.py`` passes it: the hires pass uses
+    ``hr_second_pass_steps or steps`` (:1552), img2img uses None (:1920).
+    Returns None when the offset cannot be worked out; the gate then uses the
+    whole list. It is not inferred from ``shared.state.sampling_steps``,
+    because some schedulers (Forge's ``ddim_scheduler``) return more than
+    ``steps + 1`` sigmas."""
+    if getattr(p, "is_hr_pass", False):
+        requested = getattr(p, "hr_second_pass_steps", 0) or getattr(p, "steps", None)
+    elif _is_img2img_request(p):
+        requested = None
+    else:
+        return 0
+    try:
+        from modules import sd_samplers_common
+
+        steps, t_enc = sd_samplers_common.setup_img2img_steps(p, requested)
+        return int(steps) - int(t_enc) - 1
+    except Exception:
+        return None
+
+
+def _sampler_publishes_sigmas(p) -> bool:
+    """Does this pass's sampler set ``transformer_options['sampling_sigmas']``?
+
+    Forge's k-diffusion samplers do, right before sampling
+    (modules/sd_samplers_kdiffusion.py:192, 246). The CompVis timestep
+    samplers (DDIM, PLMS — ``classic_ddim_eps_estimation``) never do,
+    so a list found there was left by an earlier run."""
+    denoiser = getattr(getattr(p, "sampler", None), "model_wrap_cfg", None)
+    return not bool(getattr(denoiser, "classic_ddim_eps_estimation", False))
+
+
+def _dave_gate_open(args, kwargs) -> bool:
+    """DAVE's early-step gate for this block call — the original node's gate.
+
+    Upstream decides once per forward in its APPLY_MODEL wrapper (origin:
+    sorryhyun/ComfyUI-Anima-DAVE@83143e8d:nodes.py:91-106, 199-208): the
+    forward's sigma (Forge: ``transformer_options['sigmas']``) is looked up in
+    the schedule the sampler walks — Forge's ``sampling_sigmas`` from the
+    attach-time offset on (``_forge_sampling_offset``) — and DAVE runs while
+    its index is below ``k = max(1, min(n, round(tau·n)))``; an off-schedule sigma (a
+    second-order midpoint) is step 0, so on. ``ForwardGateCache`` shares the
+    lookup across the pooled blocks of one forward. Forge's timestep samplers
+    publish no sigma list: there the index is Forge's step position — the one
+    host difference, one step late like the step-fraction gates."""
+    tau = float(_DAVE["tau"])
+    if tau <= 0.0:
+        return True
+    if not _DAVE.get("schedule_ok", True):
+        step, total = _sampling_position()
+        return dave_step_gate(step, total, tau)
+    options = _block_transformer_options(args, kwargs) or {}
+    return _DAVE["gate"].active(
+        tau,
+        options.get("sampling_sigmas"),
+        options.get("sigmas"),
+        _DAVE.get("offset"),
+    )
+
+
 def _make_block_wrapper(idx: int, orig_forward):
     """Compose CLIP modulation, original block, DAVE, then SLG restoration."""
 
@@ -1013,10 +1151,7 @@ def _make_block_wrapper(idx: int, orig_forward):
             dave_active = (
                 _DAVE["on"]
                 and idx in _DAVE["targets"]
-                and (
-                    float(_DAVE["tau"]) <= 0.0
-                    or _pct_now() < float(_DAVE["tau"])
-                )
+                and _dave_gate_open(args, kwargs)
             )
             if dave_active and torch.is_tensor(out):
                 out = apply_dave(out, float(_DAVE["strength"]))
@@ -1139,20 +1274,131 @@ def _ensure_patched(diffusion_model) -> int:
 
 
 # ---------------------------------------------------------------------------
-# CNS-inspired sampler-noise patch (global install, generation-gated fast path)
+# CNS sampler-noise patch (global install, generation-gated fast path)
 # ---------------------------------------------------------------------------
+#
+# Upstream (namemechan/comfyui-cns_sampler_patch@42278b13:cns_sampler_patch.py)
+# colors every noise_sampler call against ``state["x_current"]``: the sampler's
+# initial x (:315 ``x_initial.detach().clone()``), then the ``info["x"]`` of each
+# step callback (:473-478, :567-572) — the step's start state, recorded after
+# its first model evaluation and before its noise. Forge's k-diffusion samplers
+# pass ``callback=self.callback_state`` (modules/sd_samplers_kdiffusion.py:196,
+# :250), so the same x is captured by wrapping ``p.sampler.callback_state``.
+# The initial x is seeded when the sampler builds its default noise sampler
+# (``default_noise_sampler(x)`` at the top of every ancestral ``sample_*``).
+# Capturing the post-CFG ``input`` is only a fallback for a sampler whose
+# callback cannot be wrapped: that input is the *last* model evaluation's
+# (the midpoint of dpmpp_2s_ancestral / dpmpp_sde, the mask-blended latent in
+# inpainting), not the step's x. Coloring and recording are limited to the
+# attached sampler's run (_install_cns_sampler_scope), like upstream's
+# per-SAMPLER wrap, although the patch itself is a global install.
+
+
+def _record_cns_x(x, *, clone: bool = False) -> None:
+    _RUNTIME.cns_x_t = x.detach().clone() if clone else x.detach()
+
+
+def _install_cns_x_capture(p) -> str:
+    """Wrap ``p.sampler.callback_state`` so each step's ``d["x"]`` feeds CNS.
+
+    Returns ``"callback"`` when installed (or already installed on this sampler
+    object), else ``"post_cfg"``. The wrapper is an instance attribute of the
+    per-pass sampler object Forge creates for every ``sample()`` / hires pass,
+    so nothing outlives the pass. It records only while CNS is on, then calls
+    the original callback, in upstream's ``cns_callback`` order (:473-478).
+    """
+    sampler = getattr(p, "sampler", None)
+    original = getattr(sampler, "callback_state", None)
+    if sampler is None or not callable(original):
+        return "post_cfg"
+    if getattr(original, "_anima_cns_capture", False):
+        return "callback"
+
+    def _cns_callback_state(d, *args, **kwargs):
+        x = d.get("x") if isinstance(d, dict) else None
+        if _CNS["on"] and torch is not None and torch.is_tensor(x):
+            _record_cns_x(x)
+            _CNS["callback_seen"] = True
+        return original(d, *args, **kwargs)
+
+    _cns_callback_state._anima_cns_capture = True
+    try:
+        sampler.callback_state = _cns_callback_state
+    except Exception:
+        return "post_cfg"
+    return "callback"
+
+
+def _install_cns_sampler_scope(p) -> str:
+    """Scope CNS to the sampler run of the pass it attached to.
+
+    The noise patches are k-diffusion module globals, so without a scope a
+    nested run of another p whose script list lacks this script (ADetailer's
+    inner img2img in ``postprocess_image``, before ``postprocess`` clears
+    CNS) would also be colored, against a frozen x_t. Upstream colors only the
+    SAMPLER it wraps (:544-608). Forge runs every k-diffusion ``sample_*`` of
+    a pass inside ``self.launch_sampling(steps, func)``
+    (modules/sd_samplers_kdiffusion.py:194, :248), so wrapping that instance
+    method marks the attached run live. Returns ``"sampler"`` when installed
+    (or already installed on this sampler object), else ``"pass"``.
+    """
+    sampler = getattr(p, "sampler", None)
+    original = getattr(sampler, "launch_sampling", None)
+    if sampler is None or not callable(original):
+        return "pass"
+    if getattr(original, "_anima_cns_scope", False):
+        return "sampler"
+
+    def _cns_launch_sampling(*args, **kwargs):
+        previous = _CNS["live"]
+        _CNS["live"] = True
+        try:
+            return original(*args, **kwargs)
+        finally:
+            _CNS["live"] = previous
+
+    _cns_launch_sampling._anima_cns_scope = True
+    try:
+        sampler.launch_sampling = _cns_launch_sampling
+    except Exception:
+        return "pass"
+    return "sampler"
+
+
+def _cns_active() -> bool:
+    """CNS is on and, when scoped, the attached sampler is the one sampling."""
+    return bool(_CNS["on"]) and (_CNS["scope"] != "sampler" or bool(_CNS["live"]))
+
+
+def _capture_cns_post_cfg_input(live_input) -> None:
+    """Post-CFG ``input`` as the CNS x_t — fallback only.
+
+    With the callback capture installed it only fills a still-empty slot
+    (a Brownian sampler has no default-noise-sampler seed) until the first
+    step callback; the fallback mode keeps the per-evaluation update.
+    """
+    if not _cns_active() or not torch.is_tensor(live_input):
+        return
+    if _CNS["capture"] == "callback" and (
+        _CNS["callback_seen"] or _RUNTIME.cns_x_t is not None
+    ):
+        return
+    _record_cns_x(live_input)
 
 
 def _maybe_color_cns_noise(noise):
-    if not _CNS["on"] or torch is None:
+    if not _cns_active() or torch is None:
         return noise
     x_t = _RUNTIME.cns_x_t
     if not torch.is_tensor(x_t):
         return noise
     try:
+        # Device only: color_noise_wavelet casts x_t to float32 itself like
+        # upstream (:220 ``x_t.float()``); rounding it to a half-precision
+        # noise dtype first would change the band energies.
         result = color_noise_wavelet(
             noise,
-            x_t.to(device=noise.device, dtype=noise.dtype),
+            x_t.to(device=noise.device),
             strength=float(_CNS["strength"]),
             gamma_power=float(_CNS["gamma_power"]),
             gamma_scale=float(_CNS["gamma_scale"]),
@@ -1171,8 +1417,12 @@ def _patched_default_noise_sampler(x):
     if not callable(factory):
         return lambda _sigma, _sigma_next: torch.randn_like(x)
     original_sampler = factory(x)
-    if not _CNS["on"]:
+    if not _cns_active():
         return original_sampler
+    # The sampler's initial x, like upstream's make_cns_noise_sampler seed
+    # (:315); the step callbacks replace it.
+    if torch.is_tensor(x):
+        _record_cns_x(x, clone=True)
 
     def _sample(sigma, sigma_next):
         return _maybe_color_cns_noise(original_sampler(sigma, sigma_next))
@@ -1521,9 +1771,10 @@ def _pag_in_range(sigma) -> bool:
     are placed exactly as upstream places them. ``sigma`` is the ``timestep``
     Forge passes to the model wrapper and the pre-CFG hook — KModel.apply_model
     treats it as the sampler sigma. Without bounds (no predictor) the old
-    step-fraction gate is the fallback. DAVE/ADG keep using ``_pct_now``; a
-    step Adaptive Guidance skips never reaches this gate (the wrapper's ADG
-    branch runs first), so the bounds carry no ADG cut.
+    step-fraction gate is the fallback. ADG keeps using ``_pct_now`` (DAVE
+    has its own schedule gate, _dave_gate_open); a step Adaptive Guidance
+    skips never reaches this gate (the wrapper's ADG branch runs first), so
+    the bounds carry no ADG cut.
     """
     sigma_hi, sigma_lo = _STATE.get("sigma_hi"), _STATE.get("sigma_lo")
     if sigma_hi is None or sigma_lo is None or sigma is None:
@@ -1609,8 +1860,20 @@ def _adg_should_skip() -> bool:
 
 
 def reset_cfg_state() -> None:
-    """Clear all stateful CFG transforms at a pass boundary or ADG skip."""
+    """Clear all stateful CFG transforms (APG momentum and SMC e_prev)."""
     _RUNTIME.reset_cfg_state()
+
+
+def _reset_apg_momentum() -> None:
+    """Clear only APG's momentum buffer (an ADG cond-only step).
+
+    SMC keeps ``e_prev``: the upstream DCW(+a) node carries it across every
+    step of a run and resets it only per KSampler run (fresh model_options) or
+    on a shape change (origin: namemechan/ComfyUI-DCW@66aaf9dd:dcw_node.py:
+    87-89, 486-507). ADG is not part of upstream; its cond-only steps give SMC
+    no CFG error, so they neither update nor discard it."""
+    _APG["avg"] = None
+    _APG["last_sigma"] = None
 
 
 # ---------------------------------------------------------------------------
@@ -1808,7 +2071,8 @@ def _model_wrapper_inner(apply_model, w):
             _STATE["adg_skipped"] = True
             # APG momentum from a preceding guided step must not leak through
             # a cond-only interval or into the next periodically-kept step.
-            reset_cfg_state()
+            # SMC's e_prev is kept (see _reset_apg_momentum).
+            _reset_apg_momentum()
             out_full = torch.empty(
                 (batch,) + tuple(out_c.shape[1:]),
                 device=out_c.device, dtype=out_c.dtype,
@@ -2046,11 +2310,13 @@ def _apply_apg(args, effective_scale, guidance_override=None):
 def _recover_effective_cfg(args, incoming, with_fit_error=True):
     """Fit the incoming CFG result to ``uncond + w_eff*(cond-uncond)``.
 
-    Forge does not expose per-conditioning ``edit_strength`` in post-CFG args.
-    Least-squares recovery retains it for linear CFG and quantifies how poorly
-    a nonlinear/custom CFG result fits before any explicit base override.
-    ``with_fit_error=False`` skips that diagnostic (two norms and a second
-    GPU->CPU sync) and returns ``fit_error=None``; ``effective`` is unchanged.
+    Diagnostics only: the base override takes its scale from
+    ``args["cond_scale"]`` like the upstream cfg hook (_cfg_scale_from_args).
+    The fit quantifies how poorly a nonlinear/custom CFG result fits before an
+    explicit base override, and supplies the scale only for callers that pass
+    no ``cond_scale`` (Forge always does). ``with_fit_error=False`` skips the
+    fit error (two norms and a second GPU->CPU sync) and returns
+    ``fit_error=None``; ``effective`` is unchanged.
     """
     cond = args["cond_denoised"].float()
     uncond = args["uncond_denoised"].float()
@@ -2068,6 +2334,122 @@ def _recover_effective_cfg(args, incoming, with_fit_error=True):
         ).item()
     )
     return effective, fit_error
+
+
+def _cfg_scale_from_args(args) -> float | None:
+    """The CFG scale SMC/APG/CWM combine with, or None without ``cond_scale``.
+
+    Upstream's cfg hook reads ``args["cond_scale"]`` (origin: namemechan/
+    ComfyUI-DCW@66aaf9dd:dcw_node.py:848-866). Forge's own linear CFG also
+    multiplies by ``edit_strength`` — the summed ``strength`` of the cond
+    entries, e.g. ``a AND b`` — whenever no ``sampler_cfg_function`` is set
+    (backend/sampling/sampling_function.py:293, 307-310); the same factor is
+    applied here so a neutral base reproduces Forge's CFG. Post-CFG args carry
+    that cond list as ``args["cond"]``.
+    """
+    try:
+        scale = float(args.get("cond_scale"))
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(scale):
+        return None
+    model_options = args.get("model_options") or {}
+    if isinstance(model_options, dict) and "sampler_cfg_function" in model_options:
+        return scale
+    cond = args.get("cond")
+    if isinstance(cond, (list, tuple)) and cond:
+        try:
+            edit_strength = sum(
+                (item["strength"] if "strength" in item else 1)
+                for item in cond
+            )
+            edit_strength = float(edit_strength)
+        except (TypeError, ValueError, KeyError):
+            edit_strength = 1.0
+        if math.isfinite(edit_strength) and not math.isclose(edit_strength, 1.0):
+            scale *= edit_strength
+    return scale
+
+
+def _uncond_ran_at_cfg1(args, skip_reason: str) -> bool:
+    """At cond_scale≈1, did Forge still evaluate a real uncond batch?
+
+    Only with ``disable_cfg1_optimization`` (Forge sampling_function.py:295;
+    ComfyUI samplers.py:610 is the same test). This script sets that flag
+    whenever SMC or CWM would install upstream's cfg hook on a pass whose own
+    CFG is ≈1, so those bases run at CFG 1 like upstream (origin:
+    namemechan/ComfyUI-DCW@66aaf9dd:dcw_node.py:877-878).
+
+    The flag cannot conjure an uncond Forge never encoded: at CFG == 1 Forge
+    drops the negative prompt (modules/processing.py:481-483, hires
+    :1606-1608), so the post-CFG ``uncond`` is None and ``uncond_denoised``
+    is all zeros. Forge always passes the ``uncond`` key
+    (backend/sampling/sampling_function.py:316-317), hence the explicit
+    None test."""
+    if "uncond" in args and args["uncond"] is None:
+        return False
+    model_options = args.get("model_options") or {}
+    return bool(
+        isinstance(model_options, dict)
+        and model_options.get("disable_cfg1_optimization", False)
+        and skip_reason.startswith("cond_scale")
+    )
+
+
+def _cfg_hook_needed(unet=None) -> bool:
+    """Would upstream DCW(+a) install its cfg hook (and ``disable_cfg1_optimization``)?
+
+    Upstream: ``cwm_alpha_active = cwm_enabled and (alpha_l or alpha_h)``,
+    ``cfg_hook_needed = cwm_alpha_active or smc_on``, and the hook plus the
+    flag are skipped when another node already registered
+    ``sampler_cfg_function`` (origin: namemechan/ComfyUI-DCW@66aaf9dd:
+    dcw_node.py:817-821, 834-841, 877-878). APG is not upstream and never
+    needs the flag: it is skipped at CFG≈1."""
+    smc_on, _apg_on, cwm_on = _cfg_base_flags()
+    cwm_alpha_active = cwm_on and (
+        float(_CFG["alpha_low"]) != 0.0 or float(_CFG["alpha_high"]) != 0.0
+    )
+    if not (smc_on or cwm_alpha_active):
+        return False
+    options = getattr(unet, "model_options", None) if unet is not None else None
+    if isinstance(options, dict) and "sampler_cfg_function" in options:
+        return False
+    return True
+
+
+def _pass_cfg_near_one(p) -> bool:
+    """Is the configured CFG of the pass being attached ≈1?
+
+    Forge's per-step ``cond_scale`` starts at ``p.cfg_scale``
+    (modules/sd_samplers_kdiffusion.py:188, 242), becomes ``p.hr_cfg`` on the
+    hires pass and ``p.refiner_cfg or cond_scale`` after a refiner switch
+    (modules/sd_samplers_cfg_denoiser.py:136-139); the refiner reuses this
+    pass's unet and cannot run with hires (sd_samplers_common.py:277-279).
+    Any other cond_scale=1 step comes from Forge's skip-negative settings
+    (:141-148), which ``disable_cfg1_optimization`` would undo. Without a
+    readable CFG (non-Forge callers) this keeps upstream's unconditional
+    flag."""
+    if bool(getattr(p, "is_hr_pass", False)):
+        scales = [getattr(p, "hr_cfg", None)]
+    else:
+        scales = [getattr(p, "cfg_scale", None)]
+        if (
+            getattr(p, "refiner_checkpoint_info", None) is not None
+            and getattr(p, "refiner_switch_at", None)
+            and getattr(p, "refiner_cfg", None)
+        ):
+            scales.append(p.refiner_cfg)
+    known = []
+    for scale in scales:
+        try:
+            number = float(scale)
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(number):
+            known.append(number)
+    if not known:
+        return True
+    return any(math.isclose(number, 1.0) for number in known)
 
 
 def _cfg_base_flags() -> tuple[bool, bool, bool]:
@@ -2121,37 +2503,47 @@ def _cfg_base_skip_reason(args) -> str | None:
     return None
 
 
-def _cfg1_skip_message(args, skip_reason: str) -> str:
+def _cfg1_skip_message(
+    args,
+    skip_reason: str,
+    skipped: tuple = ("SMC", "APG", "CWM"),
+    kept: tuple = (),
+) -> str:
     """CFG 1 가드 경고 한 줄(생성당 1회).
 
     ``disable_cfg1_optimization`` 이 켜져 있으면 Forge 는 CFG 1 에서도 uncond
-    패스를 돌린다. 그때 건너뛰는 이유는 uncond 부재가 아니라 배율 1 이다
-    (CFG 결과가 cond 예측 그 자체라 다듬을 가이던스가 없다)."""
-    model_options = args.get("model_options") or {}
-    forced_uncond = bool(
-        isinstance(model_options, dict)
-        and model_options.get("disable_cfg1_optimization", False)
-        and skip_reason.startswith("cond_scale")
-    )
+    패스를 돌린다. 그때 SMC/CWM 은 원본 cfg 훅처럼 그대로 돌고(``kept``), APG 만
+    배율 1 이라 건너뛴다(CFG 결과가 cond 예측 그 자체라 되투영할 가이던스가 없다).
+    플래그가 없으면 uncond 가 없어 켜진 기반 전부를 건너뛴다."""
+    forced_uncond = _uncond_ran_at_cfg1(args, skip_reason)
+    names = "/".join(skipped)
     if forced_uncond:
         why = (
             "disable_cfg1_optimization is set, so Forge still ran the uncond "
             "pass, but at CFG 1 the incoming result is the cond prediction "
-            "itself and there is no CFG guidance to smooth, reproject or "
-            "reweight"
+            "itself and there is no CFG guidance to reproject"
         )
     else:
         why = (
             "Forge runs no uncond at CFG 1, so there is no CFG error to "
             "smooth, reproject or reweight"
         )
-    message = (
-        f"CFG base override (SMC/APG/CWM) skipped: {skip_reason}. {why}; "
-        "the incoming result is kept unchanged (set CFG > 1 to use these "
-        "bases)."
-    )
+    if kept:
+        message = (
+            f"CFG base override ({names}) skipped: {skip_reason}. {why}; "
+            f"{'/'.join(kept)} still run on the real uncond like the original "
+            "DCW(+a) cfg hook (set CFG > 1 to use "
+            f"{'it' if len(skipped) == 1 else 'them'})."
+        )
+    else:
+        message = (
+            f"CFG base override ({names}) skipped: {skip_reason}. {why}; "
+            "the incoming result is kept unchanged (set CFG > 1 to use "
+            f"{'it' if len(skipped) == 1 else 'these bases'})."
+        )
     if (
-        _APG["on"]
+        "APG" in skipped
+        and _APG["on"]
         and _STATE.get("apg_autooff_rescale", True)
         and _STATE.get("on")
         and float(_STATE.get("rescale", 0.0) or 0.0) > 0
@@ -2169,34 +2561,92 @@ def _apply_cfg_base(args, incoming):
     SMC, APG and CWM are independent; whichever are on run in the fixed order
     SMC (smooth the CFG error across steps) -> APG (reproject it) -> CWM
     (reweight it per Haar band). With none on, the incoming CFG result from
-    Forge/MaHiRo/other extensions is preserved untouched."""
+    Forge/MaHiRo/other extensions is preserved untouched.
+
+    Matches upstream DCW(+a) (origin: namemechan/ComfyUI-DCW@66aaf9dd:
+    dcw_node.py:813-878):
+
+    - CWM counts only with a non-zero alpha (``cwm_alpha_active``).
+    - When another extension registered ``sampler_cfg_function`` (RescaleCFG,
+      Dynamic Thresholding…), SMC/CWM step aside with one warning and its
+      result is kept; PAG/SEG/SLG and DCW/RDC still run.
+    - SMC/CWM also run at CFG≈1: on a pass configured at CFG≈1 attach sets
+      ``disable_cfg1_optimization`` (_cfg_hook_needed, _pass_cfg_near_one)
+      so Forge evaluates the uncond. APG (not upstream) is skipped at
+      CFG≈1, and every base is skipped when no uncond ran — including
+      CFG == 1, where Forge encodes no negative prompt at all.
+    - The scale is ``args["cond_scale"]`` (× Forge edit_strength); the
+      least-squares fit of the incoming result is a diagnostic.
+    """
     _CFG["base_skipped"] = False
     smc_on, apg_on, cwm_on = _cfg_base_flags()
+    cwm_on = cwm_on and (
+        float(_CFG["alpha_low"]) != 0.0 or float(_CFG["alpha_high"]) != 0.0
+    )
     if not (smc_on or apg_on or cwm_on):
         return incoming.float()
 
+    model_options = args.get("model_options") or {}
+    external_cfg = (
+        isinstance(model_options, dict)
+        and "sampler_cfg_function" in model_options
+    )
+    _CFG["external_cfg_detected"] = bool(external_cfg)
+    if external_cfg and (smc_on or cwm_on):
+        if not _CFG["external_cfg_warned"]:
+            _CFG["external_cfg_warned"] = True
+            stepped_aside = "/".join(
+                name for name, on in (("SMC", smc_on), ("CWM", cwm_on)) if on
+            )
+            _log(
+                "another extension registered sampler_cfg_function; "
+                f"{stepped_aside} skipped to avoid the conflict, like the "
+                "original DCW(+a) node. Its CFG result is kept and PAG/SEG/SLG "
+                "and DCW/RDC still apply"
+                + ("; APG still replaces it." if apg_on else ".")
+            )
+        smc_on = cwm_on = False
+        if not apg_on:
+            return incoming.float()
+
     skip_reason = _cfg_base_skip_reason(args)
     if skip_reason is not None:
-        _CFG["base_skipped"] = True
-        if not _CFG["cfg1_warned"]:
+        uncond_ran = _uncond_ran_at_cfg1(args, skip_reason)
+        requested = (("SMC", smc_on), ("APG", apg_on), ("CWM", cwm_on))
+        kept = tuple(
+            name for name, on in requested
+            if on and uncond_ran and name != "APG"
+        )
+        skipped = tuple(
+            name for name, on in requested if on and name not in kept
+        )
+        # base_skipped: APG did not run this step (see _apply_perturbation).
+        _CFG["base_skipped"] = bool(apg_on)
+        if skipped and not _CFG["cfg1_warned"]:
             _CFG["cfg1_warned"] = True
-            _log(_cfg1_skip_message(args, skip_reason))
-        return incoming.float()
+            _log(_cfg1_skip_message(args, skip_reason, skipped, kept))
+        if not kept:
+            return incoming.float()
+        apg_on = False
 
-    # fit_error 는 진단값(경고 한 줄 + [VERIFY] 요약)이라 결과에 쓰이지 않는다.
-    # 진단이 꺼져 있으면 패스의 첫 평가에서만 재서 비선형 CFG 경고를 살리고,
-    # 이후 스텝의 두 번째 .item() 동기화를 건너뛴다. effective_scale 은 늘 잰다.
+    # The scale comes from cond_scale. fit_error / fit_scale are diagnostics
+    # (a warning line + the [VERIFY] summary): with diagnostics off they are
+    # measured once per pass (one GPU->CPU sync) to keep the nonlinear-CFG
+    # warning, and every step only for a caller without cond_scale.
+    scale = _cfg_scale_from_args(args)
     measure_fit = guidance_diagnostics_enabled() or not _CFG["fit_checked"]
-    effective_scale, fit_error = _recover_effective_cfg(
-        args, incoming, with_fit_error=measure_fit
-    )
-    _CFG["effective_scale"] = effective_scale
-    if measure_fit:
-        _CFG["fit_checked"] = True
-        _CFG["fit_error"] = fit_error
-    model_options = args.get("model_options") or {}
-    external_cfg = "sampler_cfg_function" in model_options
-    _CFG["external_cfg_detected"] = bool(external_cfg)
+    fit_error = None
+    if measure_fit or scale is None:
+        fit_scale, fit_error = _recover_effective_cfg(
+            args, incoming, with_fit_error=measure_fit
+        )
+        if measure_fit:
+            _CFG["fit_checked"] = True
+            _CFG["fit_error"] = fit_error
+            _CFG["fit_scale"] = fit_scale
+        if scale is None:
+            scale = fit_scale
+    _CFG["effective_scale"] = scale
     nonlinear = fit_error is not None and fit_error > 0.05
     if not _CFG["warned"] and (external_cfg or nonlinear):
         _CFG["warned"] = True
@@ -2223,12 +2673,12 @@ def _apply_cfg_base(args, incoming):
                 float(_CFG["smc_k"]),
             )
         apg_result = _apply_apg(
-            args, effective_scale, raw_error if smc_on else None
+            args, scale, raw_error if smc_on else None
         )
         if apg_result is None:
             if not (smc_on or cwm_on):
                 return incoming.float()  # APG alone failed: keep incoming CFG
-            apg_result = uncond + effective_scale * raw_error
+            apg_result = uncond + scale * raw_error
         else:
             _STATE["apg_steps"] += 1
         _CFG["steps"] += 1
@@ -2247,7 +2697,7 @@ def _apply_cfg_base(args, incoming):
         cond=cond,
         uncond=uncond,
         sigma=sigma,
-        effective_scale=effective_scale,
+        effective_scale=scale,
         mode="smc+cwm" if smc_on and cwm_on else ("smc" if smc_on else "cwm"),
         alpha_low=float(_CFG["alpha_low"]),
         alpha_high=float(_CFG["alpha_high"]),
@@ -2332,9 +2782,16 @@ def _apply_perturbation(args, base):
 def _post_cfg(args):
     """Single post-CFG orchestrator.
 
-    Order is fixed and visible: capture live x_t for CNS; handle ADG state;
+    Order is fixed and visible: CNS x_t fallback capture (the step callback
+    is the primary source, see _install_cns_x_capture); handle ADG state;
     select one CFG base (or the explicit experimental stack); add perturbation
     deltas; run DCW last inside sam-extra.
+
+    DCW/RDC runs on every model evaluation like upstream's post-CFG hook
+    (origin: namemechan/ComfyUI-DCW@66aaf9dd:dcw_node.py:883-930), including
+    the cond-only steps Adaptive Guidance skips: there the incoming result is
+    the cond prediction, no CFG base or perturbation applies, APG momentum is
+    cleared and SMC keeps its e_prev.
     """
     denoised = args["denoised"]
     aggregate = _STATE.pop("condition_aggregation", None)
@@ -2348,16 +2805,14 @@ def _post_cfg(args):
     if torch is None:
         return denoised
     live_input = args.get("input")
-    if torch.is_tensor(live_input):
-        _RUNTIME.cns_x_t = live_input.detach()
+    _capture_cns_post_cfg_input(live_input)
 
-    if _STATE["adg_skipped"]:
-        reset_cfg_state()
-        _RUNTIME.close_step()
-        return denoised
+    adg_skipped = bool(_STATE["adg_skipped"])
+    if adg_skipped:
+        _reset_apg_momentum()
 
-    has_base_override = any(_cfg_base_flags())
-    has_pert = _STATE["on"] and (
+    has_base_override = not adg_skipped and any(_cfg_base_flags())
+    has_pert = not adg_skipped and _STATE["on"] and (
         _STATE["attn_raw"] is not None or _STATE["slg_raw"] is not None
     )
     if not has_base_override and not has_pert and not _DCW["on"]:
@@ -2365,7 +2820,10 @@ def _post_cfg(args):
         return denoised
 
     try:
-        result = _apply_cfg_base(args, denoised)
+        result = (
+            denoised.float() if adg_skipped
+            else _apply_cfg_base(args, denoised)
+        )
 
         if has_pert:
             result = _apply_perturbation(args, result)
@@ -2700,6 +3158,8 @@ def _make_pag_xyz_axis() -> None:
         ),
         # RDC was introduced upstream after the existing 47-axis compatibility
         # prefix. Append only: xyz_grid persists the integer axis index.
+        # "Enable" is the legacy switch: False turns RDC off, True leaves the
+        # upstream gate (Enable DCW and tau > 0) in charge.
         xyz_grid.AxisOption(
             "[Anima RDC] Enable", str,
             partial(_pag_xyz_set, field="rdc_enabled"), choices=bool_choices,
@@ -2726,7 +3186,34 @@ def _make_pag_xyz_axis() -> None:
     )
 
 
+def _migrate_saved_ui_config() -> None:
+    """Carry an existing ui-config.json over the DCW(+a)/CNS parity change (one-time).
+
+    The DCW/RDC/CWM labels are the ui-config keys and did not change, so Forge's
+    UiLoadsave would reapply the old RDC tau 0.15 (while the removed RDC switch's
+    saved False no longer applies), the old slider bounds and the old 2x defaults.
+    The CNS strength/gamma power bounds would come back the same way, and the
+    renamed CNS gamma scale would drop a value the user saved under its old label.
+    on_before_ui runs before ui.create_ui() builds UiLoadsave (webui.py,
+    modules/ui.py:866), so fixing the file here is what the UI then loads. See
+    sam3ext/guidance/ui_config_migration.py for the rules."""
+    cmd_opts = getattr(shared, "cmd_opts", None) if shared is not None else None
+    path = getattr(cmd_opts, "ui_config_file", None)
+    if not path:
+        return
+    changes = migrate_ui_config_file(path, script_file=Path(__file__).name)
+    if changes:
+        _log(
+            "ui-config.json migrated to the upstream DCW(+a)/CNS defaults/ranges:\n  "
+            + "\n  ".join(changes)
+        )
+
+
 def _pag_on_before_ui() -> None:
+    try:
+        _migrate_saved_ui_config()
+    except Exception:
+        _log("ui-config migration failed (left as is):\n" + traceback.format_exc())
     try:
         _make_pag_xyz_axis()
     except Exception:
@@ -3030,11 +3517,19 @@ class AnimaSafePAG(scripts.Script):
 
             gr.Markdown("---\n### Guidance Orchestrator (CFG / Wavelet / Control)")
             gr.Markdown(
-                "**DCW · RDC · CWM · SMC · APG는 서로 독립 토글**입니다. 원하는 만큼 함께 켤 수 "
+                "**DCW · CWM · SMC · APG는 서로 독립 토글**입니다. 원하는 만큼 함께 켤 수 "
                 "있고, 여러 개가 켜지면 항상 **SMC → APG → CWM** 순서로 적용됩니다. "
+                "RDC는 원본 ComfyUI-DCW처럼 따로 켜는 스위치 없이 **DCW가 켜져 있고 "
+                "tau > 0**일 때 DCW 보정 안에서 돕니다. "
                 "APG 토글은 위 APG 섹션에 있습니다. CFG 세 기능(SMC·APG·CWM)을 "
                 "모두 끄면 Forge·MaHiRo·다른 CFG "
-                "확장의 결과를 그대로 보존합니다. 아래 패널은 찾기 쉽도록 "
+                "확장의 결과를 그대로 보존합니다. RescaleCFG처럼 다른 확장이 CFG 함수를 "
+                "이미 걸어 두면 원본처럼 SMC·CWM만 비키고(경고 1회) DCW·PAG는 그대로 "
+                "적용됩니다. 원본 노드는 SMC·CWM을 CFG 1에서도 돌리지만, Forge는 "
+                "**CFG = 1이면 negative prompt를 인코딩하지 않아**(uncond 없음) 그때는 "
+                "SMC·CWM도 건너뜁니다(경고 1회). CFG가 1이 아닌 패스에서 Forge의 "
+                "'Ignore Negative Prompt during Early Steps'·NGMS가 negative를 건너뛰는 "
+                "스텝은 그대로 negative 없이 둡니다. 아래 패널은 찾기 쉽도록 "
                 "**DCW → RDC → CWM → SMC** 순서로 배치했습니다."
             )
 
@@ -3045,37 +3540,59 @@ class AnimaSafePAG(scripts.Script):
                 elem_id="anima_guidance_dcw_enable",
                 elem_classes=["sam3-on", "sam3-on--dcw"],
             )
+            # Ranges/defaults = upstream DCW(+a) (origin: namemechan/
+            # ComfyUI-DCW@66aaf9dd:dcw_node.py:636-667): lambda_l 0.05 ±0.5
+            # step .005, lambda_h 0.01 ±0.3 step .001. The labels are the
+            # ui-config keys; _migrate_saved_ui_config drops the old saved
+            # bounds and old defaults once so these reach an existing install.
             with gr.Row():
                 dcw_lambda_low = gr.Slider(
                     label="DCW lambda low",
-                    minimum=-0.5, maximum=0.5, step=0.005, value=0.10,
-                    info="구도·밝기·큰 색면이 어색해지면 0 쪽으로 줄이세요.",
+                    minimum=-0.5, maximum=0.5, step=0.005, value=0.05,
+                    info=(
+                        "원본 기본 0.05. 구도·밝기·큰 색면이 어색해지면 "
+                        "0 쪽으로 줄이세요."
+                    ),
                     elem_id="anima_guidance_dcw_lambda_low",
                 )
                 dcw_lambda_high = gr.Slider(
                     label="DCW lambda high",
-                    minimum=-0.5, maximum=0.5, step=0.005, value=0.02,
-                    info="윤곽 링·미세 노이즈가 생기면 0 쪽으로 줄이세요.",
+                    minimum=-0.3, maximum=0.3, step=0.001, value=0.01,
+                    info=(
+                        "원본 기본 0.01. 윤곽 링·미세 노이즈가 생기면 "
+                        "0 쪽으로 줄이세요."
+                    ),
                     elem_id="anima_guidance_dcw_lambda_high",
                 )
 
-            gr.Markdown("#### RDC — band-wise reverse drift compensation")
+            gr.Markdown(
+                "#### RDC — band-wise reverse drift compensation\n"
+                "원본처럼 켜기 스위치가 없습니다: **Enable DCW + tau > 0**이면 켜지고 "
+                "tau 0(기본)이면 꺼집니다. DCW lambda를 0으로 두면 RDC만 쓸 수 있습니다."
+            )
+            # Script-arg 58 keeps its slot (the old separate RDC toggle) so
+            # args 59-61 and every API/app caller stay aligned. Upstream has
+            # no toggle — rdc_tau alone switches RDC and it runs inside the
+            # DCW hook (origin: namemechan/ComfyUI-DCW@66aaf9dd:dcw_node.py:
+            # 757-815, 817-819). The hidden checkbox always sends True from
+            # this UI, so here RDC is exactly ``dcw_enabled and tau > 0``; an
+            # API caller (UR_IV app) may still send False to veto RDC. Not
+            # saved to ui-config, so an old saved False cannot stick; the
+            # old tau 0.15 saved beside that False is reset to 0 once by
+            # _migrate_saved_ui_config (else Enable DCW would turn RDC on).
             rdc_enabled = gr.Checkbox(
                 label="Enable RDC",
-                value=False,
-                info=(
-                    "여러 스텝에 걸쳐 구도·포즈가 서서히 표류하는 현상을 대역별 "
-                    "EMA로 억제합니다. DCW와 독립적으로 켤 수 있습니다."
-                ),
+                value=True,
+                visible=False,
                 elem_id="anima_guidance_rdc_enable",
-                elem_classes=["sam3-on", "sam3-on--rdc"],
             )
+            rdc_enabled.do_not_save_to_config = True
             rdc_tau = gr.Slider(
                 label="RDC tau (EMA 기억 구간)",
-                minimum=0.0, maximum=0.5, step=0.01, value=0.15,
+                minimum=0.0, maximum=0.5, step=0.01, value=0.0,
                 info=(
-                    "0.05~0.10은 빠른 반응, 0.15~0.20은 권장 절충값입니다. "
-                    "구도가 초반 상태에 고착되면 낮추세요."
+                    "0 = RDC 끔(원본 기본). 0.05~0.10은 빠른 반응, 0.2~0.3은 느리고 "
+                    "부드러운 보정입니다. 구도가 초반 상태에 고착되면 낮추세요."
                 ),
                 elem_id="anima_guidance_rdc_tau",
             )
@@ -3103,20 +3620,25 @@ class AnimaSafePAG(scripts.Script):
             cwm_enabled = gr.Checkbox(
                 label="Enable CWM",
                 value=False,
-                info="alpha low·high가 모두 0이면 켜도 표준 CFG와 같습니다.",
+                info=(
+                    "alpha low·high가 모두 0(원본 기본)이면 켜도 표준 CFG와 "
+                    "같습니다 — 원본 권장 시작값 low 0.1~0.3, high 0.1~0.2."
+                ),
                 elem_id="anima_guidance_cwm_enable",
                 elem_classes=["sam3-on", "sam3-on--cwm"],
             )
+            # Upstream alpha_l/alpha_h: default 0.0, range -1..2, step .01
+            # (origin: namemechan/ComfyUI-DCW@66aaf9dd:dcw_node.py:675-704).
             with gr.Row():
                 cwm_alpha_low = gr.Slider(
                     label="CWM alpha low (초반 저주파 CFG)",
-                    minimum=-1.0, maximum=1.0, step=0.01, value=0.30,
+                    minimum=-1.0, maximum=2.0, step=0.01, value=0.0,
                     info="전체 구도·큰 색면이 과하게 변하면 0 쪽으로 줄이세요.",
                     elem_id="anima_guidance_cwm_alpha_low",
                 )
                 cwm_alpha_high = gr.Slider(
                     label="CWM alpha high (후반 고주파 CFG)",
-                    minimum=-1.0, maximum=1.0, step=0.01, value=0.15,
+                    minimum=-1.0, maximum=2.0, step=0.01, value=0.0,
                     info="인물 복제·윤곽 링·세부 노이즈가 생기면 0 쪽으로 줄이세요.",
                     elem_id="anima_guidance_cwm_alpha_high",
                 )
@@ -3250,22 +3772,26 @@ class AnimaSafePAG(scripts.Script):
                 elem_id="anima_guidance_cns_enable",
                 elem_classes=["sam3-on", "sam3-on--cns"],
             )
+            # Ranges/defaults = upstream INPUT_TYPES (origin: namemechan/
+            # comfyui-cns_sampler_patch@42278b13:cns_sampler_patch.py:395-437);
+            # the 3.0 hint is upstream README's "Flux / Anima +
+            # euler_ancestral_cfg_pp" row.
             cns_strength = gr.Slider(
                 label="CNS strength",
-                minimum=0.0, maximum=1.0, step=0.01, value=1.0,
+                minimum=0.0, maximum=1.0, step=0.05, value=1.0,
                 info="색 노이즈·거친 입자·구조 변형이 과하면 먼저 낮추세요.",
                 elem_id="anima_guidance_cns_strength",
             )
             cns_gamma_power = gr.Slider(
                 label="CNS gamma power",
-                minimum=0.05, maximum=2.0, step=0.05, value=0.5,
+                minimum=0.1, maximum=2.0, step=0.05, value=0.5,
                 info="주파수별 색 노이즈가 어색하면 기본값 0.5로 되돌린 뒤 Strength를 낮추세요.",
                 elem_id="anima_guidance_cns_gamma_power",
             )
             cns_gamma_scale = gr.Slider(
-                label="CNS gamma scale (Anima 시작값 3.0)",
-                minimum=0.25, maximum=25.0, step=0.25, value=3.0,
-                info="노이즈 분포가 과장되면 기본값 3.0으로 되돌린 뒤 Strength를 낮추세요.",
+                label=CNS_GAMMA_SCALE_LABEL,
+                minimum=0.1, maximum=25.0, step=0.1, value=2.0,
+                info="노이즈 분포가 과장되면 기본값 2.0으로 되돌린 뒤 Strength를 낮추세요.",
                 elem_id="anima_guidance_cns_gamma_scale",
             )
 
@@ -3422,8 +3948,9 @@ class AnimaSafePAG(scripts.Script):
             smc_on=False, apg_on=False, cwm_on=False,
             mode="preserve", experimental_stack=False, steps=0,
             smc_preset="Off", smc_resolved_preset="Off",
-            fit_error=None, effective_scale=None,
+            fit_error=None, effective_scale=None, fit_scale=None,
             external_cfg_detected=False, warned=False, cfg1_warned=False,
+            external_cfg_warned=False,
             base_skipped=False, fit_checked=False,
         )
         _DCW.update(
@@ -3434,8 +3961,11 @@ class AnimaSafePAG(scripts.Script):
             dcw_steps=0,
             rdc_steps=0,
         )
-        _DAVE.update(on=False, targets=set(), steps=0)
-        _CNS.update(on=False, warned=False)
+        _DAVE.update(on=False, targets=set(), steps=0, offset=None)
+        _CNS.update(
+            on=False, warned=False, capture="post_cfg", callback_seen=False,
+            scope="pass",
+        )
         _MOD.update(
             on=False,
             targets=set(),
@@ -3560,10 +4090,14 @@ class AnimaSafePAG(scripts.Script):
             if "dcw_enabled" in xyz
             else _as_bool(_arg(28, False), False)
         )
-        rdc_enabled = (
-            _as_bool(xyz["rdc_enabled"], _as_bool(_arg(58, False), False))
+        # Arg 58 is the old separate RDC toggle, kept as a slot. Upstream has
+        # none: RDC = dcw_enabled and rdc_tau > 0 (resolved below). This UI's
+        # hidden checkbox always sends True; False (an API caller such as the
+        # UR_IV app, or the legacy XYZ axis) only vetoes RDC.
+        rdc_switch = (
+            _as_bool(xyz["rdc_enabled"], _as_bool(_arg(58, True), True))
             if "rdc_enabled" in xyz
-            else _as_bool(_arg(58, False), False)
+            else _as_bool(_arg(58, True), True)
         )
         dave_enabled = (
             _as_bool(xyz["dave_enabled"], _as_bool(_arg(31, False), False))
@@ -3617,7 +4151,8 @@ class AnimaSafePAG(scripts.Script):
             requested_smc=resolved_smc,
             requested_cwm=resolved_cwm,
             requested_dcw=dcw_enabled,
-            requested_rdc=rdc_enabled,
+            # Set once rdc_tau is read (RDC needs DCW and tau > 0).
+            requested_rdc=False,
             requested_dave=dave_enabled,
             requested_cns=cns_enabled,
             requested_modulation=mod_enabled,
@@ -3631,7 +4166,6 @@ class AnimaSafePAG(scripts.Script):
             resolved_smc,
             resolved_cwm,
             dcw_enabled,
-            rdc_enabled,
             dave_enabled,
             cns_enabled,
             mod_enabled,
@@ -3682,20 +4216,21 @@ class AnimaSafePAG(scripts.Script):
             legacy_attn = _as_bool(xyz["legacy_attn"], _as_bool(_arg(20, False), False)) \
                 if "legacy_attn" in xyz else _as_bool(_arg(20, False), False)
             seg_sigma = _xyz_num("seg_sigma", float(_arg(21, 100.0)))
-            cwm_alpha_low = _xyz_num("cwm_alpha_low", float(_arg(24, 0.30)))
-            cwm_alpha_high = _xyz_num("cwm_alpha_high", float(_arg(25, 0.15)))
+            # Omitted-argument fallbacks are the upstream DCW(+a) defaults
+            # (origin: namemechan/ComfyUI-DCW@66aaf9dd:dcw_node.py:636-667
+            # lambda_l/lambda_h, 675-704 alpha_l/alpha_h, 729-750 smc_lambda/
+            # smc_k, 757-777 rdc_tau). Values a caller sends are used as-is.
+            cwm_alpha_low = _xyz_num("cwm_alpha_low", float(_arg(24, 0.0)))
+            cwm_alpha_high = _xyz_num("cwm_alpha_high", float(_arg(25, 0.0)))
             smc_lambda = _xyz_num("smc_lambda", float(_arg(26, 6.0)))
-            # Index 27 predates the appended preset selector. Keep its omitted
-            # API/infotext fallback at the historical 0.20; the new Custom UI
-            # still supplies its explicit upstream default of 0.10.
-            smc_k = _xyz_num("smc_k", float(_arg(27, 0.20)))
+            smc_k = _xyz_num("smc_k", float(_arg(27, 0.10)))
             dcw_lambda_low = _xyz_num(
-                "dcw_lambda_low", float(_arg(29, 0.10))
+                "dcw_lambda_low", float(_arg(29, 0.05))
             )
             dcw_lambda_high = _xyz_num(
-                "dcw_lambda_high", float(_arg(30, 0.02))
+                "dcw_lambda_high", float(_arg(30, 0.01))
             )
-            rdc_tau = _xyz_num("rdc_tau", float(_arg(59, 0.15)))
+            rdc_tau = _xyz_num("rdc_tau", float(_arg(59, 0.0)))
             rdc_alpha_ll = _xyz_num(
                 "rdc_alpha_ll", float(_arg(60, 0.03))
             )
@@ -3717,7 +4252,7 @@ class AnimaSafePAG(scripts.Script):
                 "cns_gamma_power", float(_arg(37, 0.5))
             )
             cns_gamma_scale = _xyz_num(
-                "cns_gamma_scale", float(_arg(38, 3.0))
+                "cns_gamma_scale", float(_arg(38, 2.0))
             )
             mod_clip_model = str(_arg(45, "") or "").strip()
             mod_weight = _xyz_num(
@@ -3780,22 +4315,34 @@ class AnimaSafePAG(scripts.Script):
         adg_start = _finite_clamp(adg_start, 0.0, 1.0, 0.5)
         adg_interval = int(_finite_clamp(adg_interval, 0.0, 10.0, 0.0))
         seg_sigma = _finite_clamp(seg_sigma, 0.0, 10000.0, 100.0)
-        cwm_alpha_low = _finite_clamp(cwm_alpha_low, -1.0, 1.0, 0.30)
-        cwm_alpha_high = _finite_clamp(cwm_alpha_high, -1.0, 1.0, 0.15)
-        # Keep 0 valid for legacy/API neutral values even though the upstream
-        # Custom UI starts lambda at 0.5.
-        smc_lambda = _finite_clamp(smc_lambda, 0.0, 30.0, 6.0)
-        smc_k = _finite_clamp(smc_k, 0.0, 5.0, 0.20)
-        dcw_lambda_low = _finite_clamp(dcw_lambda_low, -0.5, 0.5, 0.10)
-        dcw_lambda_high = _finite_clamp(dcw_lambda_high, -0.5, 0.5, 0.02)
-        rdc_tau = _finite_clamp(rdc_tau, 0.0, 0.5, 0.15)
+        # DCW(+a) domains = the upstream INPUT_TYPES min/max, non-finite values
+        # fall back to the upstream default (origin: namemechan/
+        # ComfyUI-DCW@66aaf9dd:dcw_node.py:636-801).
+        cwm_alpha_low = _finite_clamp(cwm_alpha_low, -1.0, 2.0, 0.0)
+        cwm_alpha_high = _finite_clamp(cwm_alpha_high, -1.0, 2.0, 0.0)
+        smc_lambda = _finite_clamp(smc_lambda, 0.5, 30.0, 6.0)
+        smc_k = _finite_clamp(smc_k, 0.0, 5.0, 0.10)
+        dcw_lambda_low = _finite_clamp(dcw_lambda_low, -0.5, 0.5, 0.05)
+        dcw_lambda_high = _finite_clamp(dcw_lambda_high, -0.3, 0.3, 0.01)
+        rdc_tau = _finite_clamp(rdc_tau, 0.0, 0.5, 0.0)
         rdc_alpha_ll = _finite_clamp(rdc_alpha_ll, 0.0, 0.3, 0.03)
         rdc_alpha_hh = _finite_clamp(rdc_alpha_hh, 0.0, 0.1, 0.0)
+        # Upstream gating (origin: namemechan/ComfyUI-DCW@66aaf9dd:
+        # dcw_node.py:817-819): RDC is on when rdc_tau > 0 and only inside
+        # the DCW hook, which needs dcw_enabled and a non-zero lambda or RDC.
+        rdc_on = bool(dcw_enabled and rdc_tau > 0.0 and rdc_switch)
+        dcw_active = bool(
+            dcw_enabled
+            and (dcw_lambda_low != 0.0 or dcw_lambda_high != 0.0 or rdc_on)
+        )
+        _STATE["requested_rdc"] = rdc_on
         dave_strength = _finite_clamp(dave_strength, 0.0, 1.0, 0.30)
         dave_tau = _finite_clamp(dave_tau, 0.0, 1.0, 0.10)
+        # Upstream INPUT_TYPES bounds/defaults (origin: namemechan/
+        # comfyui-cns_sampler_patch@42278b13:cns_sampler_patch.py:395-437).
         cns_strength = _finite_clamp(cns_strength, 0.0, 1.0, 1.0)
-        cns_gamma_power = _finite_clamp(cns_gamma_power, 0.05, 2.0, 0.5)
-        cns_gamma_scale = _finite_clamp(cns_gamma_scale, 0.25, 25.0, 3.0)
+        cns_gamma_power = _finite_clamp(cns_gamma_power, 0.1, 2.0, 0.5)
+        cns_gamma_scale = _finite_clamp(cns_gamma_scale, 0.1, 25.0, 2.0)
         mod_weight = _finite_clamp(mod_weight, -20.0, 20.0, 3.0)
         mod_start_layer = int(
             _finite_clamp(mod_start_layer, 0.0, 1024.0, 0.0)
@@ -3828,9 +4375,9 @@ class AnimaSafePAG(scripts.Script):
             smc_k=smc_k,
         )
         _DCW.update(
-            on=dcw_enabled or rdc_enabled,
+            on=dcw_active,
             dcw_on=dcw_enabled,
-            rdc_on=rdc_enabled,
+            rdc_on=rdc_on,
             lambda_low=dcw_lambda_low,
             lambda_high=dcw_lambda_high,
             rdc_tau=rdc_tau,
@@ -4066,19 +4613,33 @@ class AnimaSafePAG(scripts.Script):
                                 _log(
                                     "no valid target blocks — perturbation skipped."
                                 )
-                        if dave_enabled and dave_strength > 0:
+                        # Upstream pools a block only when its attenuation
+                        # clip(strength·w, 0, 1) > 1e-3, and an empty pool is
+                        # a passthrough (origin: sorryhyun/ComfyUI-Anima-DAVE
+                        # @83143e8d:nodes.py:165-172). The block field stands
+                        # in for the mask; empty = the shipped mask's 8-18.
+                        if dave_enabled and dave_attenuation_active(dave_strength):
                             dave_targets = _parse_blocks(
-                                dave_block_spec, nblocks
+                                dave_block_spec.strip() or DAVE_DEFAULT_BLOCKS,
+                                nblocks,
                             )
                             dave_ok = bool(dave_targets)
                             if not dave_ok:
                                 _log("no valid DAVE blocks — DAVE skipped.")
+                        elif dave_enabled:
+                            _log(
+                                "DAVE strength <= 0.001 — no-op, like the "
+                                "original node."
+                            )
 
         _DAVE.update(
             on=dave_ok,
             strength=dave_strength,
             tau=dave_tau,
             targets=dave_targets,
+            gate=ForwardGateCache(),
+            schedule_ok=_sampler_publishes_sigmas(p),
+            offset=_forge_sampling_offset(p),
         )
         if not mod_ok:
             _MOD.update(
@@ -4152,6 +4713,9 @@ class AnimaSafePAG(scripts.Script):
         try:
             if _CNS["on"] and not _ensure_cns_noise_patched():
                 _CNS["on"] = False
+            if _CNS["on"]:
+                _CNS["capture"] = _install_cns_x_capture(p)
+                _CNS["scope"] = _install_cns_sampler_scope(p)
             unet = unet.clone()
             # The wrapper is needed for perturbation AND for Adaptive Guidance
             # (both manipulate the cond/uncond batch before apply_model).
@@ -4160,7 +4724,21 @@ class AnimaSafePAG(scripts.Script):
                 unet.set_model_unet_function_wrapper(_model_wrapper)
             if _STATE["on"]:
                 unet.set_model_sampler_pre_cfg_function(_prepare_condition_aggregation)
-            unet.set_model_sampler_post_cfg_function(_post_cfg)
+            # Upstream installs its SMC/CWM cfg hook with
+            # disable_cfg1_optimization=True, so those bases also work at
+            # CFG 1 on a real uncond (origin: namemechan/ComfyUI-DCW@66aaf9dd:
+            # dcw_node.py:877-878). DCW-only / APG-only registrations keep
+            # Forge's CFG 1 shortcut. Only for a pass whose own CFG is ≈1:
+            # in a CFG≠1 pass the cond_scale=1 steps are Forge's "Ignore
+            # Negative Prompt during Early Steps" / NGMS skips, which must
+            # stay negative-free (ComfyUI has no such setting).
+            cfg1_uncond = _cfg_hook_needed(unet) and _pass_cfg_near_one(p)
+            if cfg1_uncond:
+                unet.set_model_sampler_post_cfg_function(
+                    _post_cfg, disable_cfg1_optimization=True
+                )
+            else:
+                unet.set_model_sampler_post_cfg_function(_post_cfg)
             p.sd_model.forge_objects.unet = unet
 
             if not hasattr(p, "extra_generation_params"):
@@ -4223,7 +4801,7 @@ class AnimaSafePAG(scripts.Script):
                         if smc_on else ""
                     )
                 )
-            if _DCW["dcw_on"]:
+            if _DCW["on"]:
                 p.extra_generation_params["Anima DCW"] = (
                     f"lambda_low={dcw_lambda_low}, "
                     f"lambda_high={dcw_lambda_high}"
@@ -4275,6 +4853,7 @@ class AnimaSafePAG(scripts.Script):
                 f"AdaptiveG={'on' if _ADG['on'] else 'off'} "
                 f"(skip_after={_ADG['start']} keep_every={_ADG['interval']}) "
                 f"CFGBase={_CFG['mode']} stack={_CFG['experimental_stack']} "
+                f"cfg1_uncond={cfg1_uncond} "
                 f"SMC={smc_preset_label}"
                 f"({smc_lambda:g},{smc_k:g}) "
                 f"DCW={_DCW['dcw_on']} RDC={_DCW['rdc_on']} "
@@ -4425,6 +5004,11 @@ class AnimaSafePAG(scripts.Script):
                 if _CFG["effective_scale"] is None
                 else f"{float(_CFG['effective_scale']):.4g}"
             )
+            fit_scale_text = (
+                "?"
+                if _CFG["fit_scale"] is None
+                else f"{float(_CFG['fit_scale']):.4g}"
+            )
             dcw_verdict = (
                 "OFF"
                 if not _STATE["requested_dcw"]
@@ -4453,7 +5037,8 @@ class AnimaSafePAG(scripts.Script):
                 "OFF"
                 if not _STATE["requested_cns"]
                 else (
-                    f"APPLIED({_RUNTIME.cns_noise_calls} noise calls)"
+                    f"APPLIED({_RUNTIME.cns_noise_calls} noise calls, "
+                    f"x_t={_CNS['capture']})"
                     if _RUNTIME.cns_noise_calls > 0
                     else "INERT(no ancestral/SDE noise call)"
                 )
@@ -4470,7 +5055,7 @@ class AnimaSafePAG(scripts.Script):
                 "[VERIFY] suite: "
                 f"attention={attention_verdict}, "
                 f"CFG={requested_mode}:{cfg_verdict} "
-                f"(w_eff={scale_text}, fit={fit_text}), "
+                f"(w_eff={scale_text}, w_fit={fit_scale_text}, fit={fit_text}), "
                 f"DCW={dcw_verdict}, RDC={rdc_verdict}, "
                 f"DAVE={dave_verdict}, CNS={cns_verdict}, "
                 f"Modulation={modulation_verdict}"
@@ -4489,9 +5074,11 @@ class AnimaSafePAG(scripts.Script):
             steps=0,
             fit_error=None,
             effective_scale=None,
+            fit_scale=None,
             external_cfg_detected=False,
             warned=False,
             cfg1_warned=False,
+            external_cfg_warned=False,
             base_skipped=False,
             fit_checked=False,
         )
@@ -4503,8 +5090,11 @@ class AnimaSafePAG(scripts.Script):
             dcw_steps=0,
             rdc_steps=0,
         )
-        _DAVE.update(on=False, targets=set(), steps=0)
-        _CNS.update(on=False, warned=False)
+        _DAVE.update(on=False, targets=set(), steps=0, offset=None)
+        _CNS.update(
+            on=False, warned=False, capture="post_cfg", callback_seen=False,
+            scope="pass",
+        )
         _MOD.update(
             on=False,
             targets=set(),
