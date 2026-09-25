@@ -798,6 +798,67 @@ class ReferenceIpaPathTests(unittest.TestCase):
     def test_the_same_depth_leaves_no_mapping_note(self):
         forge, result = self._run()
         self.assertNotIn("SAM3 IPA Blocks", forge.built[0].extra_generation_params)
+        self.assertNotIn("SAM3 IPA Duplicates", forge.built[0].extra_generation_params)
+
+    def _run_deep(self, *, setting=None, **request_overrides):
+        """28블록 어댑터 + 52블록 모델. 세션이 받은 옵션도 돌려준다."""
+        model = _Anima()
+        model.forge_objects = types.SimpleNamespace(
+            unet=types.SimpleNamespace(
+                model=types.SimpleNamespace(
+                    diffusion_model=types.SimpleNamespace(blocks=[None] * 52)
+                )
+            )
+        )
+        received = []
+
+        @contextlib.contextmanager
+        def session(sd_model, image, options):
+            received.append(options)
+            yield 28
+
+        forge = _FakeForge(model, process=self._process)
+        forge.on_sample = self._record_during_sample
+        values = dict(
+            reference_image=Image.new("RGB", (64, 64)), mode="ipa", candidate_count=2,
+            save_target=False,
+        )
+        values.update(request_overrides)
+        request = ReferenceGenerationRequest(**values)
+        modules = forge._modules()
+        if setting is not None:
+            from sam3ext.anima_ipa.options import OPT_DUPLICATE_POLICY
+
+            setattr(modules["modules.shared"].opts, OPT_DUPLICATE_POLICY, setting)
+        with mock.patch.object(runner_module, "_ipa_session", session):
+            with mock.patch.dict(sys.modules, modules):
+                result = run_anima_reference(request, sd_model=model)
+        return forge, result, received
+
+    def test_a_mapped_run_records_the_default_duplicate_policy(self):
+        forge, result, received = self._run_deep()
+        for built in forge.built:
+            self.assertEqual(built.extra_generation_params["SAM3 IPA Duplicates"], "lineage")
+        self.assertEqual(result.diagnostics.get("ipa_duplicate_policy"), "lineage")
+        # 세션은 None 이 아니라 정해진 값을 받는다 — infotext 와 실제 주입이 같은 값을 쓴다.
+        self.assertEqual([o.duplicate_policy for o in received], ["lineage", "lineage"])
+
+    def test_the_forge_setting_picks_the_duplicate_policy(self):
+        forge, result, received = self._run_deep(setting="split")
+        self.assertEqual(forge.built[0].extra_generation_params["SAM3 IPA Duplicates"], "split")
+        self.assertEqual(result.diagnostics.get("ipa_duplicate_policy"), "split")
+        self.assertEqual({o.duplicate_policy for o in received}, {"split"})
+
+    def test_the_request_policy_beats_the_forge_setting(self):
+        from sam3ext.anima_ipa.options import IpaOptions
+
+        forge, result, received = self._run_deep(
+            setting="split", ipa=IpaOptions(duplicate_policy="all", strength=0.7)
+        )
+        self.assertEqual(forge.built[0].extra_generation_params["SAM3 IPA Duplicates"], "all")
+        self.assertEqual({o.duplicate_policy for o in received}, {"all"})
+        # 나머지 옵션은 그대로 간다
+        self.assertEqual({o.strength for o in received}, {0.7})
 
     def test_an_interrupt_is_reported_in_the_diagnostics(self):
         model = _Anima()
@@ -811,6 +872,176 @@ class ReferenceIpaPathTests(unittest.TestCase):
                 result = run_anima_reference(request, sd_model=model)
         self.assertTrue(result.diagnostics.get("interrupted"))
         self.assertEqual(result.outputs, ())
+
+
+class _FakeAnima38WithRelease(_FakeAnima38):
+    """설치 순서의 첫 단계(release_foreign_install)도 기록한다."""
+
+    def release_foreign_install(self, processing, on_error=None):
+        self.calls.append(("release", processing))
+        return None
+
+
+class ReferenceIpaAnima38Tests(unittest.TestCase):
+    """IP-Adapter 방식의 3.8B v2 커넥터 토글(감사 M10) — 기본 켬(이어붙이기와 같은 설치), 끄면 예전 0.6B 조건.
+
+    주의: ReferenceIpaPathTests 와 같은 이유로 주입 세션과 anima38 런타임은 가짜다(배선만 본다).
+    """
+
+    def _run(self, runtime, *, setting=None, anima38_connector=None, error=None,
+             encoder_present=True, interrupt=False, shared_runtime=None):
+        from sam3ext.anima_ipa.options import IpaOptions
+
+        calls = runtime.calls if runtime is not None else []
+        state = {"session": False}
+
+        @contextlib.contextmanager
+        def session(sd_model, image, options):
+            calls.append(("session", sd_model))
+            state["session"] = True
+            try:
+                yield
+            finally:
+                state["session"] = False
+
+        forge = None
+
+        def process(p):
+            calls.append(("process", p))
+            p.sample()
+            if interrupt:
+                forge.state.interrupted = True
+            return types.SimpleNamespace(
+                images=[Image.new("RGB", (64, 64), "blue")], infotexts=["Seed: 7"], info=""
+            )
+
+        model = _Anima()
+        forge = _FakeForge(model, process=process)
+        request = ReferenceGenerationRequest(
+            reference_image=Image.new("RGB", (64, 64), "red"),
+            mode="ipa",
+            ipa=IpaOptions(anima38_connector=anima38_connector),
+            candidate_count=1,
+            save_target=False,
+            seed=7,
+        )
+        modules = forge._modules()
+        if setting is not None:
+            setattr(modules["modules.shared"].opts, runner_module.OPT_IPA_ANIMA38, setting)
+        if shared_runtime is not None:
+            fake_module = types.ModuleType(runner_module._ANIMA38_RUNTIME_MODULE)
+            fake_module._SHARED_RUNTIME = shared_runtime
+            modules[runner_module._ANIMA38_RUNTIME_MODULE] = fake_module
+        lookup = mock.Mock(return_value=(runtime, error))
+        with (
+            mock.patch.object(runner_module, "_ipa_session", session),
+            mock.patch.object(runner_module, "_anima38_runtime", lookup),
+            mock.patch.object(
+                runner_module, "_anima38_encoder_present", return_value=encoder_present
+            ),
+            mock.patch.dict(sys.modules, modules),
+        ):
+            result = run_anima_reference(request, sd_model=model)
+        return forge, result, lookup
+
+    def test_the_default_installs_the_connector_like_the_canvas_mode(self):
+        runtime = _FakeAnima38WithRelease()
+        forge, result, lookup = self._run(runtime)
+        lookup.assert_called_once()
+        p = forge.built[0]
+        self.assertEqual(
+            [call[0] for call in runtime.calls],
+            ["release", "install", "process", "session", "restore"],
+        )
+        self.assertEqual(p.extra_generation_params["Reference Anima38"], "v2 bundle")
+        self.assertTrue(result.diagnostics["anima38_connector"])
+
+    def test_the_toggle_off_leaves_the_infotext_as_before(self):
+        runtime = _FakeAnima38WithRelease()
+        forge, result, lookup = self._run(runtime, setting=False)
+        lookup.assert_not_called()          # 꺼져 있으면 무거운 런타임을 불러오지도 않는다
+        params = forge.built[0].extra_generation_params
+        self.assertNotIn("Reference Anima38", params)
+        self.assertFalse(any(key.startswith("Anima38") for key in params))
+        self.assertEqual(
+            [call[0] for call in runtime.calls], ["process", "session"],
+            "설치·복원이 없다",
+        )
+        self.assertFalse(result.diagnostics["anima38_connector"])
+        self.assertEqual(result.diagnostics["anima38"], runner_module.ANIMA38_IPA_OFF)
+
+    def test_the_setting_installs_the_connector_around_the_ipa_sampling(self):
+        runtime = _FakeAnima38WithRelease()
+        forge, result, _lookup = self._run(runtime, setting=True)
+        p = forge.built[0]
+        self.assertEqual(
+            runtime.calls,
+            [
+                ("release", p),
+                ("install", p, "Anima-3.8B-expanded_adapter.safetensors", 1.0, None),
+                ("process", p),
+                ("session", p.sd_model),     # IP 주입은 커넥터가 설치된 채로 sample() 안에서 산다
+                ("restore", p),
+            ],
+        )
+        self.assertEqual(p.extra_generation_params["Reference Anima38"], "v2 bundle")
+        self.assertTrue(result.diagnostics["anima38_connector"])
+        self.assertEqual(result.diagnostics["anima38"], "v2 bundle")
+        self.assertEqual(len(result.outputs), 1)
+
+    def test_the_request_value_wins_over_the_setting(self):
+        runtime = _FakeAnima38WithRelease()
+        forge, result, _ = self._run(runtime, setting=False, anima38_connector=True)
+        self.assertEqual(result.diagnostics["anima38"], "v2 bundle")
+        runtime = _FakeAnima38WithRelease()
+        forge, result, lookup = self._run(runtime, setting=True, anima38_connector=False)
+        lookup.assert_not_called()
+        self.assertNotIn("Reference Anima38", forge.built[0].extra_generation_params)
+
+    def test_a_model_that_is_not_a_v2_bundle_samples_natively_and_says_so(self):
+        runtime = _FakeAnima38WithRelease(v2=False)
+        forge, result, _ = self._run(runtime, setting=True)
+        self.assertEqual([call[0] for call in runtime.calls], ["release", "process", "session"])
+        self.assertEqual(
+            forge.built[0].extra_generation_params["Reference Anima38"], "not a 3.8B v2 bundle"
+        )
+
+    def test_a_failed_install_restores_before_sampling_and_the_job_continues(self):
+        runtime = _FakeAnima38WithRelease(error=RuntimeError("boom"))
+        with mock.patch("sys.stderr", new_callable=io.StringIO):
+            forge, result, _ = self._run(runtime, setting=True)
+        self.assertEqual(
+            [call[0] for call in runtime.calls],
+            ["release", "install", "restore", "process", "session"],
+        )
+        self.assertEqual(result.diagnostics["anima38"], "install failed (RuntimeError: boom)")
+        self.assertEqual(len(result.outputs), 1)
+
+    def test_a_missing_encoder_skips_the_install(self):
+        runtime = _FakeAnima38WithRelease()
+        forge, result, _ = self._run(runtime, setting=True, encoder_present=False)
+        self.assertEqual([call[0] for call in runtime.calls], ["release", "process", "session"])
+        self.assertTrue(result.diagnostics["anima38"].startswith("missing encoder"))
+
+    def test_an_unavailable_runtime_is_reported(self):
+        forge, result, _ = self._run(None, setting=True, error="ImportError: no torch")
+        self.assertEqual(result.diagnostics["anima38"], "unavailable (ImportError: no torch)")
+        self.assertEqual(len(result.outputs), 1)
+
+    def test_an_interrupted_candidate_still_restores(self):
+        runtime = _FakeAnima38WithRelease()
+        forge, result, _ = self._run(runtime, setting=True, interrupt=True)
+        self.assertEqual(runtime.calls[-1], ("restore", forge.built[0]))
+        self.assertEqual(result.outputs, ())
+
+    def test_with_the_toggle_off_a_leftover_install_is_still_released(self):
+        """txt2img 가 샘플링 중 예외로 끝나 남긴 v2 설치로 이 잡의 조건이 만들어지면 안 된다 —
+        스크립트의 Bypass 와 같은 규칙(공용 release_foreign_install). 커넥터 설치는 하지 않는다."""
+        shared_runtime = _FakeAnima38WithRelease()
+        forge, result, lookup = self._run(None, setting=False, shared_runtime=shared_runtime)
+        lookup.assert_not_called()
+        self.assertEqual(shared_runtime.calls, [("release", forge.built[0])])
+        self.assertEqual(result.diagnostics["anima38"], runner_module.ANIMA38_IPA_OFF)
 
 
 if __name__ == "__main__":

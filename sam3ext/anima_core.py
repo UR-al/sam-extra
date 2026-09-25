@@ -33,6 +33,7 @@ from __future__ import annotations
 import gc
 import os
 import random
+import re
 import sys
 import tempfile
 import traceback
@@ -45,6 +46,8 @@ from typing import Any
 import numpy as np
 import torch
 from PIL import Image
+
+from .forge_exclusive import is_interrupted
 
 EXTENSION_ROOT = Path(__file__).resolve().parent.parent
 ANIMA_VENDOR = EXTENSION_ROOT / "anima_vendor"
@@ -83,10 +86,9 @@ class AnimaTileRepairArgs:
     # Output size
     width: int = 1024
     height: int = 1024
-    # LLLite conditioning schedule
-    lllite_strength: float = 1.0
-    lllite_start: float = 0.0
-    lllite_end: float = 1.0
+    # LLLite conditioning — the vendor only takes a multiplier
+    # (control_net_lllite_anima.set_multiplier). Strength / Start % / End %
+    # used to sit here too but were never passed anywhere (audit M14).
     lllite_multiplier: float = 1.0
     # Housekeeping
     unload_forge_before: bool = True
@@ -300,16 +302,43 @@ def list_lllite_choices() -> list[str]:
     return out
 
 
+# Anima's text encoder is Qwen3 0.6B. Files in models/text_encoder that merely
+# contain "qwen3" are usually something else (Qwen3-VL 4B/8B/32B vision
+# encoders, Qwen3.5, the 3.8B expanded adapter, LLM-CLIP) and fail deep in the
+# vendor loader with a size mismatch — so match the 0.6B spelling explicitly
+# and never pick a file with one of these markers.
+_TE_PATTERNS = ("qwen_3_06b", "qwen3_06b", "qwen3-06b", "qwen3-0.6b", "qwen3_0.6b", "qwen_3_0.6b", "qwen3-0_6b")
+_TE_EXCLUDE = ("qwen35", "qwen3.5", "qwen_3.5", "adapter", "llmclip", "llm_clip")
+# 짧은 표지는 토큰으로만 본다 — 부분 문자열로 보면 'eclipse'·'clipped'·'devlin' 이 든 정상 0.6B TE
+# 까지 떨어진다. 글자가 아닌 것(숫자·구분자)과 camelCase 경계를 토큰 경계로 쳐서 qwen3vl·Qwen3-VL·
+# AnimaQwenVL·clip_l 은 그대로 걸린다.
+_TE_EXCLUDE_TOKENS = ("vl", "vlm", "clip")
+_TE_EXCLUDE_TOKEN_RE = re.compile(
+    r"(?<![a-z])(?:" + "|".join(_TE_EXCLUDE_TOKENS) + r")(?![a-z])"
+)
+
+
+def _looks_like_wrong_te(name: str) -> bool:
+    lower = name.lower()
+    if any(marker in lower for marker in _TE_EXCLUDE):
+        return True
+    split = re.sub(r"(?<=[a-z])(?=[A-Z])", "_", name).lower()
+    return _TE_EXCLUDE_TOKEN_RE.search(split) is not None
+
+
 def default_te_choice(choices: list[str]) -> str:
-    """Pick a sensible default Text Encoder for the dropdown. Anima needs a
-    Qwen3 TE — auto-select a file that looks like one so the panel works out
-    of the box (the user's anima_baseV10_txt.safetensors etc.) instead of the
-    always-failing 'Use Forge current'."""
-    for hint in ("qwen3", "qwen_3", "qwen", "anima", "_txt", "text_encoder", "te"):
-        for c in choices:
-            if c != "Use Forge current" and hint in c.lower():
+    """Pick a sensible default Text Encoder for the dropdown. Anima needs the
+    Qwen3 0.6B TE — auto-select a file that looks like one (qwen_3_06b_base,
+    the user's anima_baseV10_txt.safetensors etc.) so the panel works out of
+    the box. When nothing looks right, fall back to 'Use Forge current':
+    ``run_tile_repair`` then tells the user to pick a TE instead of the vendor
+    dying on a Qwen3-VL / Qwen3.5 size mismatch."""
+    candidates = [c for c in choices if c != "Use Forge current" and not _looks_like_wrong_te(c)]
+    for hint in _TE_PATTERNS + ("anima",):
+        for c in candidates:
+            if hint in c.lower():
                 return c
-    return choices[0] if choices else "Use Forge current"
+    return "Use Forge current"
 
 
 def default_vae_choice(choices: list[str]) -> str:
@@ -460,6 +489,50 @@ def forge_sd_unloaded():
 @contextmanager
 def _nullctx():
     yield
+
+
+@contextmanager
+def _vendor_interrupt_guard(ami):
+    """Make Forge's ⏹ Stop reach the vendor's denoising loop.
+
+    ``ami.generate_body`` (anima_minimal_inference.py, replaced by the LLLite
+    module) never looks at ``shared.state``, so Stop used to do nothing until
+    the whole sample finished. While active, the DiT handed to
+    ``generate_body`` carries a forward pre-hook that raises
+    ``InterruptedError`` at the next step once the flags are set;
+    ``run_tile_repair`` turns that into an empty result.
+    """
+    original = ami.generate_body
+
+    def _check(module, inputs):
+        if is_interrupted():
+            raise InterruptedError("SAM3 Anima: Tile-Repair interrupted by Stop")
+
+    def guarded(args, anima, *rest, **kwargs):
+        handle = anima.register_forward_pre_hook(_check)
+        try:
+            return original(args, anima, *rest, **kwargs)
+        finally:
+            handle.remove()
+
+    ami.generate_body = guarded
+    try:
+        yield
+    finally:
+        ami.generate_body = original
+
+
+def _generate_with_stop(ami, args, gen_settings):
+    """``ami.generate`` under ``_vendor_interrupt_guard``. Returns the latent,
+    or ``None`` when ⏹ Stop interrupted sampling — ``run_tile_repair`` then
+    returns an empty result so the panel says "no output produced
+    (interrupted?)" instead of a red traceback. Other errors propagate."""
+    try:
+        with _vendor_interrupt_guard(ami):
+            return ami.generate(args, gen_settings)
+    except InterruptedError:
+        print("[-] SAM3 Anima: Tile-Repair interrupted by Stop.", file=sys.stderr)
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -614,9 +687,7 @@ def _build_infotext(repair: AnimaTileRepairArgs, seed_used: int) -> str:
             f"Seed: {seed_used}, "
             f"Size: {repair.width}x{repair.height}, "
             f"Flow shift: {repair.flow_shift}, "
-            f"LLLite: {repair.lllite_model} (mult {repair.lllite_multiplier}, "
-            f"strength {repair.lllite_strength}, "
-            f"sched {repair.lllite_start:.2f}-{repair.lllite_end:.2f})"
+            f"LLLite: {repair.lllite_model} (mult {repair.lllite_multiplier})"
         ),
         "Anima Tile-Repair: on",
     ]
@@ -761,7 +832,11 @@ def run_tile_repair(
                     args.device = device
 
                     gen_settings = ami.get_generation_settings(args)
-                    latent = ami.generate(args, gen_settings)
+                    latent = _generate_with_stop(ami, args, gen_settings)
+                    if latent is None:
+                        # ⏹ Stop — the finally blocks still restore the
+                        # strategies and delete the control image.
+                        return out_pairs
 
                     # Decode — vendor loads VAE separately to keep DiT in VRAM
                     # during sampling and frees it before the VAE pass.

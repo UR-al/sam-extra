@@ -210,14 +210,13 @@ def _skim_predictions(x, target, reference, scale, skimming_scale, flip_filter):
     if not flip_filter:
         outer_influence &= denoised.sign() == (denoised - x).sign()
 
-    if not bool(outer_influence.any()):
-        return target
-
+    # torch.where 로 고른다. 예전의 ``outer_influence.any()`` 확인과 불리언 마스크
+    # gather/scatter(skimmed[mask] = target[mask] - correction[mask])는 호출마다
+    # GPU→CPU 동기화를 4번 일으켰다. 원소별 계산이 같으므로 결과는 비트 단위로
+    # 같고, 마스크가 비어 있으면 target 과 같은 값이 그대로 나온다.
     low_scale_denoised = reference + skimming_scale * (target - reference)
     correction = (denoised - low_scale_denoised) / scale
-    skimmed = target.clone()
-    skimmed[outer_influence] = target[outer_influence] - correction[outer_influence]
-    return skimmed
+    return torch.where(outer_influence, target - correction, target)
 
 
 def _post_cfg(args):

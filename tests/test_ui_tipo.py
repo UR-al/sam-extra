@@ -12,7 +12,7 @@ sys.path.insert(0, str(ROOT))
 
 from sam3ext import ui_tipo  # noqa: E402
 from sam3ext.tipo import prompt as tp  # noqa: E402
-from sam3ext.tipo.runtime import GenerationResult  # noqa: E402
+from sam3ext.tipo.runtime import EXPAND_JOB, GenerationResult  # noqa: E402
 
 PROMPT = "masterpiece, 1girl, hatsune miku, (smile:1.2)"
 EXPANDED = PROMPT + ", outdoors, cherry blossoms\nA girl \\(smiling\\)."
@@ -28,6 +28,7 @@ class _FakeRuntime:
         self.finished = finished
         self.busy = busy
         self.calls = []
+        self.keeps = []
         self.downloads = 0
 
     def missing_files(self):
@@ -42,12 +43,14 @@ class _FakeRuntime:
         self.missing = []
         return True
 
-    def generate(self, prompt_text, *, requested_device, max_new_tokens, seed):
+    def generate(self, prompt_text, *, requested_device, max_new_tokens, seed, keep_on_gpu=False):
         self.calls.append((prompt_text, requested_device, max_new_tokens, seed))
+        self.keeps.append(keep_on_gpu)
         if self.fail:
             raise self.fail
-        return GenerationResult(self.text, 5 if seed < 0 else seed, "cuda" if requested_device == "GPU" else "cpu",
-                                1.25, self.note, self.finished)
+        device = "cuda" if requested_device == "GPU" else "cpu"
+        return GenerationResult(self.text, 5 if seed < 0 else seed, device, 1.25, self.note, self.finished,
+                                resident=keep_on_gpu and device == "cuda")
 
 
 def _gradio():
@@ -61,9 +64,9 @@ NO_CHANGE = {"update": {}}
 
 class ExpandTests(unittest.TestCase):
     def _expand(self, runtime, prompt=PROMPT, mode=tp.MODE_TAGS_NL, length=tp.LENGTH_NORMAL, allow=False,
-                device="GPU", seed=-1):
+                device="GPU", seed=-1, **keep):
         with mock.patch.dict(sys.modules, {"gradio": _gradio()}):
-            return ui_tipo.handle_expand(prompt, 832, 1216, mode, length, allow, device, seed,
+            return ui_tipo.handle_expand(prompt, 832, 1216, mode, length, allow, device, seed, *keep.values(),
                                          runtime=runtime, index=tp.TagIndex({"hatsune miku": 4}))
 
     def test_success_hands_the_result_to_the_apply_step(self):
@@ -135,6 +138,23 @@ class ExpandTests(unittest.TestCase):
         _, status, _ = self._expand(_FakeRuntime(note="GPU 여유가 1.0 GB 라 CPU 로 돌렸습니다"))
         self.assertIn("1.0 GB", status)
 
+    def test_keep_on_gpu_toggle_is_passed_to_the_runtime(self):
+        self.assertEqual(ui_tipo.DEVICES, ("GPU", "CPU"), "'GPU 상주' 선택지는 토글로 바뀌었다")
+        self.assertIs(ui_tipo.KEEP_ON_GPU_DEFAULT, True, "기본은 Forge 메모리 관리에 맡긴다")
+        runtime = _FakeRuntime()
+        _, status, _ = self._expand(runtime)   # 토글을 넘기지 않으면 기본값
+        self.assertEqual((runtime.calls[0][1], runtime.keeps[0]), ("GPU", True))
+        self.assertIn(ui_tipo.KEPT_LABEL, status, "GPU 에 남겼으면 상태 줄에 알린다")
+        _, status, _ = self._expand(runtime, keep=False)
+        self.assertEqual((runtime.calls[1][1], runtime.keeps[1]), ("GPU", False), "끄면 끝나고 내린다")
+        self.assertNotIn(ui_tipo.KEPT_LABEL, status)
+        self.assertIn("GPU", status)
+        _, status, _ = self._expand(runtime, device="CPU", keep=True)
+        self.assertEqual(runtime.calls[2][1], "CPU")
+        self.assertNotIn(ui_tipo.KEPT_LABEL, status, "CPU 로 돌았으면 남긴 것이 없다")
+        self._expand(runtime, device="GPU 상주", keep=None)   # 예전 선택지가 브라우저에 남아 있어도
+        self.assertEqual((runtime.calls[3][1], runtime.keeps[3]), ("GPU", False))
+
 
 class ApplyTests(unittest.TestCase):
     def _apply(self, current, pending, undo="earlier"):
@@ -192,7 +212,9 @@ class GradioWiringTests(unittest.TestCase):
         package = types.ModuleType("modules")
         package.__path__ = []
         package.ui_components = ui_components
-        with mock.patch.dict(sys.modules, {"modules": package, "modules.ui_components": ui_components}):
+        run_exclusive = mock.Mock(side_effect=lambda job, fn: (job, "ran"))
+        with mock.patch.dict(sys.modules, {"modules": package, "modules.ui_components": ui_components}), \
+                mock.patch("sam3ext.ui_anima_reference._run_exclusive", run_exclusive):
             with gr.Blocks() as demo:
                 prompt = gr.Textbox(elem_id="txt2img_prompt")
                 width, height = gr.Slider(elem_id="txt2img_width"), gr.Slider(elem_id="txt2img_height")
@@ -206,6 +228,10 @@ class GradioWiringTests(unittest.TestCase):
         self.assertEqual(panel.mode.value, tp.MODE_TAGS_NL)
         self.assertEqual(panel.length.value, tp.LENGTH_NORMAL)
         self.assertEqual(panel.device.value, "GPU")
+        self.assertEqual([value for _label, value in panel.device.choices], ["GPU", "CPU"])
+        self.assertIs(panel.keep_on_gpu.value, True)
+        self.assertEqual(panel.keep_on_gpu.label, ui_tipo.KEEP_ON_GPU_LABEL)
+        self.assertEqual(panel.keep_on_gpu.elem_id, "sam3_tipo_keep_on_gpu")
         self.assertEqual(panel.device.elem_id, "sam3_tipo_device", "javascript/tipo_device.js 가 이 id 로 찾는다")
         self.assertIs(panel.allow_new_names.value, False)
         self.assertTrue(panel.download_button.visible)
@@ -222,9 +248,20 @@ class GradioWiringTests(unittest.TestCase):
 
         expand = clicked(button)
         self.assertEqual(ids(expand.inputs), ids((prompt, width, height, panel.mode, panel.length,
-                                                  panel.allow_new_names, panel.device, panel.seed)))
+                                                  panel.allow_new_names, panel.device, panel.seed,
+                                                  panel.keep_on_gpu)))
         self.assertEqual(ids(expand.outputs), ids((panel.pending, panel.status, panel.download_button)),
                          "확장 단계는 프롬프트 칸에 쓰지 않는다")
+        self.assertEqual(expand.fn(PROMPT, 832, 1216, tp.MODE_TAGS, tp.LENGTH_SHORT, False, "GPU", -1, True),
+                         (EXPAND_JOB, "ran"))
+        self.assertEqual(run_exclusive.call_args.args[0], EXPAND_JOB, "대기열 job 이름")
+        runtime = _FakeRuntime()
+        with mock.patch.object(ui_tipo, "shared_runtime", return_value=runtime), \
+                mock.patch.object(ui_tipo, "_tag_index", return_value=tp.TagIndex({})), \
+                mock.patch.dict(sys.modules, {"gradio": _gradio()}):
+            run_exclusive.side_effect = lambda job, fn: fn()
+            expand.fn(PROMPT, 832, 1216, tp.MODE_TAGS, tp.LENGTH_SHORT, False, "GPU", -1, False)
+        self.assertEqual(runtime.keeps, [False], "토글 값이 런타임까지 간다")
         apply = after(expand)
         self.assertEqual(ids(apply.inputs), ids((prompt, panel.pending, panel.undo_state)),
                          "적용 단계는 지금 프롬프트 칸의 값을 다시 읽는다")

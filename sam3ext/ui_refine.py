@@ -19,11 +19,19 @@ import numpy as np
 from PIL import Image
 
 from .coerce import as_float, as_int
+from .forge_exclusive import run_exclusive, stop_if_job
 from .ui import (
     _controlnet_model_choices,
     _controlnet_module_choices,
     _default_cn_module,
 )
+
+# Job name the Refine click runs under (shared.state.begin) and the prefixes
+# the per-pass names in inpaint_core.run_sam3_refine start with. The Stop
+# button only interrupts when one of these holds shared.state.job — see
+# forge_exclusive.stop_if_job.
+REFINE_JOB = "sam3_refine"
+_REFINE_JOB_PREFIXES = (REFINE_JOB, "SAM3 Refine")
 
 try:
     from modules_forge.forge_canvas.canvas import ForgeCanvas
@@ -996,6 +1004,13 @@ def _refine_error_return(gallery_value, message: str):
     return gallery_value, message, gr.update(), gr.update()
 
 
+def stop_refine():
+    """⏹ handler for the Refine panel. Interrupts only while Refine itself
+    holds the job — if txt2img holds the queue lock and our click is still
+    waiting, blindly setting the flags would stop txt2img instead."""
+    stop_if_job(_REFINE_JOB_PREFIXES)
+
+
 def handle_refine_click(
     gallery_value, selected_index, *all_values, progress=gr.Progress(track_tqdm=True)
 ):
@@ -1180,8 +1195,8 @@ def handle_refine_click(
     if sd_model_override and sd_model_override != "Use current":
         override_settings["sd_model_checkpoint"] = sd_model_override
 
-    try:
-        new_pairs = run_sam3_refine(
+    def _refine():
+        return run_sam3_refine(
             image,
             args,
             sd_model=sd_model,
@@ -1189,6 +1204,13 @@ def handle_refine_click(
             outpath_grids=outpath_grids,
             override_settings=override_settings,
         )
+
+    # Like Forge's own Generate (wrap_gradio_gpu_call): one job at a time
+    # behind queue_lock, a fresh shared.state so a previous ⏹ Stop does not
+    # end this run at its first interrupted check, and the sampling itself on
+    # Forge's main thread. See forge_exclusive.run_exclusive.
+    try:
+        new_pairs = run_exclusive(REFINE_JOB, _refine, on_main_thread=True)
     except Exception:
         error = traceback.format_exc()
         print(f"[-] SAM3 Refine: handler failed:\n{error}", file=sys.stderr)

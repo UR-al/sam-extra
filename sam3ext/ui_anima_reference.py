@@ -360,7 +360,10 @@ def build_anima_reference_panel(
                 gr.Markdown(
                     "IP-Adapter 는 참조 이미지를 SigLIP2 로 읽어 Anima 블록에 직접 넣습니다. "
                     "캔버스가 없어 구도가 자유롭습니다. 위쪽 크기·샘플러·시드 설정은 그대로 "
-                    f"쓰이고, 가중치 {TOTAL_BYTES_LABEL} 가 필요합니다."
+                    f"쓰이고, 가중치 {TOTAL_BYTES_LABEL} 가 필요합니다. "
+                    "3.8B v2 번들의 Qwen3.5 커넥터는 기본으로 쓰지 않습니다 — "
+                    "설정 › SAM Extra Anima 3.8B 의 'IP-Adapter 방식에도 v2 커넥터 설치'를 "
+                    "켜면 txt2img 처럼 커넥터로 조건을 만듭니다(결과가 바뀜)."
                 )
                 with gr.Row():
                     ipa_strength = gr.Slider(
@@ -735,17 +738,16 @@ def _forge_opts_data() -> dict[str, Any]:
 
 
 def _run_exclusive(job: str, fn):
-    """Run like Forge's own Generate: one job at a time, fresh stop flags."""
+    """Run like Forge's own Generate: one job at a time, fresh stop flags.
 
-    from modules import shared
-    from modules.call_queue import queue_lock
+    Shared with the Refine / Tile-Repair / PiD handlers — see
+    ``forge_exclusive.run_exclusive``. Kept on the Gradio worker thread as
+    before (``on_main_thread`` off).
+    """
 
-    with queue_lock:
-        shared.state.begin(job=job)
-        try:
-            return fn()
-        finally:
-            shared.state.end()
+    from .forge_exclusive import run_exclusive
+
+    return run_exclusive(job, fn)
 
 
 def _split_inputs(all_values):
@@ -778,6 +780,14 @@ def _reference_error(gallery_value, message: str):
     )
 
 
+# 복제 블록 정책(sam3ext.anima_ipa.options.DUPLICATE_POLICIES)별 상태줄 설명.
+_IPA_DUPLICATE_NOTES = {
+    "lineage": "블록 계보 매핑·끼워 넣은 블록 제외",
+    "all": "블록 계보 매핑·끼워 넣은 블록에도 주입, 깨질 수 있음",
+    "split": "블록 계보 매핑·끼워 넣은 블록과 강도 나눔, 격자 무늬가 남을 수 있음",
+}
+
+
 def _format_ipa_status(
     result: ReferenceGenerationResult,
     request: ReferenceGenerationRequest,
@@ -799,10 +809,22 @@ def _format_ipa_status(
     adapter_blocks = diagnostics.get("ipa_adapter_blocks")
     if adapter_blocks and blocks and adapter_blocks != blocks:
         # 안 알려 주면 결과가 이상할 때 매핑이 아니라 강도부터 의심하게 된다.
+        policy_note = _IPA_DUPLICATE_NOTES.get(
+            str(diagnostics.get("ipa_duplicate_policy") or ""), "블록 계보 매핑·미검증"
+        )
         parts.append(
             f"IP-Adapter {adapter_blocks}블록 → {blocks}블록 모델 "
-            "(블록 계보 매핑·미검증, 강도를 다시 잡으세요)"
+            f"({policy_note}, 강도를 다시 잡으세요)"
         )
+    warnings = list(warnings)
+    if diagnostics.get("anima38_connector"):
+        # 설정으로 켰을 때만 말한다 — 꺼져 있으면 예전과 같은 상태줄.
+        anima38_label = str(diagnostics.get("anima38", "확인 불가"))
+        if anima38_label.startswith(_ANIMA38_OFF_PREFIXES):
+            parts.append("3.8B 커넥터: 꺼짐")
+            warnings.append(f"3.8B 커넥터 사용 불가 ({anima38_label})")
+        else:
+            parts.append(f"3.8B 커넥터: {anima38_label}")
     if result.outputs:
         parts.append("시드 " + ", ".join(str(item.seed) for item in result.outputs))
     text = "<span style='color:#383'>" + html.escape(" · ".join(parts)) + "</span>"
@@ -1066,13 +1088,9 @@ def _stop_reference():
     setting these flags would stop txt2img instead.
     """
 
-    from modules import shared
+    from .forge_exclusive import stop_if_job
 
-    job = str(shared.state.job or "")
-    if not job.startswith(_FEATURE6_JOB_PREFIXES):
-        return
-    shared.state.interrupted = True
-    shared.state.skipped = True
+    stop_if_job(_FEATURE6_JOB_PREFIXES)
 
 
 def wire_anima_reference_panel(

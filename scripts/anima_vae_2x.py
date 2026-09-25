@@ -24,14 +24,15 @@ dropdown (shape mismatch). So this extension builds the decoder itself with
 `conv_out_channels=12`, then swaps a thin decode-override wrapper into
 `forge_objects.vae` for the generation.
 
-⚠️ EXPERIMENTAL — runtime iteration expected. The parts that are unit-verified:
-state-dict detection, the pixel-shuffle + downsample math. The parts that may
+⚠️ EXPERIMENTAL — runtime iteration expected. The parts that are unit-verified
+(tests/test_anima_vae_2x.py): state-dict detection, the pixel-shuffle +
+downsample math, the 5D `[B,T,H,W,3]` output contract of the is_wan pipeline,
+the stock-decode fallback and the load-device placement. The parts that may
 need one tuning pass on a real checkpoint (watch the `[AnimaVAE2x]` logs):
   * the Wan-2.1 VAE architecture config used to build the decoder (if
     `load_state_dict` reports shape/key mismatches, the logged diff pins it),
   * latent normalization between the Qwen and Wan VAE spaces (if colors shift,
-    enable the renorm toggle),
-  * the single-frame temporal axis handling.
+    enable the renorm toggle).
 """
 from __future__ import annotations
 
@@ -134,7 +135,11 @@ def _strip_prefix(sd: dict) -> dict:
 
 def _build_decoder(path: str, device, dtype):
     """Build a Wan VAE with conv_out_channels = detected (12), load weights.
-    Returns the model in eval() on ``device``/``dtype`` or None on failure."""
+    ``device`` is the *load* device (``VAE.device``); the weights are built on
+    the VAE offload device (CPU) and handed to Forge's ModelPatcher, which
+    moves them to ``device`` for each decode (see ``_load_decoder``).
+    Returns the ModelPatcher (or the bare eval() module if ModelPatcher is
+    unavailable) or None on failure."""
     key = (os.path.abspath(path), str(device), str(dtype))
     if key in _DECODER_CACHE:
         return _DECODER_CACHE[key]
@@ -170,8 +175,11 @@ def _build_decoder(path: str, device, dtype):
                  f"First unexpected: {list(unexpected)[:3]}. "
                  f"(If many, the _WAN21_VAE_CONFIG needs adjusting to match this "
                  f"checkpoint.)")
-        model = model.to(device=device, dtype=dtype).eval()
-        _log(f"built 12ch Wan decoder from {os.path.basename(path)} ✅")
+        offload = _decoder_offload_device()
+        model = model.to(device=offload, dtype=dtype).eval()
+        model = _wrap_patcher(model, torch.device(device), offload)
+        _log(f"built 12ch Wan decoder from {os.path.basename(path)} ✅ "
+             f"(load_device={device} offload={offload} dtype={dtype})")
         # Keep only the most-recent decoder resident — evict others so trying
         # different 2x VAEs in a session doesn't accumulate decoders in VRAM.
         for old in [k for k in _DECODER_CACHE if k != key]:
@@ -211,16 +219,142 @@ def _gaussian_blur(x, sigma: float):
 
 def _transform(dec_out, refine_1x: bool, blur_sigma: float):
     """dec_out: raw decoder output [B, 12, T, H, W] (or [B,12,H,W]).
-    Returns pixels in Forge's decode format: [B, H, W, 3], values in [0,1]."""
+    Returns pixels in Forge's decode format, values in [0,1], with the SAME
+    rank as the input: 5D → [B, T, H', W', 3] (what stock `VAE.decode` returns
+    for an is_wan engine such as Anima — `decode_first_stage` then does
+    `movedim(-1, 2)` and processing.py flattens the 5D batch), 4D → [B, H', W', 3].
+    Dropping the T axis here would make the is_wan pipeline crash *outside*
+    the wrapper (no fallback), so it is kept and the frames are folded into
+    the batch dim for the 2D ops instead."""
     x = dec_out
-    if x.ndim == 5:
-        x = x[:, :, 0]                 # single frame → [B,12,H,W]
-    x = F.pixel_shuffle(x, 2)          # 12=3·2·2 → [B,3,2H,2W]
+    keep_t = x.ndim == 5
+    if keep_t:
+        b, c, t, h, w = x.shape
+        x = x.movedim(2, 1).reshape(b * t, c, h, w)   # fold frames → [B·T,12,H,W]
+    x = F.pixel_shuffle(x, 2)          # 12=3·2·2 → [B·T,3,2H,2W]
     if refine_1x:
         x = F.interpolate(x, scale_factor=0.5, mode="bilinear", align_corners=False)
         x = _gaussian_blur(x, blur_sigma)
     x = x.add(1.0).div(2.0).clamp(0.0, 1.0)   # [-1,1] → [0,1] (Forge process_output)
-    return x.movedim(1, -1).contiguous()      # → [B,H,W,3]
+    x = x.movedim(1, -1)                      # → [B·T,H',W',3]
+    if keep_t:
+        x = x.reshape(b, t, *x.shape[1:])     # unfold → [B,T,H',W',3]
+    return x.contiguous()
+
+
+# ---------------------------------------------------------------------------
+# Device placement — build on the offload device, let Forge load it for decode
+# ---------------------------------------------------------------------------
+
+
+def _decoder_load_device(orig_vae):
+    """Forge's VAE keeps its *load* device in ``VAE.device`` (the GPU unless
+    --cpu-vae); the weights themselves usually sit offloaded on CPU between
+    decodes, so ``next(first_stage_model.parameters()).device`` is the wrong
+    thing to build against (it would run the 3D Wan decode on CPU)."""
+    dev = getattr(orig_vae, "device", None)
+    if dev is not None:
+        return torch.device(dev)
+    try:
+        from backend import memory_management
+        return memory_management.get_torch_device()
+    except Exception:
+        return torch.device("cpu")
+
+
+def _decoder_offload_device():
+    try:
+        from backend import memory_management
+        return memory_management.vae_offload_device()
+    except Exception:
+        return torch.device("cpu")
+
+
+def _wrap_patcher(model, load_device, offload_device):
+    """Hand the decoder to Forge's memory management (same as the stock VAE:
+    ``ModelPatcher`` + ``load_models_gpu`` in decode) so it is moved to the GPU
+    only for the decode and evicted like any other model instead of sitting
+    in VRAM for the rest of the process. Returns the bare module (placed on
+    ``load_device``) if ModelPatcher is unavailable."""
+    try:
+        from backend.patcher.base import ModelPatcher
+        return ModelPatcher(model, load_device=load_device, offload_device=offload_device)
+    except Exception as e:
+        _log(f"ModelPatcher unavailable ({type(e).__name__}: {e}) — decoder stays on {load_device}.")
+        return model.to(device=load_device)
+
+
+def _load_decoder(decoder, memory_required: float):
+    """Make the decoder resident on its load device and return
+    ``(module, device)``. A ModelPatcher goes through ``load_models_gpu``
+    (frees other models if needed, registers it for eviction); a bare module
+    is used where it already is."""
+    if hasattr(decoder, "load_device") and hasattr(decoder, "model"):
+        from backend import memory_management
+        memory_management.load_models_gpu(
+            [decoder], memory_required=memory_required, force_full_load=True
+        )
+        return decoder.model, torch.device(decoder.load_device)
+    return decoder, next(decoder.parameters()).device
+
+
+# --novram 등: load_models_gpu 가 NO_VRAM 이면 force_full_load 와 무관하게
+# lowvram_model_memory=0.1 로 부분 로드한다. 수동 캐스트가 없는 모듈(Resample 의
+# nn.Conv2d 등)은 CPU 에 남고 latent 는 load_device 로 가므로 디코드는 매번 장치
+# 불일치로 실패해 순정 decode 로 폴백한다. 결과 경로는 그대로 두고 이유만 한 번 알린다.
+_CPU_STRANDED_LOGGED = False
+
+
+def _stranded_params(module, dev) -> list:
+    """``dev`` 와 다른 장치에 남은 파라미터 이름 목록. Forge ops 모듈
+    (``parameters_manual_cast``)은 그때그때 캐스트되므로 원인이 아니라 뺀다.
+    진단용 — 무엇이든 실패하면 빈 목록."""
+    if module is None or dev is None or torch is None:
+        return []
+    try:
+        dev_type = torch.device(dev).type
+        out = []
+        for mname, m in module.named_modules():
+            if getattr(m, "parameters_manual_cast", False):
+                continue
+            for pname, p in m.named_parameters(recurse=False):
+                if p.device.type != dev_type:
+                    out.append(f"{mname}.{pname}" if mname else pname)
+        return out
+    except Exception:
+        return []
+
+
+def _vram_state_name() -> str | None:
+    try:
+        from backend import memory_management
+        return memory_management.vram_state.name
+    except Exception:
+        return None
+
+
+def _log_decode_failure(e, decoder, dev) -> None:
+    """2x 디코드 실패 로그. 디코더 가중치가 load_device 에 못 올라가 CPU 에 남은
+    경우(--novram 등)는 설정이 바뀌지 않는 한 매번 같은 이유로 실패하므로 이유를
+    담아 한 번만 알리고, 그 밖의 실패는 예전처럼 매번 알린다."""
+    global _CPU_STRANDED_LOGGED
+    stranded = _stranded_params(decoder, dev)
+    if not stranded:
+        _log(f"2x decode failed → stock decode: {type(e).__name__}: {e}")
+        return
+    if _CPU_STRANDED_LOGGED:
+        return
+    _CPU_STRANDED_LOGGED = True
+    state = _vram_state_name()
+    state_txt = f"VRAM State: {state}" if state else "VRAM State 알 수 없음"
+    _log(
+        f"2x decode 불가 → 순정 decode 로 폴백: 디코더 가중치 {len(stranded)}개"
+        f"(예: {stranded[:3]})가 load_device={dev} 로 올라가지 않고 CPU 에 남았습니다 "
+        f"({state_txt}). --novram(NO_VRAM) 에서는 Forge load_models_gpu 가 "
+        f"force_full_load 를 무시하고 부분 로드해 수동 캐스트가 없는 모듈이 CPU 에 "
+        f"남으므로, 이 실행 설정에서는 매번 순정 decode 로 폴백합니다 "
+        f"(원래 오류: {type(e).__name__}: {e}). 이 안내는 한 번만 표시합니다."
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -241,21 +375,40 @@ class _VAE2xWrapper:
         object.__setattr__(self, "_renorm", renorm)
 
     def decode(self, samples_in, *args, **kwargs):
+        decoder = dev = None   # 실패 진단(_log_decode_failure)용
         try:
-            dev = next(self._decoder.parameters()).device
-            dt = next(self._decoder.parameters()).dtype
             z = samples_in
             if self._renorm:
                 z = (z - z.mean()) / (z.std() + 1e-6)
-            if z.ndim == 4:
+            was_4d = z.ndim == 4
+            if was_4d:
                 z = z.unsqueeze(2)            # [B,C,H,W] → [B,C,1,H,W]
+            try:
+                # Same estimate stock VAE.decode uses (is_wan formula on 5D).
+                mem = float(self._orig.memory_used_decode(tuple(z.shape), self._orig.vae_dtype))
+            except Exception:
+                mem = 0.0
+            decoder, dev = _load_decoder(self._decoder, mem)
+            dt = next(decoder.parameters()).dtype
             z = z.to(device=dev, dtype=dt)
             with torch.no_grad():
-                out = self._decoder.decode(z)
+                out = decoder.decode(z)       # [B,12,T,H,W]
+            if was_4d:
+                out = out[:, :, 0]            # back to the caller's 4D world
             px = _transform(out, self._refine_1x, float(self._blur_sigma))
-            return px.to(samples_in.device)
+            # Contract check: rank must match the latent (5D for is_wan, 4D
+            # otherwise) and the channel axis must be last. Anything else
+            # would blow up later in decode_first_stage/processing — outside
+            # this try — so treat it as a failure and take the stock path.
+            if px.ndim != samples_in.ndim or px.shape[-1] != 3:
+                raise RuntimeError(
+                    f"unexpected decode shape {tuple(px.shape)} for latent "
+                    f"{tuple(samples_in.shape)}"
+                )
+            out_dev = getattr(self._orig, "output_device", None) or samples_in.device
+            return px.to(device=out_dev, dtype=torch.float32)
         except Exception as e:
-            _log(f"2x decode failed → stock decode: {type(e).__name__}: {e}")
+            _log_decode_failure(e, decoder, dev)
             return self._orig.decode(samples_in, *args, **kwargs)
 
     def clone(self):
@@ -403,11 +556,13 @@ class AnimaVAE2x(scripts.Script):
         if isinstance(orig_vae, _VAE2xWrapper):
             orig_vae = getattr(orig_vae, "_orig", orig_vae)
 
+        # Load device, not the weights' current device: Forge keeps the VAE
+        # offloaded on CPU between decodes, so the latter would build (and
+        # run) the 3D Wan decoder on the CPU.
+        device = _decoder_load_device(orig_vae)
         try:
-            device = next(orig_vae.first_stage_model.parameters()).device
             dtype = getattr(orig_vae, "vae_dtype", None) or torch.bfloat16
         except Exception:
-            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
             dtype = torch.bfloat16
 
         decoder = _build_decoder(path, device, dtype)

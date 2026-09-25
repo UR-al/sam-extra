@@ -66,6 +66,41 @@ class FakeDiT(nn.Module):
         super().__init__()
         self.blocks = nn.ModuleList([FakeBlock() for _ in range(blocks)])
 
+    def forward(self, x, emb, context, transformer_options=None):
+        # 진짜 Anima.forward 처럼 self.blocks 를 돈다 — DiT 수준 래퍼 테스트가 여기에 닿는다.
+        for block in self.blocks:
+            x = block(x, emb, context, transformer_options=transformer_options)
+        return x
+
+
+class SkippingBlock(FakeBlock):
+    """cross_attn 을 부르지 않는 블록 — 껍데기 훅이 못 잡는 배선 오류를 흉내 낸다."""
+
+    def forward(self, x_B_T_H_W_D, emb_B_T_D, crossattn_emb, **kwargs):
+        return x_B_T_H_W_D
+
+
+def _foreign_block_wrapper(block, calls):
+    """Safe PAG 식 인스턴스 forward — 원본 블록에 바인딩된 메서드를 닫아 둔다."""
+    bound = block.forward
+
+    def wrapped(*args, **kwargs):
+        calls.append("block")
+        return bound(*args, **kwargs)
+
+    return wrapped
+
+
+def _foreign_dit_wrapper(dit, calls):
+    """Anima 3.8B 런타임 식 인스턴스 forward — 항상 원본에 바인딩된 클래스 forward 를 부른다."""
+    native = type(dit).forward.__get__(dit, type(dit))
+
+    def patched_forward(x, emb, context, *args, **kwargs):
+        calls.append("dit")
+        return native(x, emb, context, *args, **kwargs)
+
+    return patched_forward
+
 
 def _weights(spec):
     out = {}
@@ -154,6 +189,36 @@ class InstallTests(unittest.TestCase):
             patch_module.install(FakeDiT(blocks=2), _spec(num_blocks=2), weights)
         self.assertIn("1", str(caught.exception))
 
+    def test_a_forward_that_never_reaches_the_cross_attn_hook_raises_with_tokens(self):
+        """훅이 안 불리면 조용히 주입을 건너뛰지 않고 멈춘다 — 토큰이 없을 때는 그대로 통과."""
+        dit = FakeDiT()
+        dit.blocks = nn.ModuleList([SkippingBlock(), SkippingBlock()])
+        patch_module.install(dit, self.spec, self.weights)
+        _run(dit)   # 토큰 없음: 주입 요청이 없으므로 오류도 없다
+        with self.assertRaises(RuntimeError) as caught:
+            _run(dit, tokens=torch.randn(1, TOKENS, EMBED))
+        self.assertIn("IP 주입", str(caught.exception))
+
+    def test_a_block_records_that_it_injected(self):
+        dit = FakeDiT()
+        patch_module.install(dit, self.spec, self.weights)
+        self.assertFalse(any(getattr(b, "_sam3_ip_applied", False) for b in dit.blocks))
+        _run(dit)
+        self.assertFalse(any(getattr(b, "_sam3_ip_applied", False) for b in dit.blocks))
+        _run(dit, tokens=torch.randn(1, TOKENS, EMBED))
+        self.assertTrue(all(getattr(b, "_sam3_ip_applied", False) for b in dit.blocks))
+
+
+class ShellTests(unittest.TestCase):
+    def test_an_instance_forward_of_the_original_is_not_carried_into_the_shell(self):
+        """다른 확장이 원본에 얹은 인스턴스 forward 는 원본에 바인딩돼 있어 껍데기에서 쓸모가 없다."""
+        block = FakeBlock()
+        block.forward = _foreign_block_wrapper(block, [])
+        copied = patch_module.shell(block)
+        self.assertNotIn("forward", copied.__dict__)
+        self.assertIn("forward", block.__dict__)          # 원본은 그대로
+        self.assertIs(copied.cross_attn, block.cross_attn)  # 나머지 공유는 그대로
+
 
 class BlockLineageTests(unittest.TestCase):
     """28블록 어댑터를 40/52블록 모델에 얹는다 — Forge 가 Edit LoRA 에 쓰는 계보표 그대로.
@@ -190,7 +255,9 @@ class BlockLineageTests(unittest.TestCase):
         from sam3ext.anima_lora_blocks import BLOCK_MAPPINGS
 
         dit = FakeDiT(blocks=52)
-        self.assertEqual(patch_module.install(dit, self.spec, self.weights), 52)
+        self.assertEqual(
+            patch_module.install(dit, self.spec, self.weights, duplicate_policy="all"), 52
+        )
         plan = BLOCK_MAPPINGS[(28, 52)]
         for index in (0, 1, 3, 4, 25, 51):
             source = plan[index]
@@ -202,9 +269,9 @@ class BlockLineageTests(unittest.TestCase):
                 f"block {index} should carry adapter block {source}",
             )
 
-    def test_no_block_of_a_deeper_model_is_left_without_injection(self):
+    def test_no_block_of_a_deeper_model_is_left_without_injection_under_all(self):
         dit = FakeDiT(blocks=52)
-        patch_module.install(dit, self.spec, self.weights)
+        patch_module.install(dit, self.spec, self.weights, duplicate_policy="all")
         for index, block in enumerate(dit.blocks):
             self.assertTrue(getattr(block, "_sam3_ip_patched", False), index)
 
@@ -215,7 +282,7 @@ class BlockLineageTests(unittest.TestCase):
         weights[f"{base}.lora_A.default.weight"] = torch.randn(2, INNER) * 0.1
         weights[f"{base}.lora_B.default.weight"] = torch.randn(INNER, 2) * 0.1
         dit = FakeDiT(blocks=52)
-        patch_module.install(dit, spec, weights, use_lora=True)
+        patch_module.install(dit, spec, weights, use_lora=True, duplicate_policy="all")
         # plan[1] == plan[2] == plan[3] == 1 이므로 그 세 블록이 LoRA 를 받는다.
         for index in (1, 2, 3):
             self.assertIsInstance(
@@ -224,6 +291,140 @@ class BlockLineageTests(unittest.TestCase):
         self.assertNotIsInstance(
             dit.blocks[0].cross_attn.q_proj, patch_module._LoRALinear
         )
+
+
+class DuplicatePolicyTests(unittest.TestCase):
+    """28블록 어댑터를 더 깊은 모델에 얹을 때 끼워 넣은 복제 블록을 어떻게 다룰지 (lineage/all/split).
+
+    all 은 3.8B 에서 강도 0.5 에도, 2.9B 에서 1.0 에 격자 무늬로 깨졌고 lineage 는 둘 다 멀쩡했다
+    (2026-09-23 GPU 확인). 그래서 기본값은 lineage 다.
+    """
+
+    def setUp(self):
+        torch.manual_seed(0)
+        self.spec = _spec(num_blocks=28)
+        self.weights = _weights(self.spec)
+
+    def _first_occurrences(self, plan):
+        seen, first = set(), []
+        for index, source in enumerate(plan):
+            if source not in seen:
+                first.append(index)
+                seen.add(source)
+        return first
+
+    def test_the_default_is_lineage(self):
+        from sam3ext.anima_ipa import options
+
+        self.assertEqual(options.DEFAULT_DUPLICATE_POLICY, "lineage")
+        self.assertEqual(patch_module.DEFAULT_DUPLICATE_POLICY, "lineage")
+        self.assertEqual(set(options.DUPLICATE_POLICIES), {"lineage", "all", "split"})
+
+    def test_lineage_gates_only_the_first_block_of_each_adapter_block(self):
+        for model in (40, 52):
+            plan = patch_module._block_plan(28, model)
+            gates = patch_module._duplicate_gates(plan, "lineage")
+            first = self._first_occurrences(plan)
+            self.assertEqual(len(first), 28, model)
+            self.assertEqual([i for i, g in enumerate(gates) if g is not None], first, model)
+            self.assertTrue(all(gates[i] == 1.0 for i in first), model)
+            # 계보 블록은 어댑터 블록을 0..27 순서대로 한 번씩 쓴다
+            self.assertEqual([plan[i] for i in first], list(range(28)), model)
+
+    def test_split_gates_sum_to_one_per_adapter_block(self):
+        for model in (40, 52):
+            plan = patch_module._block_plan(28, model)
+            gates = patch_module._duplicate_gates(plan, "split")
+            totals: dict[int, float] = {}
+            for source, gate in zip(plan, gates):
+                totals[source] = totals.get(source, 0.0) + gate
+            for source, total in totals.items():
+                self.assertAlmostEqual(total, 1.0, msg=(model, source))
+
+    def test_all_gates_every_block_at_full_strength(self):
+        plan = patch_module._block_plan(28, 52)
+        self.assertEqual(patch_module._duplicate_gates(plan, "all"), [1.0] * 52)
+
+    def test_the_same_depth_is_the_same_under_every_policy(self):
+        plan = patch_module._block_plan(28, 28)
+        for policy in ("lineage", "all", "split"):
+            self.assertEqual(patch_module._duplicate_gates(plan, policy), [1.0] * 28, policy)
+
+    def test_lineage_install_leaves_inserted_blocks_untouched(self):
+        dit = FakeDiT(blocks=52)
+        plan = patch_module._block_plan(28, 52)
+        first = set(self._first_occurrences(plan))
+        self.assertEqual(
+            patch_module.install(dit, self.spec, self.weights, duplicate_policy="lineage"), 28
+        )
+        for index, block in enumerate(dit.blocks):
+            patched = getattr(block, "_sam3_ip_patched", False)
+            self.assertEqual(patched, index in first, index)
+            if index not in first:
+                self.assertFalse(hasattr(block, "adaln_ip"), index)
+                self.assertFalse(hasattr(block, "ip_k_proj"), index)
+
+    def test_lineage_is_what_install_does_by_default(self):
+        dit = FakeDiT(blocks=52)
+        self.assertEqual(patch_module.install(dit, self.spec, self.weights), 28)
+
+    def test_lineage_blocks_carry_their_own_adapter_block(self):
+        dit = FakeDiT(blocks=52)
+        plan = patch_module._block_plan(28, 52)
+        patch_module.install(dit, self.spec, self.weights, duplicate_policy="lineage")
+        for index in self._first_occurrences(plan):
+            source = plan[index]
+            self.assertTrue(
+                torch.equal(
+                    dit.blocks[index].ip_k_proj.weight,
+                    self.weights[f"blocks.{source}.ip_k_proj.weight"],
+                ),
+                index,
+            )
+
+    def test_lineage_gives_the_adapter_lora_to_the_lineage_block_only(self):
+        spec = _spec(num_blocks=28, lora_blocks=(1,), lora_rank=2)
+        weights = _weights(spec)
+        base = "lora.base_model.model.blocks.1.cross_attn.q_proj"
+        weights[f"{base}.lora_A.default.weight"] = torch.randn(2, INNER) * 0.1
+        weights[f"{base}.lora_B.default.weight"] = torch.randn(INNER, 2) * 0.1
+        dit = FakeDiT(blocks=52)
+        patch_module.install(dit, spec, weights, use_lora=True, duplicate_policy="lineage")
+        plan = patch_module._block_plan(28, 52)
+        holders = [i for i in range(52)
+                   if isinstance(dit.blocks[i].cross_attn.q_proj, patch_module._LoRALinear)]
+        self.assertEqual(holders, [plan.index(1)])
+
+    def test_split_scales_the_gate_of_every_copy(self):
+        dit = FakeDiT(blocks=52)
+        plan = patch_module._block_plan(28, 52)
+        patch_module.install(dit, self.spec, self.weights, gate_scale=0.8, duplicate_policy="split")
+        for index, block in enumerate(dit.blocks):
+            copies = plan.count(plan[index])
+            self.assertAlmostEqual(block.sam3_ip_gate_scale, 0.8 / copies, msg=index)
+
+    def test_an_unknown_policy_falls_back_to_the_default(self):
+        dit = FakeDiT(blocks=52)
+        self.assertEqual(
+            patch_module.install(dit, self.spec, self.weights, duplicate_policy="nope"), 28
+        )
+
+    def test_lineage_changes_the_output_of_a_deeper_model(self):
+        """주입이 실제로 줄었는지 — 같은 가중치로 all 과 lineage 의 출력이 달라야 한다."""
+        spec = _spec(num_blocks=28)
+        weights = _weights(spec)
+        for key in list(weights):
+            if key.endswith("adaln_ip.1.bias"):
+                weights[key] = torch.full((INNER,), 0.5)
+        inputs = _inputs()
+        tokens = torch.randn(1, TOKENS, EMBED)
+        outs = {}
+        for policy in ("all", "lineage"):
+            torch.manual_seed(1)
+            dit = FakeDiT(blocks=52)
+            patch_module.install(dit, spec, weights, duplicate_policy=policy)
+            outs[policy] = _run(dit, tokens=tokens, inputs=inputs)
+        self.assertFalse(torch.allclose(outs["all"], outs["lineage"]))
 
 
 class CompatibilityTests(unittest.TestCase):
@@ -403,6 +604,86 @@ class _FakeSdModel:
         )
 
 
+class _SharedModelPatcher:
+    """Forge ModelPatcher 처럼 복제끼리 모델 객체와 object_patches_backup 을 공유하고, patch_model 이 객체
+    패치를 모델에 실제로 적용하며, 다른 복제로 바꿀 때 detach(unpatch_all=False) 는 되돌리지 않는다."""
+
+    def __init__(self, model, backup=None):
+        self.model = model
+        self.object_patches = {}
+        self.object_patches_backup = {} if backup is None else backup
+        self.wrapper = None
+        self.post_cfg = None
+
+    def clone(self):
+        return _SharedModelPatcher(self.model, self.object_patches_backup)
+
+    def get_model_object(self, name):
+        if name in self.object_patches:
+            return self.object_patches[name]
+        if name in self.object_patches_backup:
+            return self.object_patches_backup[name]
+        return getattr(self.model, name)
+
+    def add_object_patch(self, name, obj):
+        self.object_patches[name] = obj
+
+    def set_model_unet_function_wrapper(self, fn):
+        self.wrapper = fn
+
+    def set_model_sampler_post_cfg_function(self, fn):
+        self.post_cfg = fn
+
+    def patch_model(self):  # load_models_gpu 가 샘플링 때 부르는 부분
+        for key, obj in self.object_patches.items():
+            old = getattr(self.model, key)
+            setattr(self.model, key, obj)
+            self.object_patches_backup.setdefault(key, old)
+
+    def detach(self, unpatch_all=True):  # 다른 복제를 올릴 때 Forge 가 부르는 방식(unpatch_all=False)
+        return self.model
+
+
+class PatchedUnetObjectPatchLeakTests(unittest.TestCase):
+    """2026-09-23 GPU 에서 확인한 누수: IPA 뒤 KModel.diffusion_model 이 껍데기로 남아 다음 txt2img 의 LoRA 가 버려짐."""
+
+    def setUp(self):
+        torch.manual_seed(0)
+        self.spec = _spec()
+        self.weights = _weights(self.spec)
+        self.injection = patch_module.Injection(
+            tokens=torch.randn(1, TOKENS, EMBED),
+            null_tokens=torch.zeros(1, TOKENS, EMBED),
+        )
+
+    def test_shell_dit_does_not_stay_on_the_shared_model_after_the_session(self):
+        dit = FakeDiT()
+        kmodel = types.SimpleNamespace(diffusion_model=dit)
+        original = _SharedModelPatcher(kmodel)
+        model = types.SimpleNamespace(forge_objects_after_applying_lora=types.SimpleNamespace(unet=original))
+        inputs = _inputs()
+        before = _run(dit, inputs=inputs)
+
+        with patch_module.patched_unet(model, self.spec, self.weights, self.injection):
+            swapped = model.forge_objects_after_applying_lora.unet
+            swapped.patch_model()   # 샘플링 동안 Forge 가 껍데기를 공유 모델에 건다
+            self.assertIsNot(kmodel.diffusion_model, dit)
+        swapped.detach(unpatch_all=False)   # 다음 생성이 원본 패처를 올릴 때 Forge 가 하는 일
+        original.patch_model()               # 원본 패처엔 객체 패치가 없다
+
+        self.assertIs(kmodel.diffusion_model, dit, "껍데기 DiT 가 원본 모델에 남으면 다음 LoRA 가 버려진다")
+        self.assertEqual(original.object_patches_backup, {})
+        self.assertTrue(torch.equal(before, _run(kmodel.diffusion_model, inputs=inputs)))
+
+    def test_nothing_happens_when_the_session_never_loaded(self):
+        dit = FakeDiT()
+        kmodel = types.SimpleNamespace(diffusion_model=dit)
+        model = types.SimpleNamespace(forge_objects_after_applying_lora=types.SimpleNamespace(unet=_SharedModelPatcher(kmodel)))
+        with patch_module.patched_unet(model, self.spec, self.weights, self.injection):
+            pass
+        self.assertIs(kmodel.diffusion_model, dit)
+
+
 class PatchedUnetTests(unittest.TestCase):
     def setUp(self):
         torch.manual_seed(0)
@@ -466,6 +747,394 @@ class PatchedUnetTests(unittest.TestCase):
             ):
                 pass
         self.assertIs(model.forge_objects_after_applying_lora.unet, original)
+
+    def _patched_dit(self, model):
+        return model.forge_objects_after_applying_lora.unet.object_patches["diffusion_model"]
+
+    def test_injection_survives_a_foreign_instance_forward_on_the_blocks(self):
+        """Safe PAG 가 원본 블록에 남긴 인스턴스 forward 는 원본 블록을 돌린다 — 껍데기 훅이 안 불려
+        주입이 조용히 빠지던 경우(감사 H2)."""
+        dit = FakeDiT()
+        calls = []
+        for block in dit.blocks:
+            block.forward = _foreign_block_wrapper(block, calls)
+        model = _FakeSdModel(dit)
+        inputs = _inputs()
+        before = _run(dit, inputs=inputs)
+        self.assertEqual(calls, ["block"] * len(dit.blocks))   # 원본 블록은 래퍼를 거친다
+        calls.clear()                                          # 세션 밖 호출이 단언을 채우지 않도록
+        with patch_module.patched_unet(model, self.spec, self.weights, self.injection):
+            after = _run(self._patched_dit(model), tokens=self.injection.tokens, inputs=inputs)
+        self.assertFalse(torch.allclose(before, after))
+        # 껍데기 블록은 클래스 forward 를 쓰므로 블록 수준 래퍼는 IPA 패스에서 적용되지 않는다.
+        self.assertEqual(calls, [])
+        # 원본 블록의 래퍼는 그대로 남아 있고 원본은 여전히 주입 없이 돈다.
+        self.assertTrue(all("forward" in b.__dict__ for b in dit.blocks))
+        self.assertTrue(torch.equal(before, _run(dit, tokens=self.injection.tokens, inputs=inputs)))
+
+    def test_injection_survives_a_foreign_instance_forward_on_the_dit(self):
+        """Anima 3.8B 런타임이 원본 DiT 에 남긴 forward 래퍼는 원본에 바인딩된 클래스 forward 를 부른다.
+        껍데기는 그 체인을 살리되(래퍼가 하는 조건 확장을 잃지 않도록) 그 동안만 껍데기 블록을 돌린다."""
+        dit = FakeDiT()
+        calls = []
+        dit.forward = _foreign_dit_wrapper(dit, calls)
+        original_blocks = dit.blocks
+        model = _FakeSdModel(dit)
+        x, emb, context = _inputs()
+        before = dit(x, emb, context, transformer_options={})
+        self.assertEqual(calls, ["dit"])
+        calls.clear()                                     # 세션 밖 호출이 단언을 채우지 않도록
+        with patch_module.patched_unet(model, self.spec, self.weights, self.injection):
+            patched = self._patched_dit(model)
+            after = patched(
+                x, emb, context, transformer_options={patch_module.TOKENS_KEY: self.injection.tokens}
+            )
+        self.assertFalse(torch.allclose(before, after))
+        self.assertEqual(calls, ["dit"])                  # 껍데기 호출이 다른 확장의 래퍼를 정확히 한 번 거쳤다
+        self.assertIs(dit.blocks, original_blocks)        # 호출이 끝나면 원본 blocks 가 돌아온다
+        self.assertFalse(any(getattr(b, "_sam3_ip_patched", False) for b in dit.blocks))
+        self.assertTrue(torch.equal(before, dit(x, emb, context, transformer_options={})))
+
+    def test_a_foreign_dit_forward_that_raises_still_restores_the_original_blocks(self):
+        dit = FakeDiT()
+        original_blocks = dit.blocks
+
+        def boom(*args, **kwargs):
+            raise ValueError("boom")
+
+        dit.forward = boom
+        model = _FakeSdModel(dit)
+        x, emb, context = _inputs()
+        with patch_module.patched_unet(model, self.spec, self.weights, self.injection):
+            with self.assertRaises(ValueError):
+                self._patched_dit(model)(x, emb, context, transformer_options={})
+        self.assertIs(dit.blocks, original_blocks)
+
+    def test_a_foreign_dit_forward_removed_mid_session_is_not_called(self):
+        """세션 도중 외부 래퍼(NegPiP 등)가 풀리면 낡은 클로저를 부르지 않고 껍데기 클래스 forward 로 돈다."""
+        dit = FakeDiT()
+        calls = []
+        dit.forward = _foreign_dit_wrapper(dit, calls)
+        original_blocks = dit.blocks
+        model = _FakeSdModel(dit)
+        x, emb, context = _inputs()
+        before = dit(x, emb, context, transformer_options={})
+        calls.clear()
+        with patch_module.patched_unet(model, self.spec, self.weights, self.injection):
+            del dit.forward                                   # 외부 확장이 래퍼를 해제했다
+            after = self._patched_dit(model)(
+                x, emb, context, transformer_options={patch_module.TOKENS_KEY: self.injection.tokens}
+            )
+        self.assertEqual(calls, [])                           # 해제된 래퍼는 불리지 않는다
+        self.assertFalse(torch.allclose(before, after))       # 주입은 그대로 걸린다
+        self.assertIs(dit.blocks, original_blocks)
+
+    def test_a_foreign_dit_forward_replaced_mid_session_uses_the_current_one(self):
+        dit = FakeDiT()
+        stale, current = [], []
+        dit.forward = _foreign_dit_wrapper(dit, stale)
+        model = _FakeSdModel(dit)
+        x, emb, context = _inputs()
+        with patch_module.patched_unet(model, self.spec, self.weights, self.injection):
+            dit.forward = _foreign_dit_wrapper(dit, current)  # 다른 래퍼로 갈아 끼웠다
+            self._patched_dit(model)(
+                x, emb, context, transformer_options={patch_module.TOKENS_KEY: self.injection.tokens}
+            )
+        self.assertEqual(stale, [])
+        self.assertEqual(current, ["dit"])
+
+    def test_a_foreign_dit_forward_added_mid_session_is_followed(self):
+        """시작 때 없던 래퍼가 도중에 생겨도 호출 시점의 원본 forward 를 따른다."""
+        dit = FakeDiT()
+        calls = []
+        original_blocks = dit.blocks
+        model = _FakeSdModel(dit)
+        x, emb, context = _inputs()
+        before = dit(x, emb, context, transformer_options={})
+        with patch_module.patched_unet(model, self.spec, self.weights, self.injection):
+            dit.forward = _foreign_dit_wrapper(dit, calls)
+            after = self._patched_dit(model)(
+                x, emb, context, transformer_options={patch_module.TOKENS_KEY: self.injection.tokens}
+            )
+        self.assertEqual(calls, ["dit"])
+        self.assertFalse(torch.allclose(before, after))
+        self.assertIs(dit.blocks, original_blocks)
+
+    def test_without_a_foreign_forward_the_shell_output_matches_its_class_forward(self):
+        """외부 래퍼가 없으면 결과는 껍데기의 클래스 forward 와 비트 단위로 같다(기본 경로 불변)."""
+        dit = FakeDiT()
+        model = _FakeSdModel(dit)
+        x, emb, context = _inputs()
+        options = {patch_module.TOKENS_KEY: self.injection.tokens}
+        with patch_module.patched_unet(model, self.spec, self.weights, self.injection):
+            patched = self._patched_dit(model)
+            via_call = patched(x, emb, context, transformer_options=options)
+            direct = FakeDiT.forward(patched, x, emb, context, transformer_options=options)
+        self.assertTrue(torch.equal(via_call, direct))
+
+    def test_the_handler_hint_says_the_shell_blocks_never_ran(self):
+        dit = FakeDiT()
+        model = _FakeSdModel(dit)
+        x, emb, context = _inputs()
+        with patch_module.patched_unet(model, self.spec, self.weights, self.injection):
+            swapped = model.forge_objects_after_applying_lora.unet
+            args = {
+                "input": x, "timestep": torch.zeros(1),
+                "c": {"transformer_options": {}}, "cond_or_uncond": [0],
+            }
+            with self.assertRaises(RuntimeError) as caught:
+                swapped.wrapper(lambda xx, t, **c: dit(xx, emb, context, **c), args)
+        message = str(caught.exception)
+        self.assertIn("한 번도 돌지 않았습니다", message)
+        self.assertNotIn("transformer_options", message)
+
+    def test_the_handler_hint_says_the_tokens_never_arrived(self):
+        """껍데기 블록은 돌았는데 토큰이 빠진 경우 — 원인은 배선이 아니라 transformer_options 전달이다."""
+        dit = FakeDiT()
+        model = _FakeSdModel(dit)
+        x, emb, context = _inputs()
+        with patch_module.patched_unet(model, self.spec, self.weights, self.injection):
+            swapped = model.forge_objects_after_applying_lora.unet
+            patched = self._patched_dit(model)
+            args = {
+                "input": x, "timestep": torch.zeros(1),
+                "c": {"transformer_options": {}}, "cond_or_uncond": [0],
+            }
+            # transformer_options 를 새 딕셔너리로 바꿔 넘기는 중간 래퍼를 흉내 낸다.
+            with self.assertRaises(RuntimeError) as caught:
+                swapped.wrapper(
+                    lambda xx, t, **c: patched(xx, emb, context, transformer_options={}), args
+                )
+        message = str(caught.exception)
+        self.assertIn("transformer_options", message)
+        self.assertIn(patch_module.TOKENS_KEY, message)
+        self.assertNotIn("한 번도 돌지 않았습니다", message)
+
+    def test_the_handler_stops_when_no_shell_block_injected(self):
+        """DiT forward 가 껍데기 블록을 거치지 않으면(주입 0건) 첫 호출에서 바로 멈춘다."""
+        dit = FakeDiT()
+        model = _FakeSdModel(dit)
+        x, emb, context = _inputs()
+        with patch_module.patched_unet(model, self.spec, self.weights, self.injection):
+            swapped = model.forge_objects_after_applying_lora.unet
+            args = {
+                "input": x, "timestep": torch.zeros(1),
+                "c": {"transformer_options": {}}, "cond_or_uncond": [0],
+            }
+            # 껍데기 블록을 돌지 않는 apply_model — 원본 DiT 를 부르는 낡은 래퍼와 같은 상황.
+            with self.assertRaises(RuntimeError) as caught:
+                swapped.wrapper(lambda xx, t, **c: dit(xx, emb, context, transformer_options={}), args)
+            self.assertIn("IP 주입", str(caught.exception))
+            # 정상 배선이면 통과한다(검사는 성공할 때까지 매 호출 반복되고 성공하면 멈춘다).
+            patched = self._patched_dit(model)
+            out = swapped.wrapper(
+                lambda xx, t, **c: patched(xx, emb, context, transformer_options=c["transformer_options"]),
+                args,
+            )
+            self.assertEqual(tuple(out.shape), tuple(x.shape))
+
+
+class Anima38ConnectorWrapperTests(unittest.TestCase):
+    """실제 Anima 3.8B 런타임의 DiT forward 래퍼(``Anima3BRuntime._wrap_forward``)가 원본 DiT 에 걸린 채로
+    IP-Adapter 세션을 열면, 한 번의 forward 에서 커넥터의 조건 확장과 IP 주입이 **둘 다** 실행된다
+    (감사 M10 + H2 — 캐릭터 레퍼런스 IP-Adapter 를 3.8B v2 커넥터 토글과 함께 쓰는 경우).
+
+    런타임은 test_anima38 과 같은 방식으로 Forge 의존만 스텁해 실제 코드를 불러온다. 조건 확장
+    (``_expand_v2_context``)만 결정적인 가짜로 바꾼다 — Qwen3.5·커넥터 가중치는 CPU 테스트 밖이다.
+    """
+
+    def setUp(self):
+        from sam3ext.anima38 import marker
+        from test_anima38 import _load_lifecycle_runtime
+
+        torch.manual_seed(0)
+        self.spec = _spec()
+        self.weights = _weights(self.spec)
+        self.injection = patch_module.Injection(
+            tokens=torch.randn(1, TOKENS, EMBED),
+            null_tokens=torch.zeros(1, TOKENS, EMBED),
+        )
+        self.runtime = _load_lifecycle_runtime().Anima3BRuntime()
+        self.expanded = []
+
+        def expand(rows, timesteps, run_ids, ids=None):
+            self.expanded.append(ids)
+            return rows + 1.0          # 커넥터가 자리표시 행을 의미 조건으로 바꾸는 것을 흉내 낸다
+
+        self.runtime._expand_v2_context = expand
+        self.runtime._v2_models = object()
+        self.runtime._v2_active = True     # install() 뒤의 상태 — restore() 는 이 플래그만 끈다
+        self.dit = FakeDiT()
+        self.runtime._wrap_forward(self.dit)
+        self.x, self.emb, context = _inputs()
+        self.context = marker.stamp_run_id(context, 0)   # 긍정 프롬프트 줄 = run 0 마커가 새겨진 조건
+
+    def _session(self):
+        return patch_module.patched_unet(
+            _FakeSdModel(self.dit), self.spec, self.weights, self.injection
+        )
+
+    def test_the_connector_wrapper_is_on_the_original_dit(self):
+        self.assertIn("forward", self.dit.__dict__)
+        self.assertTrue(self.runtime._patched(self.dit.forward))
+
+    def test_one_forward_runs_both_the_connector_and_the_injection(self):
+        original_blocks = self.dit.blocks
+        connector_only = self.dit(self.x, self.emb, self.context, transformer_options={})
+        self.assertEqual(self.expanded, [[0]])
+        self.expanded.clear()
+        options = {patch_module.TOKENS_KEY: self.injection.tokens}
+        model = _FakeSdModel(self.dit)
+        with patch_module.patched_unet(model, self.spec, self.weights, self.injection):
+            patched = model.forge_objects_after_applying_lora.unet.object_patches["diffusion_model"]
+            both = patched(self.x, self.emb, self.context, transformer_options=options)
+            # 기대값: 커넥터가 바꾼 조건(context+1)으로 껍데기(주입된) 블록을 돈 결과와 비트 단위로 같다.
+            expected = FakeDiT.forward(
+                patched, self.x, self.emb, self.context + 1.0, transformer_options=options
+            )
+            injected = [bool(getattr(b, "_sam3_ip_applied", False)) for b in patched.blocks]
+        self.assertEqual(self.expanded, [[0]], "커넥터의 조건 확장이 IP 세션 안에서도 정확히 한 번 돌았다")
+        self.assertEqual(injected, [True] * len(injected), "모든 껍데기 블록이 주입했다")
+        self.assertTrue(torch.equal(both, expected))
+        self.assertFalse(torch.allclose(both, connector_only), "주입이 결과를 바꾼다")
+        self.assertIs(self.dit.blocks, original_blocks)
+
+    def test_the_injection_handler_passes_its_first_call_check(self):
+        """샘플러 경로(unet 래퍼 → apply_model → 껍데기 DiT → 커넥터 래퍼 → 껍데기 블록)에서
+        InjectionHandler 의 '주입이 실제로 실행됐는가' 검사가 통과한다."""
+        model = _FakeSdModel(self.dit)
+        with patch_module.patched_unet(model, self.spec, self.weights, self.injection):
+            swapped = model.forge_objects_after_applying_lora.unet
+            patched = swapped.object_patches["diffusion_model"]
+            args = {
+                "input": self.x, "timestep": torch.zeros(1),
+                "c": {"transformer_options": {}}, "cond_or_uncond": [0],
+            }
+            out = swapped.wrapper(
+                lambda xx, t, **c: patched(xx, self.emb, self.context, **c), args
+            )
+        self.assertEqual(tuple(out.shape), tuple(self.x.shape))
+        self.assertEqual(self.expanded, [[0]])
+
+    def test_after_restore_the_left_wrapper_is_transparent_and_the_injection_still_runs(self):
+        """restore() 는 래퍼를 떼지 않고 플래그만 끈다 — 토글을 끈 다음 IP 잡은 커넥터 없이 주입만 된다."""
+        self.runtime._v2_active = False
+        options = {patch_module.TOKENS_KEY: self.injection.tokens}
+        model = _FakeSdModel(self.dit)
+        with patch_module.patched_unet(model, self.spec, self.weights, self.injection):
+            patched = model.forge_objects_after_applying_lora.unet.object_patches["diffusion_model"]
+            out = patched(self.x, self.emb, self.context, transformer_options=options)
+            expected = FakeDiT.forward(
+                patched, self.x, self.emb, self.context, transformer_options=options
+            )
+        self.assertEqual(self.expanded, [])
+        self.assertTrue(torch.equal(out, expected))
+
+
+class _ForgeLikePatcher(_FakePatcher):
+    """Forge ModelPatcher 의 객체 패치 수명만 흉내 낸다(backend/patcher/base.py): ``object_patches_backup`` 은
+    클론끼리 공유하고, 적재(partially_load) 때 먼저 unpatch_model 로 backup 을 되돌린 뒤 자기 패치를 건다.
+    다른 클론으로 바뀔 때의 detach(unpatch_all=False) 는 되돌리지 않으므로 여기서도 아무것도 하지 않는다."""
+
+    def __init__(self, model, backup):
+        self.model = model
+        self.object_patches = {}
+        self.object_patches_backup = backup
+        self.wrapper = None
+        self.post_cfg = None
+
+    def clone(self):
+        n = _ForgeLikePatcher(self.model, self.object_patches_backup)
+        n.object_patches = dict(self.object_patches)
+        return n
+
+    def get_model_object(self, name):
+        if name in self.object_patches:
+            return self.object_patches[name]
+        if name in self.object_patches_backup:
+            return self.object_patches_backup[name]
+        return getattr(self.model, name)
+
+    def load(self):
+        for key, value in list(self.object_patches_backup.items()):
+            setattr(self.model, key, value)
+        self.object_patches_backup.clear()
+        for key, value in self.object_patches.items():
+            old = getattr(self.model, key)
+            setattr(self.model, key, value)
+            self.object_patches_backup.setdefault(key, old)
+
+
+class Anima38AfterPreviousIpaJobTests(unittest.TestCase):
+    """새로 불러온 3.8B 에서 IP 잡(토글 OFF)을 한 번 돌린 뒤 토글 ON 으로 IP 잡을 돌린다 — 검토 반례.
+    지난 잡의 껍데기가 ``model.diffusion_model`` 에 남아 있어도 런타임이 진짜 DiT 를 감싸 커넥터 확장이 돈다."""
+
+    def setUp(self):
+        from sam3ext.anima38 import marker
+        from test_anima38 import _load_lifecycle_runtime
+
+        torch.manual_seed(0)
+        self.spec = _spec()
+        self.weights = _weights(self.spec)
+        self.injection = patch_module.Injection(
+            tokens=torch.randn(1, TOKENS, EMBED),
+            null_tokens=torch.zeros(1, TOKENS, EMBED),
+        )
+        self.dit = FakeDiT()
+        self.kmodel = types.SimpleNamespace(diffusion_model=self.dit)
+        root = _ForgeLikePatcher(self.kmodel, {})
+        self.sd = types.SimpleNamespace(
+            forge_objects=types.SimpleNamespace(unet=root.clone()),
+            forge_objects_after_applying_lora=types.SimpleNamespace(unet=root.clone()),
+            forge_objects_original=types.SimpleNamespace(unet=root),
+        )
+        self.x, self.emb, context = _inputs()
+        self.context = marker.stamp_run_id(context, 0)
+        self.runtime = _load_lifecycle_runtime().Anima3BRuntime()
+        self.expanded = []
+
+        def expand(rows, timesteps, run_ids, ids=None):
+            self.expanded.append(ids)
+            return rows + 1.0
+
+        self.runtime._expand_v2_context = expand
+        self.runtime._v2_models = object()
+
+    def _ipa_job(self):
+        options = {patch_module.TOKENS_KEY: self.injection.tokens}
+        with patch_module.patched_unet(self.sd, self.spec, self.weights, self.injection):
+            swapped = self.sd.forge_objects_after_applying_lora.unet
+            swapped.load()   # sample(): 적재 → model.diffusion_model 이 이번 잡의 껍데기
+            shell = self.kmodel.diffusion_model
+            out = shell(self.x, self.emb, self.context, transformer_options=options)   # apply_model 이 부르는 것
+            injected = [bool(getattr(b, "_sam3_ip_applied", False)) for b in shell.blocks]
+        return out, shell, injected
+
+    def test_the_connector_runs_in_the_ipa_job_after_a_plain_one(self):
+        _, first_shell, _ = self._ipa_job()
+        # 잡이 끝나면 patched_unet 이 자기 객체 패치를 되돌린다 — 껍데기가 원본 KModel 에 남지 않는다
+        # (남으면 다음 txt2img 의 LoRA 가 [LORA] Mismatch 로 버려졌다, 2026-09-23 GPU 확인).
+        self.assertIs(self.kmodel.diffusion_model, self.dit)
+        self.assertEqual(self.expanded, [])
+
+        # 토글 ON: _install_v2 / ensure_attached 가 감쌀 대상
+        target = self.runtime._real_dit(self.sd)
+        self.assertIs(target, self.dit)
+        self.runtime._v2_active = True
+        self.runtime._wrap_forward(target)
+
+        out, shell, injected = self._ipa_job()
+        self.assertIsNot(shell, first_shell)
+        self.assertEqual(self.expanded, [[0]], "커넥터 조건 확장이 정확히 한 번")
+        self.assertEqual(injected, [True] * len(injected))
+        options = {patch_module.TOKENS_KEY: self.injection.tokens}
+        expected = FakeDiT.forward(shell, self.x, self.emb, self.context + 1.0, transformer_options=options)
+        self.assertTrue(torch.equal(out, expected))
+
+    def test_without_a_leftover_shell_the_target_is_the_model_attribute(self):
+        self.assertIs(self.runtime._real_dit(self.sd), self.dit)
+        self.sd.forge_objects.unet.load()   # 객체 패치 없는 적재(txt2img) — backup 은 비어 있다
+        self.assertIs(self.runtime._real_dit(self.sd), self.dit)
 
 
 class LoraTests(unittest.TestCase):

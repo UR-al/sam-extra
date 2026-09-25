@@ -141,6 +141,7 @@ class IpaRuntime:
         with patched_unet(
             sd_model, loaded.spec, loaded.weights, injection,
             use_lora=bool(options.use_lora),
+            duplicate_policy=options.resolved_duplicate_policy(),
         ):
             yield int(loaded.spec.num_blocks)
 

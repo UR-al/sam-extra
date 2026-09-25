@@ -25,7 +25,7 @@ from __future__ import annotations
 import sys
 import traceback
 from contextlib import contextmanager
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Iterator
 
 from PIL import Image
@@ -523,6 +523,55 @@ def _restore_anima38(runtime: Any, processing: Any) -> None:
         )
 
 
+# IP-Adapter 방식에 3.8B v2 커넥터를 설치할지 — scripts/anima_3_8b.py 가 같은 이름으로
+# 'SAM Extra Anima 3.8B' 설정 섹션에 등록한다. 기본은 켬 — 이어붙이기 방식·txt2img 와 같은 조건.
+# 끄면 0.21 까지처럼 0.6B 조건으로 샘플링한다(결과가 바뀜).
+OPT_IPA_ANIMA38 = "sam3_anima38_reference_ipa"
+DEFAULT_IPA_ANIMA38 = True
+_ANIMA38_RUNTIME_MODULE = f"{__package__}.anima38.runtime"
+# 설정이 꺼져 있을 때 diagnostics 에 남기는 값 (infotext 에는 아무것도 남기지 않는다 — 예전 결과와 같다)
+ANIMA38_IPA_OFF = "off"
+
+
+def _ipa_anima38_wanted(request: ReferenceGenerationRequest, opts: Any) -> bool:
+    """요청이 정했으면 그 값, 아니면 Forge 설정(기본 켬)."""
+    explicit = request.ipa.anima38_connector
+    if explicit is not None:
+        return bool(explicit)
+    try:
+        return bool(getattr(opts, OPT_IPA_ANIMA38, DEFAULT_IPA_ANIMA38))
+    except Exception:
+        return DEFAULT_IPA_ANIMA38
+
+
+def _release_foreign_anima38(runtime: Any, processing: Any) -> None:
+    """3.8B 설치 순서의 첫 단계 — 다른 생성이 예외로 끝나 남긴 설치를 내린다.
+
+    ``scripts/anima_3_8b.py`` 의 ``_release_stale_install`` 과 같은 공용 함수
+    (``Anima3BRuntime.release_foreign_install``)를 쓴다. 커넥터를 안 쓰는 잡도 부른다 —
+    안 그러면 txt2img 가 남긴 v2 조건 래퍼로 이 잡의 조건이 만들어진다(스크립트의 Bypass 와 같은 규칙).
+    그때는 무거운 임포트 없이 이미 떠 있는 공용 런타임만 본다.
+    """
+    if runtime is None:
+        module = sys.modules.get(_ANIMA38_RUNTIME_MODULE)
+        runtime = getattr(module, "_SHARED_RUNTIME", None)
+    release = getattr(runtime, "release_foreign_install", None)
+    if release is None:
+        return
+
+    def report(exc: Exception) -> None:
+        print(
+            "[-] Feature 6: stale Anima 3.8B restore failed — "
+            f"{type(exc).__name__}: {exc}",
+            file=sys.stderr,
+        )
+
+    try:
+        release(processing, on_error=report)
+    except Exception as exc:  # pragma: no cover - 복구가 실패해도 이번 잡은 진행한다
+        report(exc)
+
+
 def _ipa_session(sd_model, image, options):
     """IP-Adapter 주입 세션. 테스트에서 통째로 갈아끼울 수 있게 얇게 감싼다."""
     from .anima_ipa.runtime import shared_runtime
@@ -798,6 +847,17 @@ def _run_ipa_reference(
         )
 
     model_blocks = _model_block_count(model)
+    # 3.8B v2 커넥터(감사 M10). 이 잡은 스크립트 러너 없이 돌아 Anima38 스크립트가 붙지 않는다 —
+    # 토글이 켜져 있을 때만 이어붙이기 방식과 같은 설치(_install_anima38)를 후보마다 한다.
+    anima38_wanted = _ipa_anima38_wanted(request, shared.opts)
+    anima38_runtime, anima38_error = (
+        _anima38_runtime() if anima38_wanted else (None, None)
+    )
+    anima38_label = "not attempted" if anima38_wanted else ANIMA38_IPA_OFF
+    # 복제 블록 정책(lineage/all/split)은 잡 시작 때 한 번 정한다 — 후보마다 설정을 다시 읽으면 도중에
+    # 설정을 바꿨을 때 infotext 와 실제 주입이 어긋날 수 있다. 요청이 정했으면 그 값, 아니면 Forge 설정.
+    duplicate_policy = request.ipa.resolved_duplicate_policy(shared.opts)
+    ipa_options = replace(request.ipa, duplicate_policy=duplicate_policy)
     sample_path = outpath_samples or getattr(
         shared.opts, "outdir_txt2img_samples", "outputs/txt2img-images"
     )
@@ -857,17 +917,30 @@ def _run_ipa_reference(
 
                 def sample_with_ipa(*args, _original=original_sample, _p=p2, **kwargs):
                     with _ipa_session(
-                        _p.sd_model, request.reference_image, request.ipa
+                        _p.sd_model, request.reference_image, ipa_options
                     ) as adapter_blocks:
-                        # 깊이가 다르면 블록 계보 매핑이 걸린 것이다 — 결과에 남긴다.
+                        # 깊이가 다르면 블록 계보 매핑이 걸린 것이다 — 결과에 남긴다(복제 블록 정책도 함께).
                         if adapter_blocks and model_blocks and adapter_blocks != model_blocks:
                             seen_adapter_blocks.append(int(adapter_blocks))
                             _p.extra_generation_params["SAM3 IPA Blocks"] = (
                                 f"{int(adapter_blocks)}→{model_blocks}"
                             )
+                            _p.extra_generation_params["SAM3 IPA Duplicates"] = duplicate_policy
                         return _original(*args, **kwargs)
 
                 p2.sample = sample_with_ipa
+
+                # 스크립트와 같은 순서: 남은 설치 내리기 → (토글이 켜졌으면) 설치 → 끝나면 복원.
+                # 커넥터는 조건(setup_conds)을 만들 때 쓰이므로 process_images 앞에서 단다. DiT forward
+                # 래퍼는 IP 주입 껍데기가 _keep_foreign_dit_forward 로 체인째 부른다(주입과 함께 산다).
+                _release_foreign_anima38(anima38_runtime, p2)
+                anima38_installed = False
+                if anima38_wanted:
+                    anima38_label = _install_anima38(
+                        anima38_runtime, anima38_error, p2, model
+                    )
+                    anima38_installed = anima38_label == "v2 bundle"
+                    p2.extra_generation_params["Reference Anima38"] = anima38_label
 
                 try:
                     processed = process_images(p2)
@@ -915,6 +988,8 @@ def _run_ipa_reference(
                     )
                     raise
                 finally:
+                    if anima38_installed:
+                        _restore_anima38(anima38_runtime, p2)
                     close = getattr(p2, "close", None)
                     if callable(close):
                         close()
@@ -932,5 +1007,8 @@ def _run_ipa_reference(
             "ipa_strength": float(request.ipa.strength),
             "ipa_ref_size": int(request.ipa.ref_size),
             "ipa_separate_cfg": bool(request.ipa.separate_cfg),
+            "ipa_duplicate_policy": duplicate_policy,
+            "anima38_connector": anima38_wanted,
+            "anima38": anima38_label,
         },
     )

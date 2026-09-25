@@ -6,6 +6,8 @@
 
 확장은 두 단계다: 결과를 만들어 숨은 State 에 두고, 다음 단계가 지금 프롬프트 칸의 값을 다시 읽어 누를 때와 같을 때만
 넣는다 — 생성이 끝나길 기다리는 동안 고친 내용을 덮어쓰지 않게. 장치 선택은 javascript/tipo_device.js 가 브라우저에 기억한다.
+토글 "GPU 에 남겨 두기"(기본 켬)는 GPU 로 돈 모델을 Forge 메모리 관리에 맡긴다 — 여유가 있으면 VRAM 에 남고 자리가 필요하면
+Forge 가 내린다. 끄면 누를 때만 올렸다가 끝나면 내린다(sam3ext/tipo/runtime.py). 어느 쪽이든 같은 시드면 같은 텍스트다.
 """
 from __future__ import annotations
 
@@ -16,13 +18,18 @@ from pathlib import Path
 from typing import Any
 
 from .tipo import prompt as tp
-from .tipo.runtime import MODEL_BYTES_LABEL, shared_runtime
+from .tipo.runtime import EXPAND_JOB, MODEL_BYTES_LABEL, shared_runtime
 
 BUTTON_ICON = "🪄"
 BUTTON_ELEM_ID = "txt2img_tipo_expand"
 BUTTON_TOOLTIP = "TIPO 로 프롬프트 확장 (설정: 스타일 줄 아래 'TIPO 프롬프트 확장')"
 DEVICES = ("GPU", "CPU")
 DEVICE_DEFAULT = "GPU"
+KEEP_ON_GPU_DEFAULT = True
+KEEP_ON_GPU_LABEL = "GPU 에 남겨 두기"
+KEEP_ON_GPU_INFO = ("GPU 로 돈 모델(약 2 GB)을 Forge 메모리 관리에 맡깁니다 — 여유가 있으면 남아 다음 클릭이 빠르고, "
+                    "이미지 생성 등에 자리가 필요하면 Forge 가 내립니다. 끄면 누를 때만 올렸다가 끝나면 내립니다")
+KEPT_LABEL = "GPU(남김)"   # 상태 줄 — 끝난 뒤 GPU 에 남겨 Forge 에 맡겼다
 # 새 토큰 한도 — 모델이 보통 먼저 EOS 로 끝내므로 넉넉히. 태그 36/48/72개 ≈ 110/140/210 토큰, 설명은 문장 몇 개가 더 붙는다.
 MAX_NEW_TOKENS = {
     tp.MODE_TAGS: {tp.LENGTH_SHORT: 192, tp.LENGTH_NORMAL: 256, tp.LENGTH_LONG: 384},
@@ -72,6 +79,7 @@ class TipoPanel:
     status: Any
     undo_state: Any
     pending: Any
+    keep_on_gpu: Any = None   # "GPU 에 남겨 두기" 토글
 
 
 def build_tipo_panel(model_missing: bool) -> TipoPanel:
@@ -84,6 +92,8 @@ def build_tipo_panel(model_missing: bool) -> TipoPanel:
         with gr.Row():
             allow_new_names = gr.Checkbox(False, label="새 작가·캐릭터·작품 허용", elem_id="sam3_tipo_allow_names")
             device = gr.Radio(list(DEVICES), value=DEVICE_DEFAULT, label="장치", elem_id="sam3_tipo_device")
+            keep_on_gpu = gr.Checkbox(KEEP_ON_GPU_DEFAULT, label=KEEP_ON_GPU_LABEL, info=KEEP_ON_GPU_INFO,
+                                      elem_id="sam3_tipo_keep_on_gpu")
             seed = gr.Number(-1, label="시드 (-1 = 매번 다르게)", precision=0, elem_id="sam3_tipo_seed")
         with gr.Row():
             undo_button = gr.Button("↩ 되돌리기", size="sm", elem_id="sam3_tipo_undo")
@@ -95,7 +105,7 @@ def build_tipo_panel(model_missing: bool) -> TipoPanel:
         undo_state = gr.State(None)
         pending = gr.State(None)
     return TipoPanel(accordion, mode, length, allow_new_names, device, seed, undo_button, download_button,
-                     status, undo_state, pending)
+                     status, undo_state, pending, keep_on_gpu)
 
 
 def create_tipo_button():
@@ -109,7 +119,8 @@ def max_new_tokens(mode: str, length: str) -> int:
     return budgets.get(length, budgets[tp.LENGTH_NORMAL])
 
 
-def handle_expand(prompt, width, height, mode, length, allow_new_names, device, seed, *, runtime=None, index=None):
+def handle_expand(prompt, width, height, mode, length, allow_new_names, device, seed,
+                  keep_on_gpu=KEEP_ON_GPU_DEFAULT, *, runtime=None, index=None):
     """출력: 적용 대기({before, after} 또는 None), 상태 줄, 모델 받기 버튼. 프롬프트 칸은 handle_apply 가 쓴다."""
     import gradio as gr
 
@@ -136,7 +147,7 @@ def handle_expand(prompt, width, height, mode, length, allow_new_names, device, 
     try:
         result = runtime.generate(
             tipo_input, requested_device=device, max_new_tokens=max_new_tokens(mode, length),
-            seed=int(seed) if seed is not None else -1,
+            seed=int(seed) if seed is not None else -1, keep_on_gpu=bool(keep_on_gpu),
         )
     except Exception as exc:
         _log(f"expand failed:\n{traceback.format_exc()}")
@@ -144,7 +155,7 @@ def handle_expand(prompt, width, height, mode, length, allow_new_names, device, 
 
     new_tags, description = tp.parse_tipo_output(mode, result.text, finished=result.finished)
     text, added = tp.assemble_prompt(prompt, parts, new_tags, description, mode, bool(allow_new_names), index)
-    device_label = "GPU" if result.device == "cuda" else "CPU"
+    device_label = "CPU" if result.device != "cuda" else KEPT_LABEL if result.resident else "GPU"
     notes = [note for note in (result.note, None if result.finished else "토큰 한도에서 멈춰 잘린 끝부분은 뺐습니다") if note]
     tail = f"시드 {result.seed} · {device_label} · {result.seconds:.1f}초" + "".join(f" — {note}" for note in notes)
     if text == prompt:
@@ -193,15 +204,17 @@ def wire_tipo(button, panel: TipoPanel, prompt, width, height) -> None:
     """확장은 Forge 대기열 잠금 안에서(이미지 생성과 겹치지 않게). 받기는 잠그지 않는다(몇 분 걸려도 생성은 막지 않게)."""
     from .ui_anima_reference import _run_exclusive
 
-    def expand(prompt_value, width_value, height_value, mode, length, allow, device, seed):
+    def expand(prompt_value, width_value, height_value, mode, length, allow, device, seed, keep_on_gpu):
         return _run_exclusive(
-            "sam3_tipo_expand",
-            lambda: handle_expand(prompt_value, width_value, height_value, mode, length, allow, device, seed),
+            EXPAND_JOB,
+            lambda: handle_expand(prompt_value, width_value, height_value, mode, length, allow, device, seed,
+                                  keep_on_gpu),
         )
 
     button.click(
         fn=expand,
-        inputs=[prompt, width, height, panel.mode, panel.length, panel.allow_new_names, panel.device, panel.seed],
+        inputs=[prompt, width, height, panel.mode, panel.length, panel.allow_new_names, panel.device, panel.seed,
+                panel.keep_on_gpu],
         outputs=[panel.pending, panel.status, panel.download_button],
         show_progress="minimal",
     ).then(

@@ -5,6 +5,7 @@ import sys
 import types
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import torch
 
@@ -77,6 +78,31 @@ def _reference_skim(x_orig, cond, uncond, cond_scale, skimming_scale,
     return cond
 
 
+def _legacy_skim_predictions(x, target, reference, scale, skimming_scale,
+                             flip_filter):
+    """The pre-``torch.where`` implementation, kept verbatim as a bit-exact
+    oracle: a host ``.any()`` check plus three boolean-mask gathers/scatter,
+    each of which synchronises the GPU."""
+    if abs(float(scale)) < 1e-6:
+        return target
+
+    denoised = reference + scale * (target - reference)
+    matching_pred_signs = (target - reference).sign() == target.sign()
+    matching_diff_after = target.sign() == denoised.sign()
+    outer_influence = matching_pred_signs & matching_diff_after
+    if not flip_filter:
+        outer_influence &= denoised.sign() == (denoised - x).sign()
+
+    if not bool(outer_influence.any()):
+        return target
+
+    low_scale_denoised = reference + skimming_scale * (target - reference)
+    correction = (denoised - low_scale_denoised) / scale
+    skimmed = target.clone()
+    skimmed[outer_influence] = target[outer_influence] - correction[outer_influence]
+    return skimmed
+
+
 class SkimmedCFGTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -113,6 +139,131 @@ class SkimmedCFGTests(unittest.TestCase):
                     self.x, self.cond, self.uncond, 8.0, 7.0, flip
                 )
                 torch.testing.assert_close(out, expected)
+
+    def test_where_skim_is_bit_identical_to_legacy_mask_indexing(self):
+        """The ``torch.where`` rewrite must reproduce the old boolean-mask
+        scatter bit for bit (torch.equal, not a tolerance), including the
+        CFG-1 shortcut and a mask that selects nothing."""
+        shapes = ((1, 4, 8, 8), (2, 16, 1, 12, 10))
+        cases = 0
+        for seed in range(6):
+            for shape in shapes:
+                g = torch.Generator().manual_seed(seed)
+                x = torch.randn(shape, generator=g)
+                target = torch.randn(shape, generator=g)
+                reference = torch.randn(shape, generator=g)
+                for scale in (8.0, 7.0, 4.5, 1.5, 0.5, -2.0, 0.0):
+                    for skimming in (7.0, 3.0, 0.0, 12.0):
+                        for flip in (False, True):
+                            with self.subTest(seed=seed, shape=shape,
+                                              scale=scale, skim=skimming,
+                                              flip=flip):
+                                new = self.skim._skim_predictions(
+                                    x, target, reference, scale, skimming,
+                                    flip,
+                                )
+                                old = _legacy_skim_predictions(
+                                    x, target, reference, scale, skimming,
+                                    flip,
+                                )
+                                self.assertTrue(torch.equal(new, old))
+                                self.assertEqual(new.dtype, old.dtype)
+                                cases += 1
+        self.assertGreater(cases, 600)
+
+        # A mask that selects nothing: target == reference makes the guidance
+        # direction zero, so ``matching_pred_signs`` is False everywhere.
+        same = torch.randn(1, 4, 8, 8)
+        new = self.skim._skim_predictions(self.x, same, same.clone(), 8.0, 3.0, False)
+        self.assertTrue(torch.equal(new, same))
+
+    def test_post_cfg_is_bit_identical_to_legacy_implementation(self):
+        """Whole hook, including the in-place publish into Forge's cond/uncond
+        tensors, against the legacy helper, for every storage dtype."""
+        original = self.skim._skim_predictions
+        configs = (
+            dict(skimming_cfg=7.0),
+            dict(skimming_cfg=3.0),
+            dict(skimming_cfg=-1.0),
+            dict(skimming_cfg=3.0, full_skim_negative=True),
+            dict(skimming_cfg=2.0, disable_flipping_filter=True),
+            dict(skimming_cfg=2.0, flip_at=0.5),
+        )
+        for dtype in (torch.float32, torch.bfloat16, torch.float16):
+            for config in configs:
+                for cond_scale in (8.0, 4.0, 1.5):
+                    with self.subTest(dtype=dtype, config=config,
+                                      cond_scale=cond_scale):
+                        g = torch.Generator().manual_seed(11)
+                        x = torch.randn(2, 16, 1, 16, 16, generator=g).to(dtype)
+                        cond = torch.randn(2, 16, 1, 16, 16, generator=g).to(dtype)
+                        uncond = torch.randn(2, 16, 1, 16, 16, generator=g).to(dtype)
+
+                        def run(helper):
+                            self.skim._SKIM.update(
+                                on=True, skimming_cfg=7.0,
+                                full_skim_negative=False,
+                                disable_flipping_filter=False,
+                                start=0.0, end=1.0, flip_at=0.0,
+                                steps=0, warned=False,
+                            )
+                            self.skim._SKIM.update(**config)
+                            c, u = cond.clone(), uncond.clone()
+                            args = {
+                                "denoised": (u + cond_scale * (c - u)),
+                                "input": x,
+                                "cond_denoised": c,
+                                "uncond_denoised": u,
+                                "cond_scale": cond_scale,
+                            }
+                            self.skim._skim_predictions = helper
+                            try:
+                                out = self.skim._post_cfg(args)
+                            finally:
+                                self.skim._skim_predictions = original
+                            return out, c, u
+
+                        new_out, new_c, new_u = run(original)
+                        old_out, old_c, old_u = run(_legacy_skim_predictions)
+                        self.assertTrue(torch.equal(new_out, old_out))
+                        self.assertTrue(torch.equal(new_c, old_c))
+                        self.assertTrue(torch.equal(new_u, old_u))
+                        self.assertEqual(new_out.dtype, dtype)
+
+    def test_skim_never_reads_the_mask_back_to_the_host(self):
+        """No ``.any()``/``.item()``/boolean-mask indexing: each of those is a
+        GPU->CPU synchronisation in the per-step post-CFG hook."""
+        getitem = torch.Tensor.__getitem__
+        setitem = torch.Tensor.__setitem__
+
+        def is_mask(key):
+            return torch.is_tensor(key) and key.dtype == torch.bool
+
+        def guarded_getitem(tensor, key):
+            if is_mask(key):
+                raise AssertionError("boolean-mask gather syncs the GPU")
+            return getitem(tensor, key)
+
+        def guarded_setitem(tensor, key, value):
+            if is_mask(key):
+                raise AssertionError("boolean-mask scatter syncs the GPU")
+            return setitem(tensor, key, value)
+
+        def host_sync(*_args, **_kwargs):
+            raise AssertionError("host sync")
+
+        with mock.patch.object(torch.Tensor, "__getitem__", guarded_getitem), \
+                mock.patch.object(torch.Tensor, "__setitem__", guarded_setitem), \
+                mock.patch.object(torch.Tensor, "any", host_sync), \
+                mock.patch.object(torch.Tensor, "item", host_sync), \
+                mock.patch.object(torch.Tensor, "__bool__", host_sync):
+            out = self.skim._skim_predictions(
+                self.x, self.cond, self.uncond, 8.0, 3.0, False
+            )
+        expected = _legacy_skim_predictions(
+            self.x, self.cond, self.uncond, 8.0, 3.0, False
+        )
+        self.assertTrue(torch.equal(out, expected))
 
     def test_predictions_are_not_mutated_in_place(self):
         cond_before = self.cond.clone()

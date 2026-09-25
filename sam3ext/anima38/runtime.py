@@ -2,10 +2,11 @@ from __future__ import annotations
 
 import functools
 import logging
+import sys
 import uuid
 import weakref
 from collections import OrderedDict
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import torch
@@ -17,7 +18,9 @@ from backend import memory_management
 from backend.operations import ForgeOperations, using_forge_operations
 from backend.patcher.clip import CLIP
 
+from . import connector_cache
 from .adapter import ProgressiveCrossAdapter
+from .connector_fp32 import make_connector_patcher
 from .marker import as_rows, read_run_ids, stamp_run_id
 from .files import (
     ARCHITECTURE,
@@ -37,6 +40,44 @@ LAYER_INDICES = (7, 15, 23, 31)
 NATIVE_ADAPTER_PREFIX = "net.llm_adapter."   # 번들 안의 원본 llm_adapter (Forge 는 TE 로 옮겨 쓴다)
 TE_ADAPTER_PATCH_PREFIX = "qwen3_06b.llm_adapter."   # TE 패처(JointTextEncoder) 기준 LoRA 키
 SEMANTIC_CACHE_LINES = 32   # 줄당 수 MB (CPU) — batch count·Feature 6 후보·ADetailer 가 같은 줄을 되풀이한다
+NATIVE_CACHE_LINES = 32     # 줄당 수백 KB (CPU) — 0.6B TE 의 source·T5 토큰·가중치
+DORA_STATE_ATTR = "_sam3_dora_merged_state"   # sam3ext.dora_infer_mode.MERGED_STATE_ATTR (모듈이 없을 때)
+# 샘플링 장치에 올려 둔 run 사본 상한 — batch 8 × (긍정·부정 커넥터). run 당 수 MiB(fp32 의미 특징 4층·source)
+V2_DEVICE_CACHE_RUNS = 16
+# run 별 커넥터 캐시(connector_cache — timestep 무관 K/V·첫 블록) 합계 상한. run 당 fp32 약 15~70 MB(토큰 28~141,
+# 실제 크기) — 긍정·부정 run 2개면 약 30~140 MB. 넘는 run 은 캐시하지 않고 원래 경로와 같은 계산을 한다(값은 같음).
+V2_RUN_CACHE_BYTES = 512 * 1024 * 1024
+# Forge 설정 — TE·Qwen3.5·커넥터를 생성 사이 VRAM 에 남길지 (scripts/anima_3_8b.py 가 같은 이름으로 등록한다)
+OPT_KEEP_RESIDENT = "sam3_anima38_keep_resident"
+# 값이 그대로 보존되는 올림 캐스트 (원래 dtype, 쓰는 dtype)
+_EXACT_UPCASTS = frozenset({
+    (torch.bfloat16, torch.float32),
+    (torch.float16, torch.float32),
+    (torch.bfloat16, torch.float64),
+    (torch.float16, torch.float64),
+    (torch.float32, torch.float64),
+})
+
+
+def _semantic_storage_dtype(produced: torch.dtype, wanted: torch.dtype) -> torch.dtype:
+    """의미 특징 캐시에 둘 dtype. 쓰는 곳(_expand_v2_context·v1 encode)은 늘 wanted 로 다시 캐스트하므로,
+    produced→wanted 가 값이 그대로인 올림이면 produced 로 둔다 — Qwen3.5 는 bf16 로 계산하므로 fp32 로 올려
+    두면 RAM 만 두 배다. 정확하지 않은 캐스트(bf16↔fp16, 내림)는 예전처럼 저장할 때 wanted 로 한 번 한다."""
+    if produced == wanted or (produced, wanted) in _EXACT_UPCASTS:
+        return produced
+    return wanted
+
+
+def keep_resident() -> bool:
+    """TE·Qwen3.5·커넥터를 생성 사이 VRAM 에 남겨도 되는가 (Forge 설정 OPT_KEEP_RESIDENT).
+    설정이 없거나(저장 전·opts 로드 전) Forge 밖(테스트)이면 켜짐 — 지금 동작. 끄면 예전처럼 TE·Qwen3.5 는
+    인코딩 직후, 커넥터는 생성이 끝날 때 내린다. 어느 쪽이든 결과는 같다(VRAM 에 둘지 말지만 다르다)."""
+    try:
+        from modules import shared
+
+        return bool(getattr(shared.opts, OPT_KEEP_RESIDENT, True))
+    except Exception:
+        return True
 
 
 def _outside_inference_mode(load):
@@ -71,6 +112,10 @@ class _V2Run:
     target_weights: torch.Tensor
     semantic: list[torch.Tensor]
     semantic_mask: torch.Tensor
+    # 샘플링 장치 사본 — (장치, dtype) → .to() 결과. 스텝마다 같은 CPU 텐서를 다시 올리지 않는다(값은 .to 그대로).
+    # 위 텐서는 만든 뒤 바뀌지 않고 커넥터도 입력을 제자리 수정하지 않는다. 상한·비우기는 Anima3BRuntime 이 한다.
+    # ("run_cache", …) 키에는 커넥터의 timestep 무관 텐서(connector_cache.RunCache)도 둔다 — 사본과 함께 버려진다.
+    device_copies: dict = field(default_factory=dict, repr=False, compare=False)
 
 
 class Anima3BRuntime:
@@ -87,12 +132,22 @@ class Anima3BRuntime:
         self._v2_models: BundledV2Models | None = None
         self._v2_source = None   # 커넥터를 만든 TE llm_adapter 의 weakref (붙잡지 않는다)
         self._v2_sampling_patcher = None
+        # 커넥터 번들(_v2_models)에 묶인 Forge 패처 — 생성마다 새로 만들지 않고 다시 단다. Forge 의 LoadedModel 은
+        # 패처를 약한 참조로만 쥐므로, 여기서 붙잡아 두어야 생성 사이 GPU 에 남은 커넥터가 '죽은 모델'이 되지 않고
+        # 다음 생성에서 그대로 쓰인다(재적재 없음). 퇴출은 Forge free_memory 가 필요할 때 한다.
+        self._v2_connector_patcher = None
         self._v2_sampling_unets: list = []   # 패처를 단 UNet 의 weakref (설치 동안만 — restore 에서 비운다)
         self._installed_processing = None
         self._installed_model = None   # 설치한 sd_model 의 weakref — 반복 사이 모델 재로드 판별
         self._v2_runs: dict[int, _V2Run] = {}
+        # 장치 사본을 가진 run (id(run) → run, 최근 쓴 순) — V2_DEVICE_CACHE_RUNS 를 넘으면 오래된 사본부터 놓는다.
+        # run id 가 아니라 run 객체에 묶는다: restore 뒤 카운터가 0 부터 다시 세어 같은 id 가 다른 run 이 된다.
+        self._v2_device_runs: OrderedDict[int, _V2Run] = OrderedDict()
         # (Qwen 파일, 줄, dtype) → Qwen3.5 의미 특징. 같은 줄이면 4.45 GiB 모델을 GPU 로 올리지 않는다.
         self._semantic_cache: OrderedDict[tuple, tuple] = OrderedDict()
+        # (TE 상태, 줄) → 0.6B TE 의 (source, target_ids, target_weights). 같은 줄이면 TE(약 1.75 GB)를 GPU 로
+        # 올리지 않는다. TE 상태는 _native_cache_key — 결과를 바꾸는 것(LoRA·DoRA 방식·emphasis …)을 모두 담는다.
+        self._native_cache: OrderedDict[tuple, tuple] = OrderedDict()
         self._v2_run_counter = 0
         # 다른 확장(NegPiP 등)이 같은 속성을 감싸고 비중첩으로 되돌릴 수 있으므로, 우리 패치는
         # "속성 교체" 가 아니라 이 플래그로 켜고 끈다. 꺼진 채 남아 있어도 순정으로 위임한다.
@@ -252,6 +307,119 @@ class Anima3BRuntime:
         if removed:
             memory_management.soft_empty_cache()
 
+    @staticmethod
+    def _same_device(left, right) -> bool:
+        left, right = torch.device(left), torch.device(right)
+        if left.type != right.type:
+            return False
+        return left.index is None or right.index is None or left.index == right.index
+
+    @classmethod
+    def _pending_memory(cls, patcher, device) -> float:
+        """patcher 를 device 에 다 올리려면 더 필요한 바이트 (Forge LoadedModel.model_memory_required 와 같은 셈)."""
+        if patcher is None or not cls._same_device(patcher.load_device, device):
+            return 0.0
+        return max(0.0, float(patcher.model_size()) - float(patcher.loaded_size()))
+
+    def _sampling_reserve(self, device) -> float | None:
+        """다음 샘플링에서 Forge 가 비워 두려 할 VRAM — sampling_prepare → load_models_gpu 의 첫 free_memory 와
+        같은 셈(아직 안 올라간 UNet·커넥터 ×1.1 + 추론 몫). 하이레스면 큰 쪽 해상도. 셀 수 없으면 None."""
+        processing = self._installed_processing
+        unet = getattr(getattr(getattr(processing, "sd_model", None), "forge_objects", None), "unet", None)
+        if unet is None:
+            return None
+        width, height = int(processing.width), int(processing.height)
+        if getattr(processing, "enable_hr", False):
+            width = max(width, int(getattr(processing, "hr_upscale_to_x", 0) or 0))
+            height = max(height, int(getattr(processing, "hr_upscale_to_y", 0) or 0))
+        batch = max(1, int(getattr(processing, "batch_size", 1) or 1))
+        shape = [2 * batch, 16, max(1, height // 8), max(1, width // 8)]
+        inference = float(unet.memory_required(shape)) + float(getattr(unet, "extra_preserved_memory_during_sampling", 0) or 0)
+        extra = max(
+            float(memory_management.minimum_inference_memory()),
+            inference + float(memory_management.extra_reserved_memory()),
+        )
+        pending = sum(
+            self._pending_memory(model, device)
+            for model in (unet, *getattr(unet, "extra_model_patchers_during_sampling", ()))
+        )
+        return pending * 1.1 + extra
+
+    def _release_encoder(self, patcher, upcoming=()) -> None:
+        """인코딩에 쓴 TE·Qwen3.5 를 내릴지 정한다. 다음 샘플링(과 곧 올릴 upcoming)에 Forge 가 확보할 VRAM 이
+        이미 비어 있으면 Forge 의 LoadedModel 로 남겨 둔다 — 다음 인코딩에서 다시 올리지 않고, 자리가 필요해지면
+        Forge free_memory 가 스스로 퇴출한다(순정 TE 와 같은 대우). 모자라거나 셀 수 없으면 예전처럼 바로 내린다.
+        unpatch_weights=False 로 GPU 에 남긴 채 목록에서만 빼는 방식은 Forge 계산 밖 VRAM 이 되므로 쓰지 않는다.
+        설정(keep_resident)을 끄면 여유와 상관없이 예전처럼 바로 내린다 — 같은 GPU 의 학습은 이 판단에 안 보인다."""
+        if patcher is None:
+            return
+        if not keep_resident():
+            self._unload_patchers(patcher)
+            return
+        try:
+            device = patcher.load_device
+            reserve = self._sampling_reserve(device)
+            if reserve is not None:
+                reserve += sum(self._pending_memory(model, device) * 1.1 for model in upcoming)
+                if float(memory_management.get_free_memory(device)) >= reserve:
+                    return
+        except Exception as exc:  # Forge 버전 차이·스텁 — 예전 동작으로
+            logger.debug("[Anima38] VRAM headroom check failed (%s); unloading", exc)
+        self._unload_patchers(patcher)
+
+    def _connector_shares_te(self, native_clip) -> bool:
+        """커넥터가 TE 의 llm_adapter 모듈을 같이 쓰는 폴백(번들에 원본 사본이 없음)인가.
+        그러면 TE 패처와 커넥터 패처가 같은 가중치를 제자리 패치·이동하므로 TE 를 상주시키면 커넥터가
+        TE LoRA 의 llm_adapter 몫이 합쳐진 가중치를 본다 — 이 경우엔 TE 를 예전처럼 매번 내린다."""
+        models = self._v2_models
+        if models is None:
+            return False
+        try:
+            te_adapter = native_clip.cond_stage_model.qwen3_06b.llm_adapter
+        except AttributeError:
+            return False
+        return getattr(models, "native_adapter", None) is te_adapter
+
+    def _release_native(self, native_clip, upcoming=()) -> None:
+        """0.6B TE 를 쓴 뒤 — 공유 폴백이면 예전처럼 곧바로 내리고, 아니면 여유 VRAM 기준(_release_encoder)."""
+        if self._connector_shares_te(native_clip):
+            self._unload_patchers(native_clip.patcher)
+        else:
+            self._release_encoder(native_clip.patcher, upcoming=upcoming)
+
+    @staticmethod
+    def _dora_state(sd_model):
+        """DoRA 추론 방식이 모델에 남긴 '합친 방식' 표시 (sam3ext/dora_infer_mode.py). 없으면 None."""
+        if sd_model is None:
+            return None
+        module = sys.modules.get("sam3ext.dora_infer_mode")
+        return repr(getattr(sd_model, getattr(module, "MERGED_STATE_ATTR", DORA_STATE_ATTR), None))
+
+    def _native_cache_key(self, native_engine, native_clip, dtype, offload_device, sd_model):
+        """TE 줄 캐시 키 — 0.6B TE 출력을 바꾸는 모든 것. None 이면 이번 인코딩은 캐시를 쓰지 않는다.
+
+        - patches_uuid: Forge 는 LoRA 세트가 바뀌면 원본 TE 패처를 복제해 add_patches 로 새 uuid 를 받는다
+          (DoRA 추론 방식 전환도 current_lora_hash=None → 다시 합치기 → 새 uuid). 체크포인트가 바뀌면 새 패처.
+        - current_lora_hash 가 None: LoRA 캐시가 막 무효화됐고 아직 다시 합치지 않았다 — 캐시를 비우고 쓰지 않는다.
+        - DoRA 합치기 방식 표시: dora_infer_mode 가 방식을 바꾸면 다른 키(파일은 건드리지 않고 표시만 읽는다).
+        - emphasis: _native_inputs 는 엔진이 지금 쥔 방식으로 줄을 파싱한다(opts 가 아니라 엔진 상태).
+        """
+        patches_uuid = getattr(getattr(native_clip, "patcher", None), "patches_uuid", None)
+        if patches_uuid is None:
+            return None
+        if sd_model is not None and getattr(sd_model, "current_lora_hash", "") is None:
+            self._native_cache.clear()
+            return None
+        return (
+            patches_uuid,
+            id(native_engine),
+            id(native_clip.cond_stage_model),
+            getattr(getattr(native_engine, "emphasis", None), "name", None),
+            dtype,
+            str(offload_device),
+            self._dora_state(sd_model),
+        )
+
     @_outside_inference_mode
     def _load_qwen(self) -> tuple[Qwen35HybridModel, Qwen35Tokenizer, CLIP]:
         path = self._qwen35_path()
@@ -371,32 +539,11 @@ class Anima3BRuntime:
         ).reshape(1, -1, 1)
         return source.to(device=device, dtype=dtype), target_ids, target_weights
 
-    def _extract_prompt_features(self, native_engine, native_clip, prompt):
+    def _extract_prompt_features(self, native_engine, native_clip, prompt, sd_model=None):
         qwen, tokenizer, qwen_clip = self._load_qwen()
         native_adapter = native_clip.cond_stage_model.qwen3_06b.llm_adapter
         dtype = native_adapter.embed.weight.dtype
         offload_device = native_clip.patcher.offload_device
-
-        native_rows = []
-        memory_management.load_model_gpu(native_clip.patcher)
-        try:
-            device = native_clip.patcher.load_device
-            for line in prompt:
-                source, target_ids, target_weights = self._native_inputs(
-                    native_engine,
-                    str(line),
-                    device,
-                    dtype,
-                )
-                native_rows.append(
-                    (
-                        source.to(offload_device),
-                        target_ids.to(offload_device),
-                        target_weights.to(offload_device),
-                    )
-                )
-        finally:
-            self._unload_patchers(native_clip.patcher)
 
         lines = [str(line) for line in prompt]
         rows: dict[str, tuple] = {}
@@ -406,6 +553,47 @@ class Anima3BRuntime:
                 self._semantic_cache.move_to_end(key)
                 rows[line] = self._semantic_cache[key]
         missing = [line for line in dict.fromkeys(lines) if line not in rows]
+
+        # 0.6B TE 줄 캐시 — 같은 줄·같은 TE 상태면 TE 를 GPU 로 올리지 않는다(예전엔 생성·XYZ 칸마다 왕복)
+        native_key = self._native_cache_key(native_engine, native_clip, dtype, offload_device, sd_model)
+        natives: dict[str, tuple] = {}
+        if native_key is not None:
+            for line in dict.fromkeys(lines):
+                if (native_key, line) in self._native_cache:
+                    self._native_cache.move_to_end((native_key, line))
+                    natives[line] = self._native_cache[(native_key, line)]
+        native_missing = [line for line in dict.fromkeys(lines) if line not in natives]
+        if native_missing:
+            memory_management.load_model_gpu(native_clip.patcher)
+            try:
+                device = native_clip.patcher.load_device
+                for line in native_missing:
+                    source, target_ids, target_weights = self._native_inputs(
+                        native_engine,
+                        line,
+                        device,
+                        dtype,
+                    )
+                    natives[line] = (
+                        source.to(offload_device),
+                        target_ids.to(offload_device),
+                        target_weights.to(offload_device),
+                    )
+                    if native_key is not None:
+                        self._native_cache[(native_key, line)] = natives[line]
+                        while len(self._native_cache) > NATIVE_CACHE_LINES:
+                            self._native_cache.popitem(last=False)
+            except BaseException:
+                self._unload_patchers(native_clip.patcher)   # 실패(OOM 등)면 예전처럼 바로 내린다
+                raise
+            # 곧 Qwen3.5 를 올린다면 그 자리까지 비어 있을 때만 TE 를 남긴다 — Forge 가 DiT 를 밀어내지 않게
+            self._release_native(native_clip, upcoming=(qwen_clip.patcher,) if missing else ())
+        elif self._connector_shares_te(native_clip):
+            # 공유 폴백: 줄 캐시로 TE 를 올리지 않았어도 지난(비 v2) 생성에서 남은 TE 가 LoRA 를 합친 채
+            # 공유 llm_adapter 를 쥐고 있을 수 있다 — 예전처럼 샘플링 전에 내려 커넥터가 원본을 보게 한다
+            self._unload_patchers(native_clip.patcher)
+        native_rows = [natives[line] for line in lines]
+
         if missing:
             memory_management.load_model_gpu(qwen_clip.patcher)
             try:
@@ -418,14 +606,20 @@ class Anima3BRuntime:
                         device,
                     )
                     rows[line] = (
-                        [state.to(offload_device, dtype=dtype) for state in semantic],
+                        # bf16 로 계산된 층은 bf16 그대로 둔다(쓸 때 dtype 으로 정확히 올린다) — _semantic_storage_dtype
+                        [
+                            state.to(offload_device, dtype=_semantic_storage_dtype(state.dtype, dtype))
+                            for state in semantic
+                        ],
                         semantic_mask.to(offload_device),
                     )
                     self._semantic_cache[(self._qwen_path, line, dtype)] = rows[line]
                     while len(self._semantic_cache) > SEMANTIC_CACHE_LINES:
                         self._semantic_cache.popitem(last=False)
-            finally:
+            except BaseException:
                 self._unload_patchers(qwen_clip.patcher)
+                raise
+            self._release_encoder(qwen_clip.patcher)
         return native_adapter, native_rows, [rows[line] for line in lines]
 
     @staticmethod
@@ -599,13 +793,115 @@ class Anima3BRuntime:
         self._v2_runs[self._v2_run_counter] = run
         return self._v2_run_counter
 
-    def _encode_v2(self, native_engine, native_clip, prompt):
+    def _run_on(self, run: _V2Run, device, dtype, weights_dtype=None):
+        """run 텐서의 샘플링 장치 사본 — 처음 한 번만 .to() 하고 이후 스텝은 같은 사본을 쓴다.
+        weights_dtype 를 주면 target_weights 사본만 돌려준다(커넥터 출력 dtype 을 알고 난 뒤)."""
+        if weights_dtype is not None:
+            key = ("weights", device, weights_dtype)
+            copies = run.device_copies.get(key)
+            if copies is None:
+                copies = run.target_weights.to(device, dtype=weights_dtype)
+        else:
+            key = ("inputs", device, dtype)
+            copies = run.device_copies.get(key)
+            if copies is None:
+                copies = (
+                    run.source.to(device, dtype=dtype),
+                    run.target_ids.to(device),
+                    [state.to(device, dtype=dtype) for state in run.semantic],
+                    run.semantic_mask.to(device),
+                )
+        run.device_copies[key] = copies
+        self._v2_device_runs[id(run)] = run
+        self._v2_device_runs.move_to_end(id(run))
+        while len(self._v2_device_runs) > V2_DEVICE_CACHE_RUNS:
+            _, stale = self._v2_device_runs.popitem(last=False)
+            stale.device_copies.clear()
+        return copies
+
+    def _run_cache_token(self):
+        """run 캐시 키의 커넥터 가중치 판별 — 커넥터(번들) 객체 + LoRA 패치 상태. None 이면 캐시하지 않는다.
+
+        공유 폴백(커넥터가 TE 의 llm_adapter 모듈을 같이 씀)은 TE 패처가 같은 모듈에 LoRA 를 합치고 되돌리므로
+        가중치가 커넥터 패처 밖에서 바뀔 수 있다 — 캐시하지 않는다."""
+        models = self._v2_models
+        if models is None:
+            return None
+        native = getattr(models, "native_adapter", None)
+        source = self._v2_source() if self._v2_source is not None else None
+        if native is None or native is source:
+            return None
+        token = getattr(models, "_sam3_run_cache_token", None)
+        if token is None:
+            token = object()   # id() 재사용과 무관한 커넥터 정체
+            object.__setattr__(models, "_sam3_run_cache_token", token)
+        patcher = self._v2_sampling_patcher or self._v2_connector_patcher
+        # patches_uuid: _sync_adapter_lora 가 llm_adapter LoRA 를 옮기면 바뀐다. current_weight_patches_uuid: Forge 가
+        # 실제로 합쳐 올린 패치(ModelPatcher.load 가 적는다) — 둘 중 하나라도 바뀌면 다른 키
+        return (token, getattr(patcher, "patches_uuid", None), getattr(models, "current_weight_patches_uuid", None))
+
+    def _run_cache_bytes(self) -> int:
+        total = 0
+        for run in self._v2_device_runs.values():
+            for key, value in run.device_copies.items():
+                if key[0] == "run_cache":
+                    total += value.nbytes
+        return total
+
+    def _connector_run_cache(self, connector, run: _V2Run, device, dtype, inputs, source_mask):
+        """run 의 timestep 무관 텐서(connector_cache.RunCache) — 첫 스텝에 만들어 run 의 장치 사본 곁에 두고 이후
+        스텝은 재사용한다(사본과 함께 버려진다: LRU·restore·install·모델 로드). 쓸 수 없으면 None — 원래 forward."""
+        if not isinstance(connector, torch.nn.Module) or not connector_cache.run_cache_enabled():
+            return None
+        if not connector_cache.global_hooks_clear():
+            return None
+        token = self._run_cache_token()
+        if token is None:
+            return None
+        key = ("run_cache", device, dtype, int(inputs[1].shape[0]), token)
+        cached = run.device_copies.get(key)
+        if cached is not None:
+            return cached
+        if not connector_cache.supports(connector):
+            return None
+        for stale in [name for name in run.device_copies if name[0] == "run_cache" and name[4] != token]:
+            del run.device_copies[stale]   # 가중치(LoRA)·커넥터가 바뀐 옛 캐시 — 행 수만 다른 것은 둔다(배치 분할)
+        cached = connector_cache.prepare(connector, *inputs, semantic_source_mask=source_mask)
+        if self._run_cache_bytes() + cached.nbytes <= V2_RUN_CACHE_BYTES:
+            run.device_copies[key] = cached
+        return cached
+
+    def _drop_run_device_copies(self) -> None:
+        for run in self._v2_device_runs.values():
+            run.device_copies.clear()
+        self._v2_device_runs.clear()
+
+    def _clear_v2_runs(self) -> None:
+        self._drop_run_device_copies()
+        self._v2_runs.clear()
+
+    @staticmethod
+    def _select_rows(values: torch.Tensor, rows: list[int]) -> torch.Tensor:
+        """values[rows] 와 같은 값 — 오름차순 등간격(대부분: 한 행·연속 행·CFG 교차)이면 슬라이스로 동기화 없이,
+        아니면 인덱스 텐서로 (그때만 작은 H2D)."""
+        start = rows[0]
+        step = rows[1] - start if len(rows) > 1 else 1
+        if all(right - left == step for left, right in zip(rows, rows[1:])):
+            picked = values[start : rows[-1] + 1 : step]
+            return picked if step == 1 else picked.contiguous()
+        return values[torch.tensor(rows, dtype=torch.long, device=values.device)]
+
+    def _encode_v2(self, native_engine, native_clip, prompt, sd_model=None):
         self._sync_adapter_lora(native_clip)
         _, native_rows, semantic_rows = self._extract_prompt_features(
             native_engine,
             native_clip,
             prompt,
+            sd_model=sd_model,
         )
+        # 자리표시는 순정 Anima 조건처럼 TE 장치(text_encoder_device)에 둔다 — CPU 에 두면 Forge process_cond 가
+        # 스텝마다 줄당 수 MiB 를 다시 올린다. 값은 .to 복사 그대로다. 장치를 모르면 예전처럼 source 장치.
+        cond_device = getattr(getattr(native_clip, "patcher", None), "load_device", None)
         placeholders = []
         run_ids = []
         for native, semantic in zip(native_rows, semantic_rows):
@@ -628,7 +924,8 @@ class Anima3BRuntime:
                 )
             # 줄마다 텐서 하나 — Forge 네이티브 계약. run id 는 마지막 토큰 행의 마커로 실어
             # 보내므로 NegPiP 처럼 이 함수를 감싸 list 를 기대하는 확장과도 함께 돈다.
-            placeholders.append(stamp_run_id(placeholder, run_id))
+            stamped = stamp_run_id(placeholder, run_id)
+            placeholders.append(stamped if cond_device is None else stamped.to(cond_device))
             run_ids.append(run_id)
         return placeholders
 
@@ -637,14 +934,22 @@ class Anima3BRuntime:
         context: torch.Tensor,
         timesteps: torch.Tensor,
         run_ids: torch.Tensor,
+        ids: list[int] | None = None,
     ) -> torch.Tensor:
+        """ids: run_ids(long) 를 이미 .tolist() 한 목록 — forward 가 넘기면 여기서 다시 동기화하지 않는다.
+        run 묶기는 이 목록으로만 한다(예전: unique·nonzero·tolist 로 run 마다 GPU 동기화)."""
         if self._v2_models is None:
             raise RuntimeError("The anima.3-8B-v2 connector is not loaded.")
         connector = self._v2_models.connector
-        flat_ids = run_ids.reshape(-1).to(dtype=torch.long)
-        if flat_ids.numel() != context.shape[0]:
-            repeats = (context.shape[0] + flat_ids.numel() - 1) // flat_ids.numel()
-            flat_ids = flat_ids.repeat(repeats)[: context.shape[0]]
+        if ids is None:
+            ids = run_ids.reshape(-1).to(dtype=torch.long).tolist()
+        batch = context.shape[0]
+        if len(ids) != batch:
+            repeats = (batch + len(ids) - 1) // len(ids)
+            ids = (list(ids) * repeats)[:batch]
+        positions: dict[int, list[int]] = {}
+        for row_index, run_id in enumerate(ids):
+            positions.setdefault(int(run_id), []).append(row_index)
         timestep_rows = timesteps.reshape(-1)
         if timestep_rows.numel() != context.shape[0]:
             repeats = (
@@ -654,37 +959,36 @@ class Anima3BRuntime:
 
         outputs: list[torch.Tensor | None] = [None] * context.shape[0]
         dtype = self._v2_models.native_adapter.embed.weight.dtype
-        for run_id in flat_ids.unique().tolist():
-            if int(run_id) < 0:
+        for run_id in sorted(positions):   # 예전 unique() 와 같은 오름차순
+            indices = positions[run_id]
+            if run_id < 0:
                 # 마커 없는 행(네거티브 프롬프트 등 순정 경로)은 그대로 둔다
-                for row_index in (flat_ids == run_id).nonzero(as_tuple=False).reshape(-1).tolist():
+                for row_index in indices:
                     outputs[row_index] = context[row_index : row_index + 1]
                 continue
-            run = self._v2_runs.get(int(run_id))
+            run = self._v2_runs.get(run_id)
             if run is None:
                 raise RuntimeError(
                     f"Anima v2 conditioning run {run_id} is unavailable; "
                     "re-encode the prompt."
                 )
-            indices = (flat_ids == run_id).nonzero(as_tuple=False).reshape(-1)
-            count = indices.numel()
-            source = run.source.to(context.device, dtype=dtype).expand(count, -1, -1)
-            target_ids = run.target_ids.to(context.device).expand(count, -1)
-            semantic = [
-                state.to(context.device, dtype=dtype).expand(count, -1, -1)
-                for state in run.semantic
-            ]
-            semantic_mask = run.semantic_mask.to(context.device).expand(count, -1)
-            expanded = connector(
-                source,
-                target_ids,
-                semantic,
-                semantic_source_mask=semantic_mask,
-                timesteps=timestep_rows[indices].to(context.device),
+            count = len(indices)
+            source, target_ids, semantic, semantic_mask = self._run_on(run, context.device, dtype)
+            inputs = (
+                source.expand(count, -1, -1),
+                target_ids.expand(count, -1),
+                [state.expand(count, -1, -1) for state in semantic],
             )
-            weights = run.target_weights.to(
-                context.device,
-                dtype=expanded.dtype,
+            source_mask = semantic_mask.expand(count, -1)
+            steps = self._select_rows(timestep_rows, indices).to(context.device)
+            # timestep 무관 계산은 run 마다 첫 스텝에 한 번 — 같은 연산을 캐시로 건너뛸 뿐이라 값은 같다
+            cached = self._connector_run_cache(connector, run, context.device, dtype, inputs, source_mask)
+            if cached is not None:
+                expanded = connector_cache.forward(connector, cached, steps)
+            else:
+                expanded = connector(*inputs, semantic_source_mask=source_mask, timesteps=steps)
+            weights = self._run_on(
+                run, context.device, dtype, weights_dtype=expanded.dtype,
             ).expand(count, -1, -1)
             expanded = expanded * weights[:, : expanded.shape[1]]
             if expanded.shape[1] < 512:
@@ -692,26 +996,9 @@ class Anima3BRuntime:
                     expanded,
                     (0, 0, 0, 512 - expanded.shape[1]),
                 )
-            for output_index, row_index in enumerate(indices.tolist()):
+            for output_index, row_index in enumerate(indices):
                 outputs[row_index] = expanded[output_index : output_index + 1]
         return torch.cat(outputs).to(dtype=context.dtype)
-
-    @staticmethod
-    def _offload_conditioning(value, device):
-        if isinstance(value, torch.Tensor):
-            return value.to(device)
-        if isinstance(value, list):
-            return [Anima3BRuntime._offload_conditioning(item, device) for item in value]
-        if isinstance(value, tuple):
-            return tuple(
-                Anima3BRuntime._offload_conditioning(item, device) for item in value
-            )
-        if isinstance(value, dict):
-            return {
-                key: Anima3BRuntime._offload_conditioning(item, device)
-                for key, item in value.items()
-            }
-        return value
 
     @torch.inference_mode()
     def encode(
@@ -730,23 +1017,24 @@ class Anima3BRuntime:
 
         if strength is None or strength == 0.0:
             try:
+                # 순정 Anima 처럼 TE 장치에 둔 채 돌려준다 — CPU 로 내리면 Forge process_cond 가 스텝마다 다시 올린다
                 result = original(prompt)
-                return self._offload_conditioning(
-                    result,
-                    native_clip.patcher.offload_device,
-                )
-            finally:
+            except BaseException:
                 self._unload_patchers(native_clip.patcher)
+                raise
+            self._release_native(native_clip)
+            return result
 
         if not is_negative:
             self._hand_off_native_reference(sd_model)
         if self._active_bundle_metadata is not None:
-            return self._encode_v2(native_engine, native_clip, prompt)
+            return self._encode_v2(native_engine, native_clip, prompt, sd_model=sd_model)
 
         native_adapter, native_rows, semantic_rows = self._extract_prompt_features(
             native_engine,
             native_clip,
             prompt,
+            sd_model=sd_model,
         )
         memory_management.load_model_gpu(native_clip.patcher)
         try:
@@ -783,9 +1071,11 @@ class Anima3BRuntime:
                         (0, 0, 0, 512 - expanded.shape[1]),
                     )
                 outputs.append(expanded.to(native_clip.patcher.offload_device))
-            return outputs
-        finally:
+        except BaseException:
             self._unload_patchers(native_clip.patcher)
+            raise
+        self._release_native(native_clip)
+        return outputs
 
     def _install_v2(
         self,
@@ -795,14 +1085,53 @@ class Anima3BRuntime:
     ) -> None:
         models = self._load_v2_models(processing.sd_model, path, metadata)
         unet = processing.sd_model.forge_objects.unet
-        self._v2_sampling_patcher = unet.add_extra_torch_module_during_sampling(
-            models,
-            cast_to_unet_dtype=False,
-        )
+        patcher = self._v2_connector_patcher
+        if patcher is None or getattr(patcher, "model", None) is not models:
+            # 커넥터를 새로 만들었다(첫 설치·다른 번들·다른 모델) — 옛 커넥터의 패처는 Forge 목록에서 내린다
+            self._drop_connector_patcher()
+            # 샘플링 동안 fp32 상주(connector_fp32 — 스텝마다 bf16→fp32 캐스트·스트림 대기 없음, 값은 같음).
+            # 공유 폴백이면 TE 모듈(native_adapter.*)은 TE 패처 몫이라 바꾸지 않는다. Forge UNet 이 아니면 예전 방식.
+            source = self._v2_source() if self._v2_source is not None else None
+            shared = getattr(models, "native_adapter", None) is source and source is not None
+            patcher = make_connector_patcher(unet, models, skip_prefixes=("native_adapter.",) if shared else ())
+            if patcher is None:
+                patcher = unet.add_extra_torch_module_during_sampling(
+                    models,
+                    cast_to_unet_dtype=False,
+                )
+            self._v2_connector_patcher = patcher
+        sync = getattr(patcher, "sync_fp32_setting", None)
+        if sync is not None:
+            sync()   # 설정을 껐으면 지난 생성에서 바꿔 둔 fp32 를 원래 dtype 으로 되돌린다
+        # 같은 커넥터면 지난 생성의 패처를 그대로 단다 — Forge 가 아직 GPU 에 두고 있으면 다시 올리지 않는다
+        self._v2_sampling_patcher = patcher
         self._v2_sampling_unets = []
         self._attach_sampling_patcher(processing.sd_model)
         self._v2_active = True
-        self._wrap_forward(unet.model.diffusion_model)
+        self._wrap_forward(self._real_dit(processing.sd_model))
+
+    @classmethod
+    def _real_dit(cls, sd_model):
+        """감쌀 DiT — Forge 객체 패치 전의 원본.
+
+        IP-Adapter 잡은 샘플링 UNet 클론에 ``diffusion_model`` 객체 패치(껍데기 DiT)를 건다. Forge 는 적재 때
+        그 패치를 공유 KModel 에 걸고 원본을 클론끼리 공유하는 ``object_patches_backup`` 에 두며, 다른 클론으로
+        바뀔 때는 detach(unpatch_all=False) 라 되돌리지 않는다 — 다음 UNet 적재(partially_load → unpatch_model)
+        에서야 원본이 돌아온다. 그래서 IP 잡 뒤 다음 샘플링 전까지는 ``model.diffusion_model`` 이 지난 잡의
+        껍데기다. 거기에 래퍼를 걸면 진짜 DiT 에는 커넥터가 없어 조건 확장이 조용히 빠진다. 객체 패치가 걸려
+        있으면 backup 의 원본을, 아니면 지금 속성을 쓴다(패치가 없을 때의 대상은 예전과 같다).
+        ``get_model_object`` 는 쓰지 않는다 — IP 클론에서 부르면 껍데기를 돌려준다."""
+        unet = sd_model.forge_objects.unet
+        model = getattr(unet, "model", None)
+        for owner in cls._unet_slots(sd_model):
+            if getattr(owner, "model", None) is not model:
+                continue   # 다른 KModel 의 backup 은 이 DiT 와 무관하다
+            backup = getattr(owner, "object_patches_backup", None)
+            if isinstance(backup, dict):
+                original = backup.get("diffusion_model")
+                if original is not None:
+                    return original
+        return model.diffusion_model
 
     def _attach_sampling_patcher(self, sd_model) -> None:
         """LoRA 세트가 바뀌면 Forge 는 forge_objects_original.unet 을 복제해 새 UNet 으로 샘플링한다 (설치가
@@ -843,8 +1172,15 @@ class Anima3BRuntime:
                 rows = as_rows(context)
                 if run_ids is None:
                     run_ids = read_run_ids(rows)
-                if bool((run_ids >= 0).any()):
-                    expanded = self._expand_v2_context(rows, timesteps, run_ids)
+                # 이 forward 에서 GPU→CPU 동기화는 이 한 번 — 확장 여부와 run 묶기를 모두 이 목록으로 한다
+                ids = run_ids.reshape(-1).tolist()
+                if any(value >= 0 for value in ids):
+                    expanded = self._expand_v2_context(
+                        rows,
+                        timesteps,
+                        run_ids,
+                        ids=ids if run_ids.dtype == torch.long else None,   # 옛 y 경로(실수)는 long 으로 다시 읽는다
+                    )
                     negpip_mask = kwargs.get("c_negpip_mask")
                     if negpip_mask is not None:
                         # NegPiP 는 조건 텐서에 ±1 을 곱해 두고(K 부호) 어텐션에서 V 에 한 번 더 곱한다.
@@ -880,7 +1216,7 @@ class Anima3BRuntime:
         self._installed_model = self._weak(processing.sd_model)
         self._active_bundle_path = checkpoint_path if metadata is not None else None
         self._active_bundle_metadata = metadata
-        self._v2_runs.clear()
+        self._clear_v2_runs()   # 장치 사본(VRAM)도 함께 놓는다
 
         sd_model = processing.sd_model
         if metadata is not None:
@@ -968,7 +1304,25 @@ class Anima3BRuntime:
             self._wrap_conditioning(sd_model)
         if self._v2_active and self._v2_sampling_patcher is not None:
             self._attach_sampling_patcher(sd_model)
-            self._wrap_forward(sd_model.forge_objects.unet.model.diffusion_model)
+            self._wrap_forward(self._real_dit(sd_model))
+
+    def release_foreign_install(self, processing, on_error=None):
+        """다른 생성의 설치가 켜진 채 남아 있으면 먼저 내린다 — 설치 순서의 첫 단계(스크립트·Feature 6 공용).
+
+        샘플링 중 예외로 끝난 생성은 postprocess 가 안 불려 설치가 남는다. 런타임은 프로세스에 하나이고
+        txt2img·img2img 스크립트 인스턴스와 Feature 6 가 같이 쓰므로, 이번 생성이 Bypass·꺼짐·순정이라도
+        그 설치를 모르고 v2 로 돌지 않게 여기서 내린다. 내린(내리려 한) processing 을 주고, 없으면 None.
+        ``on_error`` 를 주면 restore 예외를 그쪽으로 넘기고 계속한다(주지 않으면 그대로 올린다)."""
+        stale = self._installed_processing
+        if stale is None or stale is processing:
+            return None
+        try:
+            self.restore(stale)
+        except Exception as exc:
+            if on_error is None:
+                raise
+            on_error(exc)
+        return stale
 
     @classmethod
     def _require_encoder_files(cls, v1_adapter_name: str | None) -> None:
@@ -991,6 +1345,13 @@ class Anima3BRuntime:
                 unets.append(unet)
         return unets
 
+    def _drop_connector_patcher(self) -> None:
+        """커넥터 번들이 바뀌거나 풀릴 때만 — 그 패처를 Forge 목록에서 내리고 놓는다."""
+        patcher = self._v2_connector_patcher
+        self._v2_connector_patcher = None
+        if patcher is not None:
+            self._unload_patchers(patcher)
+
     def release_stale_caches(self, sd_model) -> None:
         """다른 모델이 로드되면 이전 모델의 llm_adapter 에 묶인 커넥터·v1 어댑터를 놓는다 (on_model_loaded).
         Qwen3.5 는 체크포인트와 무관해 그대로 캐시한다 — XYZ 로 3.8B 를 오갈 때 4.8 GB 를 다시 읽지 않게."""
@@ -999,10 +1360,14 @@ class Anima3BRuntime:
         except AttributeError:
             native_adapter = None
         source = self._v2_source() if self._v2_source is not None else None
+        # run 의 장치 사본은 다시 만들 수 있는 캐시다 — 모델 로드 때 VRAM 을 돌려준다(run 자체는 하이레스 패스가 쓴다)
+        self._drop_run_device_copies()
         if source is None or source is not native_adapter:
             self._v2_models = None
             self._v2_key = None
             self._v2_source = None
+            self._drop_connector_patcher()
+            self._native_cache.clear()   # 이전 모델 TE 의 줄 (patches_uuid 가 달라 적중하지도 않는다 — RAM 만 놓는다)
         if getattr(self._adapter, "native_adapter", None) is not native_adapter:
             self._adapter = None
             self._adapter_key = None
@@ -1016,7 +1381,8 @@ class Anima3BRuntime:
         self._cond_active = False
         self._cond_params = None
         self._v2_active = False
-        if self._v2_sampling_patcher is not None:
+        sampling = self._v2_sampling_patcher
+        if sampling is not None:
             owners = [owner for owner in (ref() for ref in self._v2_sampling_unets) if owner is not None]
             # 설치 뒤 생긴 LoRA 복제본도 같은 패처를 복사해 갔다 — 지금 모델의 UNet 자리들도 비운다
             for unet in self._unet_slots(model):
@@ -1028,14 +1394,41 @@ class Anima3BRuntime:
                     for patcher in owner.extra_model_patchers_during_sampling
                     if patcher is not self._v2_sampling_patcher
                 ]
-            self._unload_patchers(self._v2_sampling_patcher)
+            # 목록에서 떼기만 한다 — 강제 언로드하면 다음 생성에서 커넥터(약 1.6 GB)를 다시 올린다. 패처는
+            # _v2_connector_patcher 가 붙잡고 있어 Forge LoadedModel 이 살아 있고, 자리가 필요하면 Forge 가 퇴출한다.
+        connector = self._v2_connector_patcher
+        release = []
+        if sampling is not None and sampling is not connector and not self._same_patcher(sampling, connector):
+            # 고아: 설치 도중 on_model_loaded(release_stale_caches)가 커넥터 패처를 놓아 다음 설치가 재사용하지 않는
+            # 패처. 그 뒤 샘플링이 다시 올렸을 수 있고 쥐는 곳이 없으니 예전처럼 내린다. 재사용 패처(와 그 복제 —
+            # 내리면 Forge 가 같은 모듈의 재사용 패처까지 내린다)는 위처럼 떼기만 한다.
+            release.append(sampling)
+        source = self._v2_source() if self._v2_source is not None else None
+        if (
+            connector is not None
+            and source is not None
+            and getattr(getattr(connector, "model", None), "native_adapter", None) is source
+        ):
+            # 공유 폴백(커넥터가 TE llm_adapter 모듈을 같이 씀): 생성 사이 상주하면 다음 인코딩의 TE 적재·언로드가
+            # 공유 모듈을 옮겨 '적재됨' 커넥터와 장치가 어긋난다 — 예전처럼 내린다(패처는 재사용하려고 쥐고 있는다)
+            release.append(connector)
+        if installed_processing is not None and not keep_resident():
+            # 설정으로 상주를 껐다 — 예전처럼 생성이 끝나면 커넥터를 내린다. 켜 둔 동안 남은 Qwen3.5·TE(설치한
+            # 모델의 것)도 함께 — 줄 캐시가 적중하면 인코딩에서 올리지 않아 거기서는 내려지지 않는다.
+            installed = self._installed_model() if self._installed_model is not None else None
+            te = getattr(getattr(getattr(installed, "forge_objects", None), "clip", None), "patcher", None)
+            release.extend((connector, getattr(self._qwen_clip, "patcher", None), te))
+        release = [patcher for index, patcher in enumerate(release)
+                   if patcher is not None and not any(patcher is seen for seen in release[:index])]
+        if release:
+            self._unload_patchers(*release)   # 패처 객체는 쥔 채로 — 다음 설치가 다시 단다
         self._v2_sampling_patcher = None
         self._v2_sampling_unets = []
         self._installed_processing = None
         self._installed_model = None
         self._active_bundle_path = None
         self._active_bundle_metadata = None
-        self._v2_runs.clear()
+        self._clear_v2_runs()   # 장치 사본(VRAM)도 함께 놓는다 — 아래에서 run id 를 0 부터 다시 센다
         self._v2_run_counter = 0   # 마커 20비트 한도 — 캐시를 비웠으니 0 부터 다시
         self._reset_cond_caches(processing)
         if installed_processing is not None and installed_processing is not processing:

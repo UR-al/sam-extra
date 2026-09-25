@@ -32,8 +32,18 @@ def _reclaim_vram() -> None:
     base 생성 + ADetailer 검출 + SAM3 검출 사이클을 거치며 PyTorch
     예약 캐시가 단편화돼, 인페인트용 KModel reload 시 가용 VRAM이
     수 GB 부족해지는 현상(16GB GPU에서 6.9GB까지 떨어짐) 완화.
-    torch.cuda.empty_cache() + Forge devices.torch_gc() 둘 다 시도.
+
+    Forge 의 devices.torch_gc() 는 곧 backend.memory_management.soft_empty_cache()
+    (synchronize → empty_cache → ipc_collect)라 한 번이면 된다. 예전엔 torch 직접 호출 +
+    torch_gc + soft_empty_cache 로 같은 회수를 세 번 했다(기존 L78, 2·3번째는 no-op).
+    torch_gc 가 없거나 실패하면 torch 로 직접 비운다.
     """
+    try:
+        if _devices is not None and hasattr(_devices, "torch_gc"):
+            _devices.torch_gc()
+            return
+    except Exception:
+        pass
     try:
         import torch
         if torch.cuda.is_available():
@@ -41,20 +51,22 @@ def _reclaim_vram() -> None:
             torch.cuda.ipc_collect()
     except Exception:
         pass
-    try:
-        if _devices is not None and hasattr(_devices, "torch_gc"):
-            _devices.torch_gc()
-    except Exception:
-        pass
-    try:  # Forge backend memory_management (있으면 더 강력)
-        from backend import memory_management as _mm
-        if hasattr(_mm, "soft_empty_cache"):
-            _mm.soft_empty_cache()
-    except Exception:
-        pass
 
 
 SCRIPT_EXCLUDE_FILENAMES = frozenset({"!sam3", "sam3_mask"})
+
+
+def is_oom(exc: BaseException) -> bool:
+    """CUDA OOM 판정 — Forge 의 backend.memory_management.is_oom 이 이미 import 돼 있으면 그것을, 없으면(테스트)
+    메시지로. 여기서 새로 import 하지 않는다(CUDA 를 건드리지 않게)."""
+    memory_management = sys.modules.get("backend.memory_management")
+    checker = getattr(memory_management, "is_oom", None)
+    if callable(checker):
+        try:
+            return bool(checker(exc))
+        except Exception:
+            pass
+    return "out of memory" in str(exc).lower()
 
 
 # Maps the user-facing inpainting_fill label (matches webui's img2img
@@ -185,6 +197,20 @@ def get_seed(p, args: dict[str, Any]) -> int:
     return getattr(p, "seed", -1) if p is not None else -1
 
 
+def _pin_seed(p2, seed, subseed, subseed_strength, seed_resize_from_h, seed_resize_from_w) -> None:
+    """``p2.script_args`` 를 대입하면 Forge 내장 Seed 스크립트(modules/processing_scripts/seed.py)의 setup 이
+    즉시 돌아 ``p2.seed``·subseed·seed resize 를 그 스크립트 칸 값으로 덮어쓴다. 칸에는 txt2img UI 의 시드 입력이
+    들어 있어(API 호출이면 기본값 -1) 인페인트 패스의 시드가 바깥 생성의 시드와 달라지고, -1 이면 매번 무작위라
+    같은 설정·시드로 다시 생성해도 SAM3 가 고친 부분이 매번 달랐다. 샘플러 칸(override_sampler_script_slot)과
+    같은 이유로, 대입 뒤에 의도한 값을 다시 적는다(🎯 빠른 버튼은 apply_quick_pass_settings 에서 이미 이렇게 한다).
+    """
+    p2.seed = seed
+    p2.subseed = subseed
+    p2.subseed_strength = subseed_strength
+    p2.seed_resize_from_h = seed_resize_from_h
+    p2.seed_resize_from_w = seed_resize_from_w
+
+
 def get_noise_multiplier(p, args: dict[str, Any]) -> float:
     if args.get("sam3_use_noise_multiplier"):
         return float(args.get("sam3_noise_multiplier", 1.0))
@@ -262,8 +288,19 @@ def build_i2i(p, image: Image.Image, args: dict[str, Any]) -> StableDiffusionPro
     p2._sam3_base_sampler = sampler_name
     p2._sam3_base_scheduler = version_args.get("scheduler", getattr(p, "scheduler", None))
     p2.scripts, p2.script_args = script_filter(p)
+    _pin_seed(
+        p2,
+        seed,
+        getattr(p, "subseed", -1),
+        getattr(p, "subseed_strength", 0),
+        getattr(p, "seed_resize_from_h", 0),
+        getattr(p, "seed_resize_from_w", 0),
+    )
     p2._sam3_inner = True
     p2._sam3_outer = p   # Anima 3.8B 스크립트가 바깥 생성의 설치를 물려받는 표시
+    # 내부 인페인트 패스는 SAM3 만 돈다 — ADetailer(!adetailer.py 는 _ad_disabled 가 없으면 정상 실행)가
+    # 마스크마다 또 돌고 바깥 생성에서도 한 번 더 도는 것을 막는다. 예전엔 🎯 빠른 버튼 경로만 껐다.
+    p2._ad_disabled = True
     if getattr(p, "_sam3_quick", False):
         from .quick_button import apply_quick_pass_settings
 
@@ -484,6 +521,7 @@ def build_standalone_i2i(
     p2._sam3_base_scheduler = version_args.get("scheduler", None)
     p2.scripts = scripts_runner
     p2.script_args = script_args
+    _pin_seed(p2, seed, -1, 0, 0, 0)
     p2._sam3_inner = True
     p2.all_hr_prompts = [""]
     p2.all_hr_negative_prompts = [""]
@@ -797,8 +835,6 @@ def run_sam3_refine(
 
     Returns ``[]`` when SAM3 finds nothing or every pass is interrupted.
     """
-    from .core import run_sam3_on_pil, unload_sam3
-
     # Standalone refine always overrides the t2i sampler/steps/scheduler/seed
     # — there's no parent process to inherit from. Set the use_* flags so
     # override_sampler_script_slot patches all three ScriptSampler slots.
@@ -819,6 +855,58 @@ def run_sam3_refine(
 
     allow_huggingface = not getattr(shared.cmd_opts, "sam3_no_huggingface", False)
 
+    # Whatever happens below (detection error, OOM, a pass raising), leave
+    # shared.state the way the caller's job set it up — a stale
+    # "SAM3 Refine: ..." textinfo/job would otherwise stay on the progress
+    # bar until the next Generate.
+    prev_job = shared.state.job
+    prev_job_count = shared.state.job_count
+    try:
+        return _run_sam3_refine_passes(
+            image,
+            args,
+            user_mask=user_mask,
+            scripts_runner=scripts_runner,
+            script_args_template=script_args_template,
+            allow_huggingface=allow_huggingface,
+            sd_model=sd_model,
+            outpath_samples=outpath_samples,
+            outpath_grids=outpath_grids,
+            override_settings=override_settings,
+        )
+    except Exception as exc:
+        # 검출·인페인트 도중 실패 — 성공 경로의 unload(검출 직후)를 못 지났으면 3.5GB 번들이 VRAM 에 남는다.
+        if args.get("sam3_unload_after") or is_oom(exc):
+            try:
+                from .core import describe_unload, unload_sam3
+
+                kept = unload_sam3()
+                print(f"[-] SAM3 Refine: {describe_unload(bool(kept), after_failure=True)}", file=sys.stderr)
+            except Exception:
+                traceback.print_exc(file=sys.stderr)
+        raise
+    finally:
+        shared.state.textinfo = ""
+        shared.state.job = prev_job
+        shared.state.job_count = prev_job_count
+
+
+def _run_sam3_refine_passes(
+    image: Image.Image,
+    args: dict[str, Any],
+    *,
+    user_mask,
+    scripts_runner,
+    script_args_template,
+    allow_huggingface: bool,
+    sd_model,
+    outpath_samples: str,
+    outpath_grids: str,
+    override_settings: dict[str, Any] | None,
+) -> list[tuple[Image.Image, str]]:
+    """Body of ``run_sam3_refine``; the wrapper restores ``shared.state``."""
+    from .core import run_sam3_on_pil, unload_sam3
+
     shared.state.textinfo = "SAM3 Refine: running detection..."
     sam3_result = run_sam3_on_pil(
         image=image,
@@ -835,8 +923,10 @@ def run_sam3_refine(
     )
 
     if args.get("sam3_unload_after"):
-        unload_sam3()
-        print("[-] SAM3 Refine: model unloaded from VRAM (re-loads on next detection).", file=sys.stderr)
+        from .core import describe_unload
+
+        kept = unload_sam3()
+        print(f"[-] SAM3 Refine: {describe_unload(bool(kept))}", file=sys.stderr)
 
     masks_source = sam3_result.masks if args.get("sam3_mask_mode") == "Individual" else None
     masks = [sam3_result.mask] if not masks_source else masks_source
@@ -981,7 +1071,6 @@ def run_sam3_refine(
             print(f"[-] SAM3 Refine: pass {index} completed.", file=sys.stderr)
             shared.state.textinfo = f"SAM3 Refine: pass {index}/{len(masks)} — done"
 
-    shared.state.textinfo = ""
     return results
 
 

@@ -33,7 +33,7 @@ SAM3 처리 모듈은 초기화하지 않고 `sam3ext.guidance`의 경량 수학
 ## 실제 처리 순서
 
 ```text
-shared.state.sampling_step / sampling_steps
+shared.state.sampling_step / sampling_steps (한 스텝 지연 — 아래 참고)
   → model wrapper: ADG cond-only 또는 PAG/SEG/SLG weak-row 확장
   → Anima block: CLIP modulation AdaLN 가산 → original forward → DAVE
                  → SLG weak-row restore
@@ -50,8 +50,17 @@ shared.state.sampling_step / sampling_steps
 
 - `sampler_cfg_function` 슬롯은 사용하지 않습니다.
 - `model_function_wrapper`와 `post_cfg_function`은 현재 `forge_objects.unet.clone()`에만 붙습니다.
-- step 비율은 wrapper 호출 횟수가 아니라 Forge의 공식 sampling step을 읽습니다. low-VRAM 분할,
-  regional conditioning, 2차 sampler가 범위 계산을 오염시키지 않습니다.
+- step 비율은 wrapper 호출 횟수가 아니라 Forge의 `shared.state.sampling_step`을 읽습니다. low-VRAM 분할,
+  regional conditioning, 2차 sampler가 범위 계산을 오염시키지 않습니다. 다만 Forge는 이 값을 그 스텝의 모델 호출
+  **뒤**에 올리므로, PAG/SEG/SLG·DAVE·Adaptive Guidance·Skimmed CFG의 Start/End 구간은 **한 스텝 늦게** 판정됩니다
+  (20 steps에서 5%만큼). Detail Daemon은 denoiser가 넘기는 자체 스텝 번호를 써서 이 지연이 없으므로, 두 기능의 %
+  값이 같아도 시작 스텝은 하나 어긋날 수 있습니다.
+- Perturbation Guidance(PAG/SEG/SLG)는 cond 행 사본(weak 행)을 배치에 덧붙여 한 forward로 돌리므로, 켜 둔
+  구간에서는 샘플링 배치가 cond/uncond에 weak 행만큼 커져 활성 VRAM과 스텝 시간이 늘어납니다(PAG 하나면 대략 1.5배
+  행 수, 첫 target 블록 앞은 `sam3_guidance_pag_prefix_dedup`이 줄여 줌).
+- `model_function_wrapper`는 하나만 둘 수 있습니다. 다른 확장이 이미 wrapper를 달아 두었으면 Suite가 그 생성 동안
+  자기 것으로 덮어쓰고 콘솔에 한 번 알립니다(`another extension already installed a unet model_function_wrapper …`).
+  그 확장의 wrapper 기능은 그 생성에서 빠집니다.
 - CFG base를 바꾸는 모드는 Forge의 incoming 결과에서 `w_eff`를 최소제곱으로 복원하므로
   `edit_strength`가 소실되지 않습니다. custom/nonlinear CFG의 fit 오차가 크면 경고합니다.
 
@@ -64,7 +73,7 @@ Anima 엔진 전용이며 ControlNet이 전달된 호출에서는 충돌 방지�
 |---|---|---|
 | PAG | 타깃 self-attention weak row를 value-only 경로로 보간 | 실제 Anima E2E 검증 |
 | SEG | 타깃 weak query를 실제 T/H/W 중 H/W 축으로 Gaussian blur·보간 | 실제 Anima E2E 검증 |
-| SLG | 타깃 block의 weak-row 출력을 block 입력으로 복원 | 실제 Anima E2E 검증 |
+| SLG | 타깃 block의 weak-row 출력을 block 입력으로 복원 | 실행 경로 확인됨(실제 Anima, 3 steps), 화질 A/B 미완 |
 
 PAG와 SEG는 라디오에서 하나만 선택합니다. SLG는 둘 중 하나와 병용할 수 있습니다. 과거 결과를
 재현할 때만 `Legacy Soft/Approx`를 켜세요. Legacy PAG는 출력의 value 경로로 보간하고 Legacy
@@ -90,6 +99,23 @@ UI의 **Attn Scale**과 XYZ의 `[Anima Pert] Attn Scale`은 같은 값입니다.
 | Rescale mode | `full` | `full`=incoming CFG+guidance, `partial`=cond+guidance 기준 |
 
 PAG 자체를 A/B 할 때는 `Rescale=0`, SLG/APG/ADG off로 두어야 원인을 분리할 수 있습니다.
+
+### 속도 설정 (Settings → SAM Extra Guidance)
+
+둘 다 기본 켬이고, 결과가 아주 미세하게 달라질 수 있어 켜고 끈 값을 infotext에 남깁니다.
+infotext를 붙여넣으면 같은 설정으로 돌아갑니다(override settings). API에서는
+`override_settings`로 한 장씩 바꿀 수 있습니다.
+
+| 설정 키 | infotext | 내용 |
+|---|---|---|
+| `sam3_guidance_pag_prefix_dedup` | `Anima PAG prefix dedup: True/False` | 첫 target 블록(PAG/SEG 블록과 SLG 블록 중 가장 앞, 기본 18) 이전 블록은 원래 cond/uncond 행만 돌리고 weak 행 자리에는 cond 행 출력을 복사합니다. 그 블록들에서 weak 행은 cond 행과 입력·연산이 같습니다. 블록 인자를 행 단위로 자를 수 없으면(모르는 kwargs, 행 수가 확장 배치도 1도 아닌 텐서, `transformer_options` 안의 모르는 확장-배치 텐서) 그 블록부터 예전 전체 배치 경로로 돌고, 잘린 배치에서 블록이 예외를 내면 그 패스는 끕니다. NegPiP 마스크(`negpip_mask`)는 행과 함께 자릅니다. |
+| `sam3_guidance_seg_separable_blur` | `Anima SEG separable blur: True/False` | 공식 SEG query blur를 같은 1D Gaussian 커널의 가로·세로 depthwise conv 두 번으로 계산합니다(픽셀당 곱셈 k² → 2k). SEG 공식 모드이고 `0 < sigma ≤ 9999`일 때만 기록합니다. 끄면 예전 2D conv입니다. |
+
+CPU 확인(실제 Forge Anima Block, 6블록 소형): 중복 제거 켬/끔 차이 fp32 최대 약 8e-7,
+bf16·fp16은 비트 동일. separable/2D blur 차이 fp32 최대 약 2.4e-7, bf16 약 7.8e-3(bf16 1ulp
+수준), fp16 약 9.8e-4. GPU(cuBLAS)는 배치 크기에 따라 커널이 달라 차이가 다를 수 있습니다.
+콘솔 `generation summary: ... prefix_dedup_blocks=N prefix_dedup_fallbacks=M`에서 실제 적용
+블록 호출 수와 폴백 수를 볼 수 있습니다.
 
 ## 2. CFG base 오케스트레이터
 
@@ -145,7 +171,8 @@ MaHiRo/RescaleCFG/custom CFG를 쓰는 경우 먼저 전부 끈 상태로 비교
 - `Enable APG` 체크박스는 이제 다른 토글과 무관하게 독립적으로 동작합니다.
 - `eta=1`, `norm=0`, `momentum=0`이면 표준 선형 CFG로 환원됩니다.
 - APG는 이 확장에서는 post-CFG denoised 공간 구현입니다. reference 구현과 픽셀 동일하지 않습니다.
-- Forge의 CFG=1 positive-only 경로에서는 uncond가 없을 수 있으므로 **CFG > 1에서 사용**하세요.
+- **CFG > 1 전용**입니다. CFG=1(Forge가 넘기는 `cond_scale`로 판정)이면 SMC·APG·CWM을 모두 건너뛰고 콘솔에 한 번
+  경고하며, 이때는 PAG rescale 자동 끄기도 적용하지 않습니다(APG를 끈 생성과 같은 결과).
 - ADG가 uncond를 생략하는 순간 APG momentum과 SMC state를 즉시 비웁니다.
 
 ### CWM / SMC
@@ -157,7 +184,7 @@ MaHiRo/RescaleCFG/custom CFG를 쓰는 경우 먼저 전부 끈 상태로 비교
 | Enable SMC | off | 프리셋 값을 유지한 채 SMC master ON/OFF |
 | SMC preset | `Auto` | master가 켜졌을 때 모델군을 감지해 upstream 값을 선택 |
 | Custom lambda | 6.0 | `Custom`에서만 사용, UI 범위 0.5–30.0 |
-| Custom k | 0.10 | `Custom`에서만 사용, UI 범위 0–5.0 |
+| Custom k | 0.10 | `Custom`에서만 사용, UI 범위 0–5.0. API 위치 인자가 짧아 이 칸(인덱스 27)이 빠지면 0.20 |
 
 SMC 프리셋과 Auto 감지는
 [namemechan/ComfyUI-DCW](https://github.com/namemechan/ComfyUI-DCW)의 공개 계약을
@@ -328,6 +355,8 @@ Euler a, ancestral, SDE처럼 sampler가 원본 noise sampler를 호출할 때�
 - `[Anima CWM]`, `[Anima SMC]`
 - `[Anima DCW]`, `[Anima RDC]`, `[Anima DAVE]`, `[Anima CNS]`
 - `[Anima Mod]`: Enable, Direction Weight, Start/End Block
+- `[Anima Skim]`(Skimmed CFG, 7축): Enable, Skimming CFG, Full Skim Negative, Disable Flipping Filter, Start, End,
+  Flip At
 - `[Detail Daemon]`
 
 WebUI의 Reload scripts 뒤에도 기존 label은 중복하지 않고 새 label만 추가합니다.
@@ -346,6 +375,8 @@ Anima RDC
 Anima DAVE
 Anima CNS Wavelet Noise
 Anima Modulation Guidance
+Anima PAG prefix dedup      (PAG/SEG/SLG 켤 때)
+Anima SEG separable blur    (공식 SEG blur 를 쓸 때)
 ```
 
 확장 목록 아래 `Anima Reference-Latent PoC (debug / 안전)`에서

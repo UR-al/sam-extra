@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import math
 import re
+import sys
 from collections import UserList
 from functools import partial
-from typing import Any, Literal, NamedTuple
+from typing import Any, Literal, NamedTuple, get_args
 
 try:
     from pydantic.v1 import (
@@ -30,6 +32,26 @@ except ImportError:
 
 
 _DEVICE_RE = re.compile(r"^cuda:\d+$")
+
+# Numeric fields whose pydantic constraint (confloat / NonNegativeInt / ...)
+# would otherwise RAISE for an out-of-range value: (lower, upper, integer?).
+# An XYZ axis value like "[SAM3] Threshold" 1.5 or an API "sam3_mask_blur": -1
+# is clamped into range instead, so SAM3 stays on for that generation.
+_NUMERIC_BOUNDS: dict[str, tuple[float, float | None, bool]] = {
+    "sam3_threshold": (0.0, 1.0, False),
+    "sam3_mask_dilation": (0, None, True),
+    "sam3_mask_outline_px": (0, None, True),
+    "sam3_mask_blur": (0, None, True),
+    "sam3_denoising_strength": (0.0, 1.0, False),
+    "sam3_inpaint_only_masked_padding": (0, None, True),
+    "sam3_steps": (1, None, True),
+    "sam3_cfg_scale": (0.0, None, False),
+    "sam3_noise_multiplier": (0.0, 2.0, False),
+    "sam3_cn_weight": (0.0, 2.0, False),
+    "sam3_cn_guidance_start": (0.0, 1.0, False),
+    "sam3_cn_guidance_end": (0.0, 1.0, False),
+    "sam3_cn_processor_res": (0, None, True),
+}
 
 
 class Arg(NamedTuple):
@@ -114,8 +136,49 @@ class Sam3Args(BaseModel, extra=Extra.forbid):
 
     # --- coercing validators -------------------------------------------------
     # These normalise instead of raising: the caller wraps Sam3Args(**payload)
-    # in a try/except that disables SAM3 on ANY error, so a hard raise here
-    # would silently turn the whole feature off for a benign out-of-range value.
+    # in a try/except that disables SAM3 on ANY error (it logs + records
+    # 'SAM3 Error' in the infotext since v0.22.x, but the generation still
+    # runs without SAM3), so a hard raise here would turn the whole feature
+    # off for a benign out-of-range value or a differently-cased dropdown label.
+
+    @validator(*_NUMERIC_BOUNDS, pre=True)
+    def _clamp_numeric(cls, value: Any, field) -> Any:
+        low, high, integer = _NUMERIC_BOUNDS[field.name]
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            return field.default
+        if math.isnan(number) or math.isinf(number):
+            return field.default
+        number = max(low, number)
+        if high is not None:
+            number = min(high, number)
+        return int(number) if integer else number
+
+    @validator(
+        "sam3_mode",
+        "sam3_mask_mode",
+        "sam3_inpainting_fill",
+        "sam3_cn_control_mode",
+        "sam3_cn_resize_mode",
+        pre=True,
+    )
+    def _normalise_literal(cls, value: Any, field) -> str:
+        # Case/whitespace-insensitive match against the Literal choices
+        # ("Original" from an XYZ axis → "original"); anything else falls
+        # back to the field default instead of raising.
+        wanted = str(value or "").strip().lower()
+        for choice in get_args(field.outer_type_):
+            if wanted == str(choice).lower():
+                return choice
+        if value is not None:
+            # 모르는 값(오타·다른 확장의 라벨)을 조용히 바꾸면 "왜 설정이 안 먹지" 가 된다 — 한 줄 남긴다.
+            # None(값 없음)은 기본값을 쓰는 게 정상이라 조용히.
+            print(
+                f"[-] SAM3: unknown {field.name} value {value!r}, using the default {field.default!r}.",
+                file=sys.stderr,
+            )
+        return field.default
 
     @validator("sam3_device")
     def _normalise_device(cls, value: str) -> str:
@@ -133,11 +196,17 @@ class Sam3Args(BaseModel, extra=Extra.forbid):
             return -1
         return min(v, 2 ** 32 - 1)
 
-    @validator("sam3_inpaint_width", "sam3_inpaint_height")
-    def _snap_to_multiple_of_8(cls, value: int) -> int:
+    @validator("sam3_inpaint_width", "sam3_inpaint_height", pre=True)
+    def _snap_to_multiple_of_8(cls, value: Any, field) -> int:
         # The WebUI sampler expects latent-aligned sizes; snap down to a
         # multiple of 8 (min 64) the way the txt2img width/height sliders do.
-        return max(64, (int(value) // 8) * 8)
+        # ``pre`` so 0 / negative values are lifted to 64 before PositiveInt
+        # gets a chance to raise.
+        try:
+            number = int(float(value))
+        except (TypeError, ValueError):
+            return field.default
+        return max(64, (number // 8) * 8)
 
     @root_validator(skip_on_failure=True)
     def _order_cn_guidance(cls, values: dict[str, Any]) -> dict[str, Any]:

@@ -1,0 +1,19 @@
+# Test/CI dependencies for: python -m unittest discover -s tests -p "test_*.py"
+# torch is installed separately from the CPU index so CI does not pull the multi-GB CUDA wheel:
+#   pip install torch --index-url https://download.pytorch.org/whl/cpu
+#   pip install -r requirements-dev.txt
+# The suite never downloads models and never touches CUDA. Keep this file ASCII-only
+# (pip decodes it with the locale code page on Windows).
+pytest
+safetensors
+transformers
+einops
+gradio<6.0,>=4.0
+pydantic
+numpy
+Pillow>=11.1.0
+fastapi
+packaging
+opencv-python-headless
+# gradio -> pydub imports audioop, which Python 3.13 removed (Forge installs this too).
+audioop-lts; python_version >= "3.13"

@@ -24,6 +24,14 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from .options import (  # noqa: F401 - 예전처럼 patch 에서도 이 이름들을 쓸 수 있게 다시 내보낸다
+    DEFAULT_DUPLICATE_POLICY,
+    DUPLICATE_POLICIES,
+    OPT_DUPLICATE_POLICY,
+    duplicate_policy_from_opts,
+    normalize_duplicate_policy,
+)
+
 TOKENS_KEY = "sam3_ip_tokens"
 
 _LORA_RE = re.compile(
@@ -87,8 +95,15 @@ class _SharedRef(nn.Module):
 
 
 def shell(module: nn.Module) -> nn.Module:
-    """가중치는 공유하고 모듈 딕셔너리만 복사한 껍데기."""
+    """가중치는 공유하고 모듈 딕셔너리만 복사한 껍데기.
+
+    다른 확장이 원본에 얹어 둔 **인스턴스** ``forward``(Safe PAG 의 블록 래퍼, Anima 3.8B 런타임의
+    DiT 래퍼)는 원본에 바인딩된 메서드를 닫아 두고 있다. 그대로 따라오면 껍데기를 불러도 원본 블록이
+    돌아 껍데기 cross_attn 의 훅이 한 번도 안 불리고 주입이 조용히 빠진다. 껍데기는 클래스 forward 를
+    쓴다 — anima38 런타임이 "항상 클래스의 순정 forward" 를 부르는 것과 같은 이유다.
+    """
     copied = copy.copy(module)
+    copied.__dict__.pop("forward", None)
     copied._modules = module._modules.copy()
     copied._parameters = module._parameters.copy()
     copied._buffers = module._buffers.copy()
@@ -117,6 +132,33 @@ def _block_plan(adapter_blocks: int, model_blocks: int) -> tuple[int, ...] | Non
     if plan is None or len(plan) != model_blocks:
         return None
     return tuple(plan)
+
+
+# 28블록 어댑터를 더 깊은 모델에 얹을 때 복제 블록을 어떻게 다룰지(lineage/all/split)의 뜻과 기본값은
+# options.py 에 있다 — UI·설정 등록·요청 조립이 torch 없이 쓰기 때문이다.
+
+
+def _duplicate_gates(plan: tuple[int, ...], policy: str) -> list[float | None]:
+    """모델 블록마다 게이트 배율. None 이면 그 블록에는 IPA 를 걸지 않는다.
+
+    ``lineage`` 는 각 어댑터 블록의 첫 번째 대응 블록만 1.0, 끼워 넣은 복제는 None.
+    ``split`` 은 같은 어댑터 블록을 쓰는 n 개가 1/n 씩. ``all`` 은 모두 1.0.
+    """
+    counts: dict[int, int] = {}
+    for source in plan:
+        counts[source] = counts.get(source, 0) + 1
+    seen: set[int] = set()
+    gates: list[float | None] = []
+    for source in plan:
+        first = source not in seen
+        seen.add(source)
+        if policy == "lineage":
+            gates.append(1.0 if first else None)
+        elif policy == "split":
+            gates.append(1.0 / counts[source])
+        else:
+            gates.append(1.0)
+    return gates
 
 
 def ensure_compatible(spec, dit) -> None:
@@ -196,11 +238,20 @@ def _patch_forward(block) -> bool:
     def forward(x_B_T_H_W_D, emb_B_T_D, crossattn_emb, **kwargs):
         options = kwargs.get("transformer_options") or {}
         result = original(x_B_T_H_W_D, emb_B_T_D, crossattn_emb, **kwargs)
+        block._sam3_ip_ran = True        # 껍데기 블록이 돌았다는 표시 — 오류 힌트를 가르는 데 쓴다
         x_cross = getattr(block, "_sam3_ip_x", None)
         block._sam3_ip_x = None          # 활성값을 붙잡아 두지 않는다
         tokens = options.get(TOKENS_KEY)
-        if tokens is None or x_cross is None:
+        if tokens is None:
             return result
+        if x_cross is None:
+            # 토큰은 왔는데 훅이 안 불렸다 — forward 가 이 껍데기의 cross_attn 을 거치지 않았다.
+            # 조용히 주입 없는 결과를 내놓으면 사용자는 "참조가 안 먹는 IP-Adapter" 만 본다.
+            raise RuntimeError(
+                "IP 주입이 실행되지 않았습니다 — 블록 forward 가 껍데기 cross_attn 을 거치지 "
+                "않았습니다(다른 확장의 forward 패치가 원본 블록에 남아 있을 수 있습니다)."
+            )
+        block._sam3_ip_applied = True    # 한 번이라도 주입했다는 표시 — InjectionHandler 가 본다
 
         batch, frames, height, width, _ = x_B_T_H_W_D.shape
         heads = block.cross_attn.n_heads
@@ -236,8 +287,13 @@ def _patch_forward(block) -> bool:
     return True
 
 
-def install(dit, spec, weights, *, use_lora: bool = True, gate_scale: float = 1.0) -> int:
-    """블록마다 ip_k_proj/ip_v_proj/adaln_ip 를 만들고 forward 를 감싼다. 패치한 블록 수를 준다."""
+def install(dit, spec, weights, *, use_lora: bool = True, gate_scale: float = 1.0,
+            duplicate_policy: str = DEFAULT_DUPLICATE_POLICY) -> int:
+    """블록마다 ip_k_proj/ip_v_proj/adaln_ip 를 만들고 forward 를 감싼다. 패치한 블록 수를 준다.
+
+    ``duplicate_policy`` 는 어댑터보다 깊은 모델에서 복제 블록을 어떻게 다룰지(:data:`DUPLICATE_POLICIES`).
+    블록 수가 같으면 복제가 없으므로 어느 값이든 결과가 같다.
+    """
     parameters = list(dit.parameters())
     device = parameters[0].device if parameters else torch.device("cpu")
     dtype = parameters[0].dtype if parameters else torch.float32
@@ -262,10 +318,15 @@ def install(dit, spec, weights, *, use_lora: bool = True, gate_scale: float = 1.
             f"블록 계보 매핑의 길이가 {len(plan)} 인데 모델 블록은 {len(dit.blocks)} 개입니다."
         )
 
+    gates = _duplicate_gates(plan, normalize_duplicate_policy(duplicate_policy) or DEFAULT_DUPLICATE_POLICY)
+
     patched = 0
     for index, block in enumerate(dit.blocks):
         if getattr(block, "_sam3_ip_patched", False):
             continue
+        gate = gates[index]
+        if gate is None:
+            continue   # lineage: 끼워 넣은 복제 블록 — IPA 없음(어댑터 LoRA 도 걸지 않는다)
         # 깊은 모델에서는 여러 블록이 같은 어댑터 블록을 쓴다(28→52 는 12개가 3번씩).
         source = plan[index]
 
@@ -309,7 +370,7 @@ def install(dit, spec, weights, *, use_lora: bool = True, gate_scale: float = 1.
                 block.cross_attn.head_dim, elementwise_affine=False, eps=1e-6
             ).to(device=device, dtype=dtype)
 
-        block.sam3_ip_gate_scale = float(gate_scale)
+        block.sam3_ip_gate_scale = float(gate_scale) * float(gate)
         if use_lora and source in spec.lora_blocks:
             _apply_lora(block, source, weights)
 
@@ -329,11 +390,36 @@ def cfg_correction(denoised, cond_with_ip, cond_without_ip, *, cond_scale, ip_cf
 
 
 class InjectionHandler:
-    """unet 래퍼 + post-CFG. cond 에는 실제 토큰, uncond 에는 null 토큰을 싣는다."""
+    """unet 래퍼 + post-CFG. cond 에는 실제 토큰, uncond 에는 null 토큰을 싣는다.
 
-    def __init__(self, injection: Injection):
+    ``blocks`` 를 주면 첫 호출 뒤 그중 하나라도 실제로 주입했는지 확인한다 — DiT forward 가
+    껍데기 블록을 아예 거치지 않는 배선이면 블록 쪽 검사가 불릴 기회조차 없기 때문이다.
+    """
+
+    def __init__(self, injection: Injection, blocks=None):
         self.injection = injection
         self._cond_without_ip = None
+        self._blocks = blocks
+        self._verified = blocks is None
+
+    def _verify_injected(self) -> None:
+        if self._verified:
+            return
+        if not any(getattr(block, "_sam3_ip_applied", False) for block in self._blocks):
+            # 원본 DiT 의 인스턴스 forward 래퍼는 _keep_foreign_dit_forward 가 이미 살려 두므로
+            # 그것을 원인으로 지목하지 않는다. 껍데기 블록이 돌았는지로 두 경우를 가른다.
+            if any(getattr(block, "_sam3_ip_ran", False) for block in self._blocks):
+                raise RuntimeError(
+                    "IP 주입이 실행되지 않았습니다 — 껍데기 블록은 돌았지만 transformer_options 에 "
+                    f"IP 토큰({TOKENS_KEY})이 실려 오지 않았습니다(중간의 다른 확장 unet/DiT 래퍼가 "
+                    "transformer_options 를 새 딕셔너리로 바꿔 넘겼을 수 있습니다)."
+                )
+            raise RuntimeError(
+                "IP 주입이 실행되지 않았습니다 — 샘플러가 부른 모델이 IP-Adapter 껍데기 블록을 한 번도 "
+                "돌지 않았습니다(diffusion_model 객체 패치가 적용되지 않았거나, 다른 확장이 원본 "
+                "DiT·블록을 직접 부르고 있을 수 있습니다)."
+            )
+        self._verified = True
 
     def __call__(self, apply_model, args):
         model_input = args["input"]
@@ -356,9 +442,12 @@ class InjectionHandler:
         conditioning["transformer_options"] = options
 
         if not self.injection.separate_cfg:
-            return apply_model(model_input, timestep, **conditioning)
+            output = apply_model(model_input, timestep, **conditioning)
+            self._verify_injected()
+            return output
 
         output = apply_model(model_input, timestep, **conditioning)
+        self._verify_injected()
 
         # IP 없는 예측을 한 번 더 — post_cfg 에서 둘의 차이를 따로 스케일한다.
         without = dict(conditioning)
@@ -389,15 +478,79 @@ class InjectionHandler:
         return self
 
 
+def _keep_foreign_dit_forward(dit, copied) -> bool:
+    """원본 DiT 에 다른 확장의 인스턴스 forward(Anima 3.8B 런타임·NegPiP 의 DiT 래퍼)가 있으면
+    껍데기가 그 체인을 그대로 부르되, 도는 동안만 원본의 ``blocks`` 를 껍데기 블록으로 바꿔 둔다.
+
+    그 래퍼들은 원본에 바인딩된 메서드를 닫아 두고 있어 껍데기가 물려받으면 원본 블록이 돈다
+    (주입 무효). 반대로 :func:`shell` 처럼 그냥 버리면 3.8B v2 커넥터의 조건 확장이 껍데기에서
+    빠진다. 체인은 결국 클래스 forward 의 ``for block in self.blocks`` 에 닿으므로, 그 동안
+    ``blocks`` 만 바꾸면 둘 다 산다. 호출이 끝나면(예외여도) 원본 ``blocks`` 를 되돌린다.
+
+    외부 forward 는 세션 시작 때 고정해 두지 않고 **호출마다** 원본에서 다시 찾는다. 도중에
+    래퍼가 풀리면(NegPiP 의 reset 등) 낡은 클로저 대신 껍데기의 클래스 forward 로 돌고, 도중에
+    생기거나 바뀌면 지금 것을 따른다. 외부 forward 가 없을 때의 결과는 클래스 forward 그대로다.
+    돌려주는 값은 설치 시점에 외부 forward 가 있었는지다.
+    """
+    shell_blocks = copied.blocks
+    native = type(copied).forward
+
+    def forward(*args, **kwargs):
+        foreign = dit.__dict__.get("forward")
+        if foreign is None:
+            return native(copied, *args, **kwargs)
+        original_blocks = dit.blocks
+        dit.blocks = shell_blocks
+        try:
+            return foreign(*args, **kwargs)
+        finally:
+            dit.blocks = original_blocks
+
+    copied.forward = forward
+    return "forward" in dit.__dict__
+
+
+def _undo_object_patches(patcher) -> None:
+    """이 복제 패처가 모델에 걸어 둔 객체 패치(``diffusion_model`` = 껍데기 DiT)를 원래대로 되돌린다.
+
+    Forge 는 같은 모델의 다른 복제를 올릴 때 이전 복제를 ``detach(unpatch_all=False)`` 로만 떼어 내고
+    (backend/memory_management.py load_models_gpu) 객체 패치는 되돌리지 않는다. 복제들은 모델 객체와
+    ``object_patches_backup`` 을 공유하므로, 그대로 두면 IPA 가 끝난 뒤에도 원본 KModel 의 diffusion_model 이
+    껍데기로 남는다. 그러면 다음 생성에서 LoRA 키가 맞지 않아 Forge 가 LoRA 를 통째로 버리고
+    (``[LORA] Mismatch``), IPA 어댑터의 cross_attn LoRA 래퍼도 남아 결과가 달라졌다(2026-09-23 GPU 확인).
+    가중치 패치는 원본 패처와 같은 것이라 건드리지 않는다.
+    """
+    backup = getattr(patcher, "object_patches_backup", None)
+    patches = getattr(patcher, "object_patches", None)
+    model = getattr(patcher, "model", None)
+    if not backup or not patches or model is None:
+        return
+    for key in list(patches):
+        if key not in backup:
+            continue
+        original = backup.pop(key)
+        try:
+            from backend import utils as forge_utils
+
+            forge_utils.set_attr_raw(model, key, original)
+        except ImportError:  # Forge 밖(테스트) — 점 없는 이름만 쓴다
+            setattr(model, key, original)
+
+
 @contextmanager
 def patched_unet(sd_model, spec, weights, injection: Injection, *,
-                 use_lora: bool = True) -> Iterator[None]:
+                 use_lora: bool = True, duplicate_policy: str | None = None) -> Iterator[None]:
     """샘플링 동안만 주입된 패처를 끼워 넣는다.
 
     ``sample()`` 이 첫머리에서 복사해 가는 ``forge_objects_after_applying_lora.unet`` 을 잠시
     바꾼다(modules/processing.py:1542). 원본 패처와 원본 DiT 는 건드리지 않으므로, 빠져나올 때
-    참조 하나만 되돌리면 흔적이 남지 않는다.
+    참조 하나만 되돌리면 흔적이 남지 않는다. (예외: 원본 DiT 에 다른 확장의 forward 래퍼가
+    있으면 :func:`_keep_foreign_dit_forward` 가 호출 동안만 원본의 ``blocks`` 를 바꿔 둔다.)
+
+    ``duplicate_policy`` 가 None 이면 Forge 설정(``sam3_ipa_duplicate_policy``)을 읽는다.
     """
+    if duplicate_policy is None:
+        duplicate_policy = duplicate_policy_from_opts()
     objects = sd_model.forge_objects_after_applying_lora
     original = objects.unet
     dit = original.get_model_object("diffusion_model")
@@ -408,9 +561,11 @@ def patched_unet(sd_model, spec, weights, injection: Injection, *,
     copied.blocks = nn.ModuleList([shell(block) for block in dit.blocks])
     for block in copied.blocks:
         block.cross_attn = shell(block.cross_attn)
-    install(copied, spec, weights, use_lora=use_lora, gate_scale=injection.gate_scale)
+    install(copied, spec, weights, use_lora=use_lora, gate_scale=injection.gate_scale,
+            duplicate_policy=duplicate_policy)
+    _keep_foreign_dit_forward(dit, copied)
 
-    handler = InjectionHandler(injection)
+    handler = InjectionHandler(injection, blocks=copied.blocks)
     patched_model.add_object_patch("diffusion_model", copied)
     patched_model.set_model_unet_function_wrapper(handler)
     patched_model.set_model_sampler_post_cfg_function(handler.post_cfg)
@@ -420,3 +575,4 @@ def patched_unet(sd_model, spec, weights, injection: Injection, *,
         yield
     finally:
         objects.unet = original
+        _undo_object_patches(patched_model)

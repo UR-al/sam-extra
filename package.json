@@ -1,6 +1,7 @@
 {
   "name": "sam-extra-frontend-tests",
   "private": true,
+  "license": "GPL-3.0-only",
   "description": "Test-only manifest. The extension ships plain scripts that Forge injects directly; nothing here is bundled or published.",
   "scripts": {
     "test": "node --test tests/js/*.test.mjs"

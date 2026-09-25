@@ -17,6 +17,7 @@ import gradio as gr
 from .panel_container import ACCORDION, panel_container
 
 from .coerce import as_float, as_int
+from .forge_exclusive import run_exclusive, stop_if_job
 from .anima_core import (
     AnimaTileRepairArgs,
     anima_available,
@@ -64,10 +65,8 @@ class AnimaPanel:
     # Output sizing
     width: gr.Slider = None  # type: ignore[assignment]
     height: gr.Slider = None  # type: ignore[assignment]
-    # LLLite schedule
-    lllite_strength: gr.Slider = None  # type: ignore[assignment]
-    lllite_start: gr.Slider = None  # type: ignore[assignment]
-    lllite_end: gr.Slider = None  # type: ignore[assignment]
+    # LLLite — only the multiplier reaches the vendor (audit M14 removed the
+    # Strength / Start % / End % sliders that were never passed anywhere)
     lllite_multiplier: gr.Slider = None  # type: ignore[assignment]
     # Housekeeping
     unload_forge_before: gr.Checkbox = None  # type: ignore[assignment]
@@ -103,9 +102,6 @@ class AnimaPanel:
             self.seed,
             self.width,
             self.height,
-            self.lllite_strength,
-            self.lllite_start,
-            self.lllite_end,
             self.lllite_multiplier,
             self.unload_forge_before,
             self.insert_mode,
@@ -136,9 +132,6 @@ ANIMA_ARG_KEYS: tuple[str, ...] = (
     "seed",
     "width",
     "height",
-    "lllite_strength",
-    "lllite_start",
-    "lllite_end",
     "lllite_multiplier",
     "unload_forge_before",
     "insert_mode",
@@ -338,32 +331,11 @@ def build_anima_panel(*, container: str = ACCORDION) -> AnimaPanel:
                 elem_id="sam3_anima_height",
             )
 
-        # --- LLLite schedule -------------------------------------------
+        # --- LLLite ------------------------------------------------------
+        # Only the multiplier exists on the vendor side
+        # (networks/control_net_lllite_anima.set_multiplier); there is no
+        # strength or step schedule, so no sliders for them.
         with gr.Row():
-            lllite_strength = gr.Slider(
-                label="SAM3 Anima LLLite Strength",
-                minimum=0.0,
-                maximum=2.0,
-                step=0.05,
-                value=1.0,
-                elem_id="sam3_anima_lllite_strength",
-            )
-            lllite_start = gr.Slider(
-                label="SAM3 Anima LLLite Start %",
-                minimum=0.0,
-                maximum=1.0,
-                step=0.01,
-                value=0.0,
-                elem_id="sam3_anima_lllite_start",
-            )
-            lllite_end = gr.Slider(
-                label="SAM3 Anima LLLite End %",
-                minimum=0.0,
-                maximum=1.0,
-                step=0.01,
-                value=1.0,
-                elem_id="sam3_anima_lllite_end",
-            )
             lllite_multiplier = gr.Slider(
                 label="SAM3 Anima LLLite Multiplier",
                 minimum=0.0,
@@ -478,9 +450,6 @@ def build_anima_panel(*, container: str = ACCORDION) -> AnimaPanel:
         seed_pull_button=seed_pull_button,
         width=width,
         height=height,
-        lllite_strength=lllite_strength,
-        lllite_start=lllite_start,
-        lllite_end=lllite_end,
         lllite_multiplier=lllite_multiplier,
         unload_forge_before=unload_forge_before,
         insert_mode=insert_mode,
@@ -504,6 +473,19 @@ def _anima_error_return(gallery_value, message: str):
     return gallery_value, message, gr.update(), gr.update()
 
 
+# Job names the two restoration modes run under (shared.state.begin). The
+# Stop button only interrupts while one of them holds shared.state.job.
+TILE_REPAIR_JOB = "sam3_tile_repair"
+PID_UPSCALE_JOB = "sam3_pid_upscale"
+_ANIMA_JOB_PREFIXES = (TILE_REPAIR_JOB, PID_UPSCALE_JOB)
+
+
+def stop_anima():
+    """⏹ handler for the Anima panel — same rule as ``ui_refine.stop_refine``:
+    never interrupt a txt2img that holds the queue while our click waits."""
+    stop_if_job(_ANIMA_JOB_PREFIXES)
+
+
 def _map_widget_values(values: tuple) -> AnimaTileRepairArgs:
     keyed = dict(zip(ANIMA_ARG_KEYS, values))
     lora_slots: list[tuple[str, float]] = []
@@ -525,9 +507,6 @@ def _map_widget_values(values: tuple) -> AnimaTileRepairArgs:
         seed=_as_int(keyed.get("seed"), -1),
         width=_as_int(keyed.get("width"), 1024),
         height=_as_int(keyed.get("height"), 1024),
-        lllite_strength=_as_float(keyed.get("lllite_strength"), 1.0),
-        lllite_start=_as_float(keyed.get("lllite_start"), 0.0),
-        lllite_end=_as_float(keyed.get("lllite_end"), 1.0),
         lllite_multiplier=_as_float(keyed.get("lllite_multiplier"), 1.0),
         unload_forge_before=bool(keyed.get("unload_forge_before", True)),
         insert_mode=str(keyed.get("insert_mode") or "After selected"),
@@ -606,17 +585,27 @@ def handle_anima_click(
             f"image (index {idx}).</span>",
         )
 
+    def _pid():
+        return run_pid_upscale(
+            source,
+            pid_checkpoint=repair.pid_checkpoint,
+            scale=repair.pid_scale,
+            degrade_sigma=repair.pid_degrade,
+            steps=repair.pid_steps,
+        )
+
+    def _tile():
+        return run_tile_repair(source, repair)
+
+    # Like Forge's own Generate (wrap_gradio_gpu_call): queue_lock so we never
+    # unload/swap models under a running txt2img, a fresh shared.state so a
+    # previous ⏹ Stop does not abort this run, and the work on Forge's main
+    # thread. See forge_exclusive.run_exclusive.
     try:
         if is_pid:
-            new_pairs = run_pid_upscale(
-                source,
-                pid_checkpoint=repair.pid_checkpoint,
-                scale=repair.pid_scale,
-                degrade_sigma=repair.pid_degrade,
-                steps=repair.pid_steps,
-            )
+            new_pairs = run_exclusive(PID_UPSCALE_JOB, _pid, on_main_thread=True)
         else:
-            new_pairs = run_tile_repair(source, repair)
+            new_pairs = run_exclusive(TILE_REPAIR_JOB, _tile, on_main_thread=True)
     except Exception as exc:
         traceback.print_exc(file=sys.stderr)
         return _anima_error_return(

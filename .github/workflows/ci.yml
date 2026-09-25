@@ -15,8 +15,10 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          # Forge Classic runs on Python 3.13 (modules/launch_utils.py warns on anything else).
+          python-version: "3.13"
           cache: pip
+          cache-dependency-path: requirements-dev.txt
 
       - name: Set up Node
         uses: actions/setup-node@v4
@@ -27,12 +29,15 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           # CPU-only torch keeps the install small and fast; the tests never
-          # touch CUDA.
+          # touch CUDA. Everything else the suite imports is in requirements-dev.txt
+          # (the same file local runs use).
           pip install torch --index-url https://download.pytorch.org/whl/cpu
-          pip install pytest "gradio>=4.0,<6.0" pydantic numpy "Pillow>=11.1.0" fastapi
+          pip install -r requirements-dev.txt
 
+      # Same command as local runs (README). unittest prints "OK (skipped=N)" so
+      # skipped tests stay visible in the log.
       - name: Run Python tests
-        run: python -m pytest tests/ -q
+        run: python -m unittest discover -s tests -p "test_*.py"
 
       - name: Check JavaScript syntax
         run: |

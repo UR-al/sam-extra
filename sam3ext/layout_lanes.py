@@ -74,6 +74,7 @@ REGISTRY: dict[str, Slot] = {
     "anima-ref-poc": Slot("etc"),
     "adetailer": Slot("det"),
     "lora-block-weight": Slot("lora"),
+    "dora-infer-mode": Slot("lora"),
     "controlnet": Slot("lora", on=OnRule(elem_class="cnet-unit-enabled")),
     "dynamic-prompting": Slot("lora", on=OnRule(label_equals="Dynamic Prompts enabled")),
     "dynamic-thresholding": Slot("lora", on=OnRule(elem_class="dynthres-enabled")),

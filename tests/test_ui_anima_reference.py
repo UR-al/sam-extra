@@ -629,6 +629,16 @@ class IpaStatusTests(unittest.TestCase):
         self.assertNotIn("계보", text)
         self.assertNotIn("미검증", text)
 
+    def test_the_mapping_note_names_the_duplicate_policy(self):
+        lineage = self._status(model_blocks=52, ipa_adapter_blocks=28, ipa_duplicate_policy="lineage")
+        self.assertIn("28블록 → 52블록", lineage)
+        self.assertIn("끼워 넣은 블록 제외", lineage)
+        self.assertNotIn("미검증", lineage)
+        self.assertIn("깨질 수 있음", self._status(
+            model_blocks=52, ipa_adapter_blocks=28, ipa_duplicate_policy="all"))
+        self.assertIn("강도 나눔", self._status(
+            model_blocks=40, ipa_adapter_blocks=28, ipa_duplicate_policy="split"))
+
 
 class IpaDownloadButtonTests(unittest.TestCase):
     def test_a_complete_install_hides_the_button(self):

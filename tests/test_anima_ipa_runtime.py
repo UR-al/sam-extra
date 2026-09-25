@@ -28,7 +28,42 @@ class OptionTests(unittest.TestCase):
         self.assertEqual(options.siglip_layer, -1)
         self.assertFalse(options.gray_null)
         self.assertTrue(options.use_lora)
+        # 3.8B 커넥터는 요청이 정하지 않으면 Forge 설정(기본 켬)을 따른다.
+        self.assertIsNone(options.anima38_connector)
+        # 복제 블록 정책도 요청이 정하지 않으면 Forge 설정(기본 lineage)을 따른다.
+        self.assertIsNone(options.duplicate_policy)
         options.validate()
+
+    def test_the_duplicate_policy_follows_the_setting_unless_the_request_sets_it(self):
+        from types import SimpleNamespace
+
+        from sam3ext.anima_ipa import options as options_module
+
+        key = options_module.OPT_DUPLICATE_POLICY
+        self.assertEqual(IpaOptions().resolved_duplicate_policy(SimpleNamespace()), "lineage")
+        self.assertEqual(
+            IpaOptions().resolved_duplicate_policy(SimpleNamespace(**{key: "split"})), "split"
+        )
+        self.assertEqual(
+            IpaOptions().resolved_duplicate_policy(SimpleNamespace(**{key: " ALL "})), "all"
+        )
+        # 설정에 이상한 값이 남아 있으면 기본값
+        self.assertEqual(
+            IpaOptions().resolved_duplicate_policy(SimpleNamespace(**{key: "???"})), "lineage"
+        )
+        # 요청이 정한 값이 설정보다 먼저다
+        self.assertEqual(
+            IpaOptions(duplicate_policy="all").resolved_duplicate_policy(
+                SimpleNamespace(**{key: "split"})
+            ),
+            "all",
+        )
+
+    def test_an_unknown_duplicate_policy_is_refused(self):
+        with self.assertRaises(ValueError):
+            IpaOptions(duplicate_policy="both").validate()
+        for policy in ("lineage", "all", "split", "Lineage"):
+            IpaOptions(duplicate_policy=policy).validate()
 
     def test_out_of_range_values_are_refused(self):
         for bad in (
@@ -116,10 +151,11 @@ class SessionTests(unittest.TestCase):
         self.seen = {}
 
         @contextmanager
-        def fake_patched_unet(sd_model, spec, weights, injection, *, use_lora):
+        def fake_patched_unet(sd_model, spec, weights, injection, *, use_lora,
+                              duplicate_policy=None):
             self.seen.update(
                 sd_model=sd_model, spec=spec, weights=weights,
-                injection=injection, use_lora=use_lora,
+                injection=injection, use_lora=use_lora, duplicate_policy=duplicate_policy,
             )
             yield
 
@@ -173,6 +209,15 @@ class SessionTests(unittest.TestCase):
         self._session(IpaOptions(separate_cfg=True, cfg_scale=5.5))
         self.assertTrue(self.seen["injection"].separate_cfg)
         self.assertEqual(self.seen["injection"].cfg_scale, 5.5)
+
+    def test_the_duplicate_policy_of_the_request_reaches_the_patch(self):
+        self._session(IpaOptions(duplicate_policy="split"))
+        self.assertEqual(self.seen["duplicate_policy"], "split")
+
+    def test_without_a_request_policy_the_patch_gets_a_concrete_one(self):
+        # Forge 밖에서는 설정을 못 읽으니 기본값 — None 을 넘겨 patch 가 다시 읽게 하지 않는다.
+        self._session(IpaOptions())
+        self.assertIn(self.seen["duplicate_policy"], ("lineage", "all", "split"))
 
 
 if __name__ == "__main__":

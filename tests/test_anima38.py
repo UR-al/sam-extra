@@ -2,18 +2,21 @@
 from __future__ import annotations
 
 import gc
+import importlib
 import importlib.util
 import json
+import os
 import re
 import sys
 import tempfile
 import types
 import unittest
 import weakref
-from contextlib import nullcontext
+from contextlib import ExitStack, nullcontext
 from functools import wraps
 from pathlib import Path
 from unittest import mock
+from uuid import uuid4
 
 import torch
 from safetensors.torch import save_file
@@ -325,9 +328,11 @@ class RuntimeLifecycleTests(unittest.TestCase):
             script.process_batch(second, {"bypass": True})
             self.assertEqual(owner.extra_model_patchers_during_sampling, [unrelated_patcher])
             self.assertEqual(second.sd_model.forge_objects.unet.extra_model_patchers_during_sampling, [])
-            unload.assert_called_once_with(installed_patcher)
+            # 목록에서 떼기만 한다 — 커넥터 언로드·재적재 왕복을 하지 않는다(퇴출은 Forge 가, 모델 교체는 on_model_loaded 가)
+            unload.assert_not_called()
         self.assertIsNone(script._installed_for)
         self.assertIsNone(runtime._v2_sampling_patcher)
+        self.assertIs(runtime._v2_connector_patcher, installed_patcher)
         for key in ("cached_c", "cached_uc", "cached_hr_c", "cached_hr_uc"):
             self.assertEqual(getattr(first, key), [None, None, None])
 
@@ -352,7 +357,8 @@ class RuntimeLifecycleTests(unittest.TestCase):
             runtime.restore(second)
             self.assertEqual(owner.extra_model_patchers_during_sampling, [])
             self.assertEqual(clone.extra_model_patchers_during_sampling, [])
-            unload.assert_called_once_with(installed_patcher)
+            unload.assert_not_called()
+        self.assertIs(runtime._v2_connector_patcher, installed_patcher, "다음 설치가 그대로 다시 단다")
         self.assertEqual(first.cached_c, [None, None, None])
         self.assertEqual(second.cached_c, [None, None, None])
         self.assertEqual(runtime._v2_sampling_unets, [])
@@ -371,7 +377,7 @@ class RuntimeLifecycleTests(unittest.TestCase):
         ), mock.patch.object(runtime, "_unload_patchers") as unload, mock.patch("traceback.print_exc"):
             script.process_batch(first, {"enabled": False})
             self.assertEqual(first.sd_model.forge_objects.unet.extra_model_patchers_during_sampling, [])
-            self.assertEqual(unload.call_count, 1)
+            self.assertEqual(unload.call_count, 0, "목록에서 떼기만 — 패처는 번들 캐시와 함께 남는다")
         self.assertIsNone(script._installed_for)
         self.assertIsNone(runtime._v2_sampling_patcher)
         self.assertIsNone(runtime._installed_processing)
@@ -599,6 +605,84 @@ class MissingEncoderFailFastTests(unittest.TestCase):
         self._assert_nothing_patched()
 
 
+_REAL_RELEASE = []
+
+
+def _real_release_foreign_install():
+    """실제 Anima3BRuntime.release_foreign_install (한 번만 로드)."""
+    if not _REAL_RELEASE:
+        _REAL_RELEASE.append(_load_lifecycle_runtime().Anima3BRuntime.release_foreign_install)
+    return _REAL_RELEASE[0]
+
+
+class ReleaseForeignInstallTests(unittest.TestCase):
+    """설치 순서의 첫 단계 — 스크립트(_release_stale_install)와 Feature 6 IP-Adapter 가 같이 쓰는 공용 함수."""
+
+    def setUp(self):
+        module = _load_lifecycle_runtime()
+        self.runtime = module.Anima3BRuntime()
+        self.restored = []
+        self.runtime.restore = self.restored.append
+
+    def test_another_generations_install_is_restored_and_returned(self):
+        stale, current = object(), object()
+        self.runtime._installed_processing = stale
+        self.assertIs(self.runtime.release_foreign_install(current), stale)
+        self.assertEqual(self.restored, [stale])
+
+    def test_nothing_installed_or_our_own_install_is_left_alone(self):
+        current = object()
+        self.assertIsNone(self.runtime.release_foreign_install(current))
+        self.runtime._installed_processing = current
+        self.assertIsNone(self.runtime.release_foreign_install(current))
+        self.assertEqual(self.restored, [])
+
+    def test_a_failing_restore_goes_to_on_error_or_raises(self):
+        stale = object()
+        self.runtime._installed_processing = stale
+
+        def boom(p):
+            raise RuntimeError("boom")
+
+        self.runtime.restore = boom
+        errors = []
+        self.assertIs(self.runtime.release_foreign_install(object(), on_error=errors.append), stale)
+        self.assertEqual([str(exc) for exc in errors], ["boom"])
+        with self.assertRaises(RuntimeError):
+            self.runtime.release_foreign_install(object())
+
+    def test_the_script_uses_the_shared_function(self):
+        script = _load_script().Anima38Script()
+        stale, current = types.SimpleNamespace(sd_model=object()), types.SimpleNamespace(sd_model=object())
+        self.runtime._installed_processing = stale
+        script._runtime = self.runtime
+        script._installed_for = stale
+        with mock.patch.object(self.runtime, "release_foreign_install",
+                               wraps=self.runtime.release_foreign_install) as shared:
+            script._release_stale_install(current)
+        shared.assert_called_once()
+        self.assertIs(shared.call_args.args[0], current)
+        self.assertEqual(self.restored, [stale])
+        self.assertIsNone(script._installed_for, "방금 내린 설치를 _safe_restore 가 한 번 더 내리지 않게")
+
+    def test_the_script_logs_a_failing_stale_restore_and_goes_on(self):
+        script_module = _load_script()
+        script = script_module.Anima38Script()
+        stale = types.SimpleNamespace(sd_model=object())
+        self.runtime._installed_processing = stale
+
+        def boom(p):
+            raise RuntimeError("boom")
+
+        self.runtime.restore = boom
+        script._runtime = self.runtime
+        script._installed_for = stale
+        with mock.patch.object(script_module, "_log") as log:
+            script._release_stale_install(types.SimpleNamespace(sd_model=object()))
+        self.assertIn("stale restore failed", log.call_args.args[0])
+        self.assertIsNone(script._installed_for)
+
+
 class _FakeRuntime:
     def __init__(self, v2: bool, fail: Exception | None = None):
         self.v2 = v2
@@ -622,6 +706,10 @@ class _FakeRuntime:
 
     def install_is_current(self, p):
         return self._installed_processing is p
+
+    def release_foreign_install(self, p, on_error=None):
+        # 가짜에 로직을 다시 쓰지 않는다 — 실제 런타임의 공용 함수를 이 가짜 위에서 그대로 돌린다.
+        return _real_release_foreign_install()(self, p, on_error=on_error)
 
     def _sync_adapter_lora(self, clip):
         self.synced = getattr(self, "synced", []) + [clip]
@@ -1421,6 +1509,76 @@ class V2ForwardTests(unittest.TestCase):
                 torch.testing.assert_close(call.context, self._expanded())
 
 
+class _UnetSlot:
+    """약한 참조가 되는 UNet 자리 대역(_attach_sampling_patcher 가 weakref 로 기록한다)."""
+
+    def __init__(self, **values):
+        self.__dict__.update(values)
+
+
+class StaleIpaShellTests(unittest.TestCase):
+    """지난 IP-Adapter 잡의 껍데기 DiT 가 Forge 객체 패치로 ``model.diffusion_model`` 에 남아 있어도(클론 전환은
+    detach(unpatch_all=False) 라 되돌리지 않는다) v2 래퍼는 ``object_patches_backup`` 의 진짜 DiT 에 걸린다.
+    껍데기에 걸면 다음 샘플링의 진짜 DiT 에 커넥터가 없어 조건 확장이 조용히 빠진다."""
+
+    setUp = V2ForwardTests.setUp
+    _install = V2ForwardTests._install
+    _encode = V2ForwardTests._encode
+    _expanded = staticmethod(V2ForwardTests._expanded)
+
+    def _leave_stale_shell(self, owner=None):
+        """IP 잡 적재 뒤의 상태: 모델 속성은 껍데기, 원본은 클론끼리 공유하는 backup 에."""
+        unet = self.model.forge_objects.unet
+        owner = unet if owner is None else owner
+        owner.object_patches_backup = {"diffusion_model": self.dit}
+        self.shell = _RecordingDiT()
+        unet.model.diffusion_model = self.shell
+
+    def _assert_real_dit_expands(self):
+        self.assertTrue(self.runtime._patched(self.dit.__dict__.get("forward")), "진짜 DiT 에 래퍼")
+        self.assertNotIn("forward", self.shell.__dict__, "껍데기는 건드리지 않는다")
+        (cond,) = self._encode()
+        self.dit.forward(self.x[:1], self.t[:1], cond)
+        (call,) = self.dit.calls
+        torch.testing.assert_close(call.context, self._expanded())
+
+    def test_install_wraps_the_backed_up_real_dit(self):
+        self._leave_stale_shell()
+        self._install()
+        self._assert_real_dit_expands()
+
+    def test_a_backup_on_another_slot_of_the_same_model_counts(self):
+        unet = self.model.forge_objects.unet
+        original = _UnetSlot(model=unet.model, extra_model_patchers_during_sampling=[])
+        self.model.forge_objects_original = types.SimpleNamespace(unet=original)
+        self._leave_stale_shell(owner=original)
+        self._install()
+        self._assert_real_dit_expands()
+
+    def test_a_backup_of_another_kmodel_is_ignored(self):
+        other = _UnetSlot(
+            model=types.SimpleNamespace(diffusion_model=_RecordingDiT()),
+            object_patches_backup={"diffusion_model": _RecordingDiT()},
+            extra_model_patchers_during_sampling=[],
+        )
+        self.model.forge_objects_original = types.SimpleNamespace(unet=other)
+        self._install()
+        self.assertTrue(self.runtime._patched(self.dit.__dict__.get("forward")))
+        self.assertNotIn("forward", other.object_patches_backup["diffusion_model"].__dict__)
+
+    def test_without_an_object_patch_the_target_is_unchanged(self):
+        self.model.forge_objects.unet.object_patches_backup = {}
+        self._install()
+        self.assertTrue(self.runtime._patched(self.dit.__dict__.get("forward")))
+
+    def test_ensure_attached_rewraps_the_real_dit(self):
+        self._install()
+        del self.dit.forward   # 다른 확장이 체인을 되돌리며 우리 래퍼까지 떨군 상태
+        self._leave_stale_shell()
+        self.runtime.ensure_attached(self.p)
+        self._assert_real_dit_expands()
+
+
 class V2LoaderValidationTests(unittest.TestCase):
     """번들의 메타데이터·텐서가 v2 커넥터와 맞지 않으면 커넥터를 만들기 전에 실패하고, 맞으면 번들이 적어 둔
     크기로 커넥터를 만든다."""
@@ -1670,6 +1828,1081 @@ class PrivateAdapterDtypeTests(unittest.TestCase):
         self.assertEqual(private.proj.bias.dtype, torch.bfloat16)
 
 
+class ConnectorPatcherReuseTests(unittest.TestCase):
+    """커넥터(약 1.6 GB)는 번들 캐시(_load_v2_models)에 묶인 패처 하나로 생성마다 다시 단다. 예전엔 설치마다 새
+    ModelPatcher 를 만들고 restore 에서 강제 언로드해 생성마다 D2H·H2D 왕복을 했다. Forge LoadedModel 은 패처를
+    약한 참조로 쥐므로 런타임이 패처를 붙잡아야 GPU 에 남은 커넥터가 '죽은 모델'이 되지 않는다."""
+
+    def setUp(self):
+        self.module = _load_lifecycle_runtime()
+        self.runtime = self.module.Anima3BRuntime()
+        self.model = _LifecycleModel()
+        self.created = []
+        unet = self.model.forge_objects.unet
+
+        class Patcher(types.SimpleNamespace):   # ModelPatcher 처럼 약한 참조가 되는 패처
+            pass
+
+        def add(module, **kwargs):
+            patcher = Patcher(model=module)
+            unet.extra_model_patchers_during_sampling.append(patcher)
+            self.created.append(patcher)
+            return patcher
+
+        unet.add_extra_torch_module_during_sampling = add
+        self.models = object()
+        patches = (
+            mock.patch.object(self.module, "bundle_metadata", return_value={"anima_v2_adapter_filename": "a"}),
+            mock.patch.object(self.runtime, "_load_v2_models", side_effect=lambda *a: self.models),
+            mock.patch.object(self.runtime, "_unload_patchers"),
+        )
+        for patcher in patches:
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def _generate(self):
+        p = _LifecycleProcessing(types.SimpleNamespace(sd_model=self.model))
+        self.runtime.install(p, "a", 1.0, None)
+        patcher = self.runtime._v2_sampling_patcher
+        self.runtime.restore(p)
+        return patcher
+
+    def _carried(self, patcher):
+        unet = self.model.forge_objects.unet
+        return sum(1 for item in unet.extra_model_patchers_during_sampling if item is patcher)
+
+    def test_same_bundle_reuses_one_patcher_and_restore_only_detaches(self):
+        first = self._generate()
+        self.assertEqual(self._carried(first), 0, "restore 는 목록에서 뗀다")
+        second = self._generate()
+        third_p = _LifecycleProcessing(types.SimpleNamespace(sd_model=self.model))
+        self.runtime.install(third_p, "a", 1.0, None)
+        self.assertIs(second, first)
+        self.assertIs(self.runtime._v2_sampling_patcher, first)
+        self.assertEqual(self._carried(first), 1, "다시 달 때 중복으로 쌓이지 않는다")
+        self.assertEqual(len(self.created), 1, "ModelPatcher 는 한 번만 만든다")
+        self.runtime._unload_patchers.assert_not_called()
+
+    def test_forge_loaded_model_stays_alive_between_generations(self):
+        loaded = weakref.ref(self._generate())   # Forge LoadedModel._model 과 같은 약한 참조
+        self.created.clear()
+        gc.collect()
+        self.assertIsNotNone(loaded(), "런타임이 붙잡지 않으면 is_dead() → Forge 가 '메모리 누수'로 치운다")
+
+    def test_other_bundle_and_model_load_unload_the_old_patcher(self):
+        old = self._generate()
+        self.models = object()   # 다른 번들 → _load_v2_models 가 새 커넥터를 만든다
+        new = self._generate()
+        self.assertIsNot(new, old)
+        self.runtime._unload_patchers.assert_called_once_with(old)
+        self.runtime._v2_source = None   # on_model_loaded: 다른 모델 → 커넥터 캐시를 놓는다
+        self.runtime.release_stale_caches(object())
+        self.assertIsNone(self.runtime._v2_connector_patcher)
+        self.assertEqual(self.runtime._unload_patchers.call_args_list[-1], mock.call(new))
+
+    def _install(self):
+        p = _LifecycleProcessing(types.SimpleNamespace(sd_model=self.model))
+        self.runtime.install(p, "a", 1.0, None)
+        return p, self.runtime._v2_sampling_patcher
+
+    def test_restore_unloads_an_orphaned_sampling_patcher(self):
+        # 설치 도중 Forge 가 다른 모델을 로드하면(on_model_loaded) 커넥터 패처를 놓는다. 그 뒤 샘플링이 고아 패처를
+        # 다시 올렸을 수 있다 — 런타임이 더는 쥐지 않으니 restore 가 예전처럼 내린다(떼기만 하면 Forge 의 죽은 모델)
+        p, orphan = self._install()
+        self.runtime.release_stale_caches(object())
+        self.assertIsNone(self.runtime._v2_connector_patcher)
+        self.runtime._unload_patchers.reset_mock()
+        self.runtime.restore(p)
+        self.runtime._unload_patchers.assert_called_once_with(orphan)
+        self.assertEqual(self._carried(orphan), 0)
+        self.assertIsNone(self.runtime._v2_sampling_patcher)
+
+    def test_orphan_is_told_apart_from_the_reused_connector(self):
+        p, orphan = self._install()
+        self.runtime.release_stale_caches(object())
+        reused = _ClonablePatcher(model=object())   # 그사이 새 커넥터 패처를 쥐었다 — 이건 남긴다
+        self.runtime._v2_connector_patcher = reused
+        self.runtime._unload_patchers.reset_mock()
+        self.runtime.restore(p)
+        self.runtime._unload_patchers.assert_called_once_with(orphan)
+        self.assertIs(self.runtime._v2_connector_patcher, reused)
+
+    def test_a_clone_of_the_reused_connector_is_not_an_orphan(self):
+        # 같은 커넥터 모듈의 복제 패처를 내리면 Forge 는 재사용 패처까지 내린다(_same_patcher 는 복제를 같은 것으로 본다)
+        p, reused = self._install()
+        self.runtime._v2_sampling_patcher = _ClonablePatcher(model=reused.model)
+        self.runtime.restore(p)
+        self.runtime._unload_patchers.assert_not_called()
+        self.assertIs(self.runtime._v2_connector_patcher, reused)
+
+
+class _ClonablePatcher(types.SimpleNamespace):
+    """ModelPatcher.is_clone 을 가진 패처 대역 (같은 모듈이면 복제)."""
+
+    def is_clone(self, other):
+        return self.model is getattr(other, "model", None)
+
+
+class _FakeNativeEngine:
+    """AnimaTextProcessingEngine 의 tokenize_line·process_tokens 대역 — 출력이 emphasis 와 TE 가중치(LoRA)에 따라 바뀐다."""
+
+    def __init__(self, width=4):
+        self.emphasis = types.SimpleNamespace(name="Original")
+        self.te_weight = torch.linspace(0.5, 1.5, width)
+        self.forward_calls = 0
+
+    def tokenize_line(self, line):
+        tokens = [ord(ch) % 97 + 1 for ch in line] or [0]
+        boost = 1.1 if self.emphasis.name == "Original" and "(" in line else 1.0
+        return [types.SimpleNamespace(
+            qwen_tokens=tokens, qwen_multipliers=[1.0] * len(tokens),
+            t5_tokens=tokens + [1], t5_multipliers=[boost] * len(tokens) + [1.0],
+        )]
+
+    def process_tokens(self, batch_tokens, batch_multipliers):
+        self.forward_calls += 1
+        tokens = torch.tensor(batch_tokens[0], dtype=torch.float32)
+        return (torch.sin(tokens)[:, None] * self.te_weight[None, :]).unsqueeze(0)
+
+
+def _reference_extract_prompt_features(runtime, native_engine, native_clip, prompt):
+    """고치기 전 _extract_prompt_features 의 계산 그대로 — 캐시 없이 줄마다 TE·Qwen3.5 를 새로 돌린다(비교 기준)."""
+    qwen, tokenizer, qwen_clip = runtime._load_qwen()
+    native_adapter = native_clip.cond_stage_model.qwen3_06b.llm_adapter
+    dtype = native_adapter.embed.weight.dtype
+    offload_device = native_clip.patcher.offload_device
+    native_rows = []
+    for line in prompt:
+        source, target_ids, target_weights = runtime._native_inputs(
+            native_engine, str(line), native_clip.patcher.load_device, dtype,
+        )
+        native_rows.append((source.to(offload_device), target_ids.to(offload_device), target_weights.to(offload_device)))
+    lines = [str(line) for line in prompt]
+    rows = {}
+    for line in dict.fromkeys(lines):
+        semantic, mask = runtime._semantic_layers(qwen, tokenizer, line, qwen_clip.patcher.load_device)
+        rows[line] = ([state.to(offload_device, dtype=dtype) for state in semantic], mask.to(offload_device))
+    return native_adapter, native_rows, [rows[line] for line in lines]
+
+
+def _semantic_for(model, tokenizer, line, device):
+    return [torch.full((1, 3, 4), float(len(line) + index)) for index in range(4)], torch.ones(1, 3)
+
+
+class NativeRowCacheTests(unittest.TestCase):
+    """0.6B TE 줄 캐시 — 같은 줄·같은 TE 상태면 TE 를 GPU 로 올리지 않는다(예전엔 생성마다 1.75 GB 왕복).
+    결과는 캐시 없이 매번 돌린 옛 계산과 비트 단위로 같아야 하고, LoRA·emphasis·DoRA 방식이 바뀌면 다시 돈다."""
+
+    def setUp(self):
+        self.module = _load_lifecycle_runtime()
+        self.load_gpu = mock.Mock()
+        self.module.memory_management.load_model_gpu = self.load_gpu
+        self.engine = _FakeNativeEngine()
+        adapter = types.SimpleNamespace(embed=types.SimpleNamespace(weight=torch.zeros(1, dtype=torch.float32)))
+        self.clip = types.SimpleNamespace(
+            cond_stage_model=types.SimpleNamespace(qwen3_06b=types.SimpleNamespace(llm_adapter=adapter)),
+            patcher=types.SimpleNamespace(load_device="cpu", offload_device="cpu", patches_uuid=uuid4()),
+        )
+        self.qwen_clip = types.SimpleNamespace(patcher=types.SimpleNamespace(load_device="cpu"))
+        self.sd_model = types.SimpleNamespace(current_lora_hash="[]")
+        self.runtime = self._runtime()
+
+    def _runtime(self):
+        runtime = self.module.Anima3BRuntime()
+        runtime._qwen_path = "qwen35_4b.safetensors"
+        for name, value in (
+            ("_load_qwen", mock.Mock(return_value=("qwen", "tokenizer", self.qwen_clip))),
+            ("_semantic_layers", _semantic_for),
+        ):
+            patcher = mock.patch.object(runtime, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        return runtime
+
+    def _te_loads(self):
+        return sum(1 for call in self.load_gpu.call_args_list if call.args[0] is self.clip.patcher)
+
+    def _assert_same_as_old(self, prompt, te_loads):
+        new = self.runtime._extract_prompt_features(self.engine, self.clip, prompt, sd_model=self.sd_model)
+        old = _reference_extract_prompt_features(self.runtime, self.engine, self.clip, prompt)
+        self.assertEqual(len(new[1]), len(old[1]))
+        for new_row, old_row in zip(new[1], old[1]):
+            for new_tensor, old_tensor in zip(new_row, old_row):
+                self.assertEqual(new_tensor.dtype, old_tensor.dtype)
+                self.assertTrue(torch.equal(new_tensor, old_tensor))
+        for (new_states, new_mask), (old_states, old_mask) in zip(new[2], old[2]):
+            self.assertTrue(all(torch.equal(a, b) for a, b in zip(new_states, old_states)))
+            self.assertTrue(torch.equal(new_mask, old_mask))
+        self.assertEqual(self._te_loads(), te_loads)
+        return new
+
+    def _lora(self, scale):
+        """Forge load_networks: LoRA 세트가 바뀌면 원본 TE 패처를 복제해 add_patches — 가중치와 uuid 가 바뀐다."""
+        self.engine.te_weight = self.engine.te_weight * scale
+        self.clip.patcher.patches_uuid = uuid4()
+
+    def test_same_lines_skip_the_te_and_stay_bit_identical(self):
+        prompt = ["girl, (smile:1.2)", "cat", "girl, (smile:1.2)"]
+        first = self._assert_same_as_old(prompt, te_loads=1)
+        self.assertEqual(self.engine.forward_calls, 2 + 3, "중복 줄은 한 번(새) + 줄마다(옛 기준)")
+        second = self._assert_same_as_old(prompt, te_loads=1)
+        self.assertIs(second[1][0][0], first[1][0][0], "두 번째는 TE 를 올리지 않고 캐시를 쓴다")
+        self._assert_same_as_old(["cat", "dog"], te_loads=2)   # 새 줄이 있을 때만 TE 를 올린다
+
+    def test_lora_emphasis_and_dora_changes_recompute(self):
+        prompt = ["girl, (smile:1.2)"]
+        self._assert_same_as_old(prompt, te_loads=1)
+        self._lora(1.5)
+        self._assert_same_as_old(prompt, te_loads=2)
+        self._assert_same_as_old(prompt, te_loads=2)
+        self.engine.emphasis = types.SimpleNamespace(name="None")
+        self._assert_same_as_old(prompt, te_loads=3)
+        # DoRA 추론 방식 표시만 바뀌어도(가중치가 달라졌다고 본다) 다른 키 — uuid 가 그대로인 최악의 경우
+        from sam3ext import dora_infer_mode as dim
+        setattr(self.sd_model, dim.MERGED_STATE_ATTR, (dim.MODE_LYCORIS, "keep"))
+        self.engine.te_weight = self.engine.te_weight + 0.25
+        self._assert_same_as_old(prompt, te_loads=4)
+        self._assert_same_as_old(prompt, te_loads=4)
+
+    def test_dora_invalidation_signal_drops_the_cache(self):
+        from sam3ext import dora_infer_mode as dim
+        prompt = ["girl"]
+        self._assert_same_as_old(prompt, te_loads=1)
+        # DoRA 추론 방식이 바뀌면 dora_infer_mode 가 current_lora_hash=None 과 조건 캐시 비우기로 알린다
+        self.assertTrue(dim.sync_merged_state(None, self.sd_model, (dim.MODE_FORGE_FP32, "keep")))
+        self.assertIsNone(self.sd_model.current_lora_hash)
+        self.engine.te_weight = self.engine.te_weight * 0.5   # 다시 합친 가중치(uuid 는 아직 그대로라고 가정)
+        self._assert_same_as_old(prompt, te_loads=2)
+        self.assertEqual(len(self.runtime._native_cache), 0, "무효화 신호를 보면 캐시를 비우고 저장하지 않는다")
+        self.sd_model.current_lora_hash = "[]"   # Forge load_networks 가 다시 합쳤다
+        self._lora(1.0)
+        self._assert_same_as_old(prompt, te_loads=3)
+        self._assert_same_as_old(prompt, te_loads=3)
+
+    def test_patcher_without_uuid_and_model_switch_do_not_reuse(self):
+        self.clip.patcher.patches_uuid = None
+        self._assert_same_as_old(["girl"], te_loads=1)
+        self._assert_same_as_old(["girl"], te_loads=2)
+        self.clip.patcher.patches_uuid = uuid4()
+        self._assert_same_as_old(["girl"], te_loads=3)
+        self.runtime.release_stale_caches(object())   # 다른 체크포인트
+        self.assertEqual(len(self.runtime._native_cache), 0)
+
+    def test_te_dtype_change_recomputes(self):
+        # 키의 dtype 필드 — 같은 TE 패처(uuid)·엔진이라도 llm_adapter dtype 이 바뀌면 줄 dtype 이 달라진다
+        prompt = ["girl, (smile:1.2)"]
+        self._assert_same_as_old(prompt, te_loads=1)
+        adapter = self.clip.cond_stage_model.qwen3_06b.llm_adapter
+        adapter.embed.weight = torch.zeros(1, dtype=torch.float16)
+        rows = self._assert_same_as_old(prompt, te_loads=2)
+        self.assertEqual(rows[1][0][0].dtype, torch.float16)
+        self._assert_same_as_old(prompt, te_loads=2)
+
+    def test_other_engine_recomputes(self):
+        # 키의 엔진 id 필드 — 같은 TE 패처(uuid)·emphasis 라도 다른 엔진이면 다른 줄 (값이 다른 엔진으로 확인)
+        prompt = ["girl, (smile:1.2)"]
+        self._assert_same_as_old(prompt, te_loads=1)
+        other = _FakeNativeEngine()
+        other.te_weight = self.engine.te_weight * 2.0
+        self.engine = other
+        self._assert_same_as_old(prompt, te_loads=2)
+        self._assert_same_as_old(prompt, te_loads=2)
+
+    def test_cache_is_bounded(self):
+        for index in range(self.module.NATIVE_CACHE_LINES + 5):
+            self.runtime._extract_prompt_features(self.engine, self.clip, [f"line {index}"], sd_model=self.sd_model)
+        self.assertEqual(len(self.runtime._native_cache), self.module.NATIVE_CACHE_LINES)
+
+    def test_encode_v2_placeholders_and_runs_match_the_old_path(self):
+        self.engine = _FakeNativeEngine(width=_V2_WIDTH)   # 마커가 들어갈 폭
+        old_runtime = self._runtime()
+        reference = lambda engine, clip, prompt, sd_model=None: _reference_extract_prompt_features(  # noqa: E731
+            old_runtime, engine, clip, prompt)
+        prompt = ["girl, (smile:1.2)", "girl, (smile:1.2)", "cat"]
+        with mock.patch.object(old_runtime, "_extract_prompt_features", side_effect=reference):
+            for _ in range(2):   # 두 번째는 새 경로가 캐시로 답한다
+                new = self.runtime._encode_v2(self.engine, self.clip, prompt, sd_model=self.sd_model)
+                old = old_runtime._encode_v2(self.engine, self.clip, prompt)
+                self.assertEqual(len(new), len(old))
+                for new_cond, old_cond in zip(new, old):
+                    self.assertTrue(torch.equal(new_cond, old_cond))
+                    run_id = int(anima_marker.read_run_ids(new_cond)[0])
+                    new_run, old_run = self.runtime._v2_runs[run_id], old_runtime._v2_runs[run_id]
+                    for field in ("source", "target_ids", "target_weights", "semantic_mask"):
+                        self.assertTrue(torch.equal(getattr(new_run, field), getattr(old_run, field)), field)
+                    self.assertTrue(all(torch.equal(a, b) for a, b in zip(new_run.semantic, old_run.semantic)))
+        self.assertEqual(self._te_loads(), 1)
+
+
+class _MemPatcher:
+    def __init__(self, size, loaded=0.0, device="cuda:0"):
+        self.load_device = device
+        self._size, self._loaded = size, loaded
+
+    def model_size(self):
+        return self._size
+
+    def loaded_size(self):
+        return self._loaded
+
+
+class _MemUnet(_MemPatcher):
+    def __init__(self, size, extras=()):
+        super().__init__(size)
+        self.extra_model_patchers_during_sampling = list(extras)
+        self.extra_preserved_memory_during_sampling = 0
+        self.shapes = []
+
+    def memory_required(self, shape):
+        self.shapes.append(list(shape))
+        return 3.0
+
+
+class EncoderResidencyTests(unittest.TestCase):
+    """TE·Qwen3.5 는 여유 VRAM 이 다음 샘플링(Forge load_models_gpu 가 비우려는 양)보다 넉넉할 때만 Forge
+    LoadedModel 로 남긴다. 모자라거나 셀 수 없으면 예전처럼 바로 내린다 — unpatch_weights=False 로 목록에서만
+    빼는 방식(Forge 계산 밖 VRAM)은 쓰지 않는다."""
+
+    def setUp(self):
+        self.module = _load_lifecycle_runtime()
+        self.runtime = self.module.Anima3BRuntime()
+        mm = self.module.memory_management
+        self.free = 0.0
+        mm.get_free_memory = lambda device=None: self.free
+        mm.minimum_inference_memory = lambda: 2.0
+        mm.extra_reserved_memory = lambda: 1.0
+        self.unet = _MemUnet(10.0, extras=[_MemPatcher(2.0)])   # DiT 미적재 10 + 커넥터 2
+        self.runtime._installed_processing = types.SimpleNamespace(
+            sd_model=types.SimpleNamespace(forge_objects=types.SimpleNamespace(unet=self.unet)),
+            width=1024, height=1024, batch_size=1, enable_hr=True, hr_upscale_to_x=1536, hr_upscale_to_y=1536,
+        )
+        self.te = _MemPatcher(1.75, loaded=1.75)
+        self.qwen = _MemPatcher(5.0)
+        unload = mock.patch.object(self.runtime, "_unload_patchers")
+        self.unload = unload.start()
+        self.addCleanup(unload.stop)
+
+    def test_kept_only_when_sampling_headroom_is_free(self):
+        # 12 × 1.1 + max(2, 3 + 0 + 1) = 17.2
+        self.free = 17.3
+        self.runtime._release_encoder(self.te)
+        self.unload.assert_not_called()
+        self.assertEqual(self.unet.shapes, [[2, 16, 192, 192]], "하이레스면 큰 쪽 해상도로 잰다")
+        self.free = 17.1
+        self.runtime._release_encoder(self.te)
+        self.unload.assert_called_once_with(self.te)
+
+    def test_upcoming_qwen_needs_room_too(self):
+        self.free = 17.3
+        self.runtime._release_encoder(self.te, upcoming=(self.qwen,))
+        self.unload.assert_called_once_with(self.te)
+        self.unload.reset_mock()
+        self.free = 22.8   # 17.2 + 5 × 1.1
+        self.runtime._release_encoder(self.te, upcoming=(self.qwen,))
+        self.unload.assert_not_called()
+
+    def test_loaded_models_and_other_devices_need_no_room(self):
+        self.unet._loaded = 10.0
+        self.unet.extra_model_patchers_during_sampling = [_MemPatcher(2.0, device="cpu")]
+        self.free = 4.0   # 추론 몫만
+        self.runtime._release_encoder(self.te)
+        self.unload.assert_not_called()
+
+    def test_unknown_state_falls_back_to_unloading(self):
+        self.free = 1e12
+        self.runtime._installed_processing = None
+        self.runtime._release_encoder(self.te)
+        self.unload.assert_called_once_with(self.te)
+        self.unload.reset_mock()
+        self.runtime._installed_processing = types.SimpleNamespace(
+            sd_model=types.SimpleNamespace(forge_objects=types.SimpleNamespace(unet=self.unet)), width=64, height=64)
+        del self.module.memory_management.get_free_memory   # 옛 Forge·스텁
+        self.runtime._release_encoder(self.te)
+        self.unload.assert_called_once_with(self.te)
+
+    def _features_setup(self):
+        load_gpu = mock.Mock()
+        self.module.memory_management.load_model_gpu = load_gpu
+        adapter = types.SimpleNamespace(embed=types.SimpleNamespace(weight=torch.zeros(1)))
+        te = _MemPatcher(1.75, loaded=1.75, device="cpu")
+        te.offload_device, te.patches_uuid = "cpu", uuid4()
+        clip = types.SimpleNamespace(
+            cond_stage_model=types.SimpleNamespace(qwen3_06b=types.SimpleNamespace(llm_adapter=adapter)), patcher=te)
+        qwen_clip = types.SimpleNamespace(patcher=_MemPatcher(5.0, device="cpu"))
+        self.runtime._qwen_path = "qwen35_4b.safetensors"
+        for name, value in (
+            ("_load_qwen", mock.Mock(return_value=("qwen", "tokenizer", qwen_clip))),
+            ("_semantic_layers", _semantic_for),
+        ):
+            patcher = mock.patch.object(self.runtime, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        return load_gpu, clip, qwen_clip
+
+    def test_repeat_generation_moves_nothing(self):
+        load_gpu, clip, qwen_clip = self._features_setup()
+        self.free = 1e12
+        engine = _FakeNativeEngine()
+        self.runtime._extract_prompt_features(engine, clip, ["girl"], sd_model=types.SimpleNamespace(current_lora_hash="[]"))
+        self.assertEqual([call.args[0] for call in load_gpu.call_args_list], [clip.patcher, qwen_clip.patcher])
+        self.unload.assert_not_called()
+        self.runtime._extract_prompt_features(engine, clip, ["girl"], sd_model=types.SimpleNamespace(current_lora_hash="[]"))
+        self.assertEqual(load_gpu.call_count, 2, "같은 프롬프트 — TE·Qwen3.5 어느 쪽도 GPU 로 옮기지 않는다")
+
+    def test_setting_off_unloads_even_with_room(self):
+        self.free = 1e12
+        with mock.patch.object(self.module, "keep_resident", return_value=False):
+            self.runtime._release_encoder(self.te)
+        self.unload.assert_called_once_with(self.te)
+        self.unload.reset_mock()
+        with mock.patch.object(self.module, "keep_resident", return_value=True):
+            self.runtime._release_encoder(self.te)
+        self.unload.assert_not_called()
+
+    def test_setting_off_unloads_te_and_qwen_right_after_encoding_with_the_same_rows(self):
+        load_gpu, clip, qwen_clip = self._features_setup()
+        self.free = 1e12
+        engine = _FakeNativeEngine()
+        sd_model = types.SimpleNamespace(current_lora_hash="[]")
+        with mock.patch.object(self.module, "keep_resident", return_value=False):
+            new = self.runtime._extract_prompt_features(engine, clip, ["girl"], sd_model=sd_model)
+        self.assertEqual(self.unload.call_args_list, [mock.call(clip.patcher), mock.call(qwen_clip.patcher)])
+        old = _reference_extract_prompt_features(self.runtime, engine, clip, ["girl"])
+        for new_tensor, old_tensor in zip(new[1][0], old[1][0]):
+            self.assertTrue(torch.equal(new_tensor, old_tensor))
+        self.assertTrue(all(torch.equal(a, b) for a, b in zip(new[2][0][0], old[2][0][0])))
+
+    def test_failed_encoding_still_unloads(self):
+        _, clip, _ = self._features_setup()
+        self.free = 1e12
+        with mock.patch.object(self.runtime, "_native_inputs", side_effect=RuntimeError("CUDA out of memory")):
+            with self.assertRaises(RuntimeError):
+                self.runtime._extract_prompt_features(_FakeNativeEngine(), clip, ["girl"])
+        self.unload.assert_called_once_with(clip.patcher)
+
+
+class _WeakAdapter:
+    """llm_adapter 대역 — weakref 가 되는 객체(_v2_source 는 약한 참조)."""
+
+    def __init__(self):
+        self.embed = types.SimpleNamespace(weight=torch.zeros(1))
+
+
+class SharedAdapterFallbackTests(unittest.TestCase):
+    """번들에 llm_adapter 원본이 없어 커넥터가 TE 모듈을 같이 쓰는 폴백. 두 패처가 같은 가중치를 제자리 패치하므로
+    TE 가 상주하면 커넥터가 TE LoRA 의 llm_adapter 몫이 합쳐진 가중치를 본다(여유 VRAM 에 따라 결과가 바뀜).
+    이 경우엔 예전처럼 TE 를 인코딩마다 내리고, 커넥터도 restore 에서 내린다."""
+
+    def setUp(self):
+        self.module = _load_lifecycle_runtime()
+        self.runtime = self.module.Anima3BRuntime()
+        mm = self.module.memory_management
+        mm.get_free_memory = lambda device=None: 1e12   # 여유는 넉넉 — 공유가 아니면 TE 를 남길 상황
+        mm.minimum_inference_memory = lambda: 2.0
+        mm.extra_reserved_memory = lambda: 1.0
+        self.load_gpu = mock.Mock()
+        mm.load_model_gpu = self.load_gpu
+        unet = _MemUnet(10.0)
+        self.runtime._installed_processing = types.SimpleNamespace(
+            sd_model=types.SimpleNamespace(forge_objects=types.SimpleNamespace(unet=unet)),
+            width=1024, height=1024, batch_size=1,
+        )
+        self.adapter = _WeakAdapter()
+        te = _MemPatcher(1.75, loaded=1.75, device="cpu")
+        te.offload_device, te.patches_uuid = "cpu", uuid4()
+        self.clip = types.SimpleNamespace(
+            cond_stage_model=types.SimpleNamespace(qwen3_06b=types.SimpleNamespace(llm_adapter=self.adapter)),
+            patcher=te,
+        )
+        qwen_clip = types.SimpleNamespace(patcher=_MemPatcher(5.0, device="cpu"))
+        self.runtime._qwen_path = "qwen35_4b.safetensors"
+        for name, value in (
+            ("_load_qwen", mock.Mock(return_value=("qwen", "tokenizer", qwen_clip))),
+            ("_semantic_layers", _semantic_for),
+            ("_unload_patchers", mock.Mock()),
+        ):
+            patcher = mock.patch.object(self.runtime, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        self.unload = self.runtime._unload_patchers
+        self.engine = _FakeNativeEngine()   # 캐시 키에 엔진 id 가 든다 — 한 엔진으로
+        self.sd_model = types.SimpleNamespace(current_lora_hash="[]")
+
+    def _te_unloads(self):
+        return sum(1 for call in self.unload.call_args_list if call.args == (self.clip.patcher,))
+
+    def _extract(self):
+        return self.runtime._extract_prompt_features(self.engine, self.clip, ["girl"], sd_model=self.sd_model)
+
+    def test_private_copy_keeps_the_te_resident(self):
+        self.runtime._v2_models = types.SimpleNamespace(native_adapter=_WeakAdapter())   # 번들 원본 사본
+        self._extract()
+        self._extract()
+        self.assertEqual(self._te_unloads(), 0)
+        self.assertFalse(self.runtime._connector_shares_te(self.clip))
+
+    def test_shared_module_unloads_the_te_after_every_encoding_even_from_cache(self):
+        self.runtime._v2_models = types.SimpleNamespace(native_adapter=self.adapter)
+        self.assertTrue(self.runtime._connector_shares_te(self.clip))
+        first = self._extract()
+        self.assertEqual(self._te_unloads(), 1, "여유 VRAM 이 넉넉해도 예전처럼 내린다")
+        # 두 번째는 줄 캐시로 TE 를 올리지 않지만, 지난 비 v2 생성에서 남은 TE 가 있을 수 있어 내린다
+        second = self._extract()
+        self.assertEqual(self._te_unloads(), 2)
+        te_loads = sum(1 for call in self.load_gpu.call_args_list if call.args[0] is self.clip.patcher)
+        self.assertEqual(te_loads, 1, "줄 캐시는 공유 폴백에서도 그대로 쓴다")
+        for new_tensor, old_tensor in zip(second[1][0], first[1][0]):
+            self.assertTrue(torch.equal(new_tensor, old_tensor))
+
+    def test_release_native_routes_by_sharing(self):
+        self.runtime._v2_models = types.SimpleNamespace(native_adapter=self.adapter)
+        with mock.patch.object(self.runtime, "_release_encoder") as release:
+            self.runtime._release_native(self.clip)
+            release.assert_not_called()
+            self.assertEqual(self._te_unloads(), 1)
+            self.runtime._v2_models = None   # v2 번들을 쓴 적 없음 — 여유 기준
+            self.runtime._release_native(self.clip, upcoming=("qwen",))
+            release.assert_called_once_with(self.clip.patcher, upcoming=("qwen",))
+            self.assertEqual(self._te_unloads(), 1)
+
+
+class SharedConnectorRestoreTests(unittest.TestCase):
+    """공유 폴백이면 restore 가 커넥터 패처를 예전처럼 내린다(다음 인코딩의 TE 적재·언로드가 공유 모듈을 옮겨
+    '적재됨' 커넥터와 장치가 어긋나지 않게). 패처 객체는 계속 재사용한다."""
+
+    def setUp(self):
+        self.module = _load_lifecycle_runtime()
+        self.runtime = self.module.Anima3BRuntime()
+        self.model = _LifecycleModel()
+        self.created = []
+        unet = self.model.forge_objects.unet
+
+        class Patcher(types.SimpleNamespace):
+            pass
+
+        def add(module, **kwargs):
+            patcher = Patcher(model=module)
+            unet.extra_model_patchers_during_sampling.append(patcher)
+            self.created.append(patcher)
+            return patcher
+
+        unet.add_extra_torch_module_during_sampling = add
+        self.te_adapter = _WeakAdapter()
+        patches = (
+            mock.patch.object(self.module, "bundle_metadata", return_value={"anima_v2_adapter_filename": "a"}),
+            mock.patch.object(self.runtime, "_load_v2_models", side_effect=lambda *a: self.models),
+            mock.patch.object(self.runtime, "_unload_patchers"),
+        )
+        for patcher in patches:
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def _generate(self):
+        p = _LifecycleProcessing(types.SimpleNamespace(sd_model=self.model))
+        self.runtime.install(p, "a", 1.0, None)
+        self.runtime._v2_source = weakref.ref(self.te_adapter)   # _load_v2_models 가 기록하는 원본 TE 모듈
+        patcher = self.runtime._v2_sampling_patcher
+        self.runtime.restore(p)
+        return patcher
+
+    def test_shared_connector_is_unloaded_at_restore_but_reused(self):
+        self.models = types.SimpleNamespace(native_adapter=self.te_adapter)
+        first = self._generate()
+        self.runtime._unload_patchers.assert_called_once_with(first)
+        second = self._generate()
+        self.assertIs(second, first)
+        self.assertEqual(len(self.created), 1)
+        self.assertEqual(self.runtime._unload_patchers.call_count, 2)
+
+    def test_private_connector_stays_resident(self):
+        self.models = types.SimpleNamespace(native_adapter=_WeakAdapter())
+        self._generate()
+        self._generate()
+        self.runtime._unload_patchers.assert_not_called()
+
+
+def _reference_expand_v2_context(runtime, context, timesteps, run_ids):
+    """고치기 전 _expand_v2_context 그대로 — 스텝마다 run 텐서를 다시 .to() 하고 run 마다 unique·nonzero·tolist 로
+    동기화한다(비교 기준). 새 구현과 같은 run·커넥터를 읽는다."""
+    connector = runtime._v2_models.connector
+    flat_ids = run_ids.reshape(-1).to(dtype=torch.long)
+    if flat_ids.numel() != context.shape[0]:
+        repeats = (context.shape[0] + flat_ids.numel() - 1) // flat_ids.numel()
+        flat_ids = flat_ids.repeat(repeats)[: context.shape[0]]
+    timestep_rows = timesteps.reshape(-1)
+    if timestep_rows.numel() != context.shape[0]:
+        repeats = (context.shape[0] + timestep_rows.numel() - 1) // timestep_rows.numel()
+        timestep_rows = timestep_rows.repeat(repeats)[: context.shape[0]]
+    outputs = [None] * context.shape[0]
+    dtype = runtime._v2_models.native_adapter.embed.weight.dtype
+    for run_id in flat_ids.unique().tolist():
+        if int(run_id) < 0:
+            for row_index in (flat_ids == run_id).nonzero(as_tuple=False).reshape(-1).tolist():
+                outputs[row_index] = context[row_index : row_index + 1]
+            continue
+        run = runtime._v2_runs.get(int(run_id))
+        if run is None:
+            raise RuntimeError(f"Anima v2 conditioning run {run_id} is unavailable; re-encode the prompt.")
+        indices = (flat_ids == run_id).nonzero(as_tuple=False).reshape(-1)
+        count = indices.numel()
+        source = run.source.to(context.device, dtype=dtype).expand(count, -1, -1)
+        target_ids = run.target_ids.to(context.device).expand(count, -1)
+        semantic = [state.to(context.device, dtype=dtype).expand(count, -1, -1) for state in run.semantic]
+        semantic_mask = run.semantic_mask.to(context.device).expand(count, -1)
+        expanded = connector(
+            source, target_ids, semantic,
+            semantic_source_mask=semantic_mask,
+            timesteps=timestep_rows[indices].to(context.device),
+        )
+        weights = run.target_weights.to(context.device, dtype=expanded.dtype).expand(count, -1, -1)
+        expanded = expanded * weights[:, : expanded.shape[1]]
+        if expanded.shape[1] < 512:
+            expanded = torch.nn.functional.pad(expanded, (0, 0, 0, 512 - expanded.shape[1]))
+        for output_index, row_index in enumerate(indices.tolist()):
+            outputs[row_index] = expanded[output_index : output_index + 1]
+    return torch.cat(outputs).to(dtype=context.dtype)
+
+
+def _v2_rich_features(count, semantic_dtype=torch.float32, seed=0):
+    """줄마다 값이 다른 _extract_prompt_features 대역 — 커넥터 입력이 하나라도 어긋나면 출력이 달라지게."""
+    generator = torch.Generator().manual_seed(seed)
+    native_rows, semantic_rows = [], []
+    for index in range(count):
+        native_rows.append((
+            torch.randn(1, _V2_TOKENS, _V2_WIDTH, generator=generator),
+            torch.randint(0, 50, (1, _V2_TOKENS), generator=generator),
+            torch.rand(1, _V2_TOKENS, 1, generator=generator) + 0.5,
+        ))
+        length = 3 + index % 4
+        semantic_rows.append((
+            [torch.randn(1, length, 16, generator=generator).to(semantic_dtype) for _ in range(4)],
+            torch.ones(1, length, dtype=torch.long),
+        ))
+    return object(), native_rows, semantic_rows
+
+
+def _mixing_connector(calls):
+    """모든 입력(source·T5 id·의미 특징 4층·mask·timestep)이 출력에 섞이는 커넥터 대역. 받은 입력을 남긴다."""
+
+    def connector(source, target_ids, semantic, semantic_source_mask=None, timesteps=None):
+        calls.append(types.SimpleNamespace(source=source, target_ids=target_ids, semantic=list(semantic),
+                                           mask=semantic_source_mask, timesteps=timesteps))
+        mixed = sum((index + 1) * state.sum(dim=(1, 2)) for index, state in enumerate(semantic))
+        extra = mixed + semantic_source_mask.sum(dim=1).to(source.dtype) + timesteps.to(source.dtype) * 0.125
+        ids = target_ids[:, :, None].to(source.dtype)   # 출력 길이는 실제 커넥터처럼 T5 토큰 수
+        return source.sum(dim=1, keepdim=True) * 1.5 + ids * 0.25 + extra[:, None, None]
+
+    return connector
+
+
+class V2StepCacheTests(unittest.TestCase):
+    """스텝마다 부르는 커넥터 경로 — run 텐서는 샘플링 장치에 한 번만 올리고, run 묶기는 forward 한 번에 동기화 한 번.
+    결과는 고치기 전 구현(_reference_expand_v2_context)과 비트 단위로 같아야 한다."""
+
+    def setUp(self):
+        self.module = _load_lifecycle_runtime()
+        self.runtime = self.module.Anima3BRuntime()
+        self.calls = []
+        self._models(torch.float32)
+        self.model = _LifecycleModel()
+        self.dit = _RecordingDiT()
+        self.model.forge_objects.unet.model.diffusion_model = self.dit
+        self.p = _LifecycleProcessing(types.SimpleNamespace(sd_model=self.model))
+        self.uncond = torch.randn(1, 512, _V2_WIDTH, generator=torch.Generator().manual_seed(7))
+
+    def _models(self, dtype):
+        """커넥터 dtype(= llm_adapter embed dtype). float64 면 .to() 가 실제 사본을 만든다 — CPU 에서 캐시가 보인다."""
+        self.models = types.SimpleNamespace(
+            connector=_mixing_connector(self.calls),
+            native_adapter=types.SimpleNamespace(embed=types.SimpleNamespace(weight=torch.zeros(1, dtype=dtype))),
+        )
+        self.runtime._v2_models = self.models
+
+    def _install(self):
+        def load(sd_model, path, metadata):
+            self.runtime._v2_models = self.models
+            return self.models
+
+        with mock.patch.object(self.runtime, "_load_v2_models", side_effect=load):
+            self.runtime._install_v2(self.p, "bundle.safetensors", {})
+
+    def _encode(self, count, seed=0, semantic_dtype=torch.float32):
+        features = _v2_rich_features(count, semantic_dtype, seed)
+        with mock.patch.object(self.runtime, "_extract_prompt_features", return_value=features):
+            conds = self.runtime._encode_v2(object(), object(), ["line"] * count)
+        return conds, [int(anima_marker.read_run_ids(cond)[0]) for cond in conds]
+
+    def _assert_same(self, context, timesteps, run_ids):
+        old = _reference_expand_v2_context(self.runtime, context, timesteps, run_ids)
+        new = self.runtime._expand_v2_context(context, timesteps, run_ids)
+        self.assertEqual(new.dtype, old.dtype)
+        self.assertTrue(torch.equal(new, old))
+        return new
+
+    def test_every_row_layout_matches_the_old_implementation_step_after_step(self):
+        for dtype in (torch.float32, torch.float64):
+            for semantic_dtype in (torch.float32, torch.bfloat16):
+                with self.subTest(dtype=dtype, semantic=semantic_dtype):
+                    self.runtime = self.module.Anima3BRuntime()
+                    self._models(dtype)
+                    conds, (a, b, c) = self._encode(3, semantic_dtype=semantic_dtype)
+                    rows = {a: conds[0], b: conds[1], c: conds[2], -1: self.uncond}
+                    layouts = (
+                        [a], [a, -1], [a, -1, a, -1], [a, b, -1, -1], [a, b, a, c],
+                        [a, a, -1, a],   # 등간격이 아닌 행 — 인덱스 텐서로 고른다
+                        [-1, -1], [c, -1, b, a], [-1, a, a, a],
+                    )
+                    for layout in layouts:
+                        context = torch.cat([rows[run_id] for run_id in layout])
+                        for start in (0.9, 0.5, 0.1):   # 같은 run 을 여러 스텝 — 두 번째부터 장치 사본으로
+                            timesteps = torch.linspace(start, start + 0.3, len(layout))
+                            self._assert_same(context, timesteps, torch.tensor(layout))
+                    # 짧은 run id·timestep 은 배치만큼 되풀이 (CFG 의 [c, uc] → [c, uc, c, uc])
+                    context = torch.cat([conds[0], self.uncond, conds[0], self.uncond])
+                    self._assert_same(context, torch.tensor([10.0, 20.0]), torch.tensor([a, -1]))
+
+    def test_forward_matches_the_old_implementation(self):
+        self._install()
+        conds, _ = self._encode(2, semantic_dtype=torch.bfloat16)
+        for context in (
+            torch.cat([conds[0], self.uncond]),
+            torch.stack([conds[0], conds[1], self.uncond]),   # reconstruct_cond_batch 의 [B, 1, 512, C]
+        ):
+            for step in range(3):
+                timesteps = torch.full((context.shape[0],), 0.8 - 0.2 * step)
+                self.dit.forward(torch.zeros(context.shape[0], 4), timesteps, context)
+                rows = anima_marker.as_rows(context)
+                expected = _reference_expand_v2_context(
+                    self.runtime, rows, timesteps, anima_marker.read_run_ids(rows)).reshape(context.shape)
+                self.assertTrue(torch.equal(self.dit.calls[-1].context, expected))
+
+    def test_run_tensors_reach_the_device_once(self):
+        self._models(torch.float64)   # 실제 사본이 생기는 캐스트 — GPU 의 H2D 자리
+        self._install()
+        (cond,), _ = self._encode(1)
+        context = torch.cat([cond, self.uncond])
+        self.dit.forward(torch.zeros(2, 4), torch.tensor([0.9, 0.9]), context)
+        self.dit.forward(torch.zeros(2, 4), torch.tensor([0.4, 0.4]), context)
+        first, second = self.calls[-2], self.calls[-1]
+        self.assertEqual(first.source.dtype, torch.float64)
+        self.assertEqual(second.source.data_ptr(), first.source.data_ptr(), "둘째 스텝은 첫 스텝의 사본을 쓴다")
+        for left, right in zip(first.semantic, second.semantic):
+            self.assertEqual(left.dtype, torch.float64)
+            self.assertEqual(right.data_ptr(), left.data_ptr())
+        self.assertFalse(torch.equal(first.timesteps, second.timesteps), "timestep 은 스텝마다 새 값")
+
+    def test_one_host_sync_per_forward(self):
+        self._install()
+        conds, _ = self._encode(2)
+        context = torch.cat([conds[0], self.uncond, conds[1], conds[0], self.uncond])
+        timesteps = torch.full((5,), 0.5)
+        counts = {}
+
+        def counting(name):
+            original = getattr(torch.Tensor, name)
+
+            def wrapper(tensor, *args, **kwargs):
+                counts[name] = counts.get(name, 0) + 1
+                return original(tensor, *args, **kwargs)
+
+            return wrapper
+
+        def run(call):
+            counts.clear()
+            with ExitStack() as stack:
+                for name in ("tolist", "item", "__bool__", "nonzero", "unique"):
+                    stack.enter_context(mock.patch.object(torch.Tensor, name, counting(name)))
+                call()
+            return dict(counts)
+
+        self.assertEqual(run(lambda: self.dit.forward(torch.zeros(5, 4), timesteps, context)), {"tolist": 1})
+        run_ids = anima_marker.read_run_ids(context)
+        old = run(lambda: _reference_expand_v2_context(self.runtime, context, timesteps, run_ids))
+        self.assertGreater(sum(old.values()), 4, "옛 구현은 run 마다 nonzero·tolist 로 동기화했다")
+
+    def test_device_copies_are_bounded_and_rebuilt_identically(self):
+        self._models(torch.float64)
+        cap = self.module.V2_DEVICE_CACHE_RUNS
+        conds, ids = self._encode(cap + 3)
+        step = torch.tensor([0.5])
+        for cond, run_id in zip(conds, ids):
+            self._assert_same(cond, step, torch.tensor([run_id]))
+        self.assertEqual(len(self.runtime._v2_device_runs), cap)
+        self.assertTrue(all(not self.runtime._v2_runs[run_id].device_copies for run_id in ids[:3]))
+        self.assertTrue(all(self.runtime._v2_runs[run_id].device_copies for run_id in ids[3:]))
+        self._assert_same(conds[0], step, torch.tensor([ids[0]]))   # 쫓겨난 run 도 다시 쓰면 같은 값
+        self.assertEqual(len(self.runtime._v2_device_runs), cap)
+
+        runs = dict(self.runtime._v2_runs)
+        self.runtime.release_stale_caches(object())   # on_model_loaded — 사본만 놓고 run 은 둔다(하이레스가 쓴다)
+        self.assertEqual(self.runtime._v2_runs, runs)
+        self.assertEqual(len(self.runtime._v2_device_runs), 0)
+        self.assertTrue(all(not run.device_copies for run in runs.values()))
+
+    def test_restore_drops_copies_and_a_reused_run_id_sees_its_own_tensors(self):
+        self._models(torch.float64)
+        self._install()
+        (first,), (run_id,) = self._encode(1, seed=1)
+        self.dit.forward(torch.zeros(1, 4), torch.tensor([0.5]), first)
+        old_run = self.runtime._v2_runs[run_id]
+        self.assertTrue(old_run.device_copies)
+        self.runtime.restore(self.p)
+        self.assertEqual(self.runtime._v2_runs, {})
+        self.assertEqual(len(self.runtime._v2_device_runs), 0)
+        self.assertFalse(old_run.device_copies, "restore 는 VRAM 사본도 놓는다")
+
+        self._install()
+        (second,), (again,) = self._encode(1, seed=2)
+        self.assertEqual(again, run_id, "카운터가 0 부터 — 같은 id 가 다른 run")
+        self.dit.forward(torch.zeros(1, 4), torch.tensor([0.5]), second)
+        expected = _reference_expand_v2_context(self.runtime, second, torch.tensor([0.5]), torch.tensor([run_id]))
+        self.assertTrue(torch.equal(self.dit.calls[-1].context, expected))
+
+    def test_clear_drops_runs_and_their_copies(self):
+        self._models(torch.float64)
+        conds, ids = self._encode(2)
+        self._assert_same(conds[0], torch.tensor([0.5]), torch.tensor([ids[0]]))
+        run = self.runtime._v2_runs[ids[0]]
+        self.runtime._clear_v2_runs()   # install·restore 가 부른다
+        self.assertEqual(self.runtime._v2_runs, {})
+        self.assertFalse(run.device_copies)
+
+    def test_placeholders_live_on_the_te_device_and_runs_stay_on_the_host(self):
+        clip = types.SimpleNamespace(patcher=types.SimpleNamespace(load_device="meta"))
+        features = _v2_rich_features(2)
+        with mock.patch.object(self.runtime, "_extract_prompt_features", return_value=features):
+            conds = self.runtime._encode_v2(object(), clip, ["a", "b"])
+        self.assertEqual([cond.device.type for cond in conds], ["meta", "meta"])
+        for run in self.runtime._v2_runs.values():
+            self.assertEqual(run.source.device.type, "cpu")
+
+    def test_native_conditioning_keeps_the_forge_device(self):
+        class MetaModel(_CondModel):
+            def get_learned_conditioning(self, prompt):
+                self.native_lines.append(list(prompt))
+                return [torch.zeros(1, 512, _V2_WIDTH, device="meta") for _ in prompt]
+
+        model = MetaModel()
+        conds = self.runtime.encode(model, _Prompt(["bad"], negative=True), "a", 1.0, None)
+        self.assertEqual([cond.device.type for cond in conds], ["meta"], "순정 Anima 처럼 TE 장치 그대로")
+        self.assertEqual(model.native_lines, [["bad"]])
+
+
+def _bf16_semantic_for(model, tokenizer, line, device):
+    """Qwen3.5 처럼 bf16 로 계산된 4개 층."""
+    generator = torch.Generator().manual_seed(len(line))
+    return [torch.randn(1, 3, 4, generator=generator).to(torch.bfloat16) for _ in range(4)], torch.ones(1, 3)
+
+
+class SemanticStorageTests(unittest.TestCase):
+    """의미 특징 캐시 — bf16 로 계산된 층은 bf16 로 두고(RAM 절반), 쓸 때 fp32 로 올린다. bf16→fp32 는 정확하므로
+    옛 경로(저장할 때 fp32)와 커넥터 입력·출력이 비트 단위로 같다. 정확하지 않은 캐스트는 예전처럼 저장할 때."""
+
+    def setUp(self):
+        self.module = _load_lifecycle_runtime()
+        self.module.memory_management.load_model_gpu = mock.Mock()
+        self.engine = _FakeNativeEngine(width=_V2_WIDTH)
+        self.sd_model = types.SimpleNamespace(current_lora_hash="[]")
+        self.qwen_clip = types.SimpleNamespace(patcher=types.SimpleNamespace(load_device="cpu"))
+
+    def _clip(self, dtype):
+        adapter = types.SimpleNamespace(embed=types.SimpleNamespace(weight=torch.zeros(1, dtype=dtype)))
+        return types.SimpleNamespace(
+            cond_stage_model=types.SimpleNamespace(qwen3_06b=types.SimpleNamespace(llm_adapter=adapter)),
+            patcher=types.SimpleNamespace(load_device="cpu", offload_device="cpu", patches_uuid=uuid4()),
+        )
+
+    def _runtime(self, semantic=_bf16_semantic_for):
+        runtime = self.module.Anima3BRuntime()
+        runtime._qwen_path = "qwen35_4b.safetensors"
+        for name, value in (
+            ("_load_qwen", mock.Mock(return_value=("qwen", "tokenizer", self.qwen_clip))),
+            ("_semantic_layers", semantic),
+        ):
+            patcher = mock.patch.object(runtime, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        return runtime
+
+    def test_bf16_layers_are_cached_as_bf16_and_upcast_exactly(self):
+        clip = self._clip(torch.float32)
+        runtime, reference = self._runtime(), self._runtime()
+        prompt = ["girl, (smile:1.2)", "cat"]
+        new = runtime._extract_prompt_features(self.engine, clip, prompt, sd_model=self.sd_model)
+        old = _reference_extract_prompt_features(reference, self.engine, clip, prompt)
+        for (new_states, new_mask), (old_states, old_mask) in zip(new[2], old[2]):
+            for new_state, old_state in zip(new_states, old_states):
+                self.assertEqual(new_state.dtype, torch.bfloat16)
+                self.assertEqual(old_state.dtype, torch.float32)
+                self.assertTrue(torch.equal(new_state.to(torch.float32), old_state))
+            self.assertTrue(torch.equal(new_mask, old_mask))
+        for states, _ in runtime._semantic_cache.values():
+            self.assertTrue(all(state.dtype == torch.bfloat16 for state in states))
+
+    def test_whole_v2_path_matches_the_old_path(self):
+        clip = self._clip(torch.float32)
+        runtime, old_runtime = self._runtime(), self._runtime()
+        calls = []
+        models = types.SimpleNamespace(
+            connector=_mixing_connector(calls),
+            native_adapter=types.SimpleNamespace(embed=types.SimpleNamespace(weight=torch.zeros(1))),
+        )
+        runtime._v2_models = old_runtime._v2_models = models
+        reference = lambda engine, clip_, prompt, sd_model=None: _reference_extract_prompt_features(  # noqa: E731
+            old_runtime, engine, clip_, prompt)
+        prompt = ["girl, (smile:1.2)", "girl, (smile:1.2)", "cat"]
+        uncond = torch.randn(1, 512, _V2_WIDTH, generator=torch.Generator().manual_seed(3))
+        with mock.patch.object(old_runtime, "_extract_prompt_features", side_effect=reference):
+            for _ in range(2):   # 두 번째 인코딩은 새 경로가 캐시(bf16)로 답한다
+                new_conds = runtime._encode_v2(self.engine, clip, prompt, sd_model=self.sd_model)
+                old_conds = old_runtime._encode_v2(self.engine, clip, prompt)
+                for new_cond, old_cond in zip(new_conds, old_conds):
+                    self.assertTrue(torch.equal(new_cond, old_cond))
+                new_context = torch.cat([*new_conds, uncond])
+                old_context = torch.cat([*old_conds, uncond])
+                for step in range(3):
+                    timesteps = torch.full((4,), 0.9 - 0.3 * step)
+                    new = runtime._expand_v2_context(
+                        new_context, timesteps, anima_marker.read_run_ids(new_context))
+                    old = _reference_expand_v2_context(
+                        old_runtime, old_context, timesteps, anima_marker.read_run_ids(old_context))
+                    self.assertTrue(torch.equal(new, old))
+
+    def test_inexact_casts_still_happen_when_stored(self):
+        cases = (
+            (torch.float16, _bf16_semantic_for, torch.float16),   # bf16→fp16 은 값이 바뀔 수 있다 — 예전처럼
+            (torch.float32, _semantic_for, torch.float32),        # 같은 dtype
+        )
+        for dtype, semantic, stored in cases:
+            with self.subTest(dtype=dtype):
+                clip = self._clip(dtype)
+                runtime, reference = self._runtime(semantic), self._runtime(semantic)
+                new = runtime._extract_prompt_features(self.engine, clip, ["girl"], sd_model=self.sd_model)
+                old = _reference_extract_prompt_features(reference, self.engine, clip, ["girl"])
+                for new_state, old_state in zip(new[2][0][0], old[2][0][0]):
+                    self.assertEqual(new_state.dtype, stored)
+                    self.assertTrue(torch.equal(new_state, old_state))
+
+    def test_storage_dtype_rule(self):
+        rule = self.module._semantic_storage_dtype
+        self.assertIs(rule(torch.bfloat16, torch.float32), torch.bfloat16)
+        self.assertIs(rule(torch.float16, torch.float32), torch.float16)
+        self.assertIs(rule(torch.float32, torch.float32), torch.float32)
+        self.assertIs(rule(torch.bfloat16, torch.float16), torch.float16)
+        self.assertIs(rule(torch.float16, torch.bfloat16), torch.bfloat16)
+        self.assertIs(rule(torch.float32, torch.bfloat16), torch.bfloat16)
+
+
+class KeepResidentSettingTests(unittest.TestCase):
+    """Forge 설정 — TE·Qwen3.5·커넥터를 생성 사이 VRAM 에 남길지. 켜짐(기본)은 지금 동작, 끄면 예전처럼 TE·Qwen3.5 는
+    인코딩 직후, 커넥터는 생성이 끝날 때(restore) 내린다. 같은 GPU 로 학습할 때 끈다."""
+
+    def setUp(self):
+        self.module = _load_lifecycle_runtime()
+
+    @staticmethod
+    def _forge_opts(opts):
+        modules = types.ModuleType("modules")
+        modules.__path__ = []
+        shared = types.ModuleType("modules.shared")
+        shared.opts = opts
+        modules.shared = shared
+        return mock.patch.dict(sys.modules, {"modules": modules, "modules.shared": shared})
+
+    def test_setting_is_read_from_forge_opts_and_defaults_to_keeping(self):
+        name = self.module.OPT_KEEP_RESIDENT
+        with self._forge_opts(types.SimpleNamespace(**{name: False})):
+            self.assertFalse(self.module.keep_resident())
+        with self._forge_opts(types.SimpleNamespace(**{name: True})):
+            self.assertTrue(self.module.keep_resident())
+        with self._forge_opts(types.SimpleNamespace()):   # 설정 저장 전
+            self.assertTrue(self.module.keep_resident())
+        with self._forge_opts(None):   # opts 로드 전
+            self.assertTrue(self.module.keep_resident())
+        with mock.patch.dict(sys.modules, {"modules": types.ModuleType("modules")}):   # Forge 밖
+            sys.modules.pop("modules.shared", None)
+            self.assertTrue(self.module.keep_resident())
+
+    def _connector_setup(self):
+        runtime = self.module.Anima3BRuntime()
+        model = _LifecycleModel()
+        te, qwen = types.SimpleNamespace(name="te"), types.SimpleNamespace(name="qwen")
+        model.forge_objects.clip = types.SimpleNamespace(patcher=te)
+        runtime._qwen_clip = types.SimpleNamespace(patcher=qwen)
+        models = types.SimpleNamespace(native_adapter=_WeakAdapter())   # 번들 원본 사본 — 공유 폴백 아님
+        patches = (
+            mock.patch.object(self.module, "bundle_metadata", return_value={"anima_v2_adapter_filename": "a"}),
+            mock.patch.object(runtime, "_load_v2_models", return_value=models),
+            mock.patch.object(runtime, "_unload_patchers"),
+        )
+        for patcher in patches:
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        return runtime, model, te, qwen
+
+    def _generate(self, runtime, model):
+        p = _LifecycleProcessing(types.SimpleNamespace(sd_model=model))
+        runtime.install(p, "a", 1.0, None)
+        connector = runtime._v2_sampling_patcher
+        runtime.restore(p)
+        return connector
+
+    def test_setting_off_unloads_connector_qwen_and_te_when_the_generation_ends(self):
+        runtime, model, te, qwen = self._connector_setup()
+        with mock.patch.object(self.module, "keep_resident", return_value=False):
+            first = self._generate(runtime, model)
+            runtime._unload_patchers.assert_called_once_with(first, qwen, te)
+            second = self._generate(runtime, model)
+        self.assertIs(second, first, "패처 객체는 그대로 재사용한다 (내리기만)")
+        self.assertEqual(runtime._unload_patchers.call_count, 2)
+
+    def test_setting_on_keeps_them(self):
+        runtime, model, _, _ = self._connector_setup()
+        with mock.patch.object(self.module, "keep_resident", return_value=True):
+            self._generate(runtime, model)
+            self._generate(runtime, model)
+        runtime._unload_patchers.assert_not_called()
+
+    def test_plain_generation_restore_unloads_nothing_even_when_off(self):
+        # 3.8B 가 아닌 생성의 postprocess 도 restore 를 부른다 — Forge 의 TE 를 건드리면 안 된다
+        runtime, model, _, _ = self._connector_setup()
+        with mock.patch.object(self.module, "keep_resident", return_value=False):
+            runtime.restore(_LifecycleProcessing(types.SimpleNamespace(sd_model=model)))
+        runtime._unload_patchers.assert_not_called()
+
+    def test_script_registers_the_setting_with_the_current_behaviour_as_default(self):
+        registered = []
+        callbacks = types.SimpleNamespace(on_model_loaded=lambda fn: None, on_ui_settings=registered.append)
+        script_module = _load_script(script_callbacks=callbacks)
+        self.assertEqual(len(registered), 1)
+        self.assertEqual(script_module.OPT_KEEP_RESIDENT, self.module.OPT_KEEP_RESIDENT)
+        added = {}
+
+        class OptionInfo:
+            def __init__(self, default, label, component=None, component_args=None, section=None):
+                self.default, self.label, self.component, self.section = default, label, component, section
+                self.comment = ""
+
+            def info(self, text):
+                self.comment = text
+                return self
+
+        opts = types.SimpleNamespace(add_option=lambda key, info: added.__setitem__(key, info))
+        with self._forge_opts(opts):
+            sys.modules["modules.shared"].OptionInfo = OptionInfo
+            with mock.patch.object(script_module, "gr", types.SimpleNamespace(Checkbox="checkbox")):
+                registered[0]()
+        info = added[self.module.OPT_KEEP_RESIDENT]
+        self.assertIs(info.default, True)
+        self.assertEqual(info.component, "checkbox")
+        text = info.label + info.comment
+        for needle in ("TE", "Qwen3.5", "커넥터", "6~8 GB", "학습"):
+            self.assertIn(needle, text)
+
+    def test_script_without_the_settings_callback_still_loads(self):
+        _load_script(script_callbacks=types.SimpleNamespace(on_model_loaded=lambda fn: None))
+
+
 class SharedRuntimeTests(unittest.TestCase):
     def test_shared_runtime_is_one_instance_per_process(self):
         module = _load_lifecycle_runtime()
@@ -1685,6 +2918,872 @@ class SharedRuntimeTests(unittest.TestCase):
             second = script_module.Anima38Script()._get_runtime()
         self.assertIs(first, sentinel)
         self.assertIs(second, sentinel)
+
+
+# ---------------------------------------------------------------------------------------------------------------
+# Semantic Connector v2 속도 경로 — fp32 상주(connector_fp32)·run 캐시(connector_cache).
+# 옛 경로(Forge manual cast: bf16 저장 가중치를 호출마다 fp32 로 캐스트해 계산, 스텝마다 전부 다시 계산)를 실제 Forge
+# 모듈(CPU, --cpu)로 돌려 기준으로 삼고, 새 경로 출력이 그와 torch.equal 인지 본다. 가중치 파일 없이 작은 차원·무작위
+# 가중치로 돈다. 실제 3.8B 번들 가중치 비교는 SAM3_RUN_FORGE_INTEGRATION_TESTS=1 일 때만(ConnectorRealWeightsTests).
+
+from sam3ext.anima38 import connector_cache, connector_fp32  # noqa: E402
+
+FORGE_ROOT = ROOT.parents[1]
+_REAL_FORGE: dict = {}
+_FORGE_OWNED = ("backend", "modules", "modules_forge", "gguf")
+_FORGE_BOUND = ("sam3ext.anima38.semantic_v2", "sam3ext.anima38.adapter")
+_V2_DIM, _V2_SOURCE_DIM = 32, 24
+
+
+def _forge_owned(name: str) -> bool:
+    return name.split(".")[0] in _FORGE_OWNED or name in _FORGE_BOUND
+
+
+class _RealForge(types.SimpleNamespace):
+    def active(self):
+        """실제 backend·semantic_v2 모듈을 잠시 sys.modules 에 둔다 — 게으른 import(ModelPatcher 등)와 모듈 조회용.
+        우리 이름만 넣고 뺀다(patch.dict 처럼 그 사이 새로 import 된 모듈까지 지우지 않는다)."""
+        modules = self.modules
+
+        class _Active:
+            def __enter__(inner):
+                inner.previous = {name: sys.modules.get(name) for name in modules}
+                sys.modules.update(modules)
+                return self
+
+            def __exit__(inner, *exc):
+                for name, module in inner.previous.items():
+                    if module is None:
+                        sys.modules.pop(name, None)
+                    else:
+                        sys.modules[name] = module
+                return False
+
+        return _Active()
+
+
+def _real_forge() -> _RealForge:
+    """실제 Forge backend(operations·nn.anima·patcher.base·memory_management)와 semantic_v2 를 CPU 로 한 번 불러
+    모듈 객체만 쥔다. sys.modules·sys.path·argv 는 원래대로 — 다른 테스트의 backend/modules 스텁과 섞이지 않게."""
+    if "forge" in _REAL_FORGE:
+        if _REAL_FORGE["forge"] is None:
+            raise unittest.SkipTest(_REAL_FORGE["reason"])
+        return _REAL_FORGE["forge"]
+    if not (FORGE_ROOT / "backend" / "operations.py").is_file():
+        _REAL_FORGE.update(forge=None, reason="Forge 본체가 없다")
+        raise unittest.SkipTest(_REAL_FORGE["reason"])
+    saved = {name: module for name, module in sys.modules.items() if _forge_owned(name)}
+    saved_path, saved_argv = list(sys.path), sys.argv
+    for name in saved:
+        del sys.modules[name]
+    try:
+        sys.path[:0] = [str(FORGE_ROOT), str(FORGE_ROOT / "modules_forge" / "packages")]
+        sys.argv = [saved_argv[0] if saved_argv else "test", "--cpu"]   # backend.args: GPU 를 건드리지 않는다
+        loaded = dict(
+            ops=importlib.import_module("backend.operations"),
+            anima=importlib.import_module("backend.nn.anima"),
+            base=importlib.import_module("backend.patcher.base"),
+            mm=importlib.import_module("backend.memory_management"),
+            semantic_v2=importlib.import_module("sam3ext.anima38.semantic_v2"),
+        )
+        modules = {name: module for name, module in sys.modules.items()
+                   if name.split(".")[0] == "backend" or name in _FORGE_BOUND}
+    except Exception as exc:  # pragma: no cover - Forge 버전 차이
+        _REAL_FORGE.update(forge=None, reason=f"Forge backend 를 CPU 로 불러오지 못함: {exc!r}")
+        raise unittest.SkipTest(_REAL_FORGE["reason"])
+    finally:
+        sys.path[:] = saved_path
+        sys.argv = saved_argv
+        for name in [name for name in sys.modules if _forge_owned(name)]:
+            del sys.modules[name]
+        sys.modules.update(saved)
+    _REAL_FORGE["forge"] = _RealForge(modules=modules, **loaded)
+    return _REAL_FORGE["forge"]
+
+
+def _set_path(root, name: str, value) -> None:
+    *parents, leaf = name.split(".")
+    for part in parents:
+        root = getattr(root, part)
+    setattr(root, leaf, value)
+
+
+def _v2_bundle(forge, seed=0, blocks=3):
+    """작은 실제 커넥터 번들(BundledV2Models) — 런타임처럼 Forge ops(manual cast)로 만들고 실제 번들과 같은 dtype
+    배치(llm_adapter embed 만 fp32, 나머지 bf16)의 무작위 가중치를 넣는다. 계산 dtype 은 embed 의 fp32."""
+    generator = torch.Generator().manual_seed(seed)
+    with forge.ops.using_forge_operations(device=torch.device("cpu"), dtype=torch.float32, manual_cast_enabled=True):
+        native = forge.anima.LLMAdapter(source_dim=_V2_DIM, target_dim=_V2_DIM, model_dim=_V2_DIM,
+                                        num_layers=blocks, num_heads=4)
+        connector = forge.semantic_v2.QualityAnchoredSemanticConnectorV2(
+            native, semantic_source_dim=_V2_SOURCE_DIM, num_queries=5, resampler_blocks=2,
+            resampler_dim=16, resampler_heads=2, mlp_hidden_dim=20)
+    models = forge.semantic_v2.BundledV2Models(native, connector)
+    with torch.no_grad():
+        for name, parameter in list(models.named_parameters()):
+            value = torch.randn(parameter.shape, generator=generator) * 0.3
+            dtype = torch.float32 if name.endswith("embed.weight") else torch.bfloat16
+            _set_path(models, name, torch.nn.Parameter(value.to(dtype), requires_grad=False))
+    return models.eval().requires_grad_(False)
+
+
+def _v2_run_inputs(count=1, seed=1, masked=True, lengths=(7, 9, 6)):
+    """커넥터 한 run 의 입력 — 런타임처럼 한 줄을 count 행으로 expand 한 뷰(source·T5 id·의미 특징 4층·mask)."""
+    generator = torch.Generator().manual_seed(seed)
+    source_tokens, target_tokens, semantic_tokens = lengths
+    source = torch.randn(1, source_tokens, _V2_DIM, generator=generator).expand(count, -1, -1)
+    target_ids = torch.randint(0, 32128, (1, target_tokens), generator=generator).expand(count, -1)
+    semantic = [torch.randn(1, semantic_tokens, _V2_SOURCE_DIM, generator=generator).expand(count, -1, -1)
+                for _ in range(4)]
+    mask = torch.ones(1, semantic_tokens, dtype=torch.long)
+    if masked:
+        mask[0, -2] = 0
+    return source, target_ids, semantic, mask.expand(count, -1)
+
+
+def _v2_schedule(count):
+    """스텝 timestep — 끝값(1·0) 포함, 행마다 다른 timestep 도 (CFG 행이 다른 sigma 를 받는 경우)."""
+    steps = [torch.full((count,), value) for value in (1.0, 0.93, 0.71, 0.5, 0.29, 0.07, 0.0)]
+    steps.append(torch.linspace(0.9, 0.2, count))
+    return steps
+
+
+def _old_outputs(models, inputs, schedule):
+    source, target_ids, semantic, mask = inputs
+    with torch.inference_mode():
+        return [models.connector(source, target_ids, semantic, semantic_source_mask=mask, timesteps=t)
+                for t in schedule]
+
+
+def _forge_modules(models):
+    return [module for module in models.modules() if hasattr(module, "parameters_manual_cast")]
+
+
+class ConnectorOldPathReferenceTests(unittest.TestCase):
+    """비교 기준(옛 경로)이 정말 지금 샘플링 경로인지 — Forge manual cast 로 bf16 가중치를 호출마다 fp32 로 캐스트해
+    계산하고, 같은 입력이면 늘 같은 값이다."""
+
+    def test_reference_is_forge_manual_cast_of_bf16_weights(self):
+        forge = _real_forge()
+        models = _v2_bundle(forge)
+        forge_modules = _forge_modules(models)
+        self.assertTrue(forge_modules and all(module.parameters_manual_cast for module in forge_modules))
+        for name, parameter in models.named_parameters():
+            self.assertEqual(parameter.dtype, torch.float32 if name.endswith("embed.weight") else torch.bfloat16, name)
+        inputs = _v2_run_inputs(count=2)
+        with mock.patch.object(forge.ops, "weights_manual_cast", wraps=forge.ops.weights_manual_cast) as cast:
+            first = _old_outputs(models, inputs, _v2_schedule(2))
+        self.assertGreater(cast.call_count, len(forge_modules), "스텝마다 모듈마다 캐스트한다")
+        second = _old_outputs(models, inputs, _v2_schedule(2))
+        for left, right in zip(first, second):
+            self.assertEqual(left.dtype, torch.float32)
+            self.assertTrue(torch.equal(left, right))
+        self.assertFalse(torch.equal(first[0], first[3]), "timestep 이 출력에 들어간다")
+
+
+class ConnectorFp32ResidencyTests(unittest.TestCase):
+    """(a) fp32 상주 — 올린 뒤 한 번 fp32 로 바꿔 둔 가중치로 같은 fp32 계산. 옛 경로와 비트 단위로 같아야 한다."""
+
+    def setUp(self):
+        self.forge = _real_forge()
+        self.cpu = torch.device("cpu")
+        setting = mock.patch.object(connector_fp32, "connector_fp32", return_value=True)
+        setting.start()
+        self.addCleanup(setting.stop)
+
+    def _unet(self):
+        added = []
+        unet = types.SimpleNamespace(load_device=self.cpu, offload_device=self.cpu, added=added,
+                                     add_extra_model_patcher_during_sampling=added.append)
+        return unet
+
+    def _patcher(self, models, **kwargs):
+        with self.forge.active():
+            return connector_fp32.make_connector_patcher(self._unet(), models, **kwargs)
+
+    def _assert_same_as_old(self, models, reference, inputs, schedule):
+        new = _old_outputs(models, inputs, schedule)   # 같은 upstream forward — 가중치 상태만 다르다
+        for index, (left, right) in enumerate(zip(reference, new)):
+            self.assertEqual(left.dtype, right.dtype)
+            self.assertTrue(torch.equal(left, right), f"step {index}")
+
+    def test_converted_weights_give_the_manual_cast_result_bit_for_bit(self):
+        for count, masked in ((1, True), (2, False), (3, True)):
+            with self.subTest(count=count, masked=masked):
+                models = _v2_bundle(self.forge, seed=count)
+                inputs = _v2_run_inputs(count=count, masked=masked, seed=10 + count)
+                schedule = _v2_schedule(count)
+                reference = _old_outputs(models, inputs, schedule)
+                with self.forge.active():
+                    plan = connector_fp32.Fp32Plan(models, torch.float32)
+                grown = plan.convert(models, self.cpu)
+                self.assertEqual(grown, plan.growth)
+                self.assertTrue(all(p.dtype == torch.float32 for p in models.parameters()))
+                self.assertFalse(any(module.parameters_manual_cast for module in _forge_modules(models)))
+                with mock.patch.object(self.forge.ops, "weights_manual_cast", wraps=self.forge.ops.weights_manual_cast) as cast:
+                    self._assert_same_as_old(models, reference, inputs, schedule)
+                self.assertEqual(cast.call_count, 0, "스텝마다 캐스트하지 않는다")
+
+    def test_revert_restores_the_stored_weights_and_manual_cast_exactly(self):
+        models = _v2_bundle(self.forge)
+        before = {name: parameter.detach().clone() for name, parameter in models.named_parameters()}
+        with self.forge.active():
+            plan = connector_fp32.Fp32Plan(models, torch.float32)
+        plan.convert(models, self.cpu)
+        self.assertEqual(plan.revert(), plan.growth)
+        for name, parameter in models.named_parameters():
+            self.assertEqual(parameter.dtype, before[name].dtype, name)
+            self.assertTrue(torch.equal(parameter, before[name]), name)
+        self.assertTrue(all(module.parameters_manual_cast for module in _forge_modules(models)))
+        self.assertFalse(plan.active)
+        self.assertEqual(plan.revert(), 0, "두 번 되돌려도 그대로")
+
+    def test_conversion_inside_inference_mode_makes_normal_parameters(self):
+        models = _v2_bundle(self.forge)
+        with self.forge.active():
+            plan = connector_fp32.Fp32Plan(models, torch.float32)
+        with torch.inference_mode():
+            plan.convert(models, self.cpu)
+        self.assertFalse(any(parameter.is_inference() for parameter in models.parameters()))
+        plan.revert()   # 인퍼런스 모드 밖(Forge 의 postprocess 언로드 자리)에서 되돌려도 된다
+        self.assertFalse(any(parameter.is_inference() for parameter in models.parameters()))
+
+    def test_forge_patcher_loads_converts_and_reports_the_fp32_size(self):
+        models = _v2_bundle(self.forge)
+        inputs, schedule = _v2_run_inputs(count=2), _v2_schedule(2)
+        reference = _old_outputs(models, inputs, schedule)
+        with self.forge.active():
+            storage = self.forge.mm.module_size(models)
+            patcher = self._patcher(models)
+            plan = connector_fp32.plan_of(models)
+            self.assertIsInstance(patcher, self.forge.base.ModelPatcher)
+            self.assertEqual(plan.storage_size, storage)
+            self.assertEqual(patcher.model_size(), storage, "바꾸기 전에는 원래 크기 — Forge 판단이 기본 패처와 같다")
+            self.assertGreater(plan.growth, 0)
+            gained = patcher.partially_load(self.cpu, 1e32)
+            self.assertEqual(patcher.loaded_size(), patcher.model_size(), "다 올리면 Forge 가 보는 적재 크기 = fp32 크기")
+            self.assertEqual(gained, patcher.model_size())
+            self.assertEqual(self.forge.mm.module_size(models), patcher.model_size())
+            self.assertTrue(plan.active)
+            self.assertEqual(patcher.model_size(), storage + plan.growth, "바꾼 뒤에는 fp32 크기")
+            self.assertEqual(patcher.partially_load(self.cpu, 1e32), 0, "이미 다 올라가 있으면 아무것도 안 한다")
+        self._assert_same_as_old(models, reference, inputs, schedule)
+        with mock.patch.object(connector_fp32, "connector_fp32", return_value=False):
+            self.assertEqual(patcher.sync_fp32_setting(), plan.growth)
+            self.assertEqual(patcher.model_size(), storage, "설정을 끄고 되돌리면 원래 크기")
+            self.assertEqual(patcher.loaded_size(), storage)
+
+    def test_llm_adapter_lora_is_merged_in_bf16_then_widened(self):
+        """LoRA 의 llm_adapter 몫(_sync_adapter_lora 가 옮긴 패치)은 Forge 가 원래 dtype 에 합치고 반올림한다 — fp32 로
+        바꾼 뒤에 합치면 반올림이 빠져 값이 달라진다. 순정 ModelPatcher(옛 경로)와 같아야 한다."""
+        old_models, new_models = _v2_bundle(self.forge), _v2_bundle(self.forge)
+        keys = ("native_adapter.blocks.1.cross_attn.q_proj.weight", "connector.v2_attentions.2.o_proj.weight",
+                "native_adapter.blocks.0.mlp.0.bias")
+        generator = torch.Generator().manual_seed(5)
+        diffs = {key: torch.randn(old_models.get_parameter(key).shape, generator=generator) * 0.01 for key in keys}
+        inputs, schedule = _v2_run_inputs(count=2), _v2_schedule(2)
+        with self.forge.active():
+            old = self.forge.base.ModelPatcher(old_models, self.cpu, self.cpu)
+            new = self._patcher(new_models)
+            for patcher in (old, new):
+                patcher.patches = {key: [(1.0, (diff,), 1.0, None, None)] for key, diff in diffs.items()}
+                patcher.patches_uuid = uuid4()
+                patcher.partially_load(self.cpu, 1e32)
+        self.assertTrue(connector_fp32.plan_of(new_models).active)
+        self.assertEqual(old_models.get_parameter(keys[0]).dtype, torch.bfloat16)
+        self.assertEqual(new_models.get_parameter(keys[0]).dtype, torch.float32)
+        reference = _old_outputs(old_models, inputs, schedule)
+        self._assert_same_as_old(new_models, reference, inputs, schedule)
+        with self.forge.active():
+            new.unpatch_model(self.cpu, unpatch_weights=True)
+            old.unpatch_model(self.cpu, unpatch_weights=True)
+        pristine = _v2_bundle(self.forge)
+        for name, parameter in new_models.named_parameters():
+            self.assertEqual(parameter.dtype, pristine.get_parameter(name).dtype, name)
+            self.assertTrue(torch.equal(parameter, pristine.get_parameter(name)), name)
+
+    def test_unload_and_partial_unload_return_to_the_stored_dtype(self):
+        models = _v2_bundle(self.forge)
+        inputs, schedule = _v2_run_inputs(), _v2_schedule(1)
+        reference = _old_outputs(models, inputs, schedule)
+        with self.forge.active():
+            patcher = self._patcher(models)
+            plan = connector_fp32.plan_of(models)
+            patcher.partially_load(self.cpu, 1e32)
+            # Forge 가 조금만 비우라고 하면 fp32→bf16 되돌림으로 충분 — 가중치는 그대로 올라가 있다
+            freed = patcher.partially_unload(self.cpu, memory_to_free=plan.growth // 2)
+            self.assertEqual(freed, plan.growth)
+            self.assertFalse(plan.active)
+            self.assertFalse(models.model_lowvram)
+            self.assertEqual(patcher.loaded_size(), plan.storage_size)
+            self._assert_same_as_old(models, reference, inputs, schedule)
+            patcher.partially_load(self.cpu, 1e32)   # 다음 샘플링 — 다시 fp32
+            self.assertTrue(plan.active)
+            self.assertEqual(patcher.loaded_size(), patcher.model_size())
+            patcher.detach()   # Forge 언로드(model_unload → detach → unpatch_model)
+            self.assertFalse(plan.active)
+            self.assertEqual(patcher.loaded_size(), 0)
+            self.assertTrue(all(p.dtype == torch.bfloat16 for n, p in models.named_parameters()
+                                if not n.endswith("embed.weight")))
+            self.assertTrue(all(module.parameters_manual_cast for module in _forge_modules(models)))
+        self._assert_same_as_old(models, reference, inputs, schedule)
+
+    def test_setting_off_is_the_plain_forge_path(self):
+        models = _v2_bundle(self.forge)
+        with self.forge.active():
+            patcher = self._patcher(models)
+            plan = connector_fp32.plan_of(models)
+            patcher.partially_load(self.cpu, 1e32)
+            self.assertTrue(plan.active)
+            with mock.patch.object(connector_fp32, "connector_fp32", return_value=False):
+                self.assertEqual(patcher.sync_fp32_setting(), plan.growth)   # 설치 때 — 지난 생성의 fp32 를 되돌린다
+                self.assertFalse(plan.active)
+                self.assertEqual(patcher.loaded_size(), patcher.model_size())
+                self.assertEqual(patcher.partially_load(self.cpu, 1e32), 0)
+                self.assertFalse(plan.active, "꺼져 있으면 바꾸지 않는다")
+                self.assertTrue(all(module.parameters_manual_cast for module in _forge_modules(models)))
+
+    def test_without_room_for_fp32_the_manual_cast_path_stays(self):
+        models = _v2_bundle(self.forge)
+        with self.forge.active():
+            patcher = self._patcher(models)
+            plan = connector_fp32.plan_of(models)
+            with mock.patch.object(connector_fp32, "connector_fp32", return_value=False):
+                patcher.partially_load(self.cpu, 1e32)   # bf16 로 다 올라가 있다
+            self.assertFalse(models.model_lowvram)
+            # Forge 가 더 쓸 수 있다고 준 몫(extra_memory)이 fp32 증가분보다 작으면 바꾸지 않는다
+            with mock.patch("builtins.print") as printed:
+                self.assertEqual(patcher.partially_load(self.cpu, plan.growth // 2), 0)
+            self.assertIn("skipped", printed.call_args[0][0])
+            self.assertFalse(plan.active)
+            self.assertEqual(patcher.loaded_size(), plan.storage_size)
+            self.assertTrue(all(module.parameters_manual_cast for module in _forge_modules(models)))
+            self.assertEqual(patcher.partially_load(self.cpu, plan.growth), plan.growth, "자리가 나면 바꾼다")
+            self.assertTrue(plan.active)
+
+    def test_room_between_bf16_and_fp32_loads_like_the_plain_patcher(self):
+        """Forge 가 준 여유가 bf16 크기 이상·fp32 크기 미만이면 순정 ModelPatcher(옛 경로)처럼 bf16 로 다 올린다(full_load)
+        — fp32 크기를 미리 보고해 lowvram 부분 적재가 되면 안 된다. 바꾸지 못한 채로는 덜 올라간 몫(offloaded)도 0."""
+        inputs, schedule = _v2_run_inputs(count=2), _v2_schedule(2)
+        for blocks in (3, 6):
+            for fraction in (0.1, 0.5, 0.9):
+                with self.subTest(blocks=blocks, fraction=fraction):
+                    plain_models, models = _v2_bundle(self.forge, blocks=blocks), _v2_bundle(self.forge, blocks=blocks)
+                    reference = _old_outputs(plain_models, inputs, schedule)
+                    with self.forge.active():
+                        plain = self.forge.base.ModelPatcher(plain_models, self.cpu, self.cpu)
+                        patcher = self._patcher(models)
+                        plan = connector_fp32.plan_of(models)
+                        self.assertEqual(patcher.model_size(), plain.model_size())
+                        extra = plan.storage_size + int(plan.growth * fraction)
+                        plain_gained = plain.partially_load(self.cpu, extra)
+                        with mock.patch("builtins.print"):
+                            gained = patcher.partially_load(self.cpu, extra)
+                        self.assertFalse(plain_models.model_lowvram)
+                        self.assertEqual(models.model_lowvram, plain_models.model_lowvram)
+                        self.assertEqual(gained, plain_gained)
+                        self.assertEqual(patcher.loaded_size(), plain.loaded_size())
+                        self.assertEqual(patcher.model_size(), plain.model_size())
+                        self.assertFalse(plan.active, "자리가 모자라면 bf16 그대로")
+                        self.assertFalse(any(hasattr(m, "prev_parameters_manual_cast") for m in _forge_modules(models)))
+                        loaded = self.forge.mm.LoadedModel(patcher)
+                        self.assertEqual(loaded.model_offloaded_memory(), 0, "Forge 가 커넥터를 덜 올라갔다고 보지 않는다")
+                        self.assertEqual(loaded.model_offloaded_memory(),
+                                         self.forge.mm.LoadedModel(plain).model_offloaded_memory())
+                    self._assert_same_as_old(models, reference, inputs, schedule)
+
+    def test_room_for_bf16_and_fp32_loads_then_converts(self):
+        models = _v2_bundle(self.forge)
+        with self.forge.active():
+            patcher = self._patcher(models)
+            plan = connector_fp32.plan_of(models)
+            with mock.patch("builtins.print"):
+                gained = patcher.partially_load(self.cpu, plan.storage_size + plan.growth)
+            self.assertTrue(plan.active)
+            self.assertFalse(models.model_lowvram)
+            self.assertEqual(gained, plan.storage_size + plan.growth)
+            self.assertEqual(patcher.loaded_size(), patcher.model_size())
+            self.assertEqual(self.forge.mm.LoadedModel(patcher).model_offloaded_memory(), 0)
+
+    def test_unbounded_room_still_respects_the_free_vram(self):
+        """HIGH_VRAM(여유 1e32)이어도 실제 빈 VRAM 에서 샘플링 최소 몫을 남긴 만큼까지만 바꾼다 — model_size 가 fp32 몫을
+        미리 보고하지 않으니 Forge 가 그만큼 비워 두지 않는다. 장치는 CPU 지만 GPU 로 보이게 해 확인한다."""
+        mm = self.forge.mm
+        reserve = mm.minimum_inference_memory()
+        for spare, converts in ((-1, False), (0, True), (1, True)):
+            with self.subTest(spare=spare):
+                models = _v2_bundle(self.forge)
+                with self.forge.active():
+                    patcher = self._patcher(models)
+                    plan = connector_fp32.plan_of(models)
+                    free = reserve + plan.growth + spare * (plan.growth // 2)
+                    with mock.patch.object(mm, "is_device_cpu", return_value=False),                             mock.patch.object(mm, "get_free_memory", return_value=free),                             mock.patch("builtins.print"):
+                        patcher.partially_load(self.cpu, 1e32)
+                    self.assertFalse(models.model_lowvram)
+                    self.assertEqual(plan.active, converts)
+                    self.assertEqual(patcher.loaded_size(), patcher.model_size())
+
+    def test_shared_fallback_leaves_the_te_llm_adapter_alone(self):
+        models = _v2_bundle(self.forge)
+        with self.forge.active():
+            patcher = self._patcher(models, skip_prefixes=("native_adapter.",))
+            patcher.partially_load(self.cpu, 1e32)
+        for name, parameter in models.named_parameters():
+            if name.startswith("native_adapter."):
+                self.assertNotEqual(parameter.dtype, torch.float32 if not name.endswith("embed.weight") else None, name)
+            else:
+                self.assertEqual(parameter.dtype, torch.float32, name)
+        self.assertTrue(all(module.parameters_manual_cast for module in models.native_adapter.modules()
+                            if hasattr(module, "parameters_manual_cast")))
+
+    def test_real_forge_load_models_gpu_flow(self):
+        """Forge 의 load_models_gpu → LoadedModel.model_load → partially_load 흐름(CPU 장치)으로 바꾸고, 언로드로 되돌린다."""
+        models = _v2_bundle(self.forge)
+        inputs, schedule = _v2_run_inputs(count=2), _v2_schedule(2)
+        reference = _old_outputs(models, inputs, schedule)
+        mm = self.forge.mm
+        with self.forge.active():
+            patcher = self._patcher(models)
+            before = list(mm.current_loaded_models)
+            try:
+                mm.load_models_gpu([patcher])
+                self.assertTrue(connector_fp32.plan_of(models).active)
+                self._assert_same_as_old(models, reference, inputs, schedule)
+            finally:
+                for loaded in [item for item in mm.current_loaded_models if item.model is patcher]:
+                    loaded.model_unload()
+                    mm.current_loaded_models.remove(loaded)
+            self.assertEqual(mm.current_loaded_models, before)
+        self.assertFalse(connector_fp32.plan_of(models).active)
+        self._assert_same_as_old(models, reference, inputs, schedule)
+
+    def test_make_patcher_falls_back_without_a_forge_unet(self):
+        models = _v2_bundle(self.forge)
+        self.assertIsNone(connector_fp32.make_connector_patcher(object(), models))
+        self.assertIsNone(connector_fp32.plan_of(models))
+
+
+class ConnectorRunCacheTests(unittest.TestCase):
+    """(b) run 캐시 — timestep 무관 계산을 첫 스텝에 한 번. 모든 스텝·모든 timestep 에서 upstream forward 와 같아야 한다."""
+
+    def setUp(self):
+        self.forge = _real_forge()
+
+    def _cached_outputs(self, models, inputs, schedule):
+        source, target_ids, semantic, mask = inputs
+        with self.forge.active(), torch.inference_mode():
+            self.assertTrue(connector_cache.supports(models.connector))
+            cache = connector_cache.prepare(models.connector, source, target_ids, semantic, semantic_source_mask=mask)
+            return cache, [connector_cache.forward(models.connector, cache, t) for t in schedule]
+
+    def test_every_step_matches_the_upstream_forward(self):
+        for fp32 in (False, True):
+            for count, masked in ((1, True), (2, True), (2, False)):
+                with self.subTest(fp32=fp32, count=count, masked=masked):
+                    models = _v2_bundle(self.forge, seed=count)
+                    inputs = _v2_run_inputs(count=count, masked=masked, seed=20 + count)
+                    schedule = _v2_schedule(count)
+                    reference = _old_outputs(models, inputs, schedule)
+                    if fp32:
+                        with self.forge.active():
+                            connector_fp32.Fp32Plan(models, torch.float32).convert(models, torch.device("cpu"))
+                    _, new = self._cached_outputs(models, inputs, schedule)
+                    for index, (left, right) in enumerate(zip(reference, new)):
+                        self.assertEqual(left.dtype, right.dtype)
+                        self.assertTrue(torch.equal(left, right), f"step {index}")
+
+    def test_cached_tensors_are_never_written_by_the_steps(self):
+        models = _v2_bundle(self.forge)
+        inputs = _v2_run_inputs(count=2)
+        source, target_ids, semantic, mask = inputs
+        with self.forge.active(), torch.inference_mode():
+            cache = connector_cache.prepare(models.connector, source, target_ids, semantic, semantic_source_mask=mask)
+            snapshot = [tensor.clone() for tensor in cache.tensors()]
+            for t in _v2_schedule(2):
+                connector_cache.forward(models.connector, cache, t)
+        for before, after in zip(snapshot, cache.tensors()):
+            self.assertTrue(torch.equal(before, after), "TransformerBlock 의 제자리 add_ 가 캐시를 건드리면 안 된다")
+        self.assertGreater(cache.nbytes, 0)
+
+    def test_the_cache_holds_only_timestep_free_values(self):
+        """같은 run 을 다른 timestep 뒤에 준비해도 캐시가 같다 — 준비는 timestep 을 받지도 않는다."""
+        models = _v2_bundle(self.forge)
+        inputs = _v2_run_inputs(count=1)
+        first, _ = self._cached_outputs(models, inputs, [torch.tensor([0.9])])
+        second, _ = self._cached_outputs(models, inputs, [torch.tensor([0.1])])
+        for left, right in zip(first.tensors(), second.tensors()):
+            self.assertTrue(torch.equal(left, right))
+
+    def test_unknown_shapes_and_hooks_fall_back_to_the_upstream_forward(self):
+        models = _v2_bundle(self.forge)
+        with self.forge.active():
+            self.assertTrue(connector_cache.supports(models.connector))
+            self.assertFalse(connector_cache.supports(lambda *a, **k: None))
+            self.assertFalse(connector_cache.supports(torch.nn.Linear(2, 2)))
+            handle = models.native_adapter.blocks[1].register_forward_hook(lambda *a: None)
+            self.assertFalse(connector_cache.supports(models.connector), "건너뛸 블록에 훅")
+            handle.remove()
+            handle = models.connector.semantic_resampler.blocks[0].cross_attention.register_forward_pre_hook(
+                lambda *a: None)
+            self.assertFalse(connector_cache.supports(models.connector))
+            handle.remove()
+            models.connector.quality_anchor.semantic_attentions[0].forward = lambda *a, **k: None
+            self.assertFalse(connector_cache.supports(models.connector), "인스턴스 forward 덮어쓰기")
+            del models.connector.quality_anchor.semantic_attentions[0].forward
+            self.assertTrue(connector_cache.supports(models.connector))
+            handle = torch.nn.modules.module.register_module_forward_hook(lambda *a: None)
+            try:
+                self.assertFalse(connector_cache.global_hooks_clear())
+                self.assertFalse(connector_cache.supports(models.connector))
+            finally:
+                handle.remove()
+            self.assertTrue(connector_cache.global_hooks_clear())
+
+
+def _v2_real_features(count, seed=0):
+    """_extract_prompt_features 대역 — 작은 실제 커넥터 차원에 맞춘 줄마다 다른 입력(의미 특징 길이도 다르게)."""
+    generator = torch.Generator().manual_seed(seed)
+    native_rows, semantic_rows = [], []
+    for index in range(count):
+        tokens = 5 + index % 3
+        native_rows.append((
+            torch.randn(1, tokens + 1, _V2_DIM, generator=generator),
+            torch.randint(0, 32128, (1, tokens), generator=generator),
+            torch.rand(1, tokens, 1, generator=generator) + 0.5,
+        ))
+        length = 4 + index % 4
+        mask = torch.ones(1, length, dtype=torch.long)
+        mask[0, 0] = 0 if index % 2 else 1
+        semantic_rows.append((
+            [torch.randn(1, length, _V2_SOURCE_DIM, generator=generator).to(torch.bfloat16) for _ in range(4)],
+            mask,
+        ))
+    return object(), native_rows, semantic_rows
+
+
+class ConnectorRunCacheRuntimeTests(unittest.TestCase):
+    """런타임의 _expand_v2_context 가 run 캐시를 run 의 장치 사본 곁에 두고 쓴다 — 옛 구현(커넥터를 스텝마다 통째로)
+    과 모든 스텝에서 같고, LoRA·커넥터 교체·restore·LRU·설정·공유 폴백에서 버리거나 쓰지 않는다."""
+
+    def setUp(self):
+        self.forge = _real_forge()
+        self.module = _load_lifecycle_runtime()
+        self.runtime = self.module.Anima3BRuntime()
+        self.models = _v2_bundle(self.forge)
+        self.te_adapter = torch.nn.Module()   # TE 의 llm_adapter — 커넥터는 번들 사본을 쓴다(공유 폴백 아님)
+        self.runtime._v2_models = self.models
+        self.runtime._v2_source = weakref.ref(self.te_adapter)
+        self.runtime._v2_sampling_patcher = types.SimpleNamespace(patches_uuid=uuid4(), patches={})
+        self.native_clip = types.SimpleNamespace(patcher=types.SimpleNamespace(patches={}))   # llm_adapter LoRA 없음
+        self.uncond = torch.randn(1, 512, _V2_DIM, generator=torch.Generator().manual_seed(3))
+        active = self.forge.active()
+        active.__enter__()
+        self.addCleanup(active.__exit__, None, None, None)
+        prepare = mock.patch.object(connector_cache, "prepare", wraps=connector_cache.prepare)
+        self.prepare = prepare.start()
+        self.addCleanup(prepare.stop)
+
+    def _encode(self, count, seed=0):
+        with mock.patch.object(self.runtime, "_extract_prompt_features", return_value=_v2_real_features(count, seed)):
+            conds = self.runtime._encode_v2(object(), self.native_clip, ["line"] * count)
+        return conds, [int(anima_marker.read_run_ids(cond)[0]) for cond in conds]
+
+    def _step(self, context, timesteps, run_ids):
+        with torch.inference_mode():
+            old = _reference_expand_v2_context(self.runtime, context, timesteps, run_ids)
+            new = self.runtime._expand_v2_context(context, timesteps, run_ids)
+        self.assertEqual(new.dtype, old.dtype)
+        self.assertTrue(torch.equal(new, old))
+        return new
+
+    def _run_caches(self, run_id):
+        return [key for key in self.runtime._v2_runs[run_id].device_copies if key[0] == "run_cache"]
+
+    def test_every_step_and_layout_matches_the_old_expand(self):
+        conds, (a, b) = self._encode(2)
+        rows = {a: conds[0], b: conds[1], -1: self.uncond}
+        layouts = ([a, -1], [a, b], [a, -1, a, -1], [b, a, -1])
+        for layout in layouts:
+            context = torch.cat([rows[run_id] for run_id in layout])
+            for step, value in enumerate((0.95, 0.6, 0.3, 0.0)):
+                timesteps = torch.full((len(layout),), value)
+                if step == 3:
+                    timesteps = torch.linspace(0.8, 0.1, len(layout))
+                self._step(context, timesteps, torch.tensor(layout))
+        # 한 run·한 행 수마다 준비는 한 번 — 스텝이 늘어도 다시 하지 않는다
+        # (a: 1행·2행, b: 1행 — [a, b] 와 [b, a, -1] 의 b 는 같은 1행 캐시)
+        self.assertEqual(self.prepare.call_count, 3)
+        self.assertEqual(len(self._run_caches(a)), 2)
+        self.assertEqual(len(self._run_caches(b)), 1)
+
+    def test_fp32_resident_weights_and_run_cache_together_match(self):
+        conds, (a,) = self._encode(1)
+        context = torch.cat([conds[0], self.uncond])
+        reference = []
+        for value in (0.9, 0.4, 0.0):
+            with torch.inference_mode():
+                reference.append(_reference_expand_v2_context(
+                    self.runtime, context, torch.tensor([value, value]), torch.tensor([a, -1])))
+        connector_fp32.Fp32Plan(self.models, torch.float32).convert(self.models, torch.device("cpu"))
+        for value, expected in zip((0.9, 0.4, 0.0), reference):
+            with torch.inference_mode():
+                new = self.runtime._expand_v2_context(context, torch.tensor([value, value]), torch.tensor([a, -1]))
+            self.assertTrue(torch.equal(new, expected))
+
+    def test_lora_or_connector_change_rebuilds_and_drops_the_old_cache(self):
+        conds, (a,) = self._encode(1)
+        step = (conds[0], torch.tensor([0.5]), torch.tensor([a]))
+        self._step(*step)
+        self._step(*step)
+        self.assertEqual(self.prepare.call_count, 1)
+        self.runtime._v2_sampling_patcher.patches_uuid = uuid4()   # _sync_adapter_lora 가 llm_adapter LoRA 를 옮김
+        self._step(*step)
+        self.assertEqual(self.prepare.call_count, 2)
+        self.assertEqual(len(self._run_caches(a)), 1, "옛 가중치의 캐시는 버린다")
+        self.models.current_weight_patches_uuid = uuid4()   # Forge 가 다른 패치로 다시 올림
+        self._step(*step)
+        self.assertEqual(self.prepare.call_count, 3)
+        self.runtime._v2_models = _v2_bundle(self.forge, seed=9)   # 다른 번들(설치가 run 을 비우지만 키도 다르다)
+        self._step(*step)
+        self.assertEqual(self.prepare.call_count, 4)
+        self.assertEqual(len(self._run_caches(a)), 1)
+
+    def test_restore_model_load_and_eviction_release_the_cache(self):
+        conds, ids = self._encode(3)
+        for cond, run_id in zip(conds, ids):
+            self._step(cond, torch.tensor([0.5]), torch.tensor([run_id]))
+        runs = [self.runtime._v2_runs[run_id] for run_id in ids]
+        self.assertTrue(all(self._run_caches(run_id) for run_id in ids))
+        with mock.patch.object(self.module, "V2_DEVICE_CACHE_RUNS", 2):
+            self._step(conds[0], torch.tensor([0.4]), torch.tensor([ids[0]]))
+        self.assertFalse(runs[1].device_copies, "LRU 로 밀려난 run 은 캐시도 놓는다")
+        self.runtime.release_stale_caches(types.SimpleNamespace())   # on_model_loaded — 사본·캐시를 놓는다
+        self.assertTrue(all(not run.device_copies for run in runs))
+        self.runtime._v2_models = self.models   # (다른 모델이라 커넥터도 놓았다 — 다시 쥐고 이어 간다)
+        self.runtime._v2_source = weakref.ref(self.te_adapter)
+        self._step(conds[0], torch.tensor([0.3]), torch.tensor([ids[0]]))
+        self.assertTrue(self._run_caches(ids[0]))
+        self.runtime._clear_v2_runs()   # install·restore 가 부른다
+        self.assertEqual(self.runtime._v2_runs, {})
+        self.assertTrue(all(not run.device_copies for run in runs))
+
+    def test_shared_fallback_setting_off_and_over_budget_use_the_plain_connector(self):
+        conds, (a,) = self._encode(1)
+        step = (conds[0], torch.tensor([0.5]), torch.tensor([a]))
+        self.runtime._v2_source = weakref.ref(self.models.native_adapter)   # 공유 폴백 — TE 패처가 가중치를 바꾼다
+        self._step(*step)
+        self.runtime._v2_source = weakref.ref(self.te_adapter)
+        with mock.patch.object(connector_cache, "run_cache_enabled", return_value=False):
+            self._step(*step)
+        self.assertEqual(self.prepare.call_count, 0)
+        self.assertEqual(self._run_caches(a), [])
+        with mock.patch.object(self.module, "V2_RUN_CACHE_BYTES", 0):
+            self._step(*step)   # 준비는 하지만(같은 계산) 남기지 않는다
+            self._step(*step)
+        self.assertEqual(self.prepare.call_count, 2)
+        self.assertEqual(self._run_caches(a), [])
+        self._step(*step)
+        self.assertEqual(len(self._run_caches(a)), 1)
+
+
+class _ForgeLikeUnet(_LifecycleUnet):
+    """Forge UnetPatcher 처럼 추가 패처를 받는 UNet (장치는 CPU)."""
+
+    def __init__(self):
+        super().__init__()
+        self.load_device = self.offload_device = torch.device("cpu")
+
+    def add_extra_model_patcher_during_sampling(self, patcher):
+        self.extra_model_patchers_during_sampling.append(patcher)
+
+
+class ConnectorSpeedInstallTests(unittest.TestCase):
+    """설치가 Forge UNet 이면 fp32 상주 패처를 달고(공유 폴백이면 TE 모듈은 빼고), 설정을 끄면 설치 때 되돌린다."""
+
+    def setUp(self):
+        self.forge = _real_forge()
+        self.module = _load_lifecycle_runtime()
+        self.runtime = self.module.Anima3BRuntime()
+        self.model = _LifecycleModel()
+        self.model.forge_objects.unet = _ForgeLikeUnet()
+        self.models = _v2_bundle(self.forge)
+        self.te_adapter = torch.nn.Module()
+        active = self.forge.active()
+        active.__enter__()
+        self.addCleanup(active.__exit__, None, None, None)
+
+    def _install(self, source):
+        def load(sd_model, path, metadata):
+            self.runtime._v2_models = self.models
+            self.runtime._v2_source = weakref.ref(source)
+            return self.models
+
+        p = _LifecycleProcessing(types.SimpleNamespace(sd_model=self.model))
+        with mock.patch.object(self.module, "bundle_metadata", return_value={"anima_v2_adapter_filename": "a"}), \
+                mock.patch.object(self.runtime, "_load_v2_models", side_effect=load):
+            self.runtime.install(p, "a", 1.0, None)
+        return p
+
+    def test_forge_unet_gets_the_fp32_patcher(self):
+        p = self._install(self.te_adapter)
+        patcher = self.runtime._v2_sampling_patcher
+        self.assertIsInstance(patcher, self.forge.base.ModelPatcher)
+        self.assertTrue(hasattr(patcher, "sync_fp32_setting"))
+        self.assertIs(patcher.model, self.models)
+        self.assertEqual(connector_fp32.plan_of(self.models).skip_prefixes, ())
+        unet = self.model.forge_objects.unet
+        self.assertEqual(sum(1 for item in unet.extra_model_patchers_during_sampling if item is patcher), 1)
+        with mock.patch.object(connector_fp32, "connector_fp32", return_value=True):
+            patcher.partially_load(torch.device("cpu"), 1e32)
+        self.assertTrue(connector_fp32.plan_of(self.models).active)
+        self.runtime.restore(p)
+        with mock.patch.object(connector_fp32, "connector_fp32", return_value=False):
+            self._install(self.te_adapter)   # 설정을 끄고 다음 생성 — 같은 패처를 다시 달며 fp32 를 되돌린다
+        self.assertIs(self.runtime._v2_sampling_patcher, patcher)
+        self.assertFalse(connector_fp32.plan_of(self.models).active)
+
+    def test_shared_fallback_keeps_the_te_module_in_its_dtype(self):
+        self._install(self.models.native_adapter)
+        self.assertEqual(connector_fp32.plan_of(self.models).skip_prefixes, ("native_adapter.",))
+
+
+class ConnectorSpeedSettingTests(unittest.TestCase):
+    """Forge 설정 두 개 — 'SAM Extra Anima 3.8B' 섹션, 기본 켬(결과는 같고 빨라지는 쪽), 끄면 예전 경로."""
+
+    def test_readers_follow_forge_opts_and_default_on(self):
+        for reader, name in ((connector_fp32.connector_fp32, connector_fp32.OPT_CONNECTOR_FP32),
+                             (connector_cache.run_cache_enabled, connector_cache.OPT_CONNECTOR_RUN_CACHE)):
+            with self.subTest(name=name):
+                for opts, expected in ((types.SimpleNamespace(**{name: False}), False),
+                                       (types.SimpleNamespace(**{name: True}), True),
+                                       (types.SimpleNamespace(), True), (None, True)):
+                    with KeepResidentSettingTests._forge_opts(opts):
+                        self.assertIs(reader(), expected)
+
+    def test_script_registers_both_settings(self):
+        registered = []
+        callbacks = types.SimpleNamespace(on_model_loaded=lambda fn: None, on_ui_settings=registered.append)
+        script_module = _load_script(script_callbacks=callbacks)
+        self.assertEqual(script_module.OPT_CONNECTOR_FP32, connector_fp32.OPT_CONNECTOR_FP32)
+        self.assertEqual(script_module.OPT_CONNECTOR_RUN_CACHE, connector_cache.OPT_CONNECTOR_RUN_CACHE)
+        added = {}
+
+        class OptionInfo:
+            def __init__(self, default, label, component=None, component_args=None, section=None):
+                self.default, self.label, self.component, self.section = default, label, component, section
+                self.comment = ""
+
+            def info(self, text):
+                self.comment = text
+                return self
+
+        opts = types.SimpleNamespace(add_option=lambda key, info: added.__setitem__(key, info))
+        with KeepResidentSettingTests._forge_opts(opts):
+            sys.modules["modules.shared"].OptionInfo = OptionInfo
+            with mock.patch.object(script_module, "gr", types.SimpleNamespace(Checkbox="checkbox")):
+                registered[0]()
+        fp32 = added[connector_fp32.OPT_CONNECTOR_FP32]
+        cache = added[connector_cache.OPT_CONNECTOR_RUN_CACHE]
+        for info in (fp32, cache):
+            self.assertIs(info.default, True)
+            self.assertEqual(info.component, "checkbox")
+            self.assertEqual(info.section, ("sam3_anima38", "SAM Extra Anima 3.8B"))
+            self.assertIn("같습니다", info.comment)
+        self.assertIn("1.5 GB", fp32.label)
+        self.assertIn("fp32", fp32.label)
+        self.assertIn("빨라짐", fp32.label)
+        self.assertIn("MB", cache.label)
+
+
+class ReferenceIpaSettingTests(unittest.TestCase):
+    """캐릭터 레퍼런스 IP-Adapter 의 3.8B 커넥터 토글 — 이어붙이기 방식과 같은 조건이 기본(켬)."""
+
+    def test_script_registers_the_toggle_under_the_runner_name(self):
+        from sam3ext import anima_reference_runner
+
+        registered = []
+        callbacks = types.SimpleNamespace(on_model_loaded=lambda fn: None, on_ui_settings=registered.append)
+        script_module = _load_script(script_callbacks=callbacks)
+        self.assertEqual(script_module.OPT_IPA_ANIMA38, anima_reference_runner.OPT_IPA_ANIMA38)
+        added = {}
+
+        class OptionInfo:
+            def __init__(self, default, label, component=None, component_args=None, section=None):
+                self.default, self.label, self.component, self.section = default, label, component, section
+                self.comment = ""
+
+            def info(self, text):
+                self.comment = text
+                return self
+
+        opts = types.SimpleNamespace(add_option=lambda key, info: added.__setitem__(key, info))
+        with KeepResidentSettingTests._forge_opts(opts):
+            sys.modules["modules.shared"].OptionInfo = OptionInfo
+            with mock.patch.object(script_module, "gr", types.SimpleNamespace(Checkbox="checkbox")):
+                registered[0]()
+        info = added[script_module.OPT_IPA_ANIMA38]
+        self.assertIs(info.default, True)
+        self.assertIs(info.default, anima_reference_runner.DEFAULT_IPA_ANIMA38)
+        self.assertEqual(info.component, "checkbox")
+        self.assertEqual(info.section, ("sam3_anima38", "SAM Extra Anima 3.8B"))
+        self.assertIn("결과가 바뀜", info.label)
+        self.assertIn("Reference Anima38", info.comment)
+
+
+_REAL_BUNDLE = Path(os.environ.get(
+    "SAM3_ANIMA38_BUNDLE", str(FORGE_ROOT / "models" / "Stable-diffusion" / "Anima-3.8B-v1.1.safetensors")))
+
+
+@unittest.skipUnless(
+    os.environ.get("SAM3_RUN_FORGE_INTEGRATION_TESTS") == "1" and _REAL_BUNDLE.is_file(),
+    "실제 3.8B 번들 가중치 비교 — SAM3_RUN_FORGE_INTEGRATION_TESTS=1 (번들: SAM3_ANIMA38_BUNDLE 또는 기본 경로)",
+)
+class ConnectorRealWeightsTests(unittest.TestCase):
+    """실제 번들 가중치(읽기 전용 safe_open)로 만든 실제 크기 커넥터 — CPU 에서 옛 경로와 새 경로가 같다(수십 초, RAM 약 6 GB)."""
+
+    def test_real_bundle_connector_matches_bit_for_bit(self):
+        forge = _real_forge()
+        module = _load_lifecycle_runtime()
+        runtime = module.Anima3BRuntime()
+        with forge.ops.using_forge_operations(device=torch.device("cpu"), dtype=torch.float32, manual_cast_enabled=True):
+            te_adapter = forge.anima.LLMAdapter()
+        with torch.no_grad():   # Forge TE 와 같은 dtype 배치 — embed 만 fp32
+            for name, parameter in list(te_adapter.named_parameters()):
+                dtype = torch.float32 if name == "embed.weight" else torch.bfloat16
+                _set_path(te_adapter, name, torch.nn.Parameter(torch.zeros(parameter.shape, dtype=dtype),
+                                                               requires_grad=False))
+        native_clip = types.SimpleNamespace(cond_stage_model=types.SimpleNamespace(
+            qwen3_06b=types.SimpleNamespace(llm_adapter=te_adapter)))
+        metadata = anima_files.bundle_metadata(_REAL_BUNDLE)
+        self.assertIsNotNone(metadata)
+        with forge.active(), \
+                mock.patch.object(module, "using_forge_operations", forge.ops.using_forge_operations), \
+                mock.patch.object(module, "QualityAnchoredSemanticConnectorV2",
+                                  forge.semantic_v2.QualityAnchoredSemanticConnectorV2), \
+                mock.patch.object(module, "BundledV2Models", forge.semantic_v2.BundledV2Models), \
+                mock.patch.object(runtime, "_require_anima", return_value=(None, native_clip)):
+            models = runtime._load_v2_models(object(), str(_REAL_BUNDLE), metadata)
+        self.assertIsNot(models.native_adapter, te_adapter, "번들 원본 llm_adapter 사본")
+        generator = torch.Generator().manual_seed(0)
+        tokens = 24
+        source = torch.randn(1, tokens, 1024, generator=generator).expand(2, -1, -1)
+        target_ids = torch.randint(0, 32128, (1, tokens), generator=generator).expand(2, -1)
+        semantic = [torch.randn(1, tokens, 2560, generator=generator).expand(2, -1, -1) for _ in range(4)]
+        mask = torch.ones(1, tokens, dtype=torch.long).expand(2, -1)
+        schedule = [torch.tensor([0.9, 0.9]), torch.tensor([0.4, 0.2])]
+        reference = _old_outputs(models, (source, target_ids, semantic, mask), schedule)
+        with forge.active():
+            plan = connector_fp32.Fp32Plan(models, torch.float32)
+            self.assertAlmostEqual(plan.growth / 1e9, 1.5, delta=0.1, msg="VRAM 추가량 약 1.5 GB")
+            plan.convert(models, torch.device("cpu"))
+            with torch.inference_mode():
+                self.assertTrue(connector_cache.supports(models.connector))
+                cache = connector_cache.prepare(models.connector, source, target_ids, semantic, semantic_source_mask=mask)
+                cached = [connector_cache.forward(models.connector, cache, t) for t in schedule]
+        fp32 = _old_outputs(models, (source, target_ids, semantic, mask), schedule)
+        for left, right, both in zip(reference, fp32, cached):
+            self.assertTrue(torch.equal(left, right))
+            self.assertTrue(torch.equal(left, both))
 
 
 if __name__ == "__main__":

@@ -59,6 +59,7 @@ generation — worst case it logs and renders normally.
 """
 from __future__ import annotations
 
+import gc
 import math
 import importlib
 import re
@@ -211,7 +212,33 @@ _STATE: dict = {
     "engine": "?",
     "diag_started_at": None,
     "delta_logged": False,
+    # 확장 배치가 OOM 으로 실패하면 그 생성(같은 p 의 남은 패스·배치)의
+    # perturbation 을 끈다. p 는 약한 참조로만 들고 postprocess 에서 푼다.
+    "pass_owner": None,
+    "pert_oom_owner": None,
+    # 앞쪽 블록 중복 제거(Forge 설정 OPT_PREFIX_DEDUP, 생성마다 읽음). 첫 target
+    # 블록 이전에는 weak 행이 cond 행과 입력·연산이 같으므로 원래 배치 행만
+    # forward 하고 weak 자리에는 cond 행 출력을 복사한다.
+    "prefix_dedup": True,
+    # 공식 SEG blur 를 가로·세로 1D depthwise 두 번으로(Forge 설정 OPT_SEG_SEPARABLE).
+    "seg_separable": True,
+    # 확장 forward 한 번 동안만 유효한 표식(_clear_markers 가 지운다).
+    "dedup_until": None,  # 첫 target 블록 번호. None = 이번 forward 에서 중복 제거 안 함
+    "dedup_src": None,    # 붙인 weak 행의 원본 cond 행 인덱스(원래 배치 기준)
+    "dedup_next": 0,      # 다음에 와야 하는 블록 번호(연속·순서 확인)
+    # 생성 단위 진단/안전장치.
+    "dedup_blocks": 0,     # 중복 제거로 돈 블록 호출 수
+    "dedup_fallbacks": 0,  # 조건이 안 맞아 예전 경로(전체 배치)로 돈 횟수
+    "dedup_warned": False,
+    "dedup_disabled": False,  # 잘린 배치 forward 가 예외를 내면 이 생성은 끈다
 }
+
+# Forge 설정(섹션 'SAM Extra Guidance'). infotext 이름은 붙여넣기 때 같은 설정으로
+# 되돌아가도록 OptionInfo(infotext=...) 로도 등록한다(값은 "True"/"False").
+OPT_PREFIX_DEDUP = "sam3_guidance_pag_prefix_dedup"
+OPT_SEG_SEPARABLE = "sam3_guidance_seg_separable_blur"
+INFOTEXT_PREFIX_DEDUP = "Anima PAG prefix dedup"
+INFOTEXT_SEG_SEPARABLE = "Anima SEG separable blur"
 
 _EXTRA_GENERATION_PARAM_KEYS = (
     "Anima Perturbation Guidance",
@@ -223,7 +250,66 @@ _EXTRA_GENERATION_PARAM_KEYS = (
     "Anima DAVE",
     "Anima CNS Wavelet Noise",
     "Anima Modulation Guidance",
+    INFOTEXT_PREFIX_DEDUP,
+    INFOTEXT_SEG_SEPARABLE,
 )
+
+
+def _read_bool_option(name: str, default: bool = True) -> bool:
+    """Forge 설정값. 설정이 없거나 Forge 밖(테스트)이면 ``default``."""
+    try:
+        opts = getattr(shared, "opts", None)
+        if opts is None:
+            return default
+        return bool(getattr(opts, name, default))
+    except Exception:
+        return default
+
+
+def _on_ui_settings() -> None:
+    section = ("sam3_guidance", "SAM Extra Guidance")
+    shared.opts.add_option(
+        OPT_PREFIX_DEDUP,
+        shared.OptionInfo(
+            True,
+            "PAG/SEG/SLG: 첫 target 블록 이전의 weak 행 중복 계산 건너뛰기",
+            gr.Checkbox,
+            section=section,
+            infotext=INFOTEXT_PREFIX_DEDUP,
+        ).info(
+            "켜면(기본) 첫 target 블록(기본 18) 이전 블록은 원래 cond/uncond 행만 돌리고 weak 행 자리에는 "
+            "cond 행 출력을 복사합니다 — 그 블록들에서 weak 행은 cond 행과 입력·연산이 같습니다. "
+            "기본 블록(18)에서 PAG 한 장에 약 9% 빨라지고 앞쪽 블록의 활성 VRAM 도 줄어듭니다(추정). 행 수가 안 맞거나 "
+            "모르는 블록 인자가 있으면 그 블록부터 예전 경로(전체 배치)로 돕니다. 행렬 곱의 배치 크기가 "
+            "달라져 결과가 아주 미세하게 달라질 수 있어 infotext 에 남깁니다. 끄면 예전 경로 그대로입니다."
+        ),
+    )
+    shared.opts.add_option(
+        OPT_SEG_SEPARABLE,
+        shared.OptionInfo(
+            True,
+            "SEG(공식): query Gaussian blur 를 가로·세로 1D 두 번으로 계산",
+            gr.Checkbox,
+            section=section,
+            infotext=INFOTEXT_SEG_SEPARABLE,
+        ).info(
+            "켜면(기본) 같은 Gaussian 커널을 2D 한 번 대신 가로·세로 1D depthwise conv 두 번으로 적용합니다 — "
+            "커널 크기 k 에서 픽셀당 곱셈이 k² 에서 2k 로 줄어듭니다. 수학적으로 같은 blur 지만 반올림 순서가 "
+            "달라 결과가 아주 미세하게 달라질 수 있어 infotext 에 남깁니다. 끄면 예전 2D conv 그대로입니다."
+        ),
+    )
+
+
+def _register_settings_hook() -> None:
+    register = getattr(script_callbacks, "on_ui_settings", None)
+    if register is not None and shared is not None:
+        try:
+            register(_on_ui_settings)
+        except Exception:
+            pass
+
+
+_register_settings_hook()
 
 
 # ---------------------------------------------------------------------------
@@ -288,6 +374,16 @@ _CFG: dict = {
     "effective_scale": None,
     "external_cfg_detected": False,
     "warned": False,
+    # CFG 1 guard: Forge skips the uncond pass at cond_scale≈1, so there is no
+    # CFG error for SMC/APG/CWM to reshape; log that skip once per generation.
+    "cfg1_warned": False,
+    # 이번 post-CFG 호출에서 CFG 1 가드로 SMC/APG/CWM 을 건너뛰었는가(스텝마다
+    # _apply_cfg_base 가 다시 씀). 건너뛴 스텝은 APG 가 돌지 않았으므로 PAG
+    # rescale 자동 끄기(apg_autooff_rescale)도 적용하지 않는다.
+    "base_skipped": False,
+    # fit_error 는 경고 한 줄과 [VERIFY] 요약에만 쓰인다. 진단이 꺼져 있으면
+    # 패스마다 첫 평가에서만 재고(동기화 1회), 이후 스텝은 건너뛴다.
+    "fit_checked": False,
 }
 
 _DCW: dict = {
@@ -372,8 +468,13 @@ _PATCHED_CNS_TARGETS: list = []  # [(sampling_module, brownian_cls_or_None)]
 # ---------------------------------------------------------------------------
 
 
-def _gaussian_blur_2d(img, sigma: float):
-    """Official SEG separable Gaussian kernel, applied depthwise over H/W."""
+def _gaussian_blur_2d(img, sigma: float, separable: bool = True):
+    """Official SEG separable Gaussian kernel, applied depthwise over H/W.
+
+    ``separable=True`` 는 같은 1D 커널을 가로(1×k)·세로(k×1) depthwise conv 로
+    두 번 적용한다(픽셀당 곱셈 k² → 2k). 반사 패딩을 먼저 한 번에 하므로 2D
+    conv 와 수학적으로 같고, 반올림 순서만 달라 결과가 아주 미세하게 다를 수
+    있다. ``False`` 는 예전 2D 외적 커널 conv 그대로다(Forge 설정으로 고른다)."""
     if F is None or sigma <= 0:
         return img
     height, width = int(img.shape[-2]), int(img.shape[-1])
@@ -392,6 +493,17 @@ def _gaussian_blur_2d(img, sigma: float):
     x = torch.linspace(-half, half, steps=kernel_size, device=img.device, dtype=torch.float32)
     pdf = torch.exp(-0.5 * (x / float(sigma)).pow(2))
     kernel_1d = (pdf / pdf.sum()).to(dtype=img.dtype)
+    if separable:
+        channels = img.shape[-3]
+        img = F.pad(img, [kernel_size // 2] * 4, mode="reflect")
+        horizontal = kernel_1d.reshape(1, 1, 1, kernel_size).expand(
+            channels, 1, 1, kernel_size
+        )
+        vertical = kernel_1d.reshape(1, 1, kernel_size, 1).expand(
+            channels, 1, kernel_size, 1
+        )
+        img = F.conv2d(img, horizontal, groups=channels)
+        return F.conv2d(img, vertical, groups=channels)
     kernel_2d = torch.mm(kernel_1d[:, None], kernel_1d[None, :])
     kernel_2d = kernel_2d.expand(img.shape[-3], 1, kernel_size, kernel_size)
     img = F.pad(img, [kernel_size // 2] * 4, mode="reflect")
@@ -425,6 +537,17 @@ def _parse_attention_heads(spec: str, n: int) -> set:
     return {i for i in out if 0 <= i < n}
 
 
+def _head_index(heads: list, device):
+    """head 축 인덱스를 장치 위 LongTensor 로(캐시) 돌려준다.
+
+    파이썬 리스트로 인덱싱하면 PyTorch 가 매번 CPU LongTensor 를 만들어 GPU 로
+    올린다(forward 중간의 동기 H2D, 인덱싱마다 1회). 같은 값의 장치 텐서로
+    인덱싱하면 같은 index/index_put 커널이 같은 출력 배치로 돌므로 결과는
+    비트 단위로 같다. slice 로 바꾸면 lerp 입력의 메모리 배치가 달라져 CPU 에서
+    마지막 비트가 달라지는 경우가 있어(FMA 벡터 경로) 쓰지 않는다."""
+    return _index_tensor(heads, device)
+
+
 def _official_seg_query(
     query,
     a0: int,
@@ -433,6 +556,7 @@ def _official_seg_query(
     spatial_shape=None,
     strength: float = 1.0,
     head_spec: str = "",
+    separable: bool = True,
 ):
     """Blur only appended weak-row queries over Anima's real spatial axes.
 
@@ -448,7 +572,7 @@ def _official_seg_query(
         if sigma > 9999.0:
             spatial = spatial.mean(dim=(-2, -1), keepdim=True).expand_as(spatial)
         else:
-            spatial = _gaussian_blur_2d(spatial, sigma)
+            spatial = _gaussian_blur_2d(spatial, sigma, separable)
         perturbed = spatial.reshape(b, t, n, d, h, w).permute(0, 1, 4, 5, 2, 3)
     elif weak.ndim == 4:  # B,S,N,D (current Forge Neo)
         if not spatial_shape or len(spatial_shape) != 3:
@@ -466,7 +590,7 @@ def _official_seg_query(
         if sigma > 9999.0:
             spatial = spatial.mean(dim=(-2, -1), keepdim=True).expand_as(spatial)
         else:
-            spatial = _gaussian_blur_2d(spatial, sigma)
+            spatial = _gaussian_blur_2d(spatial, sigma, separable)
         perturbed = (
             spatial.reshape(b, t, n, d, h, w)
             .permute(0, 1, 4, 5, 2, 3)
@@ -479,9 +603,10 @@ def _official_seg_query(
         return query
     strength = min(1.0, max(0.0, float(strength)))
     blended = weak.clone()
-    blended[..., heads, :] = torch.lerp(
-        weak[..., heads, :],
-        perturbed[..., heads, :],
+    head_idx = _head_index(heads, weak.device)
+    blended[..., head_idx, :] = torch.lerp(
+        weak[..., head_idx, :],
+        perturbed[..., head_idx, :],
         strength,
     )
     result = query.clone()
@@ -519,6 +644,7 @@ def _patched_anima_attention_op(query, key, value, *args, **kwargs):
                 _STATE.get("attn_spatial_shape"),
                 float(_STATE["strength"]),
                 str(_STATE.get("head_spec", "")),
+                bool(_STATE.get("seg_separable", True)),
             )
         out = original(query, key, value, *args, **kwargs)
         if a1 > out.shape[0]:
@@ -560,9 +686,10 @@ def _patched_anima_attention_op(query, key, value, *args, **kwargs):
         else:
             return out
         weak = result_heads[a0:a1]
-        weak[..., heads, :] = torch.lerp(
-            out_heads[a0:a1, :, heads, :],
-            target[..., heads, :],
+        head_idx = _head_index(heads, out_heads.device)
+        weak[..., head_idx, :] = torch.lerp(
+            out_heads[a0:a1, :, head_idx, :],
+            target[..., head_idx, :],
             strength,
         )
         result_heads[a0:a1] = weak
@@ -570,10 +697,16 @@ def _patched_anima_attention_op(query, key, value, *args, **kwargs):
         _STATE["attn_hook_hits_total"] += 1
         return result_heads.reshape_as(out)
     except Exception as e:  # never let the patch break sampling
+        # 여기서는 기록만 한다. except 안에서 원본 op 를 다시 돌리면 살아 있는
+        # 예외의 __traceback__ 이 실패한 호출의 중간 활성값을 붙잡은 채 두 번째
+        # attention 이 돌아 VRAM 이 이중으로 든다.
         _log(f"attention perturb skipped: {type(e).__name__}: {e}")
-        if out is not None:
-            return out
-        return original(original_query, key, value, *args, **kwargs)
+
+    # except 블록 밖: 예외·traceback 이 풀린 뒤 반환/재시도한다(결과는 같다).
+    if out is not None:
+        return out
+    query = None  # noqa: F841 - 교란된(SEG) query 를 재시도 전에 해제
+    return original(original_query, key, value, *args, **kwargs)
 
 
 _patched_anima_attention_op._anima_pag_owner = _PATCH_OWNER
@@ -666,6 +799,159 @@ def _modulate_block_call(idx: int, args, kwargs):
         return args, kwargs
 
 
+# ---------------------------------------------------------------------------
+# 앞쪽 블록 중복 제거(효율 보고서 2026-09-23 [2]).
+#
+# 확장 forward 에서 weak 행은 cond 행의 사본(x·timestep·조건 모두 index_select)이고,
+# 첫 target 블록(PAG/SEG 의 attn_targets, SLG 의 slg_targets 중 가장 앞) 이전에는
+# perturbation 이 없으므로 행마다 독립인 블록에서 weak 행 출력은 cond 행 출력과 같다.
+# 그 구간에서는 원래 배치 행([:batch])만 원본 forward 로 돌리고 weak 자리에는 cond 행
+# 출력을 복사한다. Modulation Guidance(adaln 에 행마다 같은 delta)·DAVE(행별 평균)·
+# NegPiP(행별 마스크)·3.8B 커넥터(행별 run 마커로 DiT forward 에서 미리 확장한 조건)는
+# 모두 행 단위라 이 전제를 깨지 않는다.
+#
+# 행 수를 전제로 하는 소비자와 충돌하지 않도록 블록 인자는 아는 것만 자른다.
+# 모르는 kwargs, 행 수가 확장 배치도 1(브로드캐스트)도 아닌 텐서, transformer_options
+# 안의 모르는 확장-배치 텐서가 있으면 그 블록부터 이번 forward 는 예전 경로(전체 배치)다.
+# ---------------------------------------------------------------------------
+
+# Forge Anima ``Block.forward`` 의 인자 이름(backend/nn/anima.py). Comfy 계열도 같다.
+_DEDUP_BLOCK_KWARGS = frozenset({
+    "x_B_T_H_W_D",
+    "emb_B_T_D",
+    "crossattn_emb",
+    "rope_emb_L_1_1_D",
+    "adaln_lora_B_T_3D",
+    "extra_per_block_pos_emb",
+    "transformer_options",
+})
+_DEDUP_MAX_POSITIONAL = 7
+# transformer_options 안에서 확장 배치 행 수를 가진 텐서 중 잘라도 되는 것.
+# negpip_mask: NegPiP 의 DiT forward 훅(또는 3.8B 런타임)이 c_negpip_mask 를 그대로
+# 옮겨 둔 것. NegPiP cross-attn 은 x 행 수 // 마스크 행 수 로 반복하므로 x 와 같이
+# 잘라야 한다. sigmas·cond_mark 는 Forge 가 원래 배치 행 수로 만들어 자를 것이 없다.
+_DEDUP_OPTION_ROW_KEYS = frozenset({"negpip_mask"})
+_DEDUP_UNSUPPORTED = object()
+
+
+def _dedup_slice_tensor(value, batch: int, extended: int):
+    if value is None:
+        return value
+    if not torch.is_tensor(value):
+        return _DEDUP_UNSUPPORTED
+    if value.ndim == 0 or value.shape[0] == 1:
+        return value  # 스칼라·브로드캐스트(rope 등)
+    if value.shape[0] == extended:
+        return value[:batch]
+    return _DEDUP_UNSUPPORTED
+
+
+def _dedup_slice_options(options, batch: int, extended: int):
+    if options is None:
+        return options
+    if not isinstance(options, dict):
+        return _DEDUP_UNSUPPORTED
+    changed = None
+    for key, value in options.items():
+        if torch.is_tensor(value) and value.ndim > 0 and value.shape[0] == extended:
+            if key not in _DEDUP_OPTION_ROW_KEYS:
+                return _DEDUP_UNSUPPORTED
+            if changed is None:
+                changed = dict(options)  # 공유 딕셔너리는 건드리지 않는다
+            changed[key] = value[:batch]
+    return options if changed is None else changed
+
+
+def _dedup_block_call(args, kwargs):
+    """원래 배치 행으로 자른 (args, kwargs). 쓸 수 없으면 사유 문자열."""
+    batch = _STATE["any_b0"]
+    src = _STATE["dedup_src"]
+    if batch is None or not torch.is_tensor(src) or src.ndim != 1:
+        return "no layout"
+    extended = int(batch) + int(src.shape[0])
+    x = args[0] if args else kwargs.get("x_B_T_H_W_D")
+    if not torch.is_tensor(x) or x.ndim == 0 or x.shape[0] != extended:
+        return "x rows"
+    if len(args) > _DEDUP_MAX_POSITIONAL:
+        return f"{len(args)} positional args"
+    new_args = []
+    for position, value in enumerate(args):
+        if isinstance(value, dict):
+            sliced = _dedup_slice_options(value, batch, extended)
+        else:
+            sliced = _dedup_slice_tensor(value, batch, extended)
+        if sliced is _DEDUP_UNSUPPORTED:
+            return f"positional arg {position}"
+        new_args.append(sliced)
+    new_kwargs = {}
+    for key, value in kwargs.items():
+        if key not in _DEDUP_BLOCK_KWARGS:
+            return f"unknown kwarg {key!r}"
+        if key == "transformer_options":
+            sliced = _dedup_slice_options(value, batch, extended)
+        else:
+            sliced = _dedup_slice_tensor(value, batch, extended)
+        if sliced is _DEDUP_UNSUPPORTED:
+            return f"kwarg {key!r}"
+        new_kwargs[key] = sliced
+    return tuple(new_args), new_kwargs
+
+
+def _dedup_fallback(idx: int, reason: str) -> None:
+    """이번 forward 는 이 블록부터 예전 경로(전체 배치)."""
+    _STATE["dedup_until"] = None
+    _STATE["dedup_fallbacks"] += 1
+    if not _STATE["dedup_warned"]:
+        _STATE["dedup_warned"] = True
+        _log(
+            f"앞쪽 블록 중복 제거를 블록 {idx} 부터 건너뜁니다(예전 전체 배치 경로): "
+            f"{reason}"
+        )
+
+
+def _dedup_plan(idx: int, args, kwargs):
+    """이 블록 호출을 원래 배치 행만으로 돌릴 수 있으면 잘린 (args, kwargs)."""
+    until = _STATE.get("dedup_until")
+    if until is None or _STATE["any_b0"] is None:
+        return None
+    if idx >= until or idx != _STATE["dedup_next"]:
+        # 첫 target 도달, 또는 블록이 0 부터 연속으로 오지 않았다(감싸지 않은 블록·
+        # 재호출 등) — weak 행이 cond 행과 같다는 전제를 더는 보장할 수 없다.
+        _STATE["dedup_until"] = None
+        return None
+    plan = _dedup_block_call(args, kwargs)
+    if isinstance(plan, str):
+        _dedup_fallback(idx, plan)
+        return None
+    return plan
+
+
+def _run_dedup_block(idx: int, orig_forward, plan):
+    """원래 배치 행만 forward 하고 weak 자리에 cond 행 출력을 붙인다. 실패하면 None."""
+    sliced_args, sliced_kwargs = plan
+    batch = int(_STATE["any_b0"])
+    src = _STATE["dedup_src"]
+    failure = None
+    try:
+        out_b = orig_forward(*sliced_args, **sliced_kwargs)
+    except Exception as exc:
+        if _is_out_of_memory(exc):
+            raise  # 확장 배치 OOM 경로(_model_wrapper_inner)가 처리한다
+        # 여기서는 기록만 — 폴백 forward 는 예외·traceback 이 풀린 뒤에 돈다.
+        failure = f"{type(exc).__name__}: {exc}"
+    if failure is not None:
+        _STATE["dedup_disabled"] = True  # 이 생성의 남은 스텝은 예전 경로
+        _dedup_fallback(idx, failure)
+        return None
+    if not torch.is_tensor(out_b) or out_b.ndim == 0 or out_b.shape[0] != batch:
+        _dedup_fallback(idx, "block output rows")
+        return None
+    out = torch.cat([out_b, out_b.index_select(0, src.to(out_b.device))], dim=0)
+    _STATE["dedup_next"] = idx + 1
+    _STATE["dedup_blocks"] += 1
+    return out
+
+
 def _make_block_wrapper(idx: int, orig_forward):
     """Compose CLIP modulation, original block, DAVE, then SLG restoration."""
 
@@ -681,8 +967,14 @@ def _make_block_wrapper(idx: int, orig_forward):
         )
         if captures_spatial:
             _STATE["attn_spatial_shape"] = tuple(int(v) for v in x_in.shape[1:4])
+        dedup = _dedup_plan(idx, call_args, call_kwargs)
         try:
-            out = orig_forward(*call_args, **call_kwargs)
+            out = None
+            if dedup is not None:
+                out = _run_dedup_block(idx, orig_forward, dedup)
+                dedup = None  # 잘린 인자를 폴백 forward 동안 붙잡지 않는다
+            if out is None:
+                out = orig_forward(*call_args, **call_kwargs)
         finally:
             if captures_spatial:
                 _STATE["attn_spatial_shape"] = previous_spatial
@@ -1091,6 +1383,67 @@ def _select_c(c: dict, idx_tensor, batch: int) -> dict:
     return out
 
 
+# cond/uncond 행 인덱스 텐서 캐시. ``torch.tensor(list, device=cuda)`` 는 스텝마다
+# pageable 동기 H2D 였다. 값은 (행 목록, device)만으로 정해지므로 그 둘을 키로
+# 두면 결과가 같다. 배치 배치(layout)는 몇 가지뿐이라 작게 두고 postprocess 에서 비운다.
+_INDEX_TENSOR_CACHE: dict = {}
+_INDEX_TENSOR_CACHE_MAX = 16
+
+
+def _index_tensor(indices, device):
+    key = (tuple(int(i) for i in indices), str(device))
+    cached = _INDEX_TENSOR_CACHE.get(key)
+    if cached is None:
+        if len(_INDEX_TENSOR_CACHE) >= _INDEX_TENSOR_CACHE_MAX:
+            _INDEX_TENSOR_CACHE.clear()
+        cached = torch.tensor(key[0], device=device, dtype=torch.long)
+        _INDEX_TENSOR_CACHE[key] = cached
+    return cached
+
+
+def _is_out_of_memory(exc: BaseException) -> bool:
+    oom_type = getattr(torch, "OutOfMemoryError", None) if torch is not None else None
+    if oom_type is not None and isinstance(exc, oom_type):
+        return True
+    return isinstance(exc, RuntimeError) and "out of memory" in str(exc).lower()
+
+
+def _owner_ref(p):
+    """생성(p)을 붙잡지 않는 약한 참조. 지원하지 않는 객체면 None(이번 패스만)."""
+    if p is None:
+        return None
+    try:
+        return weakref.ref(p)
+    except TypeError:
+        return None
+
+
+def _perturbation_oom_blocked(p) -> bool:
+    """이 p 의 앞선 패스/배치에서 확장 배치가 OOM 으로 실패했는가."""
+    ref = _STATE.get("pert_oom_owner")
+    return ref is not None and p is not None and ref() is p
+
+
+def _disable_perturbation_after_oom() -> None:
+    """확장 배치 OOM 뒤: 이번 생성의 PAG/SEG/SLG 를 끄고 VRAM 을 돌려받는다.
+
+    호출 시점에는 예외 객체와 traceback 이 이미 풀려 있어야 한다(except 블록 밖).
+    그래야 실패한 forward 의 중간 활성값이 해제되어 폴백 forward 가 쓸 수 있다.
+    """
+    _STATE["on"] = False
+    _STATE["pert_oom_owner"] = _STATE.get("pass_owner")
+    try:
+        gc.collect()  # traceback 순환 참조에 남은 프레임까지 정리
+    except Exception:
+        pass
+    try:
+        from backend import memory_management
+
+        memory_management.soft_empty_cache()
+    except Exception:
+        pass
+
+
 def _sampling_position() -> tuple[int, int]:
     """Return Forge's authoritative 0-based sampler position.
 
@@ -1237,6 +1590,9 @@ def _clear_markers():
     _STATE["attn_b0"] = _STATE["attn_b1"] = None
     _STATE["slg_b0"] = _STATE["slg_b1"] = None
     _STATE["attn_spatial_shape"] = None
+    _STATE["dedup_until"] = None
+    _STATE["dedup_src"] = None
+    _STATE["dedup_next"] = 0
 
 
 def _model_wrapper(apply_model, w):
@@ -1271,6 +1627,7 @@ def _model_wrapper_inner(apply_model, w):
     if not (_STATE["on"] or _ADG["on"]) or torch is None:
         return apply_model(x, ts, **c)
 
+    extended_forward = False  # OOM 이 weak 행을 붙인 확장 forward 에서 났는가
     try:
         _STATE["wrapper_calls"] += 1
         if cou is None or len(cou) == 0:
@@ -1305,10 +1662,8 @@ def _model_wrapper_inner(apply_model, w):
         elif uncond_idx:
             _STATE["split_uncond_calls"] += 1
 
-        idx = torch.tensor(cond_idx, device=x.device, dtype=torch.long) \
-            if cond_idx else None
-        uidx = torch.tensor(uncond_idx, device=x.device, dtype=torch.long) \
-            if uncond_idx else None
+        idx = _index_tensor(cond_idx, x.device) if cond_idx else None
+        uidx = _index_tensor(uncond_idx, x.device) if uncond_idx else None
 
         # A split uncond-only call cannot carry a perturbation copy. Forge's
         # post-CFG args already supply the aggregated denoised predictions, so
@@ -1373,12 +1728,31 @@ def _model_wrapper_inner(apply_model, w):
         _STATE["attn_b0"], _STATE["attn_b1"] = a0, a1
         _STATE["slg_b0"], _STATE["slg_b1"] = s0, s1
         _STATE["any_b0"] = batch
+        # 앞쪽 블록 중복 제거: 첫 target 블록 이전은 원래 배치 행만 돌린다.
+        first_target = min(
+            (_STATE["attn_targets"] if a0 is not None else set())
+            | (_STATE["slg_targets"] if s0 is not None else set()),
+            default=0,
+        )
+        _STATE["dedup_src"] = app_idx
+        _STATE["dedup_next"] = 0
+        _STATE["dedup_until"] = (
+            int(first_target)
+            if (
+                _STATE.get("prefix_dedup")
+                and not _STATE.get("dedup_disabled")
+                and int(first_target) > 0
+            )
+            else None
+        )
         if a0 is not None:
             _STATE["attn_hook_hits"] = 0
+        extended_forward = True
         try:
             out_ext = apply_model(x_ext, ts_ext, **c_ext)
         finally:
             _clear_markers()
+        extended_forward = False
 
         out = out_ext[:batch]
         # The cond rows the weak predictions were derived from. post_cfg must
@@ -1395,7 +1769,11 @@ def _model_wrapper_inner(apply_model, w):
             _STATE["slg_raw"] = out_ext[s0:s1].detach().float()
         _STATE["weak_steps"] += 1
 
-        if a0 is not None:
+        # rel_delta 는 진단값이다(첫 스텝 로그 + 진단 켰을 때 [VERIFY] 요약).
+        # float() 가 forward 전체를 기다리는 동기화라 그 둘일 때만 잰다.
+        if a0 is not None and (
+            not _STATE["attn_diag_logged"] or guidance_diagnostics_enabled()
+        ):
             weak = _STATE["attn_raw"]
             cond = cond_rows
             rel_delta = None
@@ -1424,13 +1802,33 @@ def _model_wrapper_inner(apply_model, w):
                 _STATE["attn_diag_logged"] = True
         return out
     except Exception as e:
-        _STATE["wrapper_fallbacks"] += 1
-        _clear_markers()
-        _STATE["attn_raw"] = None
-        _STATE["slg_raw"] = None
-        _STATE["cond_raw"] = None
-        _log(f"wrapper fallback → normal apply_model: {type(e).__name__}: {e}")
-        return apply_model(x, ts, **c)
+        # 여기서는 기록만 한다. except 안에서 폴백 forward 를 돌리면 살아 있는
+        # 예외의 __traceback__ 이 실패한 forward 프레임(중간 활성값)을 붙잡은
+        # 채로 두 번째 forward 가 돌아 VRAM 이 이중으로 든다.
+        failure = (
+            type(e).__name__,
+            str(e),
+            extended_forward and _is_out_of_memory(e),
+        )
+
+    # except 블록 밖: 예외·traceback 이 풀린 뒤 폴백한다.
+    name, message, oom = failure
+    _STATE["wrapper_fallbacks"] += 1
+    _clear_markers()
+    _STATE["attn_raw"] = None
+    _STATE["slg_raw"] = None
+    _STATE["cond_raw"] = None
+    x_ext = ts_ext = c_ext = out_ext = out = None  # noqa: F841 - 확장 배치 해제
+    if oom and _STATE["on"]:
+        _disable_perturbation_after_oom()
+        _log(
+            f"wrapper fallback → normal apply_model: {name}: {message} "
+            "— 확장 배치(PAG/SEG/SLG weak 행)가 VRAM 부족으로 실패해 "
+            "캐시를 비우고 이 생성의 perturbation 을 끕니다."
+        )
+    else:
+        _log(f"wrapper fallback → normal apply_model: {name}: {message}")
+    return apply_model(x, ts, **c)
 
 
 # Owner tag so a co-loaded script (e.g. anima_ref_poc) can recognise our unet
@@ -1523,12 +1921,14 @@ def _apply_apg(args, effective_scale, guidance_override=None):
         return None
 
 
-def _recover_effective_cfg(args, incoming):
+def _recover_effective_cfg(args, incoming, with_fit_error=True):
     """Fit the incoming CFG result to ``uncond + w_eff*(cond-uncond)``.
 
     Forge does not expose per-conditioning ``edit_strength`` in post-CFG args.
     Least-squares recovery retains it for linear CFG and quantifies how poorly
     a nonlinear/custom CFG result fits before any explicit base override.
+    ``with_fit_error=False`` skips that diagnostic (two norms and a second
+    GPU->CPU sync) and returns ``fit_error=None``; ``effective`` is unchanged.
     """
     cond = args["cond_denoised"].float()
     uncond = args["uncond_denoised"].float()
@@ -1536,6 +1936,8 @@ def _recover_effective_cfg(args, incoming):
     residual = incoming.float() - uncond
     denom = (guidance * guidance).sum().clamp_min(1e-12)
     effective = float(((residual * guidance).sum() / denom).item())
+    if not with_fit_error:
+        return effective, None
     fitted = uncond + effective * guidance
     fit_error = float(
         (
@@ -1560,6 +1962,85 @@ def _cfg_base_flags() -> tuple[bool, bool, bool]:
     return smc_on, apg_on, cwm_on
 
 
+def _cfg_base_skip_reason(args) -> str | None:
+    """Why the CFG base override must not run on this post-CFG call.
+
+    At ``cond_scale`` ≈ 1 Forge never evaluates the uncond batch
+    (``sampling_function_inner``: ``uncond_ = None``) and hands the hook an
+    all-zero ``uncond_denoised``. SMC/APG/CWM all rewrite ``cond - uncond``,
+    which then equals ``cond`` itself: APG with eta=0 projects most of the
+    prediction away (near-black output) and CWM/SMC reweight the image
+    instead of a guidance error. Skimmed CFG guards the same case. Either
+    signal alone is enough — ``cond_scale`` covers
+    ``disable_cfg1_optimization``, the zero check covers callers that omit
+    the key. Returns None when the override may proceed.
+
+    Forge always passes ``cond_scale`` (``sampling_function_inner``) and only
+    drops the uncond batch when it is ≈1, so with a usable ``cond_scale`` the
+    zero scan — a full-tensor ``torch.any`` read back to the host, i.e. a
+    GPU->CPU sync every step — is redundant and runs only as a fallback."""
+    cond_scale = args.get("cond_scale")
+    if cond_scale is not None:
+        try:
+            scale = float(cond_scale)
+        except (TypeError, ValueError):
+            scale = None
+        if scale is not None:
+            if math.isclose(scale, 1.0):
+                return f"cond_scale={scale:g}"
+            return None
+    uncond = args.get("uncond_denoised")
+    if (
+        torch.is_tensor(uncond)
+        and uncond.numel() > 0
+        and not bool(torch.any(uncond != 0))
+    ):
+        return "uncond_denoised is all zero (no uncond pass; cond_scale≈1)"
+    return None
+
+
+def _cfg1_skip_message(args, skip_reason: str) -> str:
+    """CFG 1 가드 경고 한 줄(생성당 1회).
+
+    ``disable_cfg1_optimization`` 이 켜져 있으면 Forge 는 CFG 1 에서도 uncond
+    패스를 돌린다. 그때 건너뛰는 이유는 uncond 부재가 아니라 배율 1 이다
+    (CFG 결과가 cond 예측 그 자체라 다듬을 가이던스가 없다)."""
+    model_options = args.get("model_options") or {}
+    forced_uncond = bool(
+        isinstance(model_options, dict)
+        and model_options.get("disable_cfg1_optimization", False)
+        and skip_reason.startswith("cond_scale")
+    )
+    if forced_uncond:
+        why = (
+            "disable_cfg1_optimization is set, so Forge still ran the uncond "
+            "pass, but at CFG 1 the incoming result is the cond prediction "
+            "itself and there is no CFG guidance to smooth, reproject or "
+            "reweight"
+        )
+    else:
+        why = (
+            "Forge runs no uncond at CFG 1, so there is no CFG error to "
+            "smooth, reproject or reweight"
+        )
+    message = (
+        f"CFG base override (SMC/APG/CWM) skipped: {skip_reason}. {why}; "
+        "the incoming result is kept unchanged (set CFG > 1 to use these "
+        "bases)."
+    )
+    if (
+        _APG["on"]
+        and _STATE.get("apg_autooff_rescale", True)
+        and _STATE.get("on")
+        and float(_STATE.get("rescale", 0.0) or 0.0) > 0
+    ):
+        message += (
+            " APG did not run, so the PAG rescale auto-off is not applied "
+            "either (rescale stays active)."
+        )
+    return message
+
+
 def _apply_cfg_base(args, incoming):
     """Return the selected CFG base before PAG/SEG/SLG and DCW.
 
@@ -1567,21 +2048,40 @@ def _apply_cfg_base(args, incoming):
     SMC (smooth the CFG error across steps) -> APG (reproject it) -> CWM
     (reweight it per Haar band). With none on, the incoming CFG result from
     Forge/MaHiRo/other extensions is preserved untouched."""
+    _CFG["base_skipped"] = False
     smc_on, apg_on, cwm_on = _cfg_base_flags()
     if not (smc_on or apg_on or cwm_on):
         return incoming.float()
 
-    effective_scale, fit_error = _recover_effective_cfg(args, incoming)
+    skip_reason = _cfg_base_skip_reason(args)
+    if skip_reason is not None:
+        _CFG["base_skipped"] = True
+        if not _CFG["cfg1_warned"]:
+            _CFG["cfg1_warned"] = True
+            _log(_cfg1_skip_message(args, skip_reason))
+        return incoming.float()
+
+    # fit_error 는 진단값(경고 한 줄 + [VERIFY] 요약)이라 결과에 쓰이지 않는다.
+    # 진단이 꺼져 있으면 패스의 첫 평가에서만 재서 비선형 CFG 경고를 살리고,
+    # 이후 스텝의 두 번째 .item() 동기화를 건너뛴다. effective_scale 은 늘 잰다.
+    measure_fit = guidance_diagnostics_enabled() or not _CFG["fit_checked"]
+    effective_scale, fit_error = _recover_effective_cfg(
+        args, incoming, with_fit_error=measure_fit
+    )
     _CFG["effective_scale"] = effective_scale
-    _CFG["fit_error"] = fit_error
+    if measure_fit:
+        _CFG["fit_checked"] = True
+        _CFG["fit_error"] = fit_error
     model_options = args.get("model_options") or {}
     external_cfg = "sampler_cfg_function" in model_options
     _CFG["external_cfg_detected"] = bool(external_cfg)
-    if not _CFG["warned"] and (external_cfg or fit_error > 0.05):
+    nonlinear = fit_error is not None and fit_error > 0.05
+    if not _CFG["warned"] and (external_cfg or nonlinear):
         _CFG["warned"] = True
+        fit_text = "?" if fit_error is None else f"{fit_error:.3e}"
         _log(
             "CFG base override requested while incoming CFG is custom/nonlinear "
-            f"(sampler_cfg_function={external_cfg}, fit_error={fit_error:.3e}); "
+            f"(sampler_cfg_function={external_cfg}, fit_error={fit_text}); "
             "the selected base intentionally replaces it."
         )
 
@@ -1684,7 +2184,12 @@ def _apply_perturbation(args, base):
     # prediction plus guidance. In both modes only the new guidance term is
     # scaled. Scaling the entire CFG base every denoise step drains image energy.
     r = float(_STATE["rescale"])
-    apg_governs = _APG["on"] and _STATE.get("apg_autooff_rescale", True)
+    # CFG 1 가드로 APG 를 건너뛴 스텝에서는 자동 끄기도 적용하지 않는다.
+    apg_governs = (
+        _APG["on"]
+        and _STATE.get("apg_autooff_rescale", True)
+        and not _CFG.get("base_skipped", False)
+    )
     if r > 0 and not apg_governs:
         guided = (
             cd + guidance
@@ -2776,7 +3281,8 @@ class AnimaSafePAG(scripts.Script):
             mode="preserve", experimental_stack=False, steps=0,
             smc_preset="Off", smc_resolved_preset="Off",
             fit_error=None, effective_scale=None,
-            external_cfg_detected=False, warned=False,
+            external_cfg_detected=False, warned=False, cfg1_warned=False,
+            base_skipped=False, fit_checked=False,
         )
         _DCW.update(
             on=False,
@@ -2820,8 +3326,18 @@ class AnimaSafePAG(scripts.Script):
             attn_spatial_shape=None, attn_raw=None, slg_raw=None,
             cond_raw=None,
             adg_skipped=False, step_open=False,
+            # 결과를 미세하게 바꾸는 Forge 설정 두 개 — 패스마다 읽어 infotext 와 맞춘다.
+            prefix_dedup=_read_bool_option(OPT_PREFIX_DEDUP, True),
+            seg_separable=_read_bool_option(OPT_SEG_SEPARABLE, True),
+            dedup_blocks=0, dedup_fallbacks=0, dedup_warned=False,
+            dedup_disabled=False,
         )
         _clear_markers()
+        # 같은 p(hires 패스, n_iter 다음 배치)면 앞선 OOM 차단을 유지하고,
+        # 다른 생성이면 지난 기록을 버린다.
+        if not _perturbation_oom_blocked(p):
+            _STATE["pert_oom_owner"] = None
+        _STATE["pass_owner"] = _owner_ref(p)
 
         def _xyz_num(key, cur):
             if key in xyz:
@@ -3427,6 +3943,13 @@ class AnimaSafePAG(scripts.Script):
                 typed={},
             )
 
+        if pert_ok and _perturbation_oom_blocked(p):
+            pert_ok = False
+            _log(
+                "PAG/SEG/SLG 확장 배치가 이 생성의 앞선 패스에서 VRAM 부족(OOM)"
+                "으로 실패해 perturbation 을 끈 상태를 유지합니다."
+            )
+
         if pert_ok:
             _STATE.update(
                 on=True, attn_method=(attn_method if attn_targets else None),
@@ -3504,6 +4027,19 @@ class AnimaSafePAG(scripts.Script):
                     + f"; range_mode={_STATE['range_mode']}"
                     + f"; rescale={rescale}({rescale_mode})"
                 )
+                # 결과를 미세하게 바꾸는 설정(재현성). 붙여넣기 때 같은 Forge 설정으로
+                # 돌아가도록 OptionInfo(infotext=...) 이름·"True"/"False" 로 적는다.
+                p.extra_generation_params[INFOTEXT_PREFIX_DEDUP] = str(
+                    bool(_STATE["prefix_dedup"])
+                )
+                if (
+                    _STATE["attn_method"] == "seg"
+                    and not legacy_attn
+                    and 0.0 < float(seg_sigma) <= 9999.0
+                ):
+                    p.extra_generation_params[INFOTEXT_SEG_SEPARABLE] = str(
+                        bool(_STATE["seg_separable"])
+                    )
             if _APG["on"]:
                 p.extra_generation_params["Anima APG"] = (
                     f"eta={apg_eta}, norm={apg_norm}, momentum={apg_momentum}"
@@ -3566,7 +4102,9 @@ class AnimaSafePAG(scripts.Script):
                 f"→{_STATE['start']:.2f}-{_STATE['end']:.2f}"
                 f"({_STATE['range_mode']}) "
                 f"rescale={'auto-off' if (_APG['on'] and apg_autooff) else rescale}"
-                f"({rescale_mode})) "
+                f"({rescale_mode}) "
+                f"prefix_dedup={bool(_STATE['prefix_dedup'])} "
+                f"seg_separable={bool(_STATE['seg_separable'])}) "
                 f"APG={'on' if _APG['on'] else 'off'} "
                 f"(eta={apg_eta} norm={apg_norm} mom={apg_momentum}) "
                 f"AdaptiveG={'on' if _ADG['on'] else 'off'} "
@@ -3610,6 +4148,11 @@ class AnimaSafePAG(scripts.Script):
                 f"wrapper_calls={_STATE['wrapper_calls']} "
                 f"weak_steps={_STATE['weak_steps']} "
                 f"applied_steps={_STATE['applied_steps']}"
+                + (
+                    f" prefix_dedup_blocks={_STATE['dedup_blocks']}"
+                    f" prefix_dedup_fallbacks={_STATE['dedup_fallbacks']}"
+                    if _STATE["weak_steps"] else ""
+                )
             )
         verify_requested = any((
             _STATE["requested_pert"],
@@ -3783,6 +4326,9 @@ class AnimaSafePAG(scripts.Script):
             effective_scale=None,
             external_cfg_detected=False,
             warned=False,
+            cfg1_warned=False,
+            base_skipped=False,
+            fit_checked=False,
         )
         _DCW.update(
             on=False,
@@ -3841,5 +4387,12 @@ class AnimaSafePAG(scripts.Script):
         _STATE["engine"] = "?"
         _STATE["diag_started_at"] = None
         _STATE["delta_logged"] = False
+        _STATE["pass_owner"] = None
+        _STATE["pert_oom_owner"] = None
+        _STATE["dedup_blocks"] = 0
+        _STATE["dedup_fallbacks"] = 0
+        _STATE["dedup_warned"] = False
+        _STATE["dedup_disabled"] = False
+        _INDEX_TENSOR_CACHE.clear()
         _RUNTIME.reset_pass()
         _clear_markers()

@@ -23,21 +23,52 @@ except Exception:
     _all_schedulers = []
 
 
+import sam3ext.core as _sam3_core
+
+if not all(hasattr(_sam3_core, name) for name in ("release_sam3", "describe_unload", "drop_offloaded_sam3")):
+    # Reload UI 는 이 스크립트만 다시 읽고 sam3ext.core 는 옛 모듈을 그대로 쓴다 — 옛 모듈의 캐시 번들을
+    # 비운 뒤 새로 불러온다(run_sam3_on_pil 도 새 캐시를 쓰도록 아래 import 보다 먼저).
+    import importlib
+
+    try:
+        (getattr(_sam3_core, "release_sam3", None) or _sam3_core.unload_sam3)()
+    except Exception:
+        pass
+    _sam3_core = importlib.reload(_sam3_core)
+
 from sam3ext import SAM3_NAME, Sam3Args, __version__, run_sam3_on_pil
 from sam3ext.anima_core import anima_available
-from sam3ext.core import find_checkpoint_options, unload_sam3, write_artifacts
-from sam3ext.inpaint_core import apply_prompt_sr, copy_prompt, run_inpaint_passes
+from sam3ext.core import (
+    OPT_UNLOAD_KEEP_IN_RAM,
+    describe_unload,
+    drop_offloaded_sam3,
+    find_checkpoint_options,
+    release_sam3,
+    unload_sam3,
+    write_artifacts,
+)
+from sam3ext.inpaint_core import apply_prompt_sr, copy_prompt, is_oom, run_inpaint_passes
 from sam3ext.notebook_store import register_notebook_routes
 from sam3ext import layout_lanes, quick_button as sam3_quick, ui_dock
 from sam3ext import ui_tipo
 from sam3ext.ui import WebuiButtons, sam3_ui
-from sam3ext.ui_anima import AnimaPanel, build_anima_panel, handle_anima_click
+from sam3ext.ui_anima import AnimaPanel, build_anima_panel, handle_anima_click, stop_anima
+from sam3ext.anima_ipa.options import (
+    DEFAULT_DUPLICATE_POLICY as IPA_DEFAULT_DUPLICATE_POLICY,
+    OPT_DUPLICATE_POLICY as OPT_IPA_DUPLICATE_POLICY,
+)
 from sam3ext.ui_anima_reference import (
     AnimaReferencePanel,
     build_anima_reference_panel,
     wire_anima_reference_panel,
 )
-from sam3ext.ui_refine import RefinePanel, _pull_seed_from_gallery_item, build_refine_panel, handle_refine_click
+from sam3ext.ui_refine import (
+    RefinePanel,
+    _pull_seed_from_gallery_item,
+    build_refine_panel,
+    handle_refine_click,
+    stop_refine,
+)
 try:
     from sam3ext.sampler_load_guard import (
         guard_sampler_app_started_callbacks,
@@ -54,7 +85,38 @@ except ImportError:
     prune_stale_sampler_load_targets = _sampler_load_guard.prune_stale_sampler_load_targets
 
 
+# metadata.ini 의 콜백 순서 섹션([callbacks/forge_sam3_extension/...])은 폴더명에 묶여 있다 — Forge 는 확장
+# 폴더명(소문자)을 canonical name 으로 쓰고, 섹션이 그 이름으로 시작하지 않으면 순서 지정을 버린다(감사 M28).
+SAM3_EXTENSION_FOLDER = "forge_sam3_extension"
+
+
+def _extension_folder_warning(script_path) -> str | None:
+    """확장 폴더명이 ``SAM3_EXTENSION_FOLDER`` 와 다르면 시작 로그에 남길 한 줄, 같으면 None."""
+    from pathlib import Path
+
+    folder = Path(script_path).resolve().parent.parent.name
+    if folder.lower().strip() == SAM3_EXTENSION_FOLDER:
+        return None
+    return (
+        f"[-] SAM3: extension folder is '{folder}', not '{SAM3_EXTENSION_FOLDER}' — Forge ignores the callback "
+        "order in metadata.ini (the RK/TDE sampler load guard then runs late). Rename the folder to "
+        f"extensions/{SAM3_EXTENSION_FOLDER} and restart."
+    )
+
+
+_folder_warning = _extension_folder_warning(__file__)
+if _folder_warning:
+    print(_folder_warning, file=sys.stderr)
+
+
 txt2img_submit_button = img2img_submit_button = None
+
+# process() 가 UI 상태·XYZ 에 없는 키를 채울 때 쓰는 기본값 — Sam3Args(= UI 기본값)와 한 곳에서 맞춘다.
+# 예전엔 여기 따로 적힌 'latent noise' / unload_after=False 가 API 호출자에게 UI 와 다른 결과를 줬다.
+_SAM3_DEFAULTS: dict[str, Any] = Sam3Args().dict()
+
+# XYZ '[SAM3] Checkpoint'·'[SAM3] Device' 축 cost — make_axis_on_xyz_grid 참고.
+SAM3_CHECKPOINT_AXIS_COST = 0.9
 
 
 class PromptSR(NamedTuple):
@@ -107,11 +169,21 @@ def make_axis_on_xyz_grid():
             str,
             partial(set_value, field="sam3_checkpoint"),
             format_value=format_path,
+            # 값이 바뀌면 SAM3 번들을 버리고 다시 빌드한다(3~5 초). xyz_grid 는 cost 가 큰 축을 바깥 루프에
+            # 두므로 Checkpoint(1.0)보다 작고 [DoRA] 축(0.8)·VAE(0.7)보다 크게 — 각 칸의 결과는 같고 순서만 바뀐다.
+            cost=SAM3_CHECKPOINT_AXIS_COST,
             choices=find_checkpoint_options,
         ),
         xyz_grid.AxisOption("[SAM3] Mode", str, partial(set_value, field="sam3_mode"), choices=mode_choices),
         xyz_grid.AxisOption("[SAM3] Mask Mode", str, partial(set_value, field="sam3_mask_mode"), choices=mask_mode_choices),
-        xyz_grid.AxisOption("[SAM3] Device", str, partial(set_value, field="sam3_device"), choices=device_choices),
+        xyz_grid.AxisOption(
+            "[SAM3] Device",
+            str,
+            partial(set_value, field="sam3_device"),
+            # 장치도 번들 캐시 키라 값이 바뀌면 버리고 다시 빌드한다 — Checkpoint 축과 같은 cost 로 바깥 루프에.
+            cost=SAM3_CHECKPOINT_AXIS_COST,
+            choices=device_choices,
+        ),
         xyz_grid.AxisOption("[SAM3] Detect Prompt", str, partial(set_value, field="sam3_prompt")),
         xyz_grid.AxisOption("[SAM3] Exclude Prompt", str, partial(set_value, field="sam3_exclude_prompt")),
         xyz_grid.AxisOption("[SAM3] Inpaint Prompt", str, partial(set_value, field="sam3_inpaint_prompt")),
@@ -206,6 +278,60 @@ def on_before_ui():
 
 script_callbacks.on_before_ui(on_before_ui)
 
+# 'Unload after' 는 SAM3 번들을 CPU 캐시에 남긴다(sam3ext.core.unload_sam3) — Reload UI·확장 언로드 때는
+# 그 캐시(RAM 약 3.4 GB)와 GPU 에 남은 것까지 진짜로 버린다.
+script_callbacks.on_script_unloaded(release_sam3, name="sam3-release-bundle")
+
+
+def _on_keep_in_ram_changed():
+    # 끄는 즉시 RAM 에 보관 중인 번들도 해제한다(다음 'Unload after' 까지 3.4 GB 가 남지 않게). 켤 때는 할 일 없음.
+    if not getattr(shared.opts, OPT_UNLOAD_KEEP_IN_RAM, True):
+        drop_offloaded_sam3()
+
+
+def on_ui_settings():
+    section = ("sam3_mask", "SAM Extra SAM3")
+    shared.opts.add_option(
+        OPT_UNLOAD_KEEP_IN_RAM,
+        shared.OptionInfo(
+            True,
+            "'Unload after' 뒤 SAM3 모델을 CPU RAM 에 보관 (약 3.4 GB)",
+            gr.Checkbox,
+            onchange=_on_keep_in_ram_changed,
+            section=section,
+        ).info(
+            "켜면 VRAM 에서 내린 모델을 RAM 에 두었다가 다음 검출 때 옮기기만 합니다(이미지당 2~4 초 절약). "
+            "끄면 예전처럼 완전히 해제해 RAM 을 비우고, 다음 검출마다 체크포인트를 다시 읽습니다. "
+            "끄는 즉시 보관 중인 모델도 해제합니다. 결과 이미지는 같습니다."
+        ),
+    )
+    shared.opts.add_option(
+        OPT_IPA_DUPLICATE_POLICY,
+        shared.OptionInfo(
+            IPA_DEFAULT_DUPLICATE_POLICY,
+            "캐릭터 레퍼런스 IP-Adapter: 28블록 어댑터를 2.9B·3.8B 에 얹을 때 끼워 넣은 블록 처리 (결과가 바뀜)",
+            gr.Radio,
+            {
+                "choices": [
+                    ("원래 계보 블록에만 주입 (lineage · 권장)", "lineage"),
+                    ("끼워 넣은 블록에도 전부 주입 (all · 0.21 까지의 동작)", "all"),
+                    ("끼워 넣은 블록과 강도를 나눔 (split)", "split"),
+                ]
+            },
+            section=("sam3_reference", "SAM Extra Character Reference"),
+        ).info(
+            "IP-Adapter 는 28블록 베이스로 학습돼, 2.9B(40블록)·3.8B(52블록)에서는 한 어댑터 블록이 블록 계보에 따라 "
+            "여러 모델 블록에 대응합니다. 모두에 주입하면(all) 같은 참조가 두세 번 더해져 2.9B 는 강도 1.0, 3.8B 는 "
+            "0.5 에서도 격자 무늬로 깨집니다. lineage(기본)는 각 어댑터 블록의 원래 자리에만 주입해 두 모델 모두 "
+            "깨지지 않았고(2026-09-23 GPU 확인, 참조 1장·시드 1개), split 은 복제들이 강도를 나눠 덜 깨지지만 격자 "
+            "무늬가 남았습니다. 28블록 베이스 모델에서는 어느 값이든 결과가 같습니다. 결과 infotext 의 "
+            "'SAM3 IPA Duplicates' 에 남습니다."
+        ),
+    )
+
+
+script_callbacks.on_ui_settings(on_ui_settings)
+
 
 def on_app_started_services(demo, app):
     if register_notebook_routes(app):
@@ -298,12 +424,13 @@ class Sam3MaskScript(scripts.Script):
             p._sam3_args = {"enabled": False}
             return
 
-        def _xyz_or(state_key: str, default: Any, *, legacy: str | None = None) -> Any:
+        def _xyz_or(state_key: str, *, legacy: str | None = None) -> Any:
+            # XYZ 축 → UI 상태 → Sam3Args 기본값 순.
             if state_key in xyz_values:
                 return xyz_values[state_key]
             if legacy is not None and legacy in xyz_values:
                 return xyz_values[legacy]
-            return state.get(state_key, default)
+            return state.get(state_key, _SAM3_DEFAULTS[state_key])
 
         def _as_bool(value: Any, default: bool) -> bool:
             if isinstance(value, bool):
@@ -312,79 +439,90 @@ class Sam3MaskScript(scripts.Script):
                 return default
             return str(value).strip().lower() in {"true", "1", "yes", "on"}
 
-        sam3_sampler = str(_xyz_or("sam3_sampler", "Use same sampler"))
-        sam3_scheduler = str(_xyz_or("sam3_scheduler", "Use same scheduler"))
+        def _bool_or(state_key: str) -> bool:
+            return _as_bool(_xyz_or(state_key), _SAM3_DEFAULTS[state_key])
+
+        sam3_sampler = str(_xyz_or("sam3_sampler"))
+        sam3_scheduler = str(_xyz_or("sam3_scheduler"))
         use_sampler = bool(state.get("sam3_use_sampler", False)) or (
             "sam3_sampler" in xyz_values or "sam3_scheduler" in xyz_values
         )
 
+        # 수치·Literal 은 문자열 그대로 넘긴다 — 범위 클램프와 표기 정규화는 Sam3Args 의 validator 가 한다.
         payload = {
-            "sam3_mode": str(_xyz_or("sam3_mode", "Inpaint")),
-            "sam3_mask_mode": str(_xyz_or("sam3_mask_mode", "Individual")),
-            "sam3_prompt": str(_xyz_or("sam3_prompt", "face", legacy="prompt")).strip() or "face",
-            "sam3_exclude_prompt": str(_xyz_or("sam3_exclude_prompt", "")),
-            "sam3_inpaint_prompt": str(_xyz_or("sam3_inpaint_prompt", "")),
-            "sam3_negative_prompt": str(_xyz_or("sam3_negative_prompt", "")),
-            "sam3_threshold": float(_xyz_or("sam3_threshold", 0.4, legacy="threshold")),
-            "sam3_mask_dilation": int(_xyz_or("sam3_mask_dilation", 0)),
-            "sam3_mask_hull": _as_bool(_xyz_or("sam3_mask_hull", False), False),
-            "sam3_mask_outline_px": int(_xyz_or("sam3_mask_outline_px", 0)),
-            "sam3_checkpoint": str(_xyz_or("sam3_checkpoint", "sam3.pt", legacy="checkpoint")),
-            "sam3_device": str(_xyz_or("sam3_device", "auto")),
-            "sam3_mask_blur": int(_xyz_or("sam3_mask_blur", 4)),
-            "sam3_denoising_strength": float(_xyz_or("sam3_denoising_strength", 0.4)),
-            "sam3_inpainting_fill": str(_xyz_or("sam3_inpainting_fill", "latent noise")),
-            "sam3_inpaint_only_masked": _as_bool(
-                _xyz_or("sam3_inpaint_only_masked", True), True
-            ),
-            "sam3_inpaint_only_masked_padding": int(_xyz_or("sam3_inpaint_only_masked_padding", 32)),
+            "sam3_mode": _xyz_or("sam3_mode"),
+            "sam3_mask_mode": _xyz_or("sam3_mask_mode"),
+            "sam3_prompt": str(_xyz_or("sam3_prompt", legacy="prompt")).strip() or _SAM3_DEFAULTS["sam3_prompt"],
+            "sam3_exclude_prompt": str(_xyz_or("sam3_exclude_prompt")),
+            "sam3_inpaint_prompt": str(_xyz_or("sam3_inpaint_prompt")),
+            "sam3_negative_prompt": str(_xyz_or("sam3_negative_prompt")),
+            "sam3_threshold": _xyz_or("sam3_threshold", legacy="threshold"),
+            "sam3_mask_dilation": _xyz_or("sam3_mask_dilation"),
+            "sam3_mask_hull": _bool_or("sam3_mask_hull"),
+            "sam3_mask_outline_px": _xyz_or("sam3_mask_outline_px"),
+            "sam3_checkpoint": str(_xyz_or("sam3_checkpoint", legacy="checkpoint")),
+            "sam3_device": str(_xyz_or("sam3_device")),
+            "sam3_mask_blur": _xyz_or("sam3_mask_blur"),
+            "sam3_denoising_strength": _xyz_or("sam3_denoising_strength"),
+            "sam3_inpainting_fill": _xyz_or("sam3_inpainting_fill"),
+            "sam3_inpaint_only_masked": _bool_or("sam3_inpaint_only_masked"),
+            "sam3_inpaint_only_masked_padding": _xyz_or("sam3_inpaint_only_masked_padding"),
             "sam3_use_inpaint_width_height": bool(state.get("sam3_use_inpaint_width_height", False))
             or ("sam3_inpaint_width" in xyz_values or "sam3_inpaint_height" in xyz_values),
-            "sam3_inpaint_width": int(_xyz_or("sam3_inpaint_width", 512)),
-            "sam3_inpaint_height": int(_xyz_or("sam3_inpaint_height", 512)),
+            "sam3_inpaint_width": _xyz_or("sam3_inpaint_width"),
+            "sam3_inpaint_height": _xyz_or("sam3_inpaint_height"),
             "sam3_use_steps": bool(state.get("sam3_use_steps", False)) or ("sam3_steps" in xyz_values),
-            "sam3_steps": int(_xyz_or("sam3_steps", 28)),
+            "sam3_steps": _xyz_or("sam3_steps"),
             "sam3_use_cfg_scale": bool(state.get("sam3_use_cfg_scale", False)) or ("sam3_cfg_scale" in xyz_values),
-            "sam3_cfg_scale": float(_xyz_or("sam3_cfg_scale", 7.0)),
+            "sam3_cfg_scale": _xyz_or("sam3_cfg_scale"),
             "sam3_use_sampler": use_sampler,
             "sam3_sampler": sam3_sampler,
             "sam3_use_scheduler": bool(state.get("sam3_use_scheduler", False))
             or ("sam3_scheduler" in xyz_values) or use_sampler,
             "sam3_scheduler": sam3_scheduler,
-            "sam3_use_seed": _as_bool(_xyz_or("sam3_use_seed", False), False)
-            or ("sam3_seed" in xyz_values),
-            "sam3_seed": int(_xyz_or("sam3_seed", -1)),
+            "sam3_use_seed": _bool_or("sam3_use_seed") or ("sam3_seed" in xyz_values),
+            "sam3_seed": _xyz_or("sam3_seed"),
             "sam3_use_noise_multiplier": bool(state.get("sam3_use_noise_multiplier", False))
             or ("sam3_noise_multiplier" in xyz_values),
-            "sam3_noise_multiplier": float(_xyz_or("sam3_noise_multiplier", 1.0)),
-            "sam3_restore_face": _as_bool(_xyz_or("sam3_restore_face", False), False),
-            "sam3_preview_overlay": bool(state.get("sam3_preview_overlay", False)),
-            "sam3_save_artifacts": bool(state.get("sam3_save_artifacts", True)),
-            "sam3_unload_after": _as_bool(_xyz_or("sam3_unload_after", False), False),
-            "sam3_cn_enable": _as_bool(_xyz_or("sam3_cn_enable", False), False),
-            "sam3_cn_override_external": _as_bool(_xyz_or("sam3_cn_override_external", False), False),
-            "sam3_cn_model": str(_xyz_or("sam3_cn_model", "None")),
-            "sam3_cn_module": str(_xyz_or("sam3_cn_module", "inpaint_only")),
-            "sam3_cn_weight": float(_xyz_or("sam3_cn_weight", 1.0)),
-            "sam3_cn_guidance_start": float(_xyz_or("sam3_cn_guidance_start", 0.0)),
-            "sam3_cn_guidance_end": float(_xyz_or("sam3_cn_guidance_end", 1.0)),
-            "sam3_cn_pixel_perfect": _as_bool(_xyz_or("sam3_cn_pixel_perfect", True), True),
-            "sam3_cn_control_mode": str(_xyz_or("sam3_cn_control_mode", "Balanced")),
-            "sam3_cn_resize_mode": str(_xyz_or("sam3_cn_resize_mode", "Crop and Resize")),
-            "sam3_cn_processor_res": int(_xyz_or("sam3_cn_processor_res", 512)),
-            "sam3_cn_threshold_a": float(_xyz_or("sam3_cn_threshold_a", -1.0)),
-            "sam3_cn_threshold_b": float(_xyz_or("sam3_cn_threshold_b", -1.0)),
+            "sam3_noise_multiplier": _xyz_or("sam3_noise_multiplier"),
+            "sam3_restore_face": _bool_or("sam3_restore_face"),
+            "sam3_preview_overlay": bool(state.get("sam3_preview_overlay", _SAM3_DEFAULTS["sam3_preview_overlay"])),
+            "sam3_save_artifacts": bool(state.get("sam3_save_artifacts", _SAM3_DEFAULTS["sam3_save_artifacts"])),
+            "sam3_unload_after": _bool_or("sam3_unload_after"),
+            "sam3_cn_enable": _bool_or("sam3_cn_enable"),
+            "sam3_cn_override_external": _bool_or("sam3_cn_override_external"),
+            "sam3_cn_model": str(_xyz_or("sam3_cn_model")),
+            "sam3_cn_module": str(_xyz_or("sam3_cn_module")),
+            "sam3_cn_weight": _xyz_or("sam3_cn_weight"),
+            "sam3_cn_guidance_start": _xyz_or("sam3_cn_guidance_start"),
+            "sam3_cn_guidance_end": _xyz_or("sam3_cn_guidance_end"),
+            "sam3_cn_pixel_perfect": _bool_or("sam3_cn_pixel_perfect"),
+            "sam3_cn_control_mode": _xyz_or("sam3_cn_control_mode"),
+            "sam3_cn_resize_mode": _xyz_or("sam3_cn_resize_mode"),
+            "sam3_cn_processor_res": _xyz_or("sam3_cn_processor_res"),
+            "sam3_cn_threshold_a": _xyz_or("sam3_cn_threshold_a"),
+            "sam3_cn_threshold_b": _xyz_or("sam3_cn_threshold_b"),
         }
+
+        if not hasattr(p, "extra_generation_params"):
+            p.extra_generation_params = {}
 
         try:
             validated = Sam3Args(**payload)
-        except Exception:
+        except Exception as exc:
+            # 검증 실패 → 이 생성은 SAM3 없이 간다. 예전엔 로그 한 줄 없이 꺼져서 "켰는데 아무 일도 없다" 가 됐다.
             p._sam3_args = {"enabled": False}
+            if enabled:
+                reason = " ".join(str(exc).split())   # pydantic 의 여러 줄 메시지를 infotext 한 줄로
+                print(
+                    f"[-] SAM3: invalid settings, SAM3 disabled for this generation: {reason}",
+                    file=sys.stderr,
+                )
+                p.extra_generation_params.pop("SAM3 Enable", None)
+                p.extra_generation_params["SAM3 Error"] = reason
             return
 
         p._sam3_args = {"enabled": bool(enabled), **validated.dict()}
-        if not hasattr(p, "extra_generation_params"):
-            p.extra_generation_params = {}
         if enabled:
             p.extra_generation_params["SAM3 Enable"] = True
             p.extra_generation_params.update(validated.extra_params())
@@ -400,6 +538,52 @@ class Sam3MaskScript(scripts.Script):
         if not args.get("enabled"):
             return
 
+        try:
+            self._run_sam3_on_image(p, pp, args)
+        except Exception as exc:
+            # Forge 의 ScriptRunner.postprocess_image 는 예외를 콘솔에만 보고하고 이미지를 그대로 저장한다 —
+            # 그 이미지가 'SAM3 Enable: True' 를 달고 나가지 않게 infotext 를 고치고, 검출 번들이 VRAM 에
+            # 남지 않게 내린 뒤 예외는 그대로 올린다(🎯 빠른 버튼도 같은 경로).
+            p._sam3_mask_found = False
+            params = getattr(p, "extra_generation_params", None)
+            if isinstance(params, dict):
+                if "SAM3 Enable" in params:
+                    # 배치의 다음 장이 성공하면 같은 자리에 되돌린다(_restore_infotext_after_failure).
+                    p._sam3_enable_index = list(params).index("SAM3 Enable")
+                params.pop("SAM3 Enable", None)
+                params["SAM3 Error"] = f"{type(exc).__name__}: {' '.join(str(exc).split())}"
+            print(f"[-] SAM3: failed, image saved without SAM3: {type(exc).__name__}: {exc}", file=sys.stderr)
+            if args.get("sam3_unload_after") or is_oom(exc):
+                try:
+                    kept = unload_sam3()
+                    print(f"[-] SAM3: {describe_unload(bool(kept), after_failure=True)}", file=sys.stderr)
+                except Exception:
+                    traceback.print_exc(file=sys.stderr)
+            raise
+
+    @staticmethod
+    def _restore_infotext_after_failure(p) -> None:
+        """배치(n_iter>1·batch_size>1)의 앞 장이 실패해 남긴 'SAM3 Error' 를 걷고 'SAM3 Enable' 을 되돌린다.
+
+        extra_generation_params 는 배치 전체가 함께 쓴다 — 되돌리지 않으면 그 뒤 성공한 장도 오류 infotext 로
+        저장된다. SAM3 가 켜진 채 여기 왔다면 'SAM3 Error' 는 postprocess_image 의 실패 기록뿐이다(process()
+        의 검증 실패는 SAM3 를 끄므로 여기 오지 않는다). 실패가 없던 배치와 같은 순서가 되게 원래 자리에 넣는다.
+        """
+        params = getattr(p, "extra_generation_params", None)
+        if not isinstance(params, dict) or "SAM3 Error" not in params:
+            return
+        params.pop("SAM3 Error", None)
+        if "SAM3 Enable" in params:
+            return
+        items = list(params.items())
+        index = getattr(p, "_sam3_enable_index", len(items))
+        items.insert(min(max(int(index), 0), len(items)), ("SAM3 Enable", True))
+        params.clear()
+        params.update(items)
+
+    def _run_sam3_on_image(self, p, pp, args: dict[str, Any]) -> None:
+        """postprocess_image 의 본문 — 검출 → (아티팩트 저장) → (unload) → 오버레이/인페인트."""
+        self._restore_infotext_after_failure(p)
         image = pp.image if isinstance(pp.image, Image.Image) else Image.fromarray(np.asarray(pp.image))
         allow_huggingface = not getattr(shared.cmd_opts, "sam3_no_huggingface", False)
         result = run_sam3_on_pil(
@@ -425,8 +609,8 @@ class Sam3MaskScript(scripts.Script):
             write_artifacts(result, seed, label=args.get("sam3_prompt"))
 
         if args.get("sam3_unload_after"):
-            unload_sam3()
-            print("[-] SAM3: model unloaded from VRAM (re-loads on next detection).", file=sys.stderr)
+            kept = unload_sam3()
+            print(f"[-] SAM3: {describe_unload(bool(kept))}", file=sys.stderr)
 
         if not np.any(np.asarray(result.mask)):
             if args.get("sam3_preview_overlay"):
@@ -520,7 +704,9 @@ def _wire_refine_panel(
     # the steps so the visibility swap happens before sampling starts and
     # restores even if the handler raises (errors bubble through to the
     # last .then). The Stop button below sets shared.state.interrupted
-    # which run_sam3_refine + process_images both poll.
+    # which run_sam3_refine + process_images both poll — but only while the
+    # Refine job holds shared.state (ui_refine.stop_refine), so a txt2img
+    # that holds the queue lock is never stopped in its place.
     refine_show_stop = panel.refine_button.click(
         fn=lambda: (gr.update(visible=False), gr.update(visible=True)),
         inputs=[],
@@ -547,14 +733,8 @@ def _wire_refine_panel(
         queue=False,
     )
 
-    def _stop_refine():
-        from modules import shared as _shared
-
-        _shared.state.interrupted = True
-        _shared.state.skipped = True
-
     panel.stop_button.click(
-        fn=_stop_refine,
+        fn=stop_refine,
         inputs=[],
         outputs=[],
         queue=False,
@@ -700,14 +880,8 @@ def _wire_anima_panel(
         queue=False,
     )
 
-    def _stop_anima():
-        from modules import shared as _shared
-
-        _shared.state.interrupted = True
-        _shared.state.skipped = True
-
     panel.stop_button.click(
-        fn=_stop_anima,
+        fn=stop_anima,
         inputs=[],
         outputs=[],
         queue=False,

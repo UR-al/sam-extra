@@ -105,6 +105,91 @@ def _register_model_loaded_hook() -> None:
 _register_model_loaded_hook()
 
 
+# sam3ext.anima38.runtime.OPT_KEEP_RESIDENT 와 같은 이름 — 런타임은 무거워(torch·backend) 여기서 불러오지 않는다
+OPT_KEEP_RESIDENT = "sam3_anima38_keep_resident"
+# sam3ext.anima38.connector_fp32.OPT_CONNECTOR_FP32 · connector_cache.OPT_CONNECTOR_RUN_CACHE 와 같은 이름
+OPT_CONNECTOR_FP32 = "sam3_anima38_connector_fp32"
+OPT_CONNECTOR_RUN_CACHE = "sam3_anima38_connector_run_cache"
+# sam3ext.anima_reference_runner.OPT_IPA_ANIMA38 과 같은 이름 — 캐릭터 레퍼런스 IP-Adapter 방식의 커넥터 토글
+OPT_IPA_ANIMA38 = "sam3_anima38_reference_ipa"
+
+
+def _on_ui_settings() -> None:
+    from modules import shared
+
+    shared.opts.add_option(
+        OPT_KEEP_RESIDENT,
+        shared.OptionInfo(
+            True,
+            "Anima 3.8B: TE·Qwen3.5·커넥터를 생성 사이 VRAM 에 남기기 (최대 약 6~8 GB)",
+            gr.Checkbox,
+            section=("sam3_anima38", "SAM Extra Anima 3.8B"),
+        ).info(
+            "켜면(기본) 다음 생성에서 다시 올리지 않도록 0.6B TE(약 1.75 GB)·Qwen3.5(약 4.45 GiB)는 다음 샘플링에 "
+            "쓸 VRAM 이 남을 때만, 커넥터(약 1.6 GB)는 생성이 끝나도 VRAM 에 남깁니다 — 합쳐 최대 약 6~8 GB. "
+            "Forge 가 자리가 필요하면 스스로 내리지만, 같은 GPU 의 학습 등 Forge 밖의 VRAM 사용은 이 판단에 안 보입니다. "
+            "학습과 Forge 를 함께 쓸 때는 끄세요 — 끄면 예전처럼 TE·Qwen3.5 는 인코딩 직후, 커넥터는 생성이 끝날 때 "
+            "내립니다(생성마다 약 1~2초 더 걸릴 수 있음). 결과 이미지는 어느 쪽이든 같습니다."
+        ),
+    )
+    shared.opts.add_option(
+        OPT_CONNECTOR_FP32,
+        shared.OptionInfo(
+            True,
+            "Anima 3.8B: 커넥터를 샘플링 동안 fp32 로 상주 (VRAM 약 +1.5 GB, 장당 약 1~2초 빨라짐)",
+            gr.Checkbox,
+            section=("sam3_anima38", "SAM Extra Anima 3.8B"),
+        ).info(
+            "커넥터(bf16 약 1.6 GB)는 fp32 로 계산합니다. 켜면(기본) Forge 가 올린 뒤 fp32 로 한 번 바꿔 두어(약 3.1 GB) "
+            "스텝마다 모듈 약 300개의 bf16→fp32 캐스트와 --cuda-stream 대기를 건너뜁니다 — 1536² 50스텝·긍정+부정 "
+            "커넥터에서 장당 약 1~2초(추정). Forge 가 bf16 로 다 올리고 남긴 여유가 있을 때만 바꾸고(바꾼 뒤에는 Forge "
+            "메모리 계산에 들어감), 자리가 모자라면 바꾸지 않고 예전처럼 계산합니다. 끄면 예전 경로 그대로입니다. "
+            "값이 같은 캐스트라 결과 이미지는 어느 쪽이든 같습니다."
+        ),
+    )
+    shared.opts.add_option(
+        OPT_CONNECTOR_RUN_CACHE,
+        shared.OptionInfo(
+            True,
+            "Anima 3.8B: 커넥터의 timestep 무관 계산을 프롬프트 줄마다 한 번만 (VRAM 줄당 약 15~70 MB)",
+            gr.Checkbox,
+            section=("sam3_anima38", "SAM Extra Anima 3.8B"),
+        ).info(
+            "켜면(기본) 커넥터가 스텝마다 똑같이 다시 하던 계산(의미 특징·0.6B source 의 K/V, 첫 블록)을 첫 스텝에 한 번 "
+            "해 두고 다시 씁니다 — 장당 약 1초(추정). 캐시는 그 생성이 끝나면 버립니다(합계 최대 512 MB). "
+            "끄면 예전 경로 그대로입니다. 같은 연산을 건너뛸 뿐이라 결과 이미지는 어느 쪽이든 같습니다."
+        ),
+    )
+    shared.opts.add_option(
+        OPT_IPA_ANIMA38,
+        shared.OptionInfo(
+            True,
+            "Anima 3.8B: 캐릭터 레퍼런스 IP-Adapter 방식에도 v2 커넥터 설치 (끄면 결과가 바뀜)",
+            gr.Checkbox,
+            section=("sam3_anima38", "SAM Extra Anima 3.8B"),
+        ).info(
+            "캐릭터 레퍼런스의 IP-Adapter 방식은 스크립트 없이 도는 별도 잡이라 이 아코디언이 붙지 않습니다. 켜면(기본) "
+            "체크포인트가 v2 번들일 때 txt2img·이어붙이기 방식처럼 Qwen3.5 커넥터로 조건을 만들고(부정 프롬프트는 순정 "
+            "경로, 강도 1.0) IP-Adapter 를 그 위에 얹습니다. v2 번들이 아니면(2.9B 등) 아무것도 설치하지 않습니다. 끄면 "
+            "0.21 까지처럼 0.6B 조건으로 샘플링합니다 — 결과 이미지가 달라집니다. 켰을 때는 결과 infotext 의 "
+            "'Reference Anima38'(설치 여부·이유)와 'Anima38 …' 키에 남습니다."
+        ),
+    )
+
+
+def _register_settings_hook() -> None:
+    try:
+        from modules import script_callbacks
+    except Exception:  # pragma: no cover - Forge 밖(테스트)
+        return
+    register = getattr(script_callbacks, "on_ui_settings", None)
+    if register is not None:
+        register(_on_ui_settings)
+
+
+_register_settings_hook()
+
+
 def _truthy(value: Any) -> bool:
     if isinstance(value, bool):
         return value
@@ -472,14 +557,18 @@ class Anima38Script(scripts.Script):
             # 아직 런타임을 안 잡은 인스턴스 — 무거운 임포트 없이 이미 떠 있는 공용 런타임만 본다
             module = sys.modules.get("sam3ext.anima38.runtime")
             runtime = getattr(module, "_SHARED_RUNTIME", None)
-        stale = getattr(runtime, "_installed_processing", None)
-        if stale is None or stale is p:
+        if runtime is None:
             return
-        try:
-            runtime.restore(stale)
-        except Exception as exc:  # pragma: no cover - 복구는 실패해도 이번 생성은 진행한다
-            _log(f"stale restore failed — {type(exc).__name__}: {exc}")
-        if self._installed_for is stale:
+        release = getattr(runtime, "release_foreign_install", None)
+        if release is None:
+            # Reload UI 는 이 스크립트만 다시 읽는다 — 이미 떠 있는 옛 런타임 모듈에는 공용 함수가 없다
+            _log("runtime predates release_foreign_install — restart Forge to pick up the update")
+            return
+        # 순서의 첫 단계는 런타임 공용 함수(Feature 6 IP-Adapter 도 같은 것을 쓴다). 복구는 실패해도 이번 생성은 진행한다.
+        stale = release(
+            p, on_error=lambda exc: _log(f"stale restore failed — {type(exc).__name__}: {exc}")
+        )
+        if stale is not None and self._installed_for is stale:
             self._installed_for = None   # 방금 내렸다 — 아래 _safe_restore 가 한 번 더 내리지 않게
 
     def postprocess(self, p, processed, *args_):
