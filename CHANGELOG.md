@@ -224,6 +224,12 @@ v0.21.2 이후 쌓인 큰 업데이트입니다. Anima 3.8B(Qwen3.5 / Semantic C
   칸부터 세고, ADetailer 내부 img2img·img2img-hires-fix 처럼 이 스크립트가 준비하지 않은 실행은 `on_cfg_denoiser` 로 그 실행을 알아내 자기 스텝 수로
   끝에서 셉니다. σ 목록이 없는 DDIM·PLMS 는 Forge 스텝 위치로 판정합니다(한 스텝 늦음). 블록 칸을 비우면 원본 마스크와 같은 `8-18`, strength 0.001 이하는
   원본처럼 아무것도 하지 않습니다.
+- **DAVE + Detail Daemon 우회 (결과 변화, 토글, 기본 켬)**: Detail Daemon 은 모델에 넘기는 σ 를 줄이는데, 줄어든 σ 는 스케줄에 없어 위
+  원본 규칙대로면 '0번 스텝'으로 판정되고 DAVE 가 모든 스텝에 걸려 이미지가 무너집니다(GPU 확인: tau 1.0 과 같은 모양. 원본 ComfyUI 노드 둘을
+  이어도 같습니다). 켜면 Detail Daemon 이 줄이기 전 σ 로 판정해 둘을 함께 써도 DAVE 가 tau 구간에만 걸립니다. Detail Daemon 을 끈 생성은 켜고
+  끔에 관계없이 같습니다. 끄는 설정: Settings → **SAM Extra Guidance** → "DAVE + Detail Daemon: DAVE 적용 스텝을 Detail Daemon 이 바꾸기
+  전 σ 로 판정(우회)"(`sam3_guidance_dave_pre_dd_sigma`). DAVE 를 쓴 생성의 infotext 에 `Anima DAVE pre-DD sigma: True/False` 가 남고
+  붙여 넣기·`override_settings` 로 복원됩니다.
 - **CNS 를 원본과 같게 (결과 변화, 토글 없음)**:
   [namemechan/comfyui-cns_sampler_patch@42278b13](https://github.com/namemechan/comfyui-cns_sampler_patch) 의
   `color_noise_wavelet` 을 `sam3ext/guidance/cns.py` 에 그대로 편입했습니다(GPL-3.0). Strength 가 1 보다 작으면 흰 노이즈와 `lerp` 로만
@@ -399,7 +405,7 @@ v0.21.2 이후 쌓인 큰 업데이트입니다. Anima 3.8B(Qwen3.5 / Semantic C
   생겼습니다. README·docs 의 코드 불일치는 문서 쪽만 고쳤습니다.
 - **개발**: `requirements-dev.txt` 를 추가했고 CI 는 Python 3.13 + `unittest discover` 로 바뀌었습니다(실제 GitHub Actions 실행은
   미확인). 테스트 사이에 가짜 모듈이 남아 실행 순서에 따라 결과가 흔들리던 문제를 고쳤습니다.
-- **검증**: Python 단위 테스트 1434개 통과(skipped 2, CPU, `python -m unittest discover -s tests -t .`), jsdom 프런트엔드 테스트
+- **검증**: Python 단위 테스트 1437개 통과(skipped 2, CPU, `python -m unittest discover -s tests -t .`), jsdom 프런트엔드 테스트
   57개 통과(`npm test`). GPU(RTX 5090) 확인 — 픽셀 동일: 성능 작업 뒤 3.8B 기준 이미지 재렌더, 3.8B 커넥터 fp32·run 캐시, TF32 수정, SAM3
   인페인트 시드 수정, IP-Adapter 잡 뒤의 txt2img. 구도 같고 잔 디테일만 다름: PAG 앞쪽 블록 중복 제거(56.2 → 51.4 초), SEG separable blur.
   비교·동작 확인: IP-Adapter lineage 정책, IP-Adapter 의 3.8B 커넥터. 이 GPU 측정은 모두 원본 동등성 작업 전의 코드에서 잰 것입니다. 아직 GPU 로 확인하지

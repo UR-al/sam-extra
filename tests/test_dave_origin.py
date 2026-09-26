@@ -580,6 +580,35 @@ class BlockWrapperGateTests(unittest.TestCase):
         self.assertIsNone(pag._DAVE["run_p"])
         self.assertEqual(pag._DAVE["run_steps"], 0)
 
+    def test_detail_daemon_scaled_sigma_is_looked_up_before_scaling(self):
+        # Detail Daemon hands the model sigma * (1 - adj*cfg); that value is on no schedule, so the
+        # original gate calls it step 0 and DAVE runs every step (tau=1.0 look). The pre-DD option
+        # (default on) looks up the sigma Detail Daemon noted before scaling it.
+        from sam3ext.guidance.dave_gate import note_pre_dd_sigma
+        self.addCleanup(note_pre_dd_sigma, None)
+        sched = _simple_sigmas(20)
+
+        def run(pre_dd):
+            self.pag._DAVE.update(pre_dd=pre_dd, gate=dave_gate.ForwardGateCache(), offset=0)
+            applied = []
+            for i, sigma in enumerate(sched[:-1]):
+                note_pre_dd_sigma(_rows(sigma), _rows(float(sigma) * 0.97))
+                options = {"sampling_sigmas": sched, "sigmas": _rows(float(sigma) * 0.97)}
+                applied.append(self._forward(options, state=_State(max(0, i - 1), 20))[0])
+            return applied
+
+        self.assertEqual(run(True), _origin_active(0.1, sched, [_rows(s) for s in sched[:-1]]))
+        self.assertEqual(run(False), [True] * 20)   # the originals chained
+
+    def test_a_note_from_another_forward_is_ignored(self):
+        from sam3ext.guidance.dave_gate import note_pre_dd_sigma
+        self.addCleanup(note_pre_dd_sigma, None)
+        sched = _simple_sigmas(20)
+        # Stale: Detail Daemon scaled step 0 earlier; this forward (step 10, unscaled) carries its own sigma.
+        note_pre_dd_sigma(_rows(sched[0]), _rows(float(sched[0]) * 0.97))
+        options = {"sampling_sigmas": sched, "sigmas": _rows(sched[10])}
+        self.assertEqual(self._forward(options, state=_State(10, 20)), [False])
+
     def test_unknown_offset_uses_the_whole_list(self):
         sched = _simple_sigmas(25)
         applied = self._run(sched, sched[:-1], 25, None)

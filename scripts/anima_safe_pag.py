@@ -93,6 +93,7 @@ from sam3ext.guidance.dave_gate import (
     DEFAULT_BLOCKS as DAVE_DEFAULT_BLOCKS,
     ForwardGateCache,
     attenuation_active as dave_attenuation_active,
+    pre_dd_sigma,
     step_gate as dave_step_gate,
 )
 from sam3ext.guidance.dcw import apply_dcw
@@ -265,6 +266,10 @@ _STATE: dict = {
 OPT_PREFIX_DEDUP = "sam3_guidance_pag_prefix_dedup"
 OPT_SEG_SEPARABLE = "sam3_guidance_seg_separable_blur"
 INFOTEXT_PREFIX_DEDUP = "Anima PAG prefix dedup"
+# DAVE + Detail Daemon: the gate looks up the sigma before Detail Daemon scaled it
+# (sam3ext/guidance/dave_gate.py note_pre_dd_sigma). Off = the originals' behaviour.
+OPT_DAVE_PRE_DD = "sam3_guidance_dave_pre_dd_sigma"
+INFOTEXT_DAVE_PRE_DD = "Anima DAVE pre-DD sigma"
 INFOTEXT_SEG_SEPARABLE = "Anima SEG separable blur"
 # ControlNet 가드(호스트 차이): 원본 노드는 ControlNet 과 함께 PAG 를 돌리지만 이 확장은
 # ControlNet 이 붙은 호출에서 PAG/SEG/SLG 를 쉰다. 실제로 막힌 패스에만 적는다(설명용,
@@ -287,6 +292,7 @@ _EXTRA_GENERATION_PARAM_KEYS = (
     INFOTEXT_PREFIX_DEDUP,
     INFOTEXT_SEG_SEPARABLE,
     INFOTEXT_CONTROLNET_GUARD,
+    INFOTEXT_DAVE_PRE_DD,
 )
 
 
@@ -331,6 +337,22 @@ def _on_ui_settings() -> None:
             "켜면(기본) 같은 Gaussian 커널을 2D 한 번 대신 가로·세로 1D depthwise conv 두 번으로 적용합니다 — "
             "커널 크기 k 에서 픽셀당 곱셈이 k² 에서 2k 로 줄어듭니다. 수학적으로 같은 blur 지만 반올림 순서가 "
             "달라 결과가 아주 미세하게 달라질 수 있어 infotext 에 남깁니다. 끄면 예전 2D conv 그대로입니다."
+        ),
+    )
+    shared.opts.add_option(
+        OPT_DAVE_PRE_DD,
+        shared.OptionInfo(
+            True,
+            "DAVE + Detail Daemon: DAVE 적용 스텝을 Detail Daemon 이 바꾸기 전 σ 로 판정(우회)",
+            gr.Checkbox,
+            section=section,
+            infotext=INFOTEXT_DAVE_PRE_DD,
+        ).info(
+            "Detail Daemon 은 모델에 넘기는 σ 를 줄이고, DAVE 는 그 σ 를 스케줄에서 찾아 앞쪽 몇 스텝에만 "
+            "적용합니다. 줄어든 σ 는 스케줄에 없어 원본 규칙대로면 '0번 스텝'으로 판정돼 DAVE 가 모든 스텝에 "
+            "걸리고 이미지가 무너집니다(원본 ComfyUI 노드 둘을 이어도 같음). 켜면(기본) Detail Daemon 이 바꾸기 "
+            "전 σ 로 판정해 둘을 함께 써도 DAVE 가 원래 구간(tau)에만 걸립니다. Detail Daemon 을 끈 생성은 "
+            "켜고 끔에 관계없이 같습니다. 끄면 원본 노드 조합과 같은 동작입니다."
         ),
     )
 
@@ -463,6 +485,8 @@ _DAVE: dict = {
     # together with the request it belongs to (``offset_p``).
     "offset": None,
     "offset_p": None,
+    # Forge option OPT_DAVE_PRE_DD, read at every attach (default on).
+    "pre_dd": True,
     # The sampling run the next block calls belong to (_dave_run_callback):
     # its request and ``launch_sampling`` step count (see _dave_offset).
     "run_p": None,
@@ -1168,10 +1192,15 @@ def _dave_gate_open(args, kwargs) -> bool:
         return dave_step_gate(step, total, tau)
     options = _block_transformer_options(args, kwargs) or {}
     schedule = options.get("sampling_sigmas")
+    sigma = options.get("sigmas")
+    if _DAVE.get("pre_dd", True):
+        noted = pre_dd_sigma(sigma)   # Detail Daemon's note, only for the forward it scaled
+        if noted is not None:
+            sigma = noted
     return _DAVE["gate"].active(
         tau,
         schedule,
-        options.get("sigmas"),
+        sigma,
         _dave_offset(schedule),
     )
 
@@ -4704,6 +4733,7 @@ class AnimaSafePAG(scripts.Script):
             schedule_ok=_sampler_publishes_sigmas(p),
             offset=_forge_sampling_offset(p),
             offset_p=p,
+            pre_dd=_read_bool_option(OPT_DAVE_PRE_DD, True),
             run_p=None,
             run_steps=0,
         )
@@ -4882,6 +4912,8 @@ class AnimaSafePAG(scripts.Script):
                     f"strength={dave_strength}, tau={dave_tau}, "
                     f"blocks={sorted(dave_targets)}"
                 )
+                # 붙여넣기 때 같은 Forge 설정으로 돌아가도록 "True"/"False" (Detail Daemon 과 함께일 때만 차이)
+                p.extra_generation_params[INFOTEXT_DAVE_PRE_DD] = str(bool(_DAVE.get("pre_dd", True)))
             if _CNS["on"]:
                 p.extra_generation_params["Anima CNS Wavelet Noise"] = (
                     f"strength={cns_strength}, gamma_power={cns_gamma_power}, "

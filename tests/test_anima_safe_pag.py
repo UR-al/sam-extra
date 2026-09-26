@@ -2603,9 +2603,10 @@ class GuidanceSettingsInfotextTests(unittest.TestCase):
         )
         with mock.patch.object(p, "shared", shared_stub):
             p._on_ui_settings()
-        self.assertEqual(set(added), {p.OPT_PREFIX_DEDUP, p.OPT_SEG_SEPARABLE})
+        self.assertEqual(set(added), {p.OPT_PREFIX_DEDUP, p.OPT_SEG_SEPARABLE, p.OPT_DAVE_PRE_DD})
         for key, infotext in ((p.OPT_PREFIX_DEDUP, p.INFOTEXT_PREFIX_DEDUP),
-                              (p.OPT_SEG_SEPARABLE, p.INFOTEXT_SEG_SEPARABLE)):
+                              (p.OPT_SEG_SEPARABLE, p.INFOTEXT_SEG_SEPARABLE),
+                              (p.OPT_DAVE_PRE_DD, p.INFOTEXT_DAVE_PRE_DD)):
             self.assertIs(added[key].default, True)
             self.assertEqual(added[key].section, ("sam3_guidance", "SAM Extra Guidance"))
             self.assertEqual(added[key].infotext, infotext)

@@ -69,6 +69,7 @@ import gradio as gr
 from modules import script_callbacks, scripts
 
 from sam3ext import layout_lanes
+from sam3ext.guidance.dave_gate import note_pre_dd_sigma
 
 try:
     import numpy as np
@@ -408,6 +409,8 @@ def _sigma_value(sigma) -> float:
 
 
 def _denoiser_callback(params) -> None:
+    # The DAVE gate (anima_safe_pag.py) reads this for the same forward: unscaled unless set below.
+    note_pre_dd_sigma(None)
     if not _DD["on"] or np is None:
         return
     try:
@@ -429,7 +432,9 @@ def _denoiser_callback(params) -> None:
         factor = _sigma_factor(value, float(_DD["cfg_scale"]))
         if isinstance(factor, float) and factor == 1.0:
             return
+        original = sigma.detach().clone() if hasattr(sigma, "detach") else sigma
         _scale_sigma(params, factor)
+        note_pre_dd_sigma(original, params.sigma)
     except Exception as e:
         _log(f"denoiser callback skipped: {type(e).__name__}: {e}")
 

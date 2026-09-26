@@ -923,6 +923,28 @@ class InPlaceTests(unittest.TestCase):
         self.assertIs(params.sigma, held)
         self.assertTrue(torch.equal(held, before * node_sigma_factor(1.0, 5.0)))
 
+    def test_notes_the_unscaled_sigma_for_the_dave_gate(self):
+        # scripts/anima_safe_pag.py _dave_gate_open looks this up instead of the scaled sigma.
+        from sam3ext.guidance.dave_gate import note_pre_dd_sigma, pre_dd_sigma
+        self.addCleanup(note_pre_dd_sigma, None)
+        sigmas = flow_sigmas(20)
+        for amount, scaled in ((1.0, True), (0.0, False)):
+            with self.subTest(amount=amount):
+                p = _p(sampling_sigmas=sigmas)
+                dd.AnimaDetailDaemon().process_before_every_sampling(p, *_args(amount=amount))
+                note_pre_dd_sigma("stale")
+                held = sigmas[10] * torch.ones(2)
+                before = held.clone()
+                params = types.SimpleNamespace(sigma=held, sampling_step=9, total_sampling_steps=20,
+                                               denoiser=ForgeDenoiser(p, steps=20, total_steps=20))
+                dd._denoiser_callback(params)
+                if scaled:
+                    self.assertTrue(torch.equal(pre_dd_sigma(params.sigma), before))
+                    self.assertFalse(torch.equal(params.sigma, before))
+                    self.assertIsNone(pre_dd_sigma(before))   # only the forward it scaled
+                else:   # an unscaled forward clears what an earlier forward noted
+                    self.assertIsNone(pre_dd_sigma())
+
     def test_a_view_of_the_samplers_timesteps_is_not_written(self):
         # Forge UniPC (sd_samplers_extra.sample_unipc → uni_pc.py:516-548) passes
         # ``timesteps[k].expand(batch)`` to the model. Writing into it would move the solver's time steps

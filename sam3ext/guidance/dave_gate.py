@@ -153,6 +153,45 @@ def gate_active(tau, schedule, sigma, offset=None) -> bool:
     return step < window_steps(tau, n_steps)
 
 
+# Detail Daemon (scripts/anima_detail_daemon.py) scales the sigma handed to the model from its
+# on_cfg_denoiser callback. The gate looks that sigma up in the schedule, and a scaled sigma is
+# never on it, so the original's "off schedule = step 0 = on" rule runs DAVE on every step (the
+# ComfyUI originals chained the same way do the same, and the image falls apart like tau=1.0).
+# Detail Daemon notes the sampler's own sigma here for the forward it is about to scale; with the
+# pre-DD option on (default) the gate looks that one up instead. The scaled value is kept too, so
+# a note is only used by the forward it belongs to (the sigma that forward carries is the scaled one).
+_PRE_DD = {"sigma": None, "scaled": None}
+_PRE_DD_RTOL = 1e-4
+
+
+def note_pre_dd_sigma(sigma, scaled=None) -> None:
+    """Detail Daemon: ``sigma`` before and ``scaled`` after it scaled the coming forward (``None`` = unscaled)."""
+    _PRE_DD["sigma"] = sigma
+    _PRE_DD["scaled"] = scaled
+
+
+def _first_value(value):
+    try:
+        if _is_tensor(value):
+            return float(value.flatten()[0].item())
+        return float(value)
+    except (TypeError, ValueError, RuntimeError):
+        return None
+
+
+def pre_dd_sigma(current=None):
+    """The unscaled sigma if Detail Daemon scaled the forward carrying ``current``, else ``None``."""
+    sigma, scaled = _PRE_DD["sigma"], _PRE_DD["scaled"]
+    if sigma is None:
+        return None
+    if current is None or scaled is None:
+        return sigma
+    now, noted = _first_value(current), _first_value(scaled)
+    if now is None or noted is None or abs(now - noted) > _PRE_DD_RTOL * max(abs(noted), 1e-12):
+        return None   # a note from another forward (Detail Daemon did not scale this one)
+    return sigma
+
+
 class ForwardGateCache:
     """One-entry memo of ``gate_active`` for the blocks of one forward.
 
