@@ -642,6 +642,70 @@ class SourceImageTests(unittest.TestCase):
                 self.assertIs(pp.image, output, "마스크가 없으면 예전처럼 부모 출력을 그대로 둔다")
                 self.assertEqual(p.extra_generation_params[self.module.INFOTEXT_SOURCE], f"output ({reason})")
 
+    # -- Forge img2img 색 보정(img2img_color_correction) --------------------------------
+    @staticmethod
+    def _forge_color_correction(p, image, i=0):
+        """Forge processing.py 가 postprocess_image 바로 뒤에 하는 일(1085-1089행)과 같은 조건 — 보정 자체는 모든 픽셀을
+        조금씩 바꾸는 대역(진짜는 LAB 왕복 히스토그램 맞춤이라 원본에 해도 픽셀 약 80% 가 바뀐다)."""
+        if p.color_corrections is not None and i < len(p.color_corrections):
+            return _drifted(image, seed=99)
+        return image
+
+    def test_color_correction_does_not_touch_the_init_result(self):
+        for found, mode in ((False, "Inpaint"), (True, "Mask only")):
+            with self.subTest(found=found, mode=mode):
+                init = _noise(seed=12)
+                p = self._p(init, _sam3_args=_enabled_args(sam3_mode=mode), color_corrections=["cc0"])
+                pp = types.SimpleNamespace(image=_drifted(init))
+                self._run(p, pp, found=found)
+                self.assertIsNone(p.color_corrections, "맞출 대상이 곧 원본 — Forge 가 LAB 왕복으로 다시 바꾸지 않게 끈다")
+                final = self._forge_color_correction(p, pp.image)
+                self.assertTrue(_same_pixels(final, init), "Forge 의 뒤 단계까지 거친 최종 결과도 원본 그대로")
+                self.assertEqual(p.extra_generation_params[self.module.INFOTEXT_SOURCE], "init image")
+
+    def test_color_correction_is_off_even_when_detection_fails(self):
+        init = _noise(seed=13)
+        p = self._p(init, color_corrections=["cc0"])
+        pp = types.SimpleNamespace(image=_drifted(init))
+        with self.assertRaises(RuntimeError):
+            self._run(p, pp, detect_error=RuntimeError("cv2 error"))
+        self.assertIsNone(p.color_corrections, "Forge 는 예외 뒤에도 색 보정을 거쳐 저장한다")
+        self.assertTrue(_same_pixels(self._forge_color_correction(p, pp.image), init))
+
+    def test_color_correction_with_an_unusable_init_in_the_batch_keeps_the_old_path(self):
+        """색 보정 목록은 배치 전체가 함께 쓴다 — 원본으로 돌 수 없는 init 이 섞였으면 끄지 않고 예전처럼 출력으로."""
+        first = _noise(seed=14)
+        for other, why in ((_noise((48, 32), seed=15), "크기가 다른 init"), ("not an image", "읽을 수 없는 init")):
+            with self.subTest(why=why):
+                corrections = ["cc0", "cc1"]
+                p = self._p(first, init_images=[first, other], batch_index=0, color_corrections=corrections)
+                output = _drifted(first)
+                pp = types.SimpleNamespace(image=output)
+                detected, _ = self._run(p, pp, found=False)
+                self.assertIs(detected, output)
+                self.assertIs(pp.image, output)
+                self.assertIs(p.color_corrections, corrections, "다른 장의 색 보정을 빼앗지 않는다")
+                self.assertEqual(p.extra_generation_params[self.module.INFOTEXT_SOURCE], "output (color correction)")
+        # 모든 init 이 원본으로 돌 수 있으면(같은 크기) 끈다 — 두 번째 장도 원본으로 돈다
+        second = _noise(seed=16)
+        p = self._p(first, init_images=[first, second], batch_index=1, color_corrections=["cc0", "cc1"])
+        pp = types.SimpleNamespace(image=_drifted(second))
+        self._run(p, pp, found=False)
+        self.assertIsNone(p.color_corrections)
+        self.assertTrue(_same_pixels(pp.image, second))
+
+    def test_color_correction_is_kept_when_the_request_is_not_honoured(self):
+        init = _noise(seed=17)
+        for changes in (dict(_sam3_source_request=False), dict(denoising_strength=0.3), dict(init_images=[])):
+            with self.subTest(changes=sorted(changes)):
+                corrections = ["cc0"]
+                p = self._p(init, color_corrections=corrections, **changes)
+                output = _drifted(init)
+                pp = types.SimpleNamespace(image=output)
+                self._run(p, pp, found=False)
+                self.assertIs(p.color_corrections, corrections, "요청을 따르지 않은 결과는 Forge 색 보정도 예전 그대로")
+                self.assertIs(pp.image, output)
+
     def test_without_the_request_nothing_changes(self):
         init = _noise(seed=11)
         output = _drifted(init)

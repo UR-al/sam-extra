@@ -143,11 +143,16 @@ txt2img 갤러리 아래 ✨(hires fix) 버튼 오른쪽의 **🎯** 는 선택�
   2.6, 최대 139).
 - `init` 이면 img2img init 이미지를 씁니다 — Forge 가 VAE 에 넣을 때처럼 투명한 부분을 `img2img_background_color` 로
   채운 것입니다. 마스크 밖은 원본 그대로이고, 마스크를 못 찾거나 Mask only 이거나 SAM3 가 실패해도 결과는 원본입니다.
+- Forge 설정 **img2img 색 보정**(`img2img_color_correction`)이 켜져 있으면 Forge 는 스크립트 뒤에 이미지 전체를 init
+  기준으로 LAB 히스토그램 맞춤합니다 — 원본에 해도 LAB 왕복으로 픽셀 대부분이 조금씩 바뀝니다. 원본으로 돌 때는 맞출 대상이
+  곧 그 원본이라 이 보정을 끕니다(인페인트 패스는 자기 색 보정을 따로 합니다). 한 요청에 init 이미지가 여러 장이고 원본으로
+  돌 수 없는 장(크기가 다르거나 읽을 수 없음)이 섞였으면, 그 장의 보정을 빼앗지 않도록 끄지 않고 예전처럼 출력을 씁니다
+  (`output (color correction)`).
 - 부모 패스가 이미지를 바꾸려던 경우에는 예전처럼 출력을 씁니다: init 이미지 없음(txt2img), 인페인트 마스크, denoise > 0,
   얼굴 복원, 크기가 다름(하이레스·VAE 2x·크기 조정).
 - infotext `SAM3 Source` 가 어느 쪽으로 돌았는지 알립니다: `init image`, 또는 요청했지만 출력을 썼으면 `output (<이유>)`
   (`not img2img` / `inpaint mask` / `denoising > 0` / `face restoration` / `size WxH != WxH` /
-  `init image unreadable`). 요청하지 않으면 이 키가 없습니다.
+  `init image unreadable` / `color correction`). 요청하지 않으면 이 키가 없습니다.
 - `Sam3Args`(모르는 키는 검증 실패) 밖에서 state 로만 읽는 키라, 이 키를 모르는 예전 빌드도 오류 없이 무시합니다(그 결과에는
   `SAM3 Source` 가 없습니다). Forge UI·🎯 빠른 버튼·XYZ 는 이 키를 쓰지 않으므로 동작이 같습니다.
 

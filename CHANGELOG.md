@@ -296,7 +296,9 @@ v0.21.2 이후 쌓인 큰 업데이트입니다. Anima 3.8B(Qwen3.5 / Semantic C
 - **API: 원본 기준 SAM3 — `sam3_source_image` (새 기능, 요청할 때만)**: img2img(denoise 0)로 이미 만든 이미지에 SAM3 만 돌리는 API 호출자가
   SAM3 state 에 `"sam3_source_image": "init"` 을 넣으면, 부모 패스 출력(denoise 0 이어도 VAE 왕복으로 픽셀이 조금씩 바뀜) 대신 init 이미지(Forge 처럼
   `img2img_background_color` 로 flatten)로 검출·인페인트합니다. 마스크 밖이 원본 그대로이고, 마스크 없음·Mask only·실패도 원본을 돌려줍니다. init 이
-  없거나 인페인트 마스크·denoise > 0·얼굴 복원·크기가 다르면 예전처럼 출력을 씁니다. infotext 는 `SAM3 Source: init image` 또는
+  없거나 인페인트 마스크·denoise > 0·얼굴 복원·크기가 다르면 예전처럼 출력을 씁니다. 원본으로 돌 때는 Forge img2img 색 보정
+  (`img2img_color_correction`, 스크립트 뒤에 이미지 전체를 LAB 왕복)을 끕니다 — 켜 두면 원본이어도 픽셀 대부분이 바뀝니다(원본으로 돌 수 없는 init 이
+  섞인 여러 장 요청은 끄지 않고 `output (color correction)`). infotext 는 `SAM3 Source: init image` 또는
   `SAM3 Source: output (<이유>)` 입니다. 키가 없으면(Forge UI·🎯·XYZ·예전 호출자) 동작과 infotext 가 그대로입니다(결과 같음). Sam3Args 밖에서 state
   로만 읽어 예전 빌드도 이 키를 오류 없이 무시합니다. `scripts/!sam3.py` 만 바뀌어 Settings → Reload UI 로 적용됩니다. 자세한 내용은 README
   워크플로 1 의 'API: 이미 만든 이미지에 SAM3 만'.

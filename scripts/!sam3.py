@@ -604,6 +604,10 @@ class Sam3MaskScript(scripts.Script):
         init 이미지를 쓴다. denoise 0 이어도 부모 패스는 VAE 인코드·디코드를 거쳐 픽셀이 조금씩 바뀐다(드리프트).
         init 은 Forge 가 VAE 에 넣기 전처럼 flatten(투명 → img2img 배경색)한다. 조건이 하나라도 어긋나면(하이레스·
         VAE 2x·크기 조정 부모 등) 출력을 쓰고 'output (<이유>)' 로 알린다.
+
+        Forge img2img 색 보정(``p.color_corrections``)이 켜져 있으면 원본으로 돌 때 _run_sam3_on_image 가 그것을 끈다.
+        색 보정 목록은 배치 전체가 함께 쓰므로, 원본으로 돌 수 없는 init(크기가 다르거나 읽을 수 없음)이 섞인 배치면
+        끄지 않고 'output (color correction)' — 그 장이 받던 색 보정을 빼앗지 않는다.
         """
         output = pp.image if isinstance(pp.image, Image.Image) else Image.fromarray(np.asarray(pp.image))
         if not getattr(p, "_sam3_source_request", False):
@@ -644,6 +648,10 @@ class Sam3MaskScript(scripts.Script):
             return fallback("init image unreadable")
         if source.size != output.size:
             return fallback(f"size {source.width}x{source.height} != {output.width}x{output.height}")
+        if getattr(p, "color_corrections", None) and not all(
+            isinstance(img, Image.Image) and img.size == output.size for img in init_images
+        ):
+            return fallback("color correction")
         return source, SOURCE_NOTE_INIT
 
     def _run_sam3_on_image(self, p, pp, args: dict[str, Any]) -> None:
@@ -658,6 +666,13 @@ class Sam3MaskScript(scripts.Script):
         if source_note == SOURCE_NOTE_INIT:
             # 원본을 먼저 결과 자리에 — 마스크 없음·Mask only·예외로 끝나도 VAE 왕복한 부모 출력이 아니라 원본이 남는다.
             pp.image = image
+            # Forge 는 postprocess_image 뒤에 img2img 색 보정(설정 img2img_color_correction — init 기준 LAB 히스토그램
+            # 맞춤, processing.py apply_color_correction)을 이미지 전체에 한다. 원본을 그대로 돌려줘도 LAB 왕복으로 거의
+            # 모든 픽셀이 바뀐다. 맞출 대상이 곧 이 원본이라 할 일이 없으므로 끈다 — 검출 전에 꺼서 예외로 끝나도 같다.
+            # 인페인트 패스(run_inpaint_passes 의 새 p2)는 자기 init 으로 색 보정을 따로 한다.
+            if getattr(p, "color_corrections", None):
+                p.color_corrections = None
+                print("[-] SAM3: skipped Forge img2img color correction for the init-image result", file=sys.stderr)
         allow_huggingface = not getattr(shared.cmd_opts, "sam3_no_huggingface", False)
         result = run_sam3_on_pil(
             image=image,
