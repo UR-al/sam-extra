@@ -440,6 +440,226 @@ class KeepInRamSettingTests(unittest.TestCase):
         self.assertEqual(drops, [1])
 
 
+# ---------------------------------------------------------------------------
+# API 'sam3_source_image': 'init' — 이미 만든 이미지에 SAM3 만 돌릴 때 VAE 왕복한 부모 출력 대신 init 이미지로
+# ---------------------------------------------------------------------------
+
+
+def _forge_flatten(img, bgcolor):
+    """Forge modules/images.py flatten 과 같다(Forge 없이 테스트하려고 옮겨 적음)."""
+    if img.mode == "RGBA":
+        background = Image.new("RGBA", img.size, bgcolor)
+        background.paste(img, mask=img)
+        img = background
+    return img.convert("RGB")
+
+
+def _noise(size=(24, 16), mode="RGB", seed=0):
+    import numpy as np
+
+    rng = np.random.default_rng(seed)
+    channels = {"RGB": 3, "RGBA": 4}[mode]
+    return Image.fromarray(rng.integers(0, 256, (size[1], size[0], channels), dtype=np.uint8), mode)
+
+
+def _drifted(image, seed=1):
+    """denoise 0 부모 패스의 VAE 왕복처럼 모든 픽셀이 ±3 안에서 흔들린 출력."""
+    import numpy as np
+
+    rng = np.random.default_rng(seed)
+    arr = np.asarray(image.convert("RGB")).astype(np.int16) + rng.integers(-3, 4, (image.height, image.width, 3))
+    return Image.fromarray(np.clip(arr, 0, 255).astype(np.uint8))
+
+
+def _same_pixels(a, b) -> bool:
+    import numpy as np
+
+    return a.size == b.size and a.mode == b.mode and np.array_equal(np.asarray(a), np.asarray(b))
+
+
+class SourceImageTests(unittest.TestCase):
+    """state 'sam3_source_image': 'init' → 검출·인페인트·조기 종료 모두 init 이미지. 조건이 안 맞으면 예전처럼 출력."""
+
+    BG = "#204060"
+
+    def setUp(self):
+        self.module = _sam3_script()
+        self.flatten_calls: list = []
+
+        def flatten(img, bgcolor):
+            self.flatten_calls.append(bgcolor)
+            return _forge_flatten(img, bgcolor)
+
+        package = types.ModuleType("modules")
+        package.__path__ = []
+        images = types.ModuleType("modules.images")
+        images.flatten = flatten
+        package.images = images
+        # _pick_source 는 실행 시점에 `from modules import images` 한다(스크립트 로드 때는 부르지 않는다).
+        for patcher in (
+            mock.patch.dict(sys.modules, {"modules": package, "modules.images": images}),
+            mock.patch.object(self.module.shared, "opts", types.SimpleNamespace(img2img_background_color=self.BG)),
+        ):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    # -- 도우미 ------------------------------------------------------------------
+    def _p(self, init=None, **changes):
+        init = init if init is not None else _noise(mode="RGBA")
+        attrs = dict(
+            extra_generation_params={"SAM3 Enable": True, "SAM3 Prompt": "face"},
+            _sam3_args=_enabled_args(),
+            _sam3_source_request=True,
+            init_images=[init],
+            image_mask=None,
+            denoising_strength=0.0,
+            restore_faces=False,
+            batch_index=0,
+        )
+        attrs.update(changes)
+        return _processing(**attrs)
+
+    @staticmethod
+    def _result(size, *, found=True):
+        mask = Image.new("L", size, 0)
+        if found:
+            mask.paste(255, (2, 2, 10, 8))
+        return types.SimpleNamespace(mask=mask, masks=[mask], overlay=Image.new("RGB", size, "red"))
+
+    def _run(self, p, pp, *, found=True, inpaint=None, detect_error=None):
+        """postprocess_image 를 돌리고 (검출에 들어간 이미지, 인페인트에 들어간 이미지|None) 을 돌려준다."""
+        seen: dict = {}
+
+        def fake_detect(**kwargs):
+            seen["detect"] = kwargs["image"]
+            if detect_error is not None:
+                raise detect_error
+            return self._result(kwargs["image"].size, found=found)
+
+        def fake_inpaint(p_, image, masks, prompt, negative_prompt, args, cn_args=None):
+            seen["inpaint"] = image
+            return inpaint if inpaint is not None else Image.new("RGB", image.size, "blue")
+
+        with mock.patch.object(self.module, "run_sam3_on_pil", fake_detect), \
+                mock.patch.object(self.module, "run_inpaint_passes", fake_inpaint), \
+                mock.patch.object(self.module, "unload_sam3", lambda: True), \
+                contextlib.redirect_stderr(io.StringIO()):
+            self.module.Sam3MaskScript().postprocess_image(p, pp)
+        return seen.get("detect"), seen.get("inpaint")
+
+    # -- process(): 요청 플래그 --------------------------------------------------
+    def test_process_reads_the_flag_outside_sam3args(self):
+        script = self.module.Sam3MaskScript()
+        p = _processing()
+        script.process(p, True, {"sam3_prompt": "face", self.module.SOURCE_STATE_KEY: "init"})
+        self.assertIs(p._sam3_source_request, True)
+        self.assertIs(p._sam3_args["enabled"], True, "Sam3Args(extra=forbid) 검증이 그대로 통과해야 한다")
+        self.assertEqual(set(p._sam3_args), {"enabled", *Sam3Args().dict()}, "요청 키는 _sam3_args 에 들어가지 않는다")
+        self.assertNotIn("SAM3 Error", p.extra_generation_params)
+        with self.assertRaises(Exception, msg="Sam3Args 에 넣으면 검증이 통째로 실패한다 — 그래서 state 에서만 읽는다"):
+            Sam3Args(**{self.module.SOURCE_STATE_KEY: "init"})
+
+    def test_process_flag_parsing(self):
+        script = self.module.Sam3MaskScript()
+        key = self.module.SOURCE_STATE_KEY
+        for value, expected in ((" INIT ", True), ("init", True), ("output", False), ("", False), (None, False)):
+            with self.subTest(value=value):
+                p = _processing()
+                script.process(p, True, {"sam3_prompt": "face", key: value})
+                self.assertIs(p._sam3_source_request, expected)
+        p = _processing()
+        script.process(p, True, {"sam3_prompt": "face"})
+        self.assertIs(p._sam3_source_request, False, "키가 없으면 예전 동작")
+        p = _processing(_sam3_xyz={"sam3_threshold": 0.5})
+        script.process(p, False, {"sam3_prompt": "face", key: "init"})
+        self.assertIs(getattr(p, "_sam3_source_request", False), False, "SAM3 가 꺼져 있으면 요청도 없다")
+
+    # -- 원본으로 돌 때 ------------------------------------------------------------
+    def test_detection_and_inpaint_get_the_flattened_init(self):
+        init = _noise(mode="RGBA", seed=3)
+        expected = _forge_flatten(init, self.BG)
+        output = _drifted(expected)
+        p, pp = self._p(init), types.SimpleNamespace(image=output)
+        final = Image.new("RGB", output.size, "blue")
+        detected, inpainted = self._run(p, pp, inpaint=final)
+        self.assertTrue(_same_pixels(detected, expected), "검출은 VAE 왕복한 출력이 아니라 flatten 한 init 을 봐야 한다")
+        self.assertIs(inpainted, detected, "인페인트도 같은 원본 위에서")
+        self.assertIs(pp.image, final)
+        self.assertEqual(self.flatten_calls, [self.BG], "Forge 가 VAE 에 넣을 때와 같은 배경색(img2img_background_color)")
+        self.assertEqual(p.extra_generation_params[self.module.INFOTEXT_SOURCE], "init image")
+        self.assertIs(p.extra_generation_params["SAM3 Enable"], True)
+
+    def test_no_mask_returns_the_init_pixels(self):
+        init = _noise(seed=4)
+        p, pp = self._p(init), types.SimpleNamespace(image=_drifted(init))
+        self._run(p, pp, found=False)
+        self.assertTrue(_same_pixels(pp.image, init), "마스크가 없으면 결과는 원본 그대로 — 드리프트한 출력이 아니다")
+        self.assertIs(p._sam3_mask_found, False)
+
+    def test_mask_only_returns_the_init_pixels(self):
+        init = _noise(seed=5)
+        p = self._p(init, _sam3_args=_enabled_args(sam3_mode="Mask only"))
+        pp = types.SimpleNamespace(image=_drifted(init))
+        _detected, inpainted = self._run(p, pp)
+        self.assertIsNone(inpainted)
+        self.assertTrue(_same_pixels(pp.image, init))
+        self.assertIs(p._sam3_mask_found, True)
+
+    def test_detection_failure_still_leaves_the_init_pixels(self):
+        init = _noise(seed=6)
+        p, pp = self._p(init), types.SimpleNamespace(image=_drifted(init))
+        with self.assertRaises(RuntimeError):
+            self._run(p, pp, detect_error=RuntimeError("cv2 error"))
+        self.assertTrue(_same_pixels(pp.image, init), "Forge 는 예외 뒤 pp.image 를 저장한다 — 원본이어야 한다")
+        self.assertIn("cv2 error", p.extra_generation_params["SAM3 Error"])
+        self.assertEqual(p.extra_generation_params[self.module.INFOTEXT_SOURCE], "init image")
+
+    def test_batch_index_picks_the_matching_init(self):
+        first, second = _noise(seed=7), _noise(seed=8)
+        p = self._p(first, init_images=[first, second], batch_index=1)
+        pp = types.SimpleNamespace(image=_drifted(second))
+        detected, _ = self._run(p, pp)
+        self.assertTrue(_same_pixels(detected, second))
+
+    # -- 조건이 안 맞으면 예전처럼 출력 + 이유 ---------------------------------------
+    def test_each_fallback_keeps_the_output_and_names_the_reason(self):
+        init = _noise(seed=9)
+        cases = {
+            "not img2img": dict(init_images=[]),
+            "inpaint mask": dict(image_mask=Image.new("L", init.size, 255)),
+            "denoising > 0": dict(denoising_strength=0.3),
+            "face restoration": dict(restore_faces=True),
+            "init image unreadable": dict(init_images=["not an image"]),
+            "size 24x16 != 48x32": dict(),
+        }
+        for reason, changes in cases.items():
+            with self.subTest(reason=reason):
+                output = _drifted(init) if not reason.startswith("size") else _noise((48, 32), seed=10)
+                p = self._p(init, **changes)
+                pp = types.SimpleNamespace(image=output)
+                detected, _ = self._run(p, pp, found=False)
+                self.assertIs(detected, output)
+                self.assertIs(pp.image, output, "마스크가 없으면 예전처럼 부모 출력을 그대로 둔다")
+                self.assertEqual(p.extra_generation_params[self.module.INFOTEXT_SOURCE], f"output ({reason})")
+
+    def test_without_the_request_nothing_changes(self):
+        init = _noise(seed=11)
+        output = _drifted(init)
+        p = self._p(init, _sam3_source_request=False)
+        pp = types.SimpleNamespace(image=output)
+        detected, _ = self._run(p, pp, found=False)
+        self.assertIs(detected, output)
+        self.assertIs(pp.image, output)
+        self.assertNotIn(self.module.INFOTEXT_SOURCE, p.extra_generation_params, "요청이 없으면 infotext 도 예전 그대로")
+        self.assertEqual(self.flatten_calls, [])
+        # process() 를 거치지 않은 p(🎯 빠른 버튼·예전 호출자)도 같다
+        p = self._p(init)
+        del p._sam3_source_request
+        detected, _ = self._run(p, types.SimpleNamespace(image=output), found=False)
+        self.assertIs(detected, output)
+        self.assertNotIn(self.module.INFOTEXT_SOURCE, p.extra_generation_params)
+
+
 class DeviceAxisCostTests(unittest.TestCase):
     """'[SAM3] Device' 가 바뀌어도 번들을 버리고 다시 빌드한다 — Checkpoint 축과 같은 cost 로 바깥 루프에."""
 

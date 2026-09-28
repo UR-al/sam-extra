@@ -118,6 +118,16 @@ _SAM3_DEFAULTS: dict[str, Any] = Sam3Args().dict()
 # XYZ '[SAM3] Checkpoint'·'[SAM3] Device' 축 cost — make_axis_on_xyz_grid 참고.
 SAM3_CHECKPOINT_AXIS_COST = 0.9
 
+# API 전용 요청: SAM3 state 의 "sam3_source_image": "init" 이면 검출·인페인트를 부모 패스 출력 대신 img2img init
+# 이미지(Forge 가 VAE 에 넣은 것과 같게 flatten)로 한다 — 이미 만든 이미지에 SAM3 만 돌리는 호출자(denoise 0 부모
+# 패스)가 VAE 왕복으로 마스크 밖까지 바뀌지 않게. Sam3Args(extra=forbid) 밖에서 state 로만 읽으므로 이 키를 모르는
+# 예전 빌드도 오류 없이 무시한다. 결과는 infotext 'SAM3 Source' 로 알린다(요청하지 않으면 키 없음).
+SOURCE_STATE_KEY = "sam3_source_image"
+SOURCE_INIT = "init"
+INFOTEXT_SOURCE = "SAM3 Source"
+SOURCE_NOTE_INIT = "init image"          # 요청대로 원본으로 돌았다
+SOURCE_NOTE_OUTPUT = "output"            # 요청했지만 조건이 맞지 않아 예전처럼 부모 출력으로: 'output (<이유>)'
+
 
 class PromptSR(NamedTuple):
     s: str
@@ -523,6 +533,10 @@ class Sam3MaskScript(scripts.Script):
             return
 
         p._sam3_args = {"enabled": bool(enabled), **validated.dict()}
+        # 원본 기준 요청(SOURCE_STATE_KEY)은 Sam3Args 에 넣지 않는다 — extra=forbid 라 검증이 통째로 실패한다.
+        p._sam3_source_request = bool(enabled) and (
+            str(state.get(SOURCE_STATE_KEY) or "").strip().lower() == SOURCE_INIT
+        )
         if enabled:
             p.extra_generation_params["SAM3 Enable"] = True
             p.extra_generation_params.update(validated.extra_params())
@@ -581,10 +595,69 @@ class Sam3MaskScript(scripts.Script):
         params.clear()
         params.update(items)
 
+    @staticmethod
+    def _pick_source(p, pp) -> tuple[Image.Image, str | None]:
+        """검출·인페인트에 쓸 이미지와 infotext 'SAM3 Source' 값(요청이 없으면 None).
+
+        요청(``p._sam3_source_request``)이 없으면 예전 그대로 부모 패스 출력이다. 요청이 있으면 부모 패스가
+        이미지를 바꾸지 않으려던 경우 — img2img, 인페인트 마스크 없음, denoise 0, 얼굴 복원 없음, 크기 같음 — 에만
+        init 이미지를 쓴다. denoise 0 이어도 부모 패스는 VAE 인코드·디코드를 거쳐 픽셀이 조금씩 바뀐다(드리프트).
+        init 은 Forge 가 VAE 에 넣기 전처럼 flatten(투명 → img2img 배경색)한다. 조건이 하나라도 어긋나면(하이레스·
+        VAE 2x·크기 조정 부모 등) 출력을 쓰고 'output (<이유>)' 로 알린다.
+        """
+        output = pp.image if isinstance(pp.image, Image.Image) else Image.fromarray(np.asarray(pp.image))
+        if not getattr(p, "_sam3_source_request", False):
+            return output, None
+
+        def fallback(reason: str) -> tuple[Image.Image, str]:
+            return output, f"{SOURCE_NOTE_OUTPUT} ({reason})"
+
+        init_images = list(getattr(p, "init_images", None) or [])
+        if not init_images:
+            return fallback("not img2img")
+        if getattr(p, "image_mask", None) is not None:
+            return fallback("inpaint mask")
+        try:
+            denoise = float(getattr(p, "denoising_strength", None))
+        except (TypeError, ValueError):
+            denoise = float("nan")
+        if denoise != 0.0:
+            return fallback("denoising > 0")
+        if getattr(p, "restore_faces", False):
+            return fallback("face restoration")
+        index = 0
+        if len(init_images) > 1:
+            try:
+                index = int(getattr(p, "batch_index", 0) or 0)
+            except (TypeError, ValueError):
+                index = -1
+        if not 0 <= index < len(init_images) or not isinstance(init_images[index], Image.Image):
+            return fallback("init image unreadable")
+        try:
+            from modules import images as forge_images
+
+            source = forge_images.flatten(
+                init_images[index], getattr(shared.opts, "img2img_background_color", "#808080")
+            )
+        except Exception as exc:
+            print(f"[-] SAM3: could not read the init image ({type(exc).__name__}: {exc})", file=sys.stderr)
+            return fallback("init image unreadable")
+        if source.size != output.size:
+            return fallback(f"size {source.width}x{source.height} != {output.width}x{output.height}")
+        return source, SOURCE_NOTE_INIT
+
     def _run_sam3_on_image(self, p, pp, args: dict[str, Any]) -> None:
         """postprocess_image 의 본문 — 검출 → (아티팩트 저장) → (unload) → 오버레이/인페인트."""
         self._restore_infotext_after_failure(p)
-        image = pp.image if isinstance(pp.image, Image.Image) else Image.fromarray(np.asarray(pp.image))
+        image, source_note = self._pick_source(p, pp)
+        if source_note is not None:
+            params = getattr(p, "extra_generation_params", None)
+            if isinstance(params, dict):
+                params[INFOTEXT_SOURCE] = source_note
+            print(f"[-] SAM3: {SOURCE_STATE_KEY}={SOURCE_INIT} -> source: {source_note}", file=sys.stderr)
+        if source_note == SOURCE_NOTE_INIT:
+            # 원본을 먼저 결과 자리에 — 마스크 없음·Mask only·예외로 끝나도 VAE 왕복한 부모 출력이 아니라 원본이 남는다.
+            pp.image = image
         allow_huggingface = not getattr(shared.cmd_opts, "sam3_no_huggingface", False)
         result = run_sam3_on_pil(
             image=image,

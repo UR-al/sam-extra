@@ -129,6 +129,28 @@ txt2img 갤러리 아래 ✨(hires fix) 버튼 오른쪽의 **🎯** 는 선택�
   ✨ 처럼 거절합니다. txt2img 의 Override 설정(Clip skip 등)도 ✨ 처럼 인페인트에 적용됩니다.
 - Forge 가 ✨ 연결 방식을 바꾸면 버튼이 연결되지 않고 콘솔에 경고만 남습니다(생성에는 영향 없음).
 
+### API: 이미 만든 이미지에 SAM3 만 — 원본 기준 (`sam3_source_image`)
+
+`/sdapi/v1/img2img` 에 `denoising_strength: 0` 과 SAM3 Mask 를 실어 이미 만든 이미지에 SAM3 만 돌리는 호출자(UR_IV 의
+단독 SAM3·Refine 등)는 SAM3 state 에 `"sam3_source_image": "init"` 을 넣으세요.
+
+```json
+"alwayson_scripts": {"SAM3 Mask": {"args": [{"sam3_enable": true, "sam3_prompt": "face", "sam3_source_image": "init"}]}}
+```
+
+- 이 키가 없으면 SAM3 는 부모 img2img 패스의 **출력**을 검출·인페인트합니다. denoise 0 이어도 그 출력은 VAE 인코드·디코드를
+  거쳐 원본과 픽셀이 조금씩 달라서, 결과의 마스크 밖도 원본과 다릅니다(측정: 마스크 밖 픽셀의 약 90% 가 바뀜, 평균 차이 약
+  2.6, 최대 139).
+- `init` 이면 img2img init 이미지를 씁니다 — Forge 가 VAE 에 넣을 때처럼 투명한 부분을 `img2img_background_color` 로
+  채운 것입니다. 마스크 밖은 원본 그대로이고, 마스크를 못 찾거나 Mask only 이거나 SAM3 가 실패해도 결과는 원본입니다.
+- 부모 패스가 이미지를 바꾸려던 경우에는 예전처럼 출력을 씁니다: init 이미지 없음(txt2img), 인페인트 마스크, denoise > 0,
+  얼굴 복원, 크기가 다름(하이레스·VAE 2x·크기 조정).
+- infotext `SAM3 Source` 가 어느 쪽으로 돌았는지 알립니다: `init image`, 또는 요청했지만 출력을 썼으면 `output (<이유>)`
+  (`not img2img` / `inpaint mask` / `denoising > 0` / `face restoration` / `size WxH != WxH` /
+  `init image unreadable`). 요청하지 않으면 이 키가 없습니다.
+- `Sam3Args`(모르는 키는 검증 실패) 밖에서 state 로만 읽는 키라, 이 키를 모르는 예전 빌드도 오류 없이 무시합니다(그 결과에는
+  `SAM3 Source` 가 없습니다). Forge UI·🎯 빠른 버튼·XYZ 는 이 키를 쓰지 않으므로 동작이 같습니다.
+
 ---
 
 ## 워크플로 2: Refine 패널 (post-generation)

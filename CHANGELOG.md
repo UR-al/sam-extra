@@ -293,6 +293,13 @@ v0.21.2 이후 쌓인 큰 업데이트입니다. Anima 3.8B(Qwen3.5 / Semantic C
   저장하고 infotext 에 SAM3 설정과 `SAM3 quick: True` 를 붙입니다.
 - **XYZ 축 순서**: `[SAM3] Checkpoint`·`[SAM3] Device` 축(cost 0.9)이 시드 등 다른 축보다 바깥 루프로 가서 칸마다 SAM3 를 다시 빌드하지 않습니다.
   칸 결과는 같고 순서만 바뀝니다.
+- **API: 원본 기준 SAM3 — `sam3_source_image` (새 기능, 요청할 때만)**: img2img(denoise 0)로 이미 만든 이미지에 SAM3 만 돌리는 API 호출자가
+  SAM3 state 에 `"sam3_source_image": "init"` 을 넣으면, 부모 패스 출력(denoise 0 이어도 VAE 왕복으로 픽셀이 조금씩 바뀜) 대신 init 이미지(Forge 처럼
+  `img2img_background_color` 로 flatten)로 검출·인페인트합니다. 마스크 밖이 원본 그대로이고, 마스크 없음·Mask only·실패도 원본을 돌려줍니다. init 이
+  없거나 인페인트 마스크·denoise > 0·얼굴 복원·크기가 다르면 예전처럼 출력을 씁니다. infotext 는 `SAM3 Source: init image` 또는
+  `SAM3 Source: output (<이유>)` 입니다. 키가 없으면(Forge UI·🎯·XYZ·예전 호출자) 동작과 infotext 가 그대로입니다(결과 같음). Sam3Args 밖에서 state
+  로만 읽어 예전 빌드도 이 키를 오류 없이 무시합니다. `scripts/!sam3.py` 만 바뀌어 Settings → Reload UI 로 적용됩니다. 자세한 내용은 README
+  워크플로 1 의 'API: 이미 만든 이미지에 SAM3 만'.
 
 ### TIPO 프롬프트 확장 (🪄)
 
