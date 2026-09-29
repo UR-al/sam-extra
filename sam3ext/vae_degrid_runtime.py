@@ -13,11 +13,13 @@
   Forge 목록에 들어간다. 끝나면 목록에서 빼고 ``model_unload``(→ CPU 로) + ``soft_empty_cache`` 로 VRAM 을 돌려준다.
   설정 ``sam3_degrid_keep_loaded`` 를 켜면 그대로 두어 Forge 가 자리가 필요할 때 내린다. Forge 가 부분 로드만 한 경우
   (``--novram`` 등 — 일반 ``nn.Conv2d`` 는 수동 캐스트가 없어 CPU 에 남음)에는 직접 옮긴다(약 117 MB).
-- 모델 생성과 장치 이동은 ``torch.inference_mode(False)`` 에서, 계산은 ``inference_mode`` 안에서 한다(Forge 는 이미지
-  후처리를 inference_mode 안에서 부른다 — ``model_for`` 참고).
+- 모델 생성과 직접 하는 장치 이동은 ``torch.inference_mode(False)`` 에서, 계산은 ``inference_mode`` 안에서 한다(Forge 는
+  이미지 후처리를 inference_mode 안에서 부른다 — ``model_for`` 참고). ``load_models_gpu`` 는 감싸지 않고 부른 문맥 그대로
+  부른다 — 그 안에서 Forge 가 inference_mode 안에서 만든 자기 모델을 내릴 수 있다(``_acquire`` 참고).
 - 타일은 모델의 ``padder_size``(NAFNet-small 16) 배수로 반사 패딩해 넣고 자른다 — spandrel NAFNet 은 안에서 0 으로 채워
   16 배수가 아닌 크기의 오른쪽·아래 가장자리에 큰 잔차를 낸다. 16 배수면 그대로라 노드 팩과 같다.
-- 모델 출력이 잔차가 아니라 이미지처럼 보이면(일반 복원 NAFNet 을 고른 경우) ``NotResidualModelError`` 로 거절한다.
+- 모델 출력이 잔차가 아니라 이미지처럼 보이면(입력을 따라감 — 일반 복원 NAFNet 을 고른 경우) ``NotResidualModelError`` 로
+  거절한다(``vae_degrid.check_residual``).
 """
 from __future__ import annotations
 
@@ -127,6 +129,19 @@ def memory_estimate(height: int, width: int, tile: int) -> float:
 
 class NotResidualModelError(ValueError):
     """모델 출력이 잔차가 아니라 이미지다 — DeGrid 가 아닌 일반 NAFNet(노이즈 제거·디블러 등)을 고른 경우."""
+
+
+def not_residual_message(model_name: str, check: vd.ResidualCheck) -> str:
+    """``NotResidualModelError`` 문구(infotext ``Anima DeGrid error`` 로도 남는다) — 무엇을 보고 거절했는지 숫자로."""
+    if check.correlation is not None:
+        correlation = f"{check.correlation:+.2f}"
+    else:
+        correlation = "n/a (single-color input)" if check.input_flat else "n/a"
+    return (
+        f"not a DeGrid residual model: {model_name} output does not look like a residual - it follows the input like "
+        f"an image (mean |output| {check.mean_abs * 255:.1f}/255; correlation with the input {correlation}) - "
+        "use a VAE DeGrid NAFNet"
+    )
 
 
 def model_pad_multiple(model) -> int:
@@ -279,8 +294,11 @@ class DegridRuntime:
                 self._release_locked()
             patcher = model_patcher(model, load_device=device, offload_device=torch.device("cpu"))
             self._patcher = patcher
-        with torch.inference_mode(False):
-            memory_management.load_models_gpu([patcher], memory_required=memory_required, force_full_load=True)
+        # 부른 문맥 그대로(scripts/anima_vae_2x.py ``_load_decoder`` 와 같음) — VRAM 이 모자라면 Forge 가 여기서 자기
+        # UNet·TE·VAE 를 (일부) 내리는데, 이것들은 Forge 가 inference_mode 안에서 만들어 inference_mode(False) 로 감싸 옮기면
+        # 다시 올릴 때까지 'Inference tensors do not track version counter.' 상태가 된다. 이 모델은 ``model_for`` 가
+        # inference_mode 밖에서 만들어 어느 문맥에서 옮겨도 계산된다.
+        memory_management.load_models_gpu([patcher], memory_required=memory_required, force_full_load=True)
         if self._off_device(model, device):
             if not self._stranded_logged:
                 self._stranded_logged = True
@@ -358,11 +376,9 @@ class DegridRuntime:
                         x, residual, tile=tile, overlap=vd.TILE_OVERLAP, out_device="cpu", is_oom=is_oom,
                         on_retry=on_retry,
                     )
-                    if vd.output_looks_like_image(x, delta):
-                        raise NotResidualModelError(
-                            f"not a DeGrid residual model: {entry.name} outputs an image, not a residual "
-                            f"(mean |output| {float(delta.abs().mean()) * 255:.1f}/255) - use a VAE DeGrid NAFNet"
-                        )
+                    check = vd.check_residual(x, delta)
+                    if check.looks_like_image:
+                        raise NotResidualModelError(not_residual_message(entry.name, check))
                     result = vd.finalize(vd.apply_residual(x, delta, mode_key, strength))
             finally:
                 if release_after_run(keep, dev):

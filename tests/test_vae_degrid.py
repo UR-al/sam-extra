@@ -8,7 +8,8 @@
   노드(``nafnet_node.py`` 132-149줄)는 같은 식 뒤에 ``torch.clamp(result, 0, 1)``.
 - 타일: Forge ``backend/patcher/vae.py`` 의 ``tiled_scale_multidim``(ComfyUI v0.3.64 ``comfy/utils.py`` 를 옮긴 것 — 노드 팩이
   부르는 ``comfy.utils.tiled_scale`` 과 같은 함수)을 Forge 가 확장 옆에 있을 때만 AST 로 꺼내 쓴다(CI 에서는 건너뜀).
-- 실제 가중치(qwenVAEDegridNafnet_v11)는 SAM3_RUN_FORGE_INTEGRATION_TESTS=1 이고 파일이 있을 때만(CPU, 1~2 초).
+- 실제 가중치(qwenVAEDegridNafnet_v11 — 잔차 검사는 있으면 Anzhc 파인튜닝 NAFNet-QwenVAE-DeGrid 로도)는
+  SAM3_RUN_FORGE_INTEGRATION_TESTS=1 이고 파일이 있을 때만(CPU, 약 10 초).
 """
 from __future__ import annotations
 
@@ -39,6 +40,9 @@ FORGE_ROOT = ROOT.parents[1]
 FORGE_VAE_PY = FORGE_ROOT / "backend" / "patcher" / "vae.py"
 REAL_MODEL = Path(os.environ.get(
     "SAM3_DEGRID_MODEL", str(FORGE_ROOT / "models" / "ESRGAN" / "qwenVAEDegridNafnet_v11.safetensors")))
+# 다른 DeGrid 파인튜닝(Anzhc 의 NAFNet-QwenVAE-DeGrid) — 있으면 잔차 검사 실제 가중치 테스트를 이것으로도 돈다.
+REAL_MODEL_ALT = Path(os.environ.get(
+    "SAM3_DEGRID_MODEL_ALT", str(FORGE_ROOT / "models" / "ESRGAN" / "NAFNet-QwenVAE-DeGrid.safetensors")))
 
 try:
     import spandrel  # noqa: F401
@@ -183,6 +187,76 @@ class ResidualSanityTests(unittest.TestCase):
         self.assertFalse(vd.output_looks_like_image(black, torch.full_like(black, 1 / 255)))
         flat = torch.full((1, 3, 32, 32), 0.5)     # 분산 0 — 상관을 정할 수 없으면 잔차로 본다
         self.assertFalse(vd.output_looks_like_image(flat, torch.full_like(flat, 5 / 255)))
+
+    @staticmethod
+    def _screentone(size=64):
+        yy, xx = torch.meshgrid(torch.arange(size), torch.arange(size), indexing="ij")
+        dots = ((yy % 4) < 2) & ((xx % 4) < 2)                      # 4px 망점(2x2 검은 점) — 화면 전체
+        return (~dots).float().expand(1, 3, size, size).contiguous()
+
+    @staticmethod
+    def _checker(size=64):
+        yy, xx = torch.meshgrid(torch.arange(size), torch.arange(size), indexing="ij")
+        return ((yy + xx) % 2).float().expand(1, 3, size, size).contiguous()
+
+    def test_large_residual_that_opposes_the_input_is_accepted(self):
+        # 실제 DeGrid 가 잔 스크린톤·1px 체커에 내는 잔차: 크지만(25/255 초과) 입력과 반대로 움직여 무늬를 누른다
+        # (CPU 실측 v1.1: 4px 스크린톤 |평균| 31.3/255 r -0.92, 1px 체커 56.7/255 r -0.47)
+        tone = self._screentone()
+        noise = torch.randn(tone.shape, generator=self.g)
+        raw = -0.33 * (tone - tone.mean()) + 0.06 * noise
+        check = vd.check_residual(tone, raw)
+        self.assertGreater(check.mean_abs, vd.IMAGE_LIKE_ABS_MEAN)
+        self.assertLess(check.correlation, -0.8)
+        self.assertFalse(check.looks_like_image)
+        self.assertFalse(vd.output_looks_like_image(tone, raw))
+
+        checker = self._checker()
+        raw = 0.08 - 0.2 * (checker - 0.5) + 0.19 * torch.randn(checker.shape, generator=self.g)
+        check = vd.check_residual(checker, raw)
+        self.assertGreater(check.mean_abs, vd.IMAGE_LIKE_ABS_MEAN)
+        self.assertLess(check.correlation, -0.3)
+        self.assertFalse(vd.output_looks_like_image(checker, raw))
+
+    def test_large_uncorrelated_residual_is_accepted(self):
+        raw = (torch.rand(self.x.shape, generator=self.g) - 0.5) * 0.5   # |평균| 약 32/255, 상관 약 0
+        self.assertGreater(float(raw.abs().mean()), vd.IMAGE_LIKE_ABS_MEAN)
+        self.assertFalse(vd.output_looks_like_image(self.x, raw))
+
+    def test_image_outputs_on_screentone_and_checker_are_refused(self):
+        for name, pattern in (("screentone", self._screentone()), ("checker", self._checker())):
+            with self.subTest(name=name):
+                self.assertTrue(vd.output_looks_like_image(pattern, pattern.clone()))              # 복원 이미지 그대로
+                softened = 0.7 * pattern + 0.3 * float(pattern.mean())                          # 대비만 줄인 이미지
+                self.assertTrue(vd.output_looks_like_image(pattern, softened))
+
+    def test_large_output_that_loosely_follows_the_input_is_refused(self):
+        # r 0.5~0.9 — 작은 출력이면 잔차로 보지만(날카롭게 하는 잔차는 r 이 양수일 수 있다), 크면 이미지다
+        out = self.x + 0.45 * torch.randn(self.x.shape, generator=self.g)
+        check = vd.check_residual(self.x, out)
+        self.assertGreater(check.mean_abs, vd.IMAGE_LIKE_ABS_MEAN)
+        self.assertTrue(0.5 < check.correlation < 0.9, check.correlation)
+        self.assertTrue(check.looks_like_image)
+        small = 0.04 * (self.x - 0.5) + 0.012 * torch.randn(self.x.shape, generator=self.g)  # 비슷한 상관, |평균| 약 3/255
+        check = vd.check_residual(self.x, small)
+        self.assertTrue(vd.IMAGE_LIKE_MIN_ABS_MEAN < check.mean_abs < vd.IMAGE_LIKE_ABS_MEAN, check.mean_abs)
+        self.assertTrue(0.5 < check.correlation < 0.9, check.correlation)
+        self.assertFalse(check.looks_like_image)
+
+    def test_single_colour_input_with_a_large_output_is_refused(self):
+        # 한 색 입력은 상관을 정할 수 없다 — 이미지를 내는 모델이면 출력이 그 색 그대로다
+        flat = torch.full((1, 3, 32, 32), 128 / 255)
+        check = vd.check_residual(flat, flat.clone())
+        self.assertTrue(check.input_flat)
+        self.assertIsNone(check.correlation)
+        self.assertTrue(check.looks_like_image)
+        self.assertFalse(vd.output_looks_like_image(flat, torch.full_like(flat, 5 / 255)))
+        red = torch.zeros((1, 3, 32, 32))
+        red[:, 0] = 1.0                            # 채널마다 값이 달라 상관을 정할 수 있다
+        self.assertTrue(vd.output_looks_like_image(red, red.clone()))
+
+    def test_constant_output_does_not_follow_the_input(self):
+        self.assertFalse(vd.output_looks_like_image(self.x, torch.full_like(self.x, 40 / 255)))
 
 
 def _pointwise(t):
@@ -722,7 +796,23 @@ class RuntimeTests(unittest.TestCase):
         rt = vdr.DegridRuntime(loader=lambda path: Identity(), forge_memory=lambda: None, logger=self.logs.append)
         with self.assertRaises(vdr.NotResidualModelError) as caught:
             rt.run(self._image(), self.entry, device="cpu")
-        self.assertIn("not a DeGrid residual model", str(caught.exception))
+        message = str(caught.exception)
+        self.assertIn("not a DeGrid residual model", message)
+        self.assertIn("output does not look like a residual", message)
+        self.assertIn("correlation with the input +1.00", message)
+        self.assertNotIn("outputs an image", message)
+
+    def test_large_opposing_residual_is_applied_through_the_runtime(self):
+        class Flatten(torch.nn.Module):     # 잔 무늬를 누르는 DeGrid 대역: 잔차 = -(x - 5x5 평균) — 크고 입력과 반대로
+            def forward(self, x):
+                return -(x - torch.nn.functional.avg_pool2d(x, 5, 1, 2, count_include_pad=False))
+
+        yy, xx = np.mgrid[:64, :64]
+        tone = Image.fromarray((255 * ~(((yy % 4) < 2) & ((xx % 4) < 2))).astype(np.uint8)).convert("RGB")
+        rt = vdr.DegridRuntime(loader=lambda path: Flatten(), forge_memory=lambda: None, logger=self.logs.append)
+        out = rt.run(tone, self.entry, tile=0, device="cpu")
+        self.assertGreater(out.stats["abs_mean_255"], 25.0)
+        self.assertGreater(out.stats["changed_pixels"], 0.9)
 
 
 class _ConvResidual(torch.nn.Module):
@@ -911,6 +1001,118 @@ class ForgeMemoryTests(unittest.TestCase):
         self.assertEqual(self.mm.current_loaded_models, [])
 
 
+def _forge_built_model():
+    """Forge 가 만든 모델 대역 — Forge 는 UNet·TE·VAE 를 ``@torch.inference_mode()`` 안에서 만든다(``backend/loader.py``
+    forge_loader, ``modules/sd_models.py`` forge_model_reload). 그래서 파라미터가 inference 텐서다."""
+    with torch.inference_mode():
+        return torch.nn.Sequential(torch.nn.Conv2d(3, 3, 3), torch.nn.LayerNorm(6))
+
+
+def _dtype_round_trip(model):
+    """장치 이동 대역 — CPU↔CUDA 와 같은 ``Module._apply`` 의 ``param.data =`` 경로(dtype 왕복)."""
+    model.to(torch.float64)
+    model.to(torch.float32)
+
+
+class _MovingLoaded(_FakeLoaded):
+    def model_unload(self):
+        self.unloads += 1
+        _dtype_round_trip(self.model.model)        # detach → offload_device(CPU) 로
+
+
+class _EvictingMemory(_FakeMemory):
+    """``load_models_gpu`` 대역: 자리가 모자라 Forge 모델을 (일부) 내리고(``free_memory`` → ``model_unload``) 요청한 모델을
+    올린다 — 둘 다 부른 문맥에서. 부를 때의 inference_mode 여부를 기록한다."""
+
+    def __init__(self, forge_model):
+        super().__init__()
+        self.forge_model = forge_model
+        self.inference_mode_seen = []
+
+    def load_models_gpu(self, models, memory_required=0, force_full_load=False):
+        self.inference_mode_seen.append(torch.is_inference_mode_enabled())
+        self.calls.append((list(models), memory_required, force_full_load))
+        self.forge_model.to(torch.float64)          # free_memory: Forge 모델을 내림
+        for patcher in models:
+            if not any(entry.model is patcher for entry in self.current_loaded_models):
+                _dtype_round_trip(patcher.model)     # 요청한 모델을 올림
+                self.current_loaded_models.insert(0, _MovingLoaded(patcher))
+
+
+class _PlacedRuntime(vdr.DegridRuntime):
+    """Forge 가 모델을 (가짜) GPU 에 다 올렸다고 본다 — 직접 옮기지 않는다."""
+
+    @staticmethod
+    def _off_device(model, device):
+        return False
+
+
+class AcquireInferenceModeTests(unittest.TestCase):
+    """``load_models_gpu`` 는 부른 문맥 그대로 부른다(``scripts/anima_vae_2x.py`` ``_load_decoder`` 와 같음). VRAM 이 모자라면
+    Forge 가 자리를 내려고 자기 UNet·TE·VAE 를 (일부) 내리는데, 이 모델들은 inference_mode 안에서 만들어져 inference_mode
+    밖에서 옮기면 Forge 가 다시 올릴 때까지 'Inference tensors do not track version counter.' 로 계산이 죽는다. DeGrid 모델은
+    ``model_for`` 가 inference_mode 밖에서 만들어 어느 문맥에서 옮겨도 계산되므로 감쌀 이유가 없다."""
+
+    def setUp(self):
+        _FakePatcher.made.clear()
+        self.tmp = tempfile.TemporaryDirectory()
+        self.path = Path(self.tmp.name) / "m.safetensors"
+        self.path.write_bytes(b"x")
+        self.forge_model = _forge_built_model()
+        self.mm = _EvictingMemory(self.forge_model)
+        self.rt = _PlacedRuntime(loader=lambda path: _ConvResidual(), forge_memory=lambda: (self.mm, _FakePatcher),
+                                 logger=lambda m: None)
+        self.cuda = torch.device("cuda")
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_load_models_gpu_runs_in_the_callers_context(self):
+        model = self.rt.model_for(self.path)
+        with torch.inference_mode():                 # 생성 탭(postprocess_image_after_composite)
+            self.rt._acquire(model, self.cuda, 1.0)
+        self.rt.release()
+        self.rt._acquire(model, self.cuda, 1.0)      # Extras
+        self.assertEqual(self.mm.inference_mode_seen, [True, False])
+
+    def test_forge_model_moved_to_make_room_keeps_working(self):
+        with torch.inference_mode():
+            model = self.rt.model_for(self.path)
+            self.rt._acquire(model, self.cuda, 1.0)
+            # 다음 생성의 Forge 모델 계산 — 예전(inference_mode(False) 로 감쌈)에는 여기서 RuntimeError
+            out = self.forge_model(torch.rand(1, 3, 8, 8, dtype=torch.float64))
+        self.assertEqual(tuple(out.shape), (1, 3, 6, 6))
+
+    def test_degrid_model_survives_moves_inside_and_outside_inference_mode(self):
+        x = torch.rand(1, 3, 16, 16)
+        with torch.inference_mode():                 # 생성 탭에서 처음 불러옴
+            model = self.rt.model_for(self.path)
+        with torch.inference_mode():
+            reference = model(x).clone()
+        outs = []
+        for label, inside in (("txt2img", True), ("txt2img", True), ("Extras", False), ("txt2img", True)):
+            with self.subTest(step=label):
+                with torch.inference_mode(inside):
+                    self.rt._acquire(model, self.cuda, 1.0)     # 부른 문맥에서 올림
+                with torch.inference_mode():
+                    outs.append(model(x).clone())
+                with torch.inference_mode(inside):
+                    self.assertTrue(self.rt.release())          # 내림(inference_mode 밖)
+        # 남겨 둔(keep_loaded) 모델을 생성 탭에서 올린 뒤 Forge 가 inference_mode 밖에서 옮기는 경우
+        with torch.inference_mode():
+            self.rt._acquire(model, self.cuda, 1.0)
+        self.assertTrue(any(p.is_inference() for p in model.parameters()))
+        _dtype_round_trip(model)
+        with torch.inference_mode():
+            outs.append(model(x).clone())
+        vdr.DegridRuntime._move(model, torch.float64)            # 부분 로드를 직접 마무리하는 경로
+        with torch.inference_mode():
+            outs.append(model(x.double()).float().clone())
+        for out in outs:
+            torch.testing.assert_close(out, reference)
+        self.assertFalse(any(p.is_inference() for p in model.parameters()))
+
+
 def _synthetic_illustration(size=256, seed=0):
     """VAE 를 거친 적 없는 깨끗한 그림(단색 면·그라데이션·안티에일리어싱 선)."""
     rng = np.random.default_rng(seed)
@@ -1020,6 +1222,81 @@ class RealWeightsTests(unittest.TestCase):
             theirs = tiled_scale(x, lambda t: self.model(t.float()), tile_x=256, tile_y=256, overlap=32,
                                  upscale_amount=1, out_channels=3, output_device="cpu")
         self.assertTrue(torch.equal(ours, theirs))
+
+
+def _screentone_image(size=512):
+    """화면을 채운 4px 망점(2x2 검은 점) — 만화 스크린톤."""
+    yy, xx = np.mgrid[:size, :size]
+    return Image.fromarray((255 * ~(((yy % 4) < 2) & ((xx % 4) < 2))).astype(np.uint8)).convert("RGB")
+
+
+def _checker_image(size=512):
+    yy, xx = np.mgrid[:size, :size]
+    return Image.fromarray((((yy + xx) % 2) * 255).astype(np.uint8)).convert("RGB")
+
+
+class _RestoredImage(torch.nn.Module):
+    """같은 DeGrid 망을 '복원 이미지' 를 내게 감싼 것(``x + 잔차``) — 이미지를 내는 일반 NAFNet 대역."""
+
+    def __init__(self, residual_model):
+        super().__init__()
+        self.residual_model = residual_model
+
+    def forward(self, x):
+        return x + self.residual_model(x)
+
+
+@unittest.skipUnless(
+    HAVE_SPANDREL and os.environ.get("SAM3_RUN_FORGE_INTEGRATION_TESTS") == "1" and REAL_MODEL.is_file(),
+    "실제 DeGrid 가중치 — SAM3_RUN_FORGE_INTEGRATION_TESTS=1 (파일: SAM3_DEGRID_MODEL 또는 models/ESRGAN 기본 경로)",
+)
+class RealWeightsResidualCheckTests(unittest.TestCase):
+    """실제 DeGrid 가중치(v1.1 + 있으면 다른 파인튜닝)로 잔차 검사: 잔 스크린톤·1px 체커에서는 잔차가 25/255 를 넘게
+    커지지만 입력과 반대로 움직이므로 적용하고(예전에는 크기만 보고 거절해 DeGrid 없이 저장), 같은 망이 복원 이미지를
+    내면 어떤 입력에서도 거절한다. CPU fp32 — 무늬는 512²(256² 스크린톤은 v1.1 잔차가 21/255 로 작아 예전 규칙도 통과)."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.models = []
+        for path in dict.fromkeys((REAL_MODEL, REAL_MODEL_ALT)):
+            if path.is_file():
+                cls.models.append((vdm.ModelEntry(path.stem, str(path)), vdm.load_nafnet(path)))
+
+    def _runtime(self, model):
+        return vdr.DegridRuntime(loader=lambda path: model, forge_memory=lambda: None, logger=lambda m: None)
+
+    def test_screentone_and_checker_are_degridded_not_refused(self):
+        for entry, model in self.models:
+            rt = self._runtime(model)
+            for name, image in (("screentone 4px", _screentone_image()), ("checker 1px", _checker_image())):
+                with self.subTest(model=entry.name, input=name):
+                    x, _ = vd.pil_to_tensor(image)
+                    with torch.inference_mode():
+                        fn, _ = vdr.make_residual_fn(model, torch.device("cpu"), False)
+                        check = vd.check_residual(x, vd.tiled_residual(x, fn, tile=512))
+                    # CPU 실측(512²) v1.1: 스크린톤 31.3/255 r -0.92, 체커 56.7/255 r -0.47 · Anzhc: 46.8 r -0.93, 47.3 r -0.53
+                    self.assertGreater(check.mean_abs, vd.IMAGE_LIKE_ABS_MEAN)     # 크기만 보던 예전 규칙은 거절
+                    self.assertLess(check.correlation, 0.0)
+                    self.assertFalse(check.looks_like_image)
+                    out = rt.run(image, entry, mode="full", strength=1.0, tile=512, device="cpu")
+                    self.assertFalse(out.skipped)
+                    self.assertGreater(out.stats["changed_pixels"], 0.2)
+
+    def test_anima_like_illustration_is_accepted(self):
+        x, _ = vd.pil_to_tensor(_synthetic_illustration(256, seed=4))
+        for entry, model in self.models:
+            with self.subTest(model=entry.name), torch.inference_mode():
+                self.assertFalse(vd.output_looks_like_image(x, model(x)))
+
+    def test_same_network_returning_the_image_is_refused(self):
+        for entry, model in self.models:
+            rt = self._runtime(_RestoredImage(model))
+            for name, image in (("illustration", _synthetic_illustration(256, seed=5)),
+                                ("screentone 4px", _screentone_image()), ("checker 1px", _checker_image())):
+                with self.subTest(model=entry.name, input=name):
+                    with self.assertRaises(vdr.NotResidualModelError) as caught:
+                        rt.run(image, entry, tile=512, device="cpu")
+                    self.assertIn("output does not look like a residual", str(caught.exception))
 
 
 if __name__ == "__main__":

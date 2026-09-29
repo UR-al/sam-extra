@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import itertools
 import math
+from dataclasses import dataclass
 from typing import Callable
 
 import numpy as np
@@ -74,12 +75,16 @@ MAX_TILE = 4096
 # NAFNet-small(인코더 4단)이 안에서 맞추는 배수 — spandrel ``padder_size = 2 ** len(encoders)``. 모델에 값이 없을 때 쓴다.
 PAD_MULTIPLE = 16
 
-# 출력이 잔차가 아니라 이미지인지 — 실제 v1.1·다른 DeGrid 파인튜닝은 |평균| 0.1~0.7/255(최대 수십/255)이고 입력과의
-# 상관이 |r| 0.2 안팎 이하다(CPU 실측, Anima 512² 조각 4장: -0.09~+0.19). 복원 이미지를 내는 NAFNet 은 |평균| 이 이미지
-# 밝기(수십~백여/255)이고 상관이 1 에 가깝다.
-IMAGE_LIKE_ABS_MEAN = 25 / 255       # 잔차가 평균 25 단계를 넘으면 이미지로 본다
-IMAGE_LIKE_MIN_ABS_MEAN = 2 / 255    # 이 아래면 상관을 보지 않는다(거의 검은 이미지에서 헛판정 방지)
-IMAGE_LIKE_CORRELATION = 0.9
+# 출력이 잔차가 아니라 이미지인지 — 복원 이미지를 내는 NAFNet 의 출력은 입력을 **따라간다**: |평균| 이 이미지 밝기
+# (수십~백여/255)이고 입력과의 상관 r 이 1 에 가깝다. DeGrid 잔차는 Anima 이미지에서 작고(|평균| 0.2~0.5/255, r -0.1~+0.45 —
+# CPU 실측 v1.1·Anzhc 파인튜닝, 512² 조각 6장·1216×1856 3장), 화면을 채운 잔 스크린톤·1px 체커처럼 격자와 닮은 무늬에서는
+# 크지만(4px 스크린톤 31~47/255, 1px 체커 47~57/255) 입력과 **반대로**(r -0.9~-0.5) 움직여 무늬를 누른다. 그래서 크기만으로
+# 거르지 않고 입력을 따라가는지(양의 상관)를 본다 — ``check_residual``.
+IMAGE_LIKE_MIN_ABS_MEAN = 2 / 255    # 이 아래면 보지 않는다(거의 검은 이미지에서 헛판정 방지)
+IMAGE_LIKE_CORRELATION = 0.9         # 이만큼 따라가면 크기와 상관없이 이미지(어두운 이미지를 내는 모델도)
+IMAGE_LIKE_ABS_MEAN = 25 / 255       # 이보다 크면서
+IMAGE_LIKE_LARGE_CORRELATION = 0.5   # 이만큼 따라가거나 입력이 한 색(상관을 정할 수 없음)이면 이미지.
+                                     # 실제 DeGrid 잔차의 r 은 작을 때 +0.81(2px 체커) 까지, 25/255 를 넘을 때 +0.18 까지 봤다.
 
 
 def normalize_mode(value) -> str | None:
@@ -150,24 +155,49 @@ def finalize(result: torch.Tensor) -> torch.Tensor:
     return torch.clamp(result, min=0.0, max=1.0)
 
 
-def output_looks_like_image(image: torch.Tensor, raw: torch.Tensor) -> bool:
+@dataclass(frozen=True)
+class ResidualCheck:
+    """``check_residual`` 결과 — 판정과 오류 문구에 쓸 숫자."""
+
+    mean_abs: float                  # |출력| 평균([0, 1] 단위)
+    correlation: float | None        # 입력과의 피어슨 상관 — 작아서 보지 않았거나 정할 수 없으면 None
+    input_flat: bool                 # 입력이 한 값뿐이라 상관을 정할 수 없다(|평균| 이 2/255 이하면 보지 않아 False)
+    looks_like_image: bool
+
+
+def check_residual(image: torch.Tensor, raw: torch.Tensor) -> ResidualCheck:
     """모델 출력(``raw``)이 잔차가 아니라 이미지인가 — 파일 키로는 DeGrid 와 일반 복원 NAFNet(SIDD width 32 노이즈 제거는
-    구성까지 같다)을 가를 수 없어, 출력으로 거른다. |평균| 이 25/255 를 넘거나, 2/255 를 넘으면서 입력과의 상관이
-    0.9 를 넘으면 이미지다. 분산이 0 이라 상관을 정할 수 없으면 잔차로 본다."""
+    구성까지 같다)을 가를 수 없어, 출력이 입력을 따라가는지로 거른다. |평균| 이 2/255 를 넘으면서
+
+    - 입력과의 상관이 0.9 를 넘거나,
+    - |평균| 이 25/255 를 넘고, 상관이 0.5 를 넘거나 입력이 한 색이면(상관을 정할 수 없고, 이미지를 내는 모델이면 그 색이
+      그대로 나온다)
+
+    이미지다. 크지만 입력과 반대로 움직이는 잔차(잔 스크린톤·1px 체커를 누르는 DeGrid)와, 한 값뿐이라 입력을 따라가지
+    않는 출력은 잔차로 본다."""
     mean_abs = float(raw.abs().mean()) if raw.numel() else 0.0
-    if mean_abs > IMAGE_LIKE_ABS_MEAN:
-        return True
     if not mean_abs > IMAGE_LIKE_MIN_ABS_MEAN:
-        return False
-    # float32 로 충분하다(문턱 0.9) — hires 2432×3712 에서도 사본 두 개 약 0.2 GB.
+        return ResidualCheck(mean_abs, None, False, False)
+    # float32 로 충분하다(문턱 0.5·0.9) — hires 2432×3712 에서도 사본 두 개 약 0.2 GB.
     a = image.detach().reshape(-1).to(dtype=torch.float32)
+    if bool(a.amax() == a.amin()):   # 정확히 본다 — a - a.mean() 은 반올림 찌꺼기가 남을 수 있다
+        return ResidualCheck(mean_abs, None, True, mean_abs > IMAGE_LIKE_ABS_MEAN)
     b = raw.detach().reshape(-1).to(device=a.device, dtype=torch.float32)
     a = a - a.mean()
     b = b - b.mean()
     denominator = float(a.norm()) * float(b.norm())
     if not denominator > 0.0:
-        return False
-    return float(torch.dot(a, b)) / denominator > IMAGE_LIKE_CORRELATION
+        return ResidualCheck(mean_abs, None, False, False)
+    correlation = float(torch.dot(a, b)) / denominator
+    looks_like_image = correlation > IMAGE_LIKE_CORRELATION or (
+        mean_abs > IMAGE_LIKE_ABS_MEAN and correlation > IMAGE_LIKE_LARGE_CORRELATION
+    )
+    return ResidualCheck(mean_abs, correlation, False, looks_like_image)
+
+
+def output_looks_like_image(image: torch.Tensor, raw: torch.Tensor) -> bool:
+    """``check_residual(image, raw).looks_like_image``."""
+    return check_residual(image, raw).looks_like_image
 
 
 # ---------------------------------------------------------------------------
