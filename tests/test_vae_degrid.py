@@ -332,6 +332,19 @@ class ResidualSanityTests(unittest.TestCase):
         self.assertFalse(check.looks_like_image)
         self.assertTrue(check.blew_up)
 
+    def test_dark_checker_residual_is_not_an_image(self):
+        # Anzhc 가 어두운 1px 체커(0/40)에서 내는 잔차 모양 — |평균| 64.6, 부호 쏠림 0.54, 투영 비 1.7, 입력과 반대 방향.
+        # 부호 쏠림 문턱이 0.5 이면 '이미지'로 잘못 거절됐다(0.8 로 올림).
+        yy, xx = torch.meshgrid(torch.arange(64), torch.arange(64), indexing="ij")
+        dark = ((yy + xx) % 2 == 1).float().expand(1, 3, 64, 64).contiguous() * (40 / 255)
+        raw = torch.where(dark > 0, -30.0 / 255, 99.2 / 255)
+        check = vd.check_residual(dark, raw)
+        self.assertGreater(check.signed_mean, vd.IMAGE_LIKE_DC_MEAN)
+        self.assertGreater(check.dc_ratio, vd.IMAGE_LIKE_DC_RATIO)
+        self.assertGreater(abs(check.signed_mean), 0.5 * check.mean_abs)
+        self.assertFalse(check.looks_like_image)
+        self.assertFalse(check.blew_up)
+
     def test_blow_up_ceiling(self):
         sign = torch.where(torch.rand(self.x.shape, generator=self.g) < 0.5, 1.0, -1.0)
         below = vd.check_residual(self.x, sign * (99 / 255))
@@ -339,7 +352,7 @@ class ResidualSanityTests(unittest.TestCase):
         self.assertFalse(below.blew_up)
         self.assertTrue(above.blew_up)
         self.assertFalse(above.looks_like_image)                 # 폭주는 이미지 판정과 따로
-        # 폭주 문턱 아래 — 실제로 잰 가장 큰 폭주 아닌 잔차(62.8/255)와 가장 작은 폭주(183.1/255) 사이
+        # 실측 예시: 1px 체커 잔차 62.8/255 는 적용, 118/138 1px 체커의 폭주 183.1/255 는 건너뜀(깨끗한 틈은 아님 — 어림 문턱)
         self.assertLess(62.8 / 255, vd.RESIDUAL_BLOWUP_ABS_MEAN)
         self.assertLess(vd.RESIDUAL_BLOWUP_ABS_MEAN, 183.1 / 255)
         self.assertFalse(vd.check_residual(self.x, sign * (1 / 255)).blew_up)   # 2/255 이하는 보지 않음
