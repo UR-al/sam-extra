@@ -45,7 +45,7 @@ class ScriptPostprocessingVaeDegrid(scripts_postprocessing.ScriptPostprocessing)
         try:
             outcome = vdr.shared_runtime().run(pp.image, entry, mode=cfg.mode, strength=cfg.strength, tile=cfg.tile)
         except Exception as exc:
-            reason = f"{type(exc).__name__}: {exc}"
+            reason = vdr.failure_reason(exc)
             vdr.log(f"Extras: 실패 — 원본을 그대로 둡니다: {reason}")
             pp.info[uvd.KEY_ERROR] = " ".join(reason.split())
             try:

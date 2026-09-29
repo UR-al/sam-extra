@@ -646,12 +646,20 @@ Anima(Qwen·Wan VAE)로 만든 이미지에 생기는 **VAE 격자 무늬**를
   들어옵니다.
 - ⚠️ **DeGrid(잔차) NAFNet 만** 쓸 수 있습니다. 이미지를 내는 일반 복원 NAFNet(SIDD 노이즈 제거·GoPro 디블러 등)도 키가 같아
   목록에 나오지만(SIDD width 32 는 구성까지 같음), 고르면 출력이 잔차가 아니라 입력을 따라가는 이미지라서 적용하지 않고
-  `Anima DeGrid error: … not a DeGrid residual model: … output does not look like a residual …` 을 남깁니다(출력 |평균|
-  2/255 초과이면서 입력과의 상관 0.9 초과, 또는 |평균| 25/255 초과이면서 상관 0.5 초과이거나 입력이 한 색 — 실제 v1.1·Anzhc
-  파인튜닝은 Anima 이미지에서 |평균| 0.2~0.5/255, 상관 -0.1~+0.45).
+  `Anima DeGrid error: not a DeGrid residual model: … output does not look like a residual …` 을 남깁니다(출력 |평균|
+  2/255 초과이면서 입력과의 상관 0.9 초과, 또는 |평균| 25/255 초과이면서 상관 0.5 초과이거나 입력이 한 색, 또는 출력 밝기가
+  입력 밝기를 따라감 — |출력 평균| 25/255 초과·한 부호로 쏠림(|평균| ≥ 0.5×평균|출력|)·채널별 평균의 투영 비 0.5 초과. 마지막
+  것은 회색 입자 바탕·화면을 채운 스크린톤처럼 잔 결이 입력 분산의 대부분이라 흐림·median 같은 이미지 모델의 상관이 0.3 안팎으로
+  낮아지는 경우를 거릅니다. 실제 v1.1·Anzhc 파인튜닝은 Anima 이미지에서 |평균| 0.2~0.5/255, 상관 -0.1~+0.45, 투영 비 ±0.04 이내).
 - 화면을 채운 **잔 스크린톤(4px 망점)·1px 체커** 같은 무늬는 DeGrid 가 격자로 보고 누릅니다. 잔차가 31~57/255 로 커지지만
   입력과 반대로(상관 -0.5~-0.9) 움직이는 잔차라 거절하지 않고 적용합니다(ComfyUI 노드와 같음 — CPU 실측 512², 강도 1:
   4px 스크린톤 대비가 v1.1 ×0.68, Anzhc ×0.55). 스크린톤을 살리려면 그 이미지에서는 DeGrid 를 끄거나 강도를 낮추세요.
+- 화면을 채운 **1px 줄무늬·3px 세로줄·저대비(118/138) 1px 줄무늬**처럼 학습에 없던 무늬에서는 DeGrid 잔차가 **폭주**합니다
+  (|평균| 183~2143/255 — 그대로 더하면 PSNR 4~8 dB). 잔차 |평균| 이 **100/255** 를 넘으면 그 이미지는 DeGrid 없이 원본을 저장하고
+  `Anima DeGrid error: output blew up (mean |residual| …/255 > 100/255 - …)` 을 남기며 콘솔에도 적습니다(CPU 실측 512²: 폭주가
+  아닌 잔차는 최대 62.8/255(64² 1px 체커), 폭주는 최소 183.1/255. 저대비 1px 체커는 v1.1 만 폭주하고 Anzhc 는 23.8/255 로 적용,
+  0/255 1px 체커·4px 스크린톤은 두 모델 모두 적용). 이미지 전체의 평균으로 보므로 그런 무늬가 화면의 1/4 쯤이면 건너뛰지만,
+  더 작은 조각(512² 안의 128²)이면 그 부분만 망가진 채 적용될 수 있습니다.
 - ⚠️ 이 모델은 이미지가 아니라 **잔차**를 냅니다. ESRGAN 폴더에 두면 Forge 의 Hires fix·Extras Upscale 업스케일러 목록에도
   보이지만, 거기서 고르면 잔차만 남은 거의 검은 이미지가 나옵니다(Forge 업스케일러는 출력을 [0,1] 로 자르고 BGR 로
   넣습니다). 이 기능으로만 쓰세요. 헷갈리면 `models/DeGrid/` 에 두세요.
@@ -715,7 +723,8 @@ Anima(Qwen·Wan VAE)로 만든 이미지에 생기는 **VAE 격자 무늬**를
 infotext 에 `Anima DeGrid model`, `Anima DeGrid mode`(Full / Dark Pixels Mainly / Bright Pixels Mainly),
 `Anima DeGrid strength`, `Anima DeGrid tile`(**실제로 쓴** 타일 — 메모리 부족으로 512 → 256 → 128 로 줄였으면 줄인 값),
 `Anima DeGrid precision`(`fp32` / `fp16-autocast` — 결과가 최대 0.27/255 다름, 설정이라 붙여 넣지는 않음)이 남습니다. 모델이
-없거나 실패하면 이미지는 DeGrid 없이 저장되고 `Anima DeGrid error` 만 남습니다. PNG Info 로 붙여 넣으면 켜짐·방식·강도·타일과
+없거나, 이미지를 내는 모델이거나, 잔차가 폭주했거나, 실패하면 이미지는 DeGrid 없이 저장되고 `Anima DeGrid error` 만 남습니다
+(앞의 셋은 `model not found: …` · `not a DeGrid residual model: …` · `output blew up (…)` 문구만, 그 밖의 오류는 예외 이름을 붙여). PNG Info 로 붙여 넣으면 켜짐·방식·강도·타일과
 (그 PC 에 있으면) 모델이 되살아나고, 이 키가 없는 이미지를 붙여 넣으면 꺼집니다. Extras 결과는 PNG 의 `postprocessing` 항목에
 같은 키가 남습니다.
 

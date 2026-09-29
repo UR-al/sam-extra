@@ -87,7 +87,8 @@ class AnimaVaeDegrid(scripts.Script):
             outcome = vdr.shared_runtime().run(pp.image, entry, mode=cfg.mode, strength=cfg.strength, tile=cfg.tile)
         except Exception as exc:
             # Forge 는 이 훅의 예외를 콘솔에만 보고하고 이미지를 그대로 저장한다 — 여기서 받아 infotext 를 고친다.
-            reason = f"{type(exc).__name__}: {exc}"
+            # 예상한 건너뜀(이미지를 내는 모델·잔차 폭주)은 문구만, 그 밖은 예외 이름을 붙인다.
+            reason = vdr.failure_reason(exc)
             vdr.log(f"실패 — 이 이미지는 DeGrid 없이 저장합니다: {reason}")
             uvd.record_failure(_params(p), reason)
             try:

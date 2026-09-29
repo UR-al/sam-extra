@@ -9,7 +9,8 @@
 - 타일: Forge ``backend/patcher/vae.py`` 의 ``tiled_scale_multidim``(ComfyUI v0.3.64 ``comfy/utils.py`` 를 옮긴 것 — 노드 팩이
   부르는 ``comfy.utils.tiled_scale`` 과 같은 함수)을 Forge 가 확장 옆에 있을 때만 AST 로 꺼내 쓴다(CI 에서는 건너뜀).
 - 실제 가중치(qwenVAEDegridNafnet_v11 — 잔차 검사는 있으면 Anzhc 파인튜닝 NAFNet-QwenVAE-DeGrid 로도)는
-  SAM3_RUN_FORGE_INTEGRATION_TESTS=1 이고 파일이 있을 때만(CPU, 약 10 초).
+  SAM3_RUN_FORGE_INTEGRATION_TESTS=1 이고 파일이 있을 때만(CPU, 약 30 초). 실제 Anima 이미지 조각은 거기에 더해
+  SAM3_DEGRID_ANIMA_IMAGES(PNG 파일·폴더, os.pathsep 구분)를 줄 때만 — 생성 이미지는 저장소에 넣지 않는다.
 """
 from __future__ import annotations
 
@@ -43,6 +44,9 @@ REAL_MODEL = Path(os.environ.get(
 # 다른 DeGrid 파인튜닝(Anzhc 의 NAFNet-QwenVAE-DeGrid) — 있으면 잔차 검사 실제 가중치 테스트를 이것으로도 돈다.
 REAL_MODEL_ALT = Path(os.environ.get(
     "SAM3_DEGRID_MODEL_ALT", str(FORGE_ROOT / "models" / "ESRGAN" / "NAFNet-QwenVAE-DeGrid.safetensors")))
+# 모델마다 다르게 재 둔 값(저대비 1px 체커 폭주 여부)을 확인할 때 쓰는 기본 파일 이름.
+REAL_MODEL_V11_STEM = "qwenVAEDegridNafnet_v11"
+REAL_MODEL_ANZHC_STEM = "NAFNet-QwenVAE-DeGrid"
 
 try:
     import spandrel  # noqa: F401
@@ -257,6 +261,124 @@ class ResidualSanityTests(unittest.TestCase):
 
     def test_constant_output_does_not_follow_the_input(self):
         self.assertFalse(vd.output_looks_like_image(self.x, torch.full_like(self.x, 40 / 255)))
+        check = vd.check_residual(self.x, torch.full_like(self.x, 40 / 255))
+        self.assertLess(check.dc_ratio, vd.IMAGE_LIKE_DC_RATIO)       # 40/255 ÷ 입력 평균 약 0.5 = 0.31
+        self.assertFalse(check.follows_input_mean)
+
+    # ── 잔 결이 입력 분산의 대부분일 때: 이미지 모델의 상관은 낮지만 밝기(DC)는 입력 그대로 ──
+
+    def test_image_model_on_fine_grain_is_refused_by_brightness(self):
+        # 회색 바탕 200±4 입자 — 흐림·median 은 입자를 지워 r 이 0.3 아래로 떨어진다(dc59409 규칙은 적용해 모든 픽셀이 255)
+        grain = _grain_image_tensor(128)
+        for name, model in (("gaussian s2", _BlurImageModel(2.0)), ("median3", _Median3ImageModel())):
+            with self.subTest(model=name):
+                check = vd.check_residual(grain, model(grain))
+                self.assertGreater(check.mean_abs, vd.IMAGE_LIKE_ABS_MEAN)
+                self.assertLess(check.correlation, vd.IMAGE_LIKE_LARGE_CORRELATION)   # 상관 규칙만으로는 못 거른다
+                self.assertAlmostEqual(check.dc_ratio, 1.0, places=2)
+                self.assertAlmostEqual(check.signed_mean, check.mean_abs, places=6)  # 이미지 — 음수가 없다
+                self.assertTrue(check.follows_input_mean)
+                self.assertTrue(check.looks_like_image)
+                self.assertTrue(check.blew_up)        # |평균| 200/255 도 폭주 문턱 위 — 런타임은 이미지 판정을 먼저 알린다
+
+    def test_image_model_on_full_screentone_is_refused_by_brightness(self):
+        tone = self._screentone(128)
+        for name, model in (("gaussian s2", _BlurImageModel(2.0)), ("median3", _Median3ImageModel())):
+            with self.subTest(model=name):
+                check = vd.check_residual(tone, model(tone))
+                self.assertLess(check.correlation, vd.IMAGE_LIKE_LARGE_CORRELATION)
+                self.assertTrue(check.follows_input_mean)
+                self.assertTrue(check.looks_like_image)
+
+    def test_output_of_the_input_average_colour_is_refused(self):
+        # 한 값뿐인 출력(상관을 정할 수 없음)이라도 그 값이 입력 평균 밝기면 이미지(아주 강한 흐림)
+        self.assertAlmostEqual(float(self.x.mean()), 0.5, places=2)
+        out = torch.full_like(self.x, 0.5)            # 정확히 한 값 — 상관의 분모가 0
+        check = vd.check_residual(self.x, out)
+        self.assertIsNone(check.correlation)
+        self.assertFalse(check.input_flat)
+        self.assertAlmostEqual(check.dc_ratio, 1.0, places=1)
+        self.assertTrue(check.looks_like_image)
+        # 채널마다 그 채널 평균이면 상관은 정해지지만 작다(채널 사이 차이뿐) — 밝기로 거른다
+        per_channel = self.x.mean(dim=(2, 3), keepdim=True).expand_as(self.x).clone()
+        check = vd.check_residual(self.x, per_channel)
+        self.assertLess(check.correlation, vd.IMAGE_LIKE_LARGE_CORRELATION)
+        self.assertAlmostEqual(check.dc_ratio, 1.0, places=5)
+        self.assertTrue(check.looks_like_image)
+
+    def test_residual_that_swings_both_ways_is_not_judged_by_brightness(self):
+        # 실제 1px 가로줄 폭주(v1.1: |평균| 362/255, 평균 +89/255, 투영 비 +0.70, r -0.07)처럼 평균은 크고 입력 밝기 쪽이지만
+        # 양쪽으로 크게 흔들리는 잔차는 이미지로 보지 않는다(부호 쏠림 0.25) — 폭주로만 건너뛴다.
+        yy, xx = torch.meshgrid(torch.arange(64), torch.arange(64), indexing="ij")
+        stripes = (yy % 2).float().expand(1, 3, 64, 64).contiguous()
+        swing = torch.where(xx % 2 == 0, 1.0, -1.0).expand(1, 3, 64, 64)
+        raw = 89 / 255 + (362 / 255) * swing
+        check = vd.check_residual(stripes, raw)
+        self.assertAlmostEqual(check.correlation, 0.0, places=5)
+        self.assertGreater(check.signed_mean, vd.IMAGE_LIKE_DC_MEAN)
+        self.assertGreater(check.dc_ratio, vd.IMAGE_LIKE_DC_RATIO)
+        self.assertLess(abs(check.signed_mean), vd.IMAGE_LIKE_DC_SIGN * check.mean_abs)
+        self.assertFalse(check.follows_input_mean)
+        self.assertFalse(check.looks_like_image)
+        self.assertTrue(check.blew_up)
+
+    def test_blow_up_ceiling(self):
+        sign = torch.where(torch.rand(self.x.shape, generator=self.g) < 0.5, 1.0, -1.0)
+        below = vd.check_residual(self.x, sign * (99 / 255))
+        above = vd.check_residual(self.x, sign * (101 / 255))
+        self.assertFalse(below.blew_up)
+        self.assertTrue(above.blew_up)
+        self.assertFalse(above.looks_like_image)                 # 폭주는 이미지 판정과 따로
+        # 폭주 문턱 아래 — 실제로 잰 가장 큰 폭주 아닌 잔차(62.8/255)와 가장 작은 폭주(183.1/255) 사이
+        self.assertLess(62.8 / 255, vd.RESIDUAL_BLOWUP_ABS_MEAN)
+        self.assertLess(vd.RESIDUAL_BLOWUP_ABS_MEAN, 183.1 / 255)
+        self.assertFalse(vd.check_residual(self.x, sign * (1 / 255)).blew_up)   # 2/255 이하는 보지 않음
+
+
+def _grain_image_tensor(size=128, level=200.0, sigma=4.0, seed=3):
+    """회색 바탕 200±4 입자(8비트로 반올림, 세 채널 같음) — (1, 3, H, W)."""
+    g = np.random.default_rng(seed)
+    gray = np.clip(np.round(level + g.normal(0, sigma, (size, size))), 0, 255) / 255.0
+    return torch.from_numpy(gray).float().expand(1, 3, size, size).contiguous()
+
+
+def _grain_image(size=128):
+    arr = (_grain_image_tensor(size)[0, 0].numpy() * 255).round().astype(np.uint8)
+    return Image.fromarray(arr).convert("RGB")
+
+
+class _BlurImageModel(torch.nn.Module):
+    """이미지를 내는 '노이즈 제거' 대역 — 가우시안 흐림(σ, 반사 패딩)."""
+
+    def __init__(self, sigma=2.0):
+        super().__init__()
+        self.sigma = float(sigma)
+
+    def forward(self, x):
+        r = int(math.ceil(3 * self.sigma))
+        k = torch.exp(-torch.arange(-r, r + 1, dtype=x.dtype) ** 2 / (2 * self.sigma ** 2))
+        k = k / k.sum()
+        c = x.shape[1]
+        y = torch.nn.functional.pad(x, (r, r, r, r), mode="reflect")
+        y = torch.nn.functional.conv2d(y, k.view(1, 1, 1, -1).repeat(c, 1, 1, 1), groups=c)
+        return torch.nn.functional.conv2d(y, k.view(1, 1, -1, 1).repeat(c, 1, 1, 1), groups=c)
+
+
+class _Median3ImageModel(torch.nn.Module):
+    """이미지를 내는 '노이즈 제거' 대역 — 3x3 median(반사 패딩)."""
+
+    def forward(self, x):
+        y = torch.nn.functional.pad(x, (1, 1, 1, 1), mode="reflect")
+        return y.unfold(2, 3, 1).unfold(3, 3, 1).reshape(*x.shape, 9).median(-1).values
+
+
+class _BlowUpModel(torch.nn.Module):
+    """잔차 폭주 대역 — 입력과 상관없이 ±2(= ±510/255)로 흔들리는 잔차(학습에 없던 무늬에서 실제 DeGrid 가 내는 것처럼)."""
+
+    def forward(self, x):
+        h, w = x.shape[-2:]
+        yy, xx = torch.meshgrid(torch.arange(h), torch.arange(w), indexing="ij")
+        return torch.where((yy + xx) % 2 == 0, 2.0, -2.0).to(x).expand_as(x).clone()
 
 
 def _pointwise(t):
@@ -803,16 +925,51 @@ class RuntimeTests(unittest.TestCase):
         self.assertNotIn("outputs an image", message)
 
     def test_large_opposing_residual_is_applied_through_the_runtime(self):
-        class Flatten(torch.nn.Module):     # 잔 무늬를 누르는 DeGrid 대역: 잔차 = -(x - 5x5 평균) — 크고 입력과 반대로
-            def forward(self, x):
-                return -(x - torch.nn.functional.avg_pool2d(x, 5, 1, 2, count_include_pad=False))
+        class Flatten(torch.nn.Module):     # 잔 무늬를 누르는 DeGrid 대역: 잔차 = -0.4·(x - 5x5 평균) — 크고 입력과 반대로
+            def forward(self, x):           # (4px 스크린톤에서 약 42/255 — 실제 v1.1 31.3, Anzhc 46.8. 0.4 없이는 106/255 로 폭주 문턱 위)
+                return -0.4 * (x - torch.nn.functional.avg_pool2d(x, 5, 1, 2, count_include_pad=False))
 
         yy, xx = np.mgrid[:64, :64]
         tone = Image.fromarray((255 * ~(((yy % 4) < 2) & ((xx % 4) < 2))).astype(np.uint8)).convert("RGB")
         rt = vdr.DegridRuntime(loader=lambda path: Flatten(), forge_memory=lambda: None, logger=self.logs.append)
         out = rt.run(tone, self.entry, tile=0, device="cpu")
         self.assertGreater(out.stats["abs_mean_255"], 25.0)
+        self.assertLess(out.stats["abs_mean_255"], vd.RESIDUAL_BLOWUP_ABS_MEAN * 255)
         self.assertGreater(out.stats["changed_pixels"], 0.9)
+
+    def test_image_models_on_grain_and_screentone_are_refused_through_the_runtime(self):
+        # dc59409 은 둘 다 적용했다 — 회색 입자는 모든 픽셀이 255, 스크린톤은 PSNR 6~9 dB
+        yy, xx = np.mgrid[:128, :128]
+        tone = Image.fromarray((255 * ~(((yy % 4) < 2) & ((xx % 4) < 2))).astype(np.uint8)).convert("RGB")
+        for model_name, model in (("gaussian s2", _BlurImageModel(2.0)), ("median3", _Median3ImageModel())):
+            for image_name, image in (("gray grain 200+-4", _grain_image()), ("screentone 4px", tone)):
+                with self.subTest(model=model_name, image=image_name):
+                    before = image.tobytes()
+                    rt = vdr.DegridRuntime(loader=lambda path, m=model: m, forge_memory=lambda: None,
+                                           logger=self.logs.append)
+                    with torch.inference_mode(), self.assertRaises(vdr.NotResidualModelError) as caught:
+                        rt.run(image, self.entry, tile=512, device="cpu")
+                    self.assertIn("follows the input brightness", str(caught.exception))
+                    self.assertEqual(image.tobytes(), before)
+
+    def test_blown_up_residual_skips_the_image(self):
+        rt = vdr.DegridRuntime(loader=lambda path: _BlowUpModel(), forge_memory=lambda: None, logger=self.logs.append)
+        image = self._image()
+        before = image.tobytes()
+        with self.assertRaises(vdr.ResidualBlowUpError) as caught:
+            rt.run(image, self.entry, tile=0, device="cpu")
+        message = str(caught.exception)
+        self.assertTrue(message.startswith("output blew up (mean |residual| 510.0/255 > 100/255"), message)
+        self.assertIsInstance(caught.exception, vdr.DegridSkipError)
+        self.assertNotIsInstance(caught.exception, vdr.NotResidualModelError)
+        self.assertEqual(vdr.failure_reason(caught.exception), message)
+        self.assertEqual(image.tobytes(), before)
+
+    def test_failure_reason_names_only_unexpected_errors(self):
+        self.assertEqual(vdr.failure_reason(vdr.NotResidualModelError("not a DeGrid residual model: m")),
+                         "not a DeGrid residual model: m")
+        self.assertEqual(vdr.failure_reason(vdr.ResidualBlowUpError("output blew up (x)")), "output blew up (x)")
+        self.assertEqual(vdr.failure_reason(RuntimeError("CUDA out of memory")), "RuntimeError: CUDA out of memory")
 
 
 class _ConvResidual(torch.nn.Module):
@@ -1235,6 +1392,29 @@ def _checker_image(size=512):
     return Image.fromarray((((yy + xx) % 2) * 255).astype(np.uint8)).convert("RGB")
 
 
+def _pattern_image(fn, size=512):
+    """화면을 채운 무늬 ``fn(yy, xx) → 0..255`` (회색, RGB)."""
+    yy, xx = np.mgrid[:size, :size]
+    return Image.fromarray(np.clip(fn(yy, xx), 0, 255).astype(np.uint8)).convert("RGB")
+
+
+def _anima_crops(limit=8, size=512):
+    """``SAM3_DEGRID_ANIMA_IMAGES``(PNG 파일·폴더, os.pathsep 구분)의 앞 ``limit`` 장 — 가로 가운데·세로 1/3 의 size² 조각."""
+    files = []
+    for item in filter(None, os.environ.get("SAM3_DEGRID_ANIMA_IMAGES", "").split(os.pathsep)):
+        path = Path(item)
+        files.extend(sorted(path.glob("*.png")) if path.is_dir() else [path] if path.is_file() else [])
+    crops = []
+    for path in files[:limit]:
+        with Image.open(path) as im:
+            im = im.convert("RGB")
+            w, h = im.size
+            half = size // 2
+            cx, cy = min(max(w // 2, half), w - half), min(max(h // 3, half), h - half)
+            crops.append((path.name, im.crop((cx - half, cy - half, cx + half, cy + half))))
+    return crops
+
+
 class _RestoredImage(torch.nn.Module):
     """같은 DeGrid 망을 '복원 이미지' 를 내게 감싼 것(``x + 잔차``) — 이미지를 내는 일반 NAFNet 대역."""
 
@@ -1253,7 +1433,8 @@ class _RestoredImage(torch.nn.Module):
 class RealWeightsResidualCheckTests(unittest.TestCase):
     """실제 DeGrid 가중치(v1.1 + 있으면 다른 파인튜닝)로 잔차 검사: 잔 스크린톤·1px 체커에서는 잔차가 25/255 를 넘게
     커지지만 입력과 반대로 움직이므로 적용하고(예전에는 크기만 보고 거절해 DeGrid 없이 저장), 같은 망이 복원 이미지를
-    내면 어떤 입력에서도 거절한다. CPU fp32 — 무늬는 512²(256² 스크린톤은 v1.1 잔차가 21/255 로 작아 예전 규칙도 통과)."""
+    내면 어떤 입력에서도 거절한다. 화면을 채운 1px 줄무늬 같은 무늬에서 폭주하면(|평균| 100/255 초과) 그 이미지는 건너뛴다.
+    CPU fp32 — 무늬는 512²(256² 스크린톤은 v1.1 잔차가 21/255 로 작아 예전 규칙도 통과)."""
 
     @classmethod
     def setUpClass(cls):
@@ -1278,6 +1459,8 @@ class RealWeightsResidualCheckTests(unittest.TestCase):
                     self.assertGreater(check.mean_abs, vd.IMAGE_LIKE_ABS_MEAN)     # 크기만 보던 예전 규칙은 거절
                     self.assertLess(check.correlation, 0.0)
                     self.assertFalse(check.looks_like_image)
+                    self.assertFalse(check.follows_input_mean)                    # 투영 비 실측 0.00~0.17
+                    self.assertFalse(check.blew_up)                               # 폭주 문턱 100/255 아래
                     out = rt.run(image, entry, mode="full", strength=1.0, tile=512, device="cpu")
                     self.assertFalse(out.skipped)
                     self.assertGreater(out.stats["changed_pixels"], 0.2)
@@ -1286,7 +1469,65 @@ class RealWeightsResidualCheckTests(unittest.TestCase):
         x, _ = vd.pil_to_tensor(_synthetic_illustration(256, seed=4))
         for entry, model in self.models:
             with self.subTest(model=entry.name), torch.inference_mode():
-                self.assertFalse(vd.output_looks_like_image(x, model(x)))
+                check = vd.check_residual(x, model(x))
+                self.assertFalse(check.looks_like_image)
+                self.assertFalse(check.blew_up)
+
+    def test_anima_crops_are_applied(self):
+        # 실제 Anima 생성 이미지(저장소에 넣지 않음) — SAM3_DEGRID_ANIMA_IMAGES 에 PNG 파일·폴더(os.pathsep 구분)를 주면
+        # 앞 8장의 512² 조각(가로 가운데·세로 1/3)으로 돈다. CPU 실측: 잔차 |평균| 0.3~0.6/255.
+        crops = _anima_crops()
+        if not crops:
+            self.skipTest("SAM3_DEGRID_ANIMA_IMAGES 가 없음(실제 Anima PNG 파일·폴더)")
+        for entry, model in self.models:
+            rt = self._runtime(model)
+            for name, crop in crops:
+                with self.subTest(model=entry.name, image=name):
+                    with torch.inference_mode():
+                        out = rt.run(crop, entry, mode="full", strength=1.0, tile=512, device="cpu")
+                    self.assertFalse(out.skipped)
+                    self.assertLess(out.stats["abs_mean_255"], 2.0)
+
+    def test_degenerate_full_frame_patterns_are_skipped_as_blow_ups(self):
+        # 화면을 채운 1px 줄무늬·3px 세로줄·저대비 1px 줄무늬 — 실제 DeGrid 가 |평균| 183~2143/255 로 폭주(적용하면 PSNR 4~8 dB).
+        # 1px 가로줄은 평균이 입력 밝기 쪽(+89/255, 투영 비 +0.70)이지만 양쪽으로 흔들려(부호 쏠림 0.25~0.33) 이미지로 보지 않고
+        # 폭주로 건너뛴다. 저대비(118/138) 1px 체커는 v1.1 만 폭주(183.1/255), Anzhc 는 23.8/255 로 적용.
+        blow_ups = [("vstripes 1px", _pattern_image(lambda yy, xx: (xx % 2) * 255)),
+                    ("hstripes 1px", _pattern_image(lambda yy, xx: (yy % 2) * 255)),
+                    ("vstripes 3px", _pattern_image(lambda yy, xx: ((xx // 3) % 2) * 255)),
+                    ("vstripes 1px 118/138", _pattern_image(lambda yy, xx: 118 + (xx % 2) * 20))]
+        low_contrast_checker = _pattern_image(lambda yy, xx: 118 + ((yy + xx) % 2) * 20)
+        checker_blows_up = {REAL_MODEL_V11_STEM: True, REAL_MODEL_ANZHC_STEM: False}   # 다른 파일이면 체커는 보지 않음
+        for entry, model in self.models:
+            rt = self._runtime(model)
+            cases = [(name, image, True) for name, image in blow_ups]
+            if entry.name in checker_blows_up:
+                cases.append(("checker 1px 118/138", low_contrast_checker, checker_blows_up[entry.name]))
+            for name, image, blows_up in cases:
+                with self.subTest(model=entry.name, input=name):
+                    before = image.tobytes()
+                    if blows_up:
+                        with torch.inference_mode(), self.assertRaises(vdr.ResidualBlowUpError) as caught:
+                            rt.run(image, entry, tile=512, device="cpu")
+                        self.assertTrue(str(caught.exception).startswith("output blew up (mean |residual| "))
+                        self.assertEqual(image.tobytes(), before)
+                    else:
+                        with torch.inference_mode():
+                            out = rt.run(image, entry, tile=512, device="cpu")
+                        self.assertLess(out.stats["abs_mean_255"], vd.RESIDUAL_BLOWUP_ABS_MEAN * 255)
+
+    def test_grain_is_degridded_but_image_models_on_it_are_refused(self):
+        # 같은 회색 입자 바탕(200±4): 실제 DeGrid 는 거의 그대로(잔차 |평균| 0.05~0.6/255) 적용, 흐림·median 이미지 모델은 거절
+        image = _grain_image(256)
+        for entry, model in self.models:
+            with self.subTest(model=entry.name):
+                with torch.inference_mode():
+                    out = self._runtime(model).run(image, entry, tile=512, device="cpu")
+                self.assertLess(out.stats["abs_mean_255"], 2.0)
+        for name, stand_in in (("gaussian s2", _BlurImageModel(2.0)), ("median3", _Median3ImageModel())):
+            with self.subTest(image_model=name):
+                with torch.inference_mode(), self.assertRaises(vdr.NotResidualModelError):
+                    self._runtime(stand_in).run(image, self.models[0][0], tile=512, device="cpu")
 
     def test_same_network_returning_the_image_is_refused(self):
         for entry, model in self.models:

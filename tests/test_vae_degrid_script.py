@@ -17,11 +17,13 @@ import importlib.util
 import os
 import re
 import sys
+import tempfile
 import types
 import unittest
 from pathlib import Path
 from unittest import mock
 
+import torch
 from PIL import Image
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -132,6 +134,50 @@ class _FakeRuntime:
 
     def release(self):
         self.released += 1
+
+
+class _BlowUpModel(torch.nn.Module):
+    """잔차 폭주 대역 — 입력과 상관없이 ±2(= ±510/255) 체커."""
+
+    def forward(self, x):
+        h, w = x.shape[-2:]
+        yy, xx = torch.meshgrid(torch.arange(h), torch.arange(w), indexing="ij")
+        return torch.where((yy + xx) % 2 == 0, 2.0, -2.0).to(x).expand_as(x).clone()
+
+
+class _IdentityModel(torch.nn.Module):
+    """이미지를 내는 일반 NAFNet 대역 — 입력 그대로."""
+
+    def forward(self, x):
+        return x.clone()
+
+
+class _CpuRuntime:
+    """실제 ``DegridRuntime`` 을 CPU 로(스크립트는 장치를 넘기지 않아 설정 auto — GPU 가 있으면 GPU 로 간다)."""
+
+    def __init__(self, model):
+        self.rt = vdr.DegridRuntime(loader=lambda path: model, forge_memory=lambda: None, logger=lambda m: None)
+        self.released = 0
+
+    def run(self, image, entry, **kwargs):
+        return self.rt.run(image, entry, device="cpu", **kwargs)
+
+    def release(self):
+        self.released += 1
+        return self.rt.release()
+
+
+class _ModelFile:
+    """``DegridRuntime.model_for`` 가 stat 할 실제 파일과 그 ``ModelEntry``."""
+
+    def __enter__(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        path = Path(self.tmp.name) / f"{ENTRY.name}.safetensors"
+        path.write_bytes(b"x")
+        return vdm.ModelEntry(ENTRY.name, str(path))
+
+    def __exit__(self, *exc):
+        self.tmp.cleanup()
 
 
 def _p(**kw):
@@ -346,10 +392,32 @@ class ProcessTests(unittest.TestCase):
         self.assertIn(uvd.KEY_MODEL, params1)
         self.assertNotIn(uvd.KEY_ERROR, params1)
         self.assertEqual(set(params2), {uvd.KEY_ERROR})
-        self.assertIn("CUDA out of memory", params2[uvd.KEY_ERROR])
+        self.assertEqual(params2[uvd.KEY_ERROR], "RuntimeError: CUDA out of memory")   # 예상 밖 오류는 예외 이름을 붙인다
         self.assertIn(uvd.KEY_MODEL, params3)
         self.assertNotIn(uvd.KEY_ERROR, params3)
         self.assertEqual(runtime.released, 1)
+
+    def test_blown_up_residual_keeps_the_original_and_records_the_reason(self):
+        # 실제 런타임(CPU) — 잔차가 폭주하면 이 이미지는 원본 그대로, infotext 는 'Anima DeGrid error: output blew up (…)'
+        p = _p()
+        image = Image.new("RGB", (32, 32), (120, 130, 140))
+        runtime = _CpuRuntime(_BlowUpModel())
+        with _ModelFile() as entry, mock.patch.object(vdm, "discover", return_value=[entry]):
+            [(out, params)] = self._run(p, [image], runtime)
+        self.assertIs(out, image)
+        self.assertEqual(set(params), {uvd.KEY_ERROR})
+        self.assertTrue(params[uvd.KEY_ERROR].startswith("output blew up (mean |residual| 510.0/255 > 100/255"), params)
+        self.assertTrue(any("output blew up (mean |residual| 510.0/255" in line for line in self.logs), self.logs)
+        self.assertEqual(runtime.released, 1)
+
+    def test_image_model_is_recorded_without_the_exception_name(self):
+        p = _p()
+        image = Image.new("RGB", (32, 32), (120, 130, 140))
+        image.putpixel((3, 4), (10, 200, 30))
+        with _ModelFile() as entry, mock.patch.object(vdm, "discover", return_value=[entry]):
+            [(out, params)] = self._run(p, [image], _CpuRuntime(_IdentityModel()))
+        self.assertIs(out, image)
+        self.assertTrue(params[uvd.KEY_ERROR].startswith("not a DeGrid residual model: "), params)
 
     def test_api_positional_and_dict_args(self):
         for args in ((True,), [{"enabled": True}], [{"enabled": "true", "mode": "bright", "strength": 2, "tile": 0}]):
@@ -567,6 +635,18 @@ class ExtrasTests(unittest.TestCase):
             self.script.process(pp, enabled=True)
         self.assertIs(pp.image, image)
         self.assertIn("CUDA out of memory", pp.info[uvd.KEY_ERROR])
+        self.assertEqual(runtime.released, 1)
+
+    def test_blown_up_residual_keeps_the_original(self):
+        image = Image.new("RGB", (32, 32), (120, 130, 140))
+        runtime = _CpuRuntime(_BlowUpModel())
+        with _ModelFile() as entry, mock.patch.object(vdm, "discover", return_value=[entry]), \
+                mock.patch.object(vdr, "shared_runtime", return_value=runtime):
+            pp = _PostprocessedImage(image)
+            self.script.process(pp, enabled=True)
+        self.assertIs(pp.image, image)
+        self.assertEqual(set(pp.info), {uvd.KEY_ERROR})
+        self.assertTrue(pp.info[uvd.KEY_ERROR].startswith("output blew up (mean |residual| 510.0/255"), pp.info)
         self.assertEqual(runtime.released, 1)
 
 

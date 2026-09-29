@@ -85,6 +85,21 @@ IMAGE_LIKE_CORRELATION = 0.9         # 이만큼 따라가면 크기와 상관�
 IMAGE_LIKE_ABS_MEAN = 25 / 255       # 이보다 크면서
 IMAGE_LIKE_LARGE_CORRELATION = 0.5   # 이만큼 따라가거나 입력이 한 색(상관을 정할 수 없음)이면 이미지.
                                      # 실제 DeGrid 잔차의 r 은 작을 때 +0.81(2px 체커) 까지, 25/255 를 넘을 때 +0.18 까지 봤다.
+# 상관은 입력의 **무늬**(분산)를 따라가는지만 본다. 잔 결(회색 바탕 200±4 의 입자, 화면을 채운 4px 스크린톤)이 입력 분산의
+# 대부분이면 흐림·median 같은 '이미지' 모델은 그 결을 지워 r 이 0.5 아래(탐침 -1.0~+0.47)로 떨어져 위 규칙을 빠져나간다 — 그래도 출력의
+# **밝기(DC)** 는 입력 밝기 그대로다. 그래서 출력 평균이 크고(|평균| 25/255 초과), 한 부호로 쏠리고(|평균| ≥ 0.5·평균|출력| —
+# 이미지는 음수가 없어 1, 잔차는 양쪽으로 움직여 작다), 채널별 평균이 입력 채널별 평균을 따라가면(투영 비 > 0.5) 이미지다.
+# 실측(CPU, review 탐침 75 입력 × v1.1·Anzhc): 실제 잔차의 부호 쏠림은 |평균| 25/255 를 넘을 때도 0.33 이하(1px 가로줄·저대비
+# 1px 체커 폭주), 투영 비는 폭주가 아니면 0.17 이하. 흐림·median 이미지 출력은 부호 쏠림 1.0, 투영 비 0.98 이상.
+IMAGE_LIKE_DC_MEAN = 25 / 255        # |출력 평균| 이 이보다 크고
+IMAGE_LIKE_DC_SIGN = 0.5             # |출력 평균| ≥ 이 비율 × 평균|출력| 이며
+IMAGE_LIKE_DC_RATIO = 0.5            # Σ_c mean_c(출력)·mean_c(입력) / Σ_c mean_c(입력)² 이 이보다 크면 이미지
+
+# 잔차 폭주 — 화면을 채운 1px 줄무늬·저대비 1px 체커·3px 세로줄처럼 학습에 없던 무늬에서 실제 DeGrid 가 |평균| 183~2143/255
+# 의 잔차를 내어(더하면 PSNR 4~8 dB) 이미지를 망친다. 실측(CPU, 위 탐침) 폭주가 아닌 실제 잔차는 최대 62.8/255(v1.1, 64² 1px
+# 체커 — 512² 1px 체커 56.7, 4px 스크린톤 31~47, Anima 0.2~0.6), 폭주는 최소 183.1/255(v1.1, 118/138 1px 체커). 그 사이
+# (기하 평균 약 107)의 100/255 를 넘으면 그 이미지는 DeGrid 없이 둔다 — 한 픽셀을 평균 100/255 옮기는 것은 격자 제거가 아니다.
+RESIDUAL_BLOWUP_ABS_MEAN = 100 / 255
 
 
 def normalize_mode(value) -> str | None:
@@ -163,6 +178,32 @@ class ResidualCheck:
     correlation: float | None        # 입력과의 피어슨 상관 — 작아서 보지 않았거나 정할 수 없으면 None
     input_flat: bool                 # 입력이 한 값뿐이라 상관을 정할 수 없다(|평균| 이 2/255 이하면 보지 않아 False)
     looks_like_image: bool
+    signed_mean: float = 0.0         # 출력 평균(부호 있음, [0, 1] 단위) — |평균| 이 2/255 이하면 보지 않아 0
+    dc_ratio: float | None = None    # Σ_c mean_c(출력)·mean_c(입력) / Σ_c mean_c(입력)² — 입력이 검으면 None
+    follows_input_mean: bool = False # 출력 밝기가 입력 밝기를 따라간다(DC 규칙으로 이미지)
+    blew_up: bool = False            # |평균| 이 ``RESIDUAL_BLOWUP_ABS_MEAN`` 을 넘는다(잔차 폭주)
+
+
+def _channel_means(t: torch.Tensor) -> torch.Tensor:
+    """(…, C, H, W) → 채널별 평균(float64, C 개). 2차원 이하면 전체 평균 하나."""
+    t = t.detach()
+    if t.ndim >= 3:
+        channel = t.ndim - 3
+        dims = tuple(d for d in range(t.ndim) if d != channel)
+        return t.to(dtype=torch.float32).mean(dim=dims).to(dtype=torch.float64)
+    return t.to(dtype=torch.float32).mean().reshape(1).to(dtype=torch.float64)
+
+
+def input_mean_ratio(image: torch.Tensor, raw: torch.Tensor) -> float | None:
+    """출력의 채널별 평균을 입력의 채널별 평균에 투영한 비 — 이미지를 내는 모델이면 약 1, 잔차면 약 0. 입력이 검으면 None."""
+    x_means = _channel_means(image)
+    r_means = _channel_means(raw).to(device=x_means.device)
+    if r_means.shape != x_means.shape:
+        return None
+    denominator = float((x_means * x_means).sum())
+    if not denominator > 0.0:
+        return None
+    return float((r_means * x_means).sum()) / denominator
 
 
 def check_residual(image: torch.Tensor, raw: torch.Tensor) -> ResidualCheck:
@@ -170,29 +211,46 @@ def check_residual(image: torch.Tensor, raw: torch.Tensor) -> ResidualCheck:
     구성까지 같다)을 가를 수 없어, 출력이 입력을 따라가는지로 거른다. |평균| 이 2/255 를 넘으면서
 
     - 입력과의 상관이 0.9 를 넘거나,
-    - |평균| 이 25/255 를 넘고, 상관이 0.5 를 넘거나 입력이 한 색이면(상관을 정할 수 없고, 이미지를 내는 모델이면 그 색이
-      그대로 나온다)
+    - |평균| 이 25/255 를 넘고, 상관이 0.5 를 넘거나 입력이 한 색이거나(상관을 정할 수 없고, 이미지를 내는 모델이면 그 색이
+      그대로 나온다),
+    - 출력 밝기가 입력 밝기를 따라가면(|출력 평균| 25/255 초과 · 한 부호로 쏠림(|평균| ≥ 0.5·평균|출력|) · 채널별 평균의 투영 비
+      0.5 초과 — 잔 결이 입력 분산의 대부분이라 흐림·median 이미지 모델의 상관이 낮아지는 경우)
 
     이미지다. 크지만 입력과 반대로 움직이는 잔차(잔 스크린톤·1px 체커를 누르는 DeGrid)와, 한 값뿐이라 입력을 따라가지
-    않는 출력은 잔차로 본다."""
+    않는 출력은 잔차로 본다. ``blew_up`` 은 판정과 따로 |평균| 이 100/255 를 넘는지(잔차 폭주 — 런타임이 그 이미지를 건너뜀)."""
     mean_abs = float(raw.abs().mean()) if raw.numel() else 0.0
     if not mean_abs > IMAGE_LIKE_MIN_ABS_MEAN:
         return ResidualCheck(mean_abs, None, False, False)
+    blew_up = mean_abs > RESIDUAL_BLOWUP_ABS_MEAN
+    signed_mean = float(raw.detach().to(dtype=torch.float32).mean())
+    dc_ratio = input_mean_ratio(image, raw)
+    follows_input_mean = (
+        dc_ratio is not None
+        and abs(signed_mean) > IMAGE_LIKE_DC_MEAN
+        and abs(signed_mean) >= IMAGE_LIKE_DC_SIGN * mean_abs
+        and dc_ratio > IMAGE_LIKE_DC_RATIO
+    )
+
+    def result(correlation, input_flat, looks_like_image):
+        return ResidualCheck(
+            mean_abs, correlation, input_flat, bool(looks_like_image or follows_input_mean),
+            signed_mean, dc_ratio, follows_input_mean, blew_up,
+        )
+
     # float32 로 충분하다(문턱 0.5·0.9) — hires 2432×3712 에서도 사본 두 개 약 0.2 GB.
     a = image.detach().reshape(-1).to(dtype=torch.float32)
     if bool(a.amax() == a.amin()):   # 정확히 본다 — a - a.mean() 은 반올림 찌꺼기가 남을 수 있다
-        return ResidualCheck(mean_abs, None, True, mean_abs > IMAGE_LIKE_ABS_MEAN)
+        return result(None, True, mean_abs > IMAGE_LIKE_ABS_MEAN)
     b = raw.detach().reshape(-1).to(device=a.device, dtype=torch.float32)
     a = a - a.mean()
     b = b - b.mean()
     denominator = float(a.norm()) * float(b.norm())
     if not denominator > 0.0:
-        return ResidualCheck(mean_abs, None, False, False)
+        return result(None, False, False)
     correlation = float(torch.dot(a, b)) / denominator
-    looks_like_image = correlation > IMAGE_LIKE_CORRELATION or (
+    return result(correlation, False, correlation > IMAGE_LIKE_CORRELATION or (
         mean_abs > IMAGE_LIKE_ABS_MEAN and correlation > IMAGE_LIKE_LARGE_CORRELATION
-    )
-    return ResidualCheck(mean_abs, correlation, False, looks_like_image)
+    ))
 
 
 def output_looks_like_image(image: torch.Tensor, raw: torch.Tensor) -> bool:

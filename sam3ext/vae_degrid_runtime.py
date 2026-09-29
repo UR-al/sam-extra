@@ -19,7 +19,8 @@
 - 타일은 모델의 ``padder_size``(NAFNet-small 16) 배수로 반사 패딩해 넣고 자른다 — spandrel NAFNet 은 안에서 0 으로 채워
   16 배수가 아닌 크기의 오른쪽·아래 가장자리에 큰 잔차를 낸다. 16 배수면 그대로라 노드 팩과 같다.
 - 모델 출력이 잔차가 아니라 이미지처럼 보이면(입력을 따라감 — 일반 복원 NAFNet 을 고른 경우) ``NotResidualModelError`` 로
-  거절한다(``vae_degrid.check_residual``).
+  거절하고, 잔차가 폭주하면(|평균| 100/255 초과 — 화면을 채운 1px 줄무늬 같은 무늬) ``ResidualBlowUpError`` 로 그 이미지를
+  건너뛴다(``vae_degrid.check_residual``). 둘 다 ``DegridSkipError`` — 원본을 그대로 두고 infotext 에는 문구만 남는다.
 """
 from __future__ import annotations
 
@@ -127,8 +128,24 @@ def memory_estimate(height: int, width: int, tile: int) -> float:
     return float(BYTES_PER_PIXEL * height * width)
 
 
-class NotResidualModelError(ValueError):
+class DegridSkipError(ValueError):
+    """이 이미지에는 DeGrid 를 쓰지 않는다(원본 그대로) — 예상한 건너뜀이라 infotext·로그에는 예외 이름 없이 문구만
+    (``failure_reason``, '모델 없음' 과 같은 모양)."""
+
+
+class NotResidualModelError(DegridSkipError):
     """모델 출력이 잔차가 아니라 이미지다 — DeGrid 가 아닌 일반 NAFNet(노이즈 제거·디블러 등)을 고른 경우."""
+
+
+class ResidualBlowUpError(DegridSkipError):
+    """잔차가 폭주했다(|평균| > ``vd.RESIDUAL_BLOWUP_ABS_MEAN``) — 화면을 채운 1px 줄무늬 같은, 학습에 없던 무늬."""
+
+
+def failure_reason(exc: BaseException) -> str:
+    """infotext ``Anima DeGrid error``·로그에 남길 이유 — 예상한 건너뜀(``DegridSkipError``)은 문구만, 그 밖은 예외 이름을 붙인다."""
+    if isinstance(exc, DegridSkipError):
+        return str(exc)
+    return f"{type(exc).__name__}: {exc}"
 
 
 def not_residual_message(model_name: str, check: vd.ResidualCheck) -> str:
@@ -137,10 +154,24 @@ def not_residual_message(model_name: str, check: vd.ResidualCheck) -> str:
         correlation = f"{check.correlation:+.2f}"
     else:
         correlation = "n/a (single-color input)" if check.input_flat else "n/a"
+    brightness = ""
+    if check.follows_input_mean and check.dc_ratio is not None:
+        brightness = (
+            f"; mean output {check.signed_mean * 255:+.1f}/255 follows the input brightness "
+            f"(x{check.dc_ratio:.2f} of the input mean)"
+        )
     return (
         f"not a DeGrid residual model: {model_name} output does not look like a residual - it follows the input like "
-        f"an image (mean |output| {check.mean_abs * 255:.1f}/255; correlation with the input {correlation}) - "
+        f"an image (mean |output| {check.mean_abs * 255:.1f}/255; correlation with the input {correlation}{brightness}) - "
         "use a VAE DeGrid NAFNet"
+    )
+
+
+def blow_up_message(model_name: str, check: vd.ResidualCheck) -> str:
+    """``ResidualBlowUpError`` 문구 — infotext 는 ``Anima DeGrid error: output blew up (…)``."""
+    return (
+        f"output blew up (mean |residual| {check.mean_abs * 255:.1f}/255 > {vd.RESIDUAL_BLOWUP_ABS_MEAN * 255:.0f}/255 - "
+        f"{model_name} does not handle this image, e.g. full-frame 1px stripes) - image kept without DeGrid"
     )
 
 
@@ -379,6 +410,8 @@ class DegridRuntime:
                     check = vd.check_residual(x, delta)
                     if check.looks_like_image:
                         raise NotResidualModelError(not_residual_message(entry.name, check))
+                    if check.blew_up:
+                        raise ResidualBlowUpError(blow_up_message(entry.name, check))
                     result = vd.finalize(vd.apply_residual(x, delta, mode_key, strength))
             finally:
                 if release_after_run(keep, dev):
