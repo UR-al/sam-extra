@@ -132,6 +132,21 @@ forward 마다 한 번만 찾는 캐시입니다. 기본 블록 `8-18` 은 같�
 MIT 고지 전문은 이 문서 끝에 있습니다. DC 감쇠 계산(`sam3ext/guidance/dave.py`)과 블록 래퍼는 이 확장이 다시 작성한
 것입니다.
 
+## ComfyUI-NAFNet-Residual — 대조 테스트용 잔차 함수 사본 (Apache-2.0)
+
+`tests/test_vae_degrid.py` 의 `_apply_residual_mode` 는
+[DraconicDragon/ComfyUI-NAFNet-Residual](https://github.com/DraconicDragon/ComfyUI-NAFNet-Residual)
+(commit `e15460d3724c70d428e333518b58eb7ba8903d76`) 의 `patch.py` 48-62줄을 바꾸지 않고 옮긴 대조 오라클입니다. 확장 실행
+코드는 이 사본을 import 하지 않습니다. 실행 코드의 잔차 적용(`sam3ext/vae_degrid.py` 의 `select_residual`·`apply_residual`·
+`finalize`)은 같은 식(`nafnet_node.py` 132-149줄)을 다시 작성한 것이고, 강도 배율은 이 확장이 더했습니다. 상류
+`LICENSE.txt` 는 Apache License 2.0 이며 저작권자 이름과 NOTICE 파일은 없습니다. 모델 가중치
+([DraconicDragon/NAFNet-VAE-DeGrid](https://huggingface.co/DraconicDragon/NAFNet-VAE-DeGrid), Apache-2.0)는 저장소에 없고
+사용자가 받습니다. NAFNet 구조는 Forge venv 의 spandrel(`spandrel/architectures/NAFNet`, megvii-research/NAFNet MIT)을
+그대로 불러 쓰며 이 저장소에 넣지 않았습니다. 타일 합치기(`tiled_residual`)는 ComfyUI `comfy/utils.py` 의 `tiled_scale`
+(GPL-3.0, Forge `backend/patcher/vae.py` 에 옮겨진 v0.3.64 판)과 같은 위치·feather 가중치로 다시 작성했고, 테스트는 Forge 가
+확장 옆에 있을 때만 그 함수를 AST 로 꺼내 대조합니다(사본 없음). 이 확장의 GPL-3.0-only 라이선스는 위 코드·가중치의
+상류 조건을 대체하지 않습니다.
+
 ## 코드를 편입하지 않은 재구현 (참고 출처)
 
 아래 기능은 상류 코드를 파일째 가져오지 않고 이 확장 코드로 다시 작성했습니다. 전체 목록(DCW·DAVE·Modulation
@@ -140,6 +155,7 @@ Guidance 등)은 README 의 출처 / 크레딧 절과 [docs/GUIDANCE.md](docs/GU
 
 | 기능 | 이 확장 파일 | 원저작 출처 | 원 라이선스 | 형태 |
 |---|---|---|---|---|
+| Anima VAE DeGrid 잔차 모드·타일 | `sam3ext/vae_degrid.py` | [DraconicDragon/ComfyUI-NAFNet-Residual](https://github.com/DraconicDragon/ComfyUI-NAFNet-Residual) `nafnet_node.py` 87-149줄, ComfyUI `comfy/utils.py` `tiled_scale` | Apache-2.0 · GPL-3.0 | 식·타일 위치·OOM 재시도를 같게 다시 작성(대조 테스트는 위 절) |
 | Anima Safe PAG | `scripts/anima_safe_pag.py` | [iljung1106/comfyui-anima-safe-pag](https://github.com/iljung1106/comfyui-anima-safe-pag) (ComfyUI 노드), PAG 논문 [arXiv:2403.17377](https://arxiv.org/abs/2403.17377) | MIT | Anima 배치 확장·블록 선택을 이식하고 Forge 훅으로 다시 작성(적용 구간·파싱은 위 절처럼 편입) |
 
 ## MIT License 전문

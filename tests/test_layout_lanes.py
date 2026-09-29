@@ -44,7 +44,7 @@ class RegistryTests(unittest.TestCase):
         expected = {
             "anima-3-8b": "anima", "anima-detail-daemon": "anima", "anima-skimmed-cfg": "anima",
             "anima-safe-pag": "anima", "anima-vae-2x": "anima",
-            "sam3": "det", "adetailer": "det",
+            "sam3": "det", "adetailer": "det", "anima-vae-degrid": "det",
             "lora-block-weight": "lora", "dora-infer-mode": "lora", "controlnet": "lora", "dynamic-prompting": "lora",
             "dynamic-thresholding": "lora",
             "anima-ref-poc": "etc", "api-payload-display": "etc", "compile": "etc",

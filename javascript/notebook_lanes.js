@@ -20,6 +20,7 @@
         "anima-safe-pag": "Guidance",
         "anima-vae-2x": "VAE 2x",
         "sam3": "SAM3 Mask",
+        "anima-vae-degrid": "VAE DeGrid",
         "anima-ref-poc": "Reference PoC"
     };
     // CSS order 값. 열 본문은 flex column 이라 order 만으로 자리가 정해진다.

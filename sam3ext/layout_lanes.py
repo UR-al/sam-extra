@@ -71,6 +71,7 @@ REGISTRY: dict[str, Slot] = {
     "anima-safe-pag": Slot("anima"),
     "anima-vae-2x": Slot("anima", exp=True),
     "sam3": Slot("det"),
+    "anima-vae-degrid": Slot("det"),   # 저장 직전 후처리 — SAM3·ADetailer 와 같은 묶음
     "anima-ref-poc": Slot("etc"),
     "adetailer": Slot("det"),
     "lora-block-weight": Slot("lora"),

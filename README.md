@@ -40,7 +40,8 @@ speckle↓·skin/hair 정리(`scripts/anima_vae_2x.py`). Qwen/Wan VAE latent 공
 - SAM3 공통: [ControlNet 통합](#controlnet-통합) · [VRAM 절약](#vram-절약) · [마스크 후처리](#마스크-후처리) ·
   [진행률 / 검증](#진행률--검증) · [XYZ Plot 축](#xyz-plot-축) · [Settings 저장](#settings-저장)
 - 별도 기능: [ANIMA LoRA 블록 호환 변환](#별도-기능-anima-lora-블록-호환-변환) ·
-  [DoRA 추론 방식](#별도-기능-dora-추론-방식) · [Anima Guidance Suite](#별도-기능-anima-guidance-suite) ·
+  [DoRA 추론 방식](#별도-기능-dora-추론-방식) · [Anima VAE DeGrid](#별도-기능-anima-vae-degrid-nafnet) ·
+  [Anima Guidance Suite](#별도-기능-anima-guidance-suite) ·
   [txt2img 화면 정리](#txt2img-화면-정리-) · [TIPO 프롬프트 확장](#별도-기능-tipo-프롬프트-확장-)
 - 참고: [출처 / 크레딧](#출처--크레딧-credits)
 
@@ -626,6 +627,89 @@ adapter를 설치합니다. 현재 선택한 ANIMA 체크포인트의 실제 DiT
 
 ---
 
+## 별도 기능: Anima VAE DeGrid (NAFNet)
+
+Anima(Qwen·Wan VAE)로 만든 이미지에 생기는 **VAE 격자 무늬**를
+[DraconicDragon/NAFNet-VAE-DeGrid](https://huggingface.co/DraconicDragon/NAFNet-VAE-DeGrid)(Apache-2.0, Civitai 의
+"Qwen VAE DeGrid NAFNet 1x" 와 같은 파일) 모델로 지웁니다. txt2img·img2img 의 **Anima VAE DeGrid (NAFNet)** 아코디언을
+켜면 이미지마다 **모든 후처리가 끝난 뒤, 저장 직전에** 한 번 적용하고, **Extras** 탭에서 이미 만든 이미지(한 장·배치·폴더)에도
+쓸 수 있습니다. 기본은 꺼짐입니다.
+
+### 준비
+
+- 모델 파일을 `models/ESRGAN/` 또는 `models/DeGrid/`(새로 만들어도 됨)에 넣습니다. 권장은 v1.1
+  (`VAE_DeGrid_NAFNet_small_v1.1.safetensors`, Civitai 이름 `qwenVAEDegridNafnet_v11.safetensors`, 117 MB, SHA-256
+  `e6f59053acb3…ff470d4e`)이고 v1.0 도 됩니다. 목록에는 **state dict 가 NAFNet 인 파일만** 나옵니다 — 같은 폴더의 일반
+  업스케일러는 safetensors 헤더(텐서는 읽지 않음)·`.pth` 키로 걸러 냅니다. 목록 맨 앞(드롭다운 기본값·API 에서 모델을 비웠을
+  때)은 metadata 의 `modelspec.version` 이 가장 높은 파일입니다(v1.1 은 `1.1` 을 적어 두었고 v1.0 은 없음). 새 파일은 🔄 로
+  목록에 들어옵니다.
+- ⚠️ 이 모델은 이미지가 아니라 **잔차**를 냅니다. ESRGAN 폴더에 두면 Forge 의 Hires fix·Extras Upscale 업스케일러 목록에도
+  보이지만, 거기서 고르면 잔차만 남은 거의 검은 이미지가 나옵니다(Forge 업스케일러는 출력을 [0,1] 로 자르고 BGR 로
+  넣습니다). 이 기능으로만 쓰세요. 헷갈리면 `models/DeGrid/` 에 두세요.
+- 설치·업데이트 뒤에는 Forge 를 **재시작**하세요(새 스크립트·설정 섹션·`metadata.ini` 콜백 순서).
+
+### 사용
+
+| 칸 | 뜻 |
+|---|---|
+| DeGrid 모델 | 찾은 NAFNet 파일(🔄 새로 고침). 없으면 `None` 이고 켜도 건너뜁니다 |
+| 적용 방식 | **Full** 잔차 전체 — 어두운·밝은 격자 모두(기본) · **Dark Pixels Mainly** 양의 잔차만 — ComfyUI 기본 노드 경로(Load Upscale Model → Upscale Image → Image Blend)와 같고 Nyquist Notch 셰이더와 비슷 · **Bright Pixels Mainly** 음의 잔차만 |
+| 강도 | 잔차에 곱하는 배율 0~1.5 (1 = 원본 노드) |
+| 타일 크기 | 512 = 원본 노드(겹침 32, 가장자리 feather). 0 = 나누지 않음(VRAM 더 씀). NAFNet 의 채널 어텐션이 타일 평균을 써서 타일 크기에 따라 결과가 조금 다릅니다(512 와 나누지 않음의 차이: 8비트로 최대 2 단계, 픽셀 9% 가 1~2 단계) |
+
+- 계산: `결과 = clamp(이미지 + 강도 × f(잔차), 0, 1)` — f 는 방식(전체 / 양수만 / 음수만). 잔차와 중간 합은 자르지 않고
+  마지막 이미지만 자릅니다. 강도 1·같은 타일이면 [ComfyUI-NAFNet-Residual](https://github.com/DraconicDragon/ComfyUI-NAFNet-Residual)
+  의 **NAFNet Restoration** 노드와 비트 단위로 같은 계산이고(`tests/test_vae_degrid.py` 가 노드의 잔차 함수·ComfyUI
+  `tiled_scale` 과 대조), 입력은 RGB [0,1] fp32, 8비트로는 반올림합니다.
+- 효과는 미세합니다. 개발 PC CPU 실측(1216×1856 Anima 이미지): 잔차 |평균| 약 0.5/255, 최대 약 25/255, Full 로 8비트 값이
+  바뀐 픽셀 약 44%(대부분 1 단계, 선화 가장자리 주변이 가장 큼). VAE 를 거친 적 없는 합성 그림(512², 단색 면·선화)을
+  Qwen-Image VAE 로 인코드·디코드한 뒤 돌리면 원본과의 PSNR 이 36.7 → 37.7 dB 로 올랐고(강도 1 이 0.5·1.5 보다 좋음,
+  잔차를 반대 부호로 더하면 34.5 dB 로 나빠짐), VAE 를 거치지 않은 그림 자체는 거의 그대로 둡니다(PSNR 60 dB 이상).
+
+### 언제 도는가
+
+- 이미지마다 ADetailer·SAM3 in-flight 인페인트·img2img-hires-fix 등 **모든** always-on 스크립트의 `postprocess_image` 와
+  img2img 색 보정·인페인트 합성이 끝난 뒤(`postprocess_image_after_composite`), 저장·infotext 직전에 돕니다. Forge
+  `modules/processing.py` 가 이 순서로 부르므로 확장 설치 순서·폴더 이름과 무관합니다(테스트가 Forge 코드로 확인).
+- SAM3 인페인트·ADetailer 의 내부 패스에서는 돌지 않고, 합친 최종 이미지에 한 번만 적용합니다.
+- Settings → Postprocessing 에서 Extras 의 Upscale 을 txt2img·img2img 탭에 켰다면 DeGrid 가 그보다 **먼저** 돕니다
+  (`metadata.ini` 콜백 순서 — 확대하면 격자 간격이 달라짐). 이 확장의 Extras DeGrid 를 메인 탭에도 켜면 두 번 적용되니
+  켜지 마세요.
+- img2img 인페인트('Inpaint only masked' 포함)는 합성한 전체 이미지에 적용합니다 — 마스크 밖 원본도 지나가지만, 격자가
+  없는 부분은 거의 바뀌지 않습니다.
+- Anima Tile & Repair·캐릭터 레퍼런스 결과는 Forge 생성 파이프라인 밖의 별도 잡이라 이 아코디언이 붙지 않습니다 —
+  Extras 탭의 DeGrid 로 처리하세요.
+
+### 장치·메모리 (Settings → **SAM Extra VAE DeGrid**)
+
+| 설정 | 기본 | 뜻 |
+|---|---|---|
+| `sam3_degrid_device` | auto | auto = Forge 가 쓰는 GPU, cpu = VRAM 을 쓰지 않음(학습과 같이 쓸 때 등, 1216×1856 한 장 약 6.5 초 — 개발 PC) |
+| `sam3_degrid_precision` | fp16 | GPU 에서 fp32 가중치 + fp16 autocast(모델이 fp16 AMP 로 학습됨, 넘친 타일은 fp32 로 다시). fp32 = 노드와 같은 계산. CPU 는 늘 fp32 |
+| `sam3_degrid_keep_loaded` | 끔 | 끄면 이미지마다 Forge `load_models_gpu` 로 올렸다 내리고 VRAM 캐시를 비웁니다. 켜면 Forge 메모리 관리에 맡겨 남깁니다(약 117 MB) |
+
+- VRAM: 가중치 117 MB + 타일 512 에서 활성 메모리 약 0.3 GB(CPU fp32 실측 1148 B/px 로 추정, fp16 은 더 적음). 모자라면
+  (OOM) 타일을 반씩 줄여 128 까지 다시 합니다(노드와 같음). `--novram` 처럼 Forge 가 모델을 일부만 올리면 직접 옮깁니다.
+- bf16 은 쓰지 않습니다 — CPU 실측에서 잔차 오차(평균 0.36/255)가 잔차 크기와 비슷했습니다(fp16 은 0.04/255).
+
+### 기록과 붙여 넣기
+
+infotext 에 `Anima DeGrid model`, `Anima DeGrid mode`(Full / Dark Pixels Mainly / Bright Pixels Mainly),
+`Anima DeGrid strength`, `Anima DeGrid tile` 이 남습니다. 모델이 없거나 실패하면 이미지는 DeGrid 없이 저장되고
+`Anima DeGrid error` 만 남습니다. PNG Info 로 붙여 넣으면 켜짐·방식·강도·타일과 (그 PC 에 있으면) 모델이 되살아나고,
+이 키가 없는 이미지를 붙여 넣으면 꺼집니다. Extras 결과는 PNG 의 `postprocessing` 항목에 같은 키가 남습니다.
+
+### API
+
+`alwayson_scripts["Anima VAE DeGrid (NAFNet)"] = {"args": [true, "qwenVAEDegridNafnet_v11", "full", 1.0, 512]}` —
+위치 인자 `[enabled, model, mode, strength, tile]`(뒤는 빼면 기본값: 첫 NAFNet 파일 · full · 1.0 · 512). 키 이름을 적은
+dict 하나도 받습니다: `{"args": [{"enabled": true, "mode": "dark"}]}`. `model` 이 비었거나 `"None"`/`"auto"` 면 찾은 첫
+NAFNet 파일, `mode` 는 `full` / `dark` / `bright` 또는 `Full` / `Dark Pixels Mainly` / `Bright Pixels Mainly`, `strength` 0~1.5,
+`tile` 0 또는 128~4096. 모델을 못 찾으면 로그를 남기고 건너뜁니다(`Anima DeGrid error: model not found: …`). Forge 의 Extras
+API(`/sdapi/v1/extra-*`)는 내장 항목(Upscale 등) 인자만 넘기므로 Extras DeGrid 는 UI 전용입니다.
+
+---
+
 ## 워크플로 5: txt2img Notebook
 
 원래 Forge 주소의 **문서 하나**에서 동작하는 프리셋 도구입니다(예전 Live Workspace 의 다중 문서·iframe·별도
@@ -1049,6 +1133,7 @@ txt2img 도구 줄(붙여넣기·지우기·스타일 적용 버튼)의 **🪄**
 | **CNS-inspired Wavelet Noise** | [namemechan/comfyui-cns_sampler_patch](https://github.com/namemechan/comfyui-cns_sampler_patch) | GPL-3.0 | `color_noise_wavelet` 편입(`sam3ext/guidance/cns.py`), Forge 훅은 재작성 |
 | **Anima Modulation Guidance** | [Anzhc/Anima-Mod-Guidance-ComfyUI-Node](https://github.com/Anzhc/Anima-Mod-Guidance-ComfyUI-Node) · [quickjkee/modulation-guidance](https://github.com/quickjkee/modulation-guidance) · [yresearch/cosmos-pooled](https://huggingface.co/yresearch/cosmos-pooled) | MIT(코드 선언) / 자산 모델 카드 | Forge block 재작성 (vendor 아님) |
 | **Skimmed CFG** (별도 기능) | [Extraltodeus/Skimmed_CFG](https://github.com/Extraltodeus/Skimmed_CFG) | Apache-2.0 | 수식·σ 게이트 편입(`sam3ext/guidance/skimmed_cfg.py`), Forge 훅 |
+| **Anima VAE DeGrid** (별도 기능) | 모델 [DraconicDragon/NAFNet-VAE-DeGrid](https://huggingface.co/DraconicDragon/NAFNet-VAE-DeGrid) · 잔차 적용 [DraconicDragon/ComfyUI-NAFNet-Residual](https://github.com/DraconicDragon/ComfyUI-NAFNet-Residual) (commit `e15460d`) · 구조 [megvii-research/NAFNet](https://github.com/megvii-research/NAFNet) | 모델·노드 Apache-2.0 · NAFNet MIT | 잔차 모드를 다시 작성(대조 테스트에만 노드 함수 사본), 모델 구조는 Forge venv 의 spandrel, 가중치는 사용자가 받음 |
 | **Detail Daemon** (별도 기능) | [muerrilla/sd-webui-detail-daemon](https://github.com/muerrilla/sd-webui-detail-daemon) (commit `1947999`) · [Jonseed/ComfyUI-Detail-Daemon](https://github.com/Jonseed/ComfyUI-Detail-Daemon) (commit `3394e44`) | MIT | schedule·σ 조회 함수 편입(`scripts/anima_detail_daemon.py`), Forge 훅 |
 | SAM3 검출 | Meta [facebook/sam3](https://huggingface.co/facebook/sam3) ([facebookresearch/sam3](https://github.com/facebookresearch/sam3)) | SAM License(Meta) | `sam3` PyPI 패키지 (저장소에 포함하지 않음) |
 
