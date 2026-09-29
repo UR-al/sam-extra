@@ -332,6 +332,13 @@ v0.21.2 이후 쌓인 큰 업데이트입니다. Anima 3.8B(Qwen3.5 / Semantic C
   잔차가 폭주하면(|평균| 100/255 초과 — 실측 183~2143/255, 폭주가 아닌 잔차는 최대 62.8/255) 그 이미지는 원본 그대로 두고
   `Anima DeGrid error: output blew up (…)` 을 남깁니다. 모델은 Forge venv 의 spandrel 로 불러옵니다. 모델 파일이 없으면 로그를
   남기고 건너뜁니다.
+- **`.pth` 목록·불러오기 안전**: 목록을 만들 때 `models/ESRGAN` 의 옛 형식 `.pth`(zip 이 아닌 pickle — 예: `4x-UltraSharp.pth`)를
+  `torch.load(mmap=True)` 로 열어 Forge 시작 콘솔에 `mmap can only be used with files saved with …` 오류와 `patch_basic.py`
+  트레이스백이 찍히던 문제를 고쳤습니다. 이제 `.pth`/`.pt` 는 `torch.load` 없이 zip 의 `data.pkl` 에서 키 이름만 읽고(텐서는 만들지
+  않고 pickle 속 전역도 부르지 않음), 옛 형식은 DeGrid 가 아니므로 열지 않습니다(디버그 로그 한 줄). 고른 모델은 Forge 가 감싸기 전
+  로더(`torch.load_origin`·`safetensors.torch.load_file_origin`)에 `Path` 로만 넘깁니다 — Forge 가 감싼 로더는 실패하면 str 인자인
+  파일을 `.corrupted` 로 이름을 바꿔 버립니다(이번 오류에서는 `Path` 를 넘겨 이름이 바뀌지 않았음). 목록 만들기는 헤더·`data.pkl` 만
+  읽어 파일 12개(.pth 3개·safetensors 6개)인 `models/ESRGAN` 에서 처음 25~49 ms(실측), 그다음은 캐시(1 ms 미만)입니다.
 - **순서**: 이미지마다 모든 always-on 스크립트의 `postprocess_image`(ADetailer·SAM3 인페인트 등)와 색 보정·인페인트 합성이 끝난 뒤,
   저장 직전(`postprocess_image_after_composite`)에 한 번 돕니다 — 설치 순서와 무관합니다. 메인 탭에 켠 Extras Upscale 보다는
   앞이고(`metadata.ini` 콜백 순서), SAM3·ADetailer 내부 패스에서는 돌지 않습니다. Extras 탭에서는 Upscale 보다 먼저 돕니다(항목 이름
@@ -341,8 +348,9 @@ v0.21.2 이후 쌓인 큰 업데이트입니다. Anima 3.8B(Qwen3.5 / Semantic C
   인자 `[enabled, model, mode, strength, tile]` 또는 dict 하나.
 - **새 설정 섹션 SAM Extra VAE DeGrid**(`sam3_degrid`): 계산 장치(auto / cpu), GPU 정밀도(fp16 autocast 기본 — fp32 가중치, 넘친
   타일만 fp32 로 다시 / fp32), VRAM 에 남기기(기본 끔 — 이미지마다 Forge `load_models_gpu` 로 올렸다가 내리고 캐시를 비움).
-- **검증**: CPU 단위 테스트 125개(실제 가중치 14개는 `SAM3_RUN_FORGE_INTEGRATION_TESTS=1` 일 때만, 그중 실제 Anima 조각은
-  `SAM3_DEGRID_ANIMA_IMAGES` 에 PNG 를 줄 때만) — 같은 입력으로 노드의 잔차 함수·
+- **검증**: CPU 단위 테스트 134개(실제 가중치 14개와 실제 `models/ESRGAN` 목록(읽기만) 1개는 `SAM3_RUN_FORGE_INTEGRATION_TESTS=1`
+  일 때만, 그중 실제 Anima 조각은 `SAM3_DEGRID_ANIMA_IMAGES` 에 PNG 를 줄 때만) — Forge `patch_basic.build_loaded` 로 감싼 로더가 찾기·
+  불러오기에서 불리지 않고 파일 이름도 바뀌지 않는지, 같은 입력으로 노드의 잔차 함수·
   Forge/ComfyUI `tiled_scale` 과 비트 단위 대조, Forge `processing.py`·`sort_callbacks`·`metadata.ini` 로 실행 순서 확인, 생성 탭
   (Forge 가 `torch.inference_mode()` 안에서 부름)에서 처음 불러 장치로 옮긴 뒤에도 계산되는지(CPU 대역: dtype 왕복 — 모델을
   inference_mode 밖에서 만들지 않으면 'Inference tensors do not track version counter.' 로 그 뒤 모든 이미지가 실패), 16 배수가

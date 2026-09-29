@@ -8,6 +8,9 @@
   노드(``nafnet_node.py`` 132-149줄)는 같은 식 뒤에 ``torch.clamp(result, 0, 1)``.
 - 타일: Forge ``backend/patcher/vae.py`` 의 ``tiled_scale_multidim``(ComfyUI v0.3.64 ``comfy/utils.py`` 를 옮긴 것 — 노드 팩이
   부르는 ``comfy.utils.tiled_scale`` 과 같은 함수)을 Forge 가 확장 옆에 있을 때만 AST 로 꺼내 쓴다(CI 에서는 건너뜀).
+- Forge 의 ``torch.load``·``safetensors.torch.load_file`` 감싸개(실패하면 str 파일 경로를 ``.corrupted`` 로 바꿈):
+  ``modules_forge/patch_basic.py`` 의 ``build_loaded`` 를 Forge 가 옆에 있으면 AST 로 꺼내 쓰고, 없으면(CI) 같은 동작의 대역.
+  실제 ``models/ESRGAN`` 목록(읽기만)은 SAM3_RUN_FORGE_INTEGRATION_TESTS=1 일 때만.
 - 실제 가중치(qwenVAEDegridNafnet_v11 — 잔차 검사는 있으면 Anzhc 파인튜닝 NAFNet-QwenVAE-DeGrid 로도)는
   SAM3_RUN_FORGE_INTEGRATION_TESTS=1 이고 파일이 있을 때만(CPU, 약 30 초). 실제 Anima 이미지 조각은 거기에 더해
   SAM3_DEGRID_ANIMA_IMAGES(PNG 파일·폴더, os.pathsep 구분)를 줄 때만 — 생성 이미지는 저장소에 넣지 않는다.
@@ -15,7 +18,11 @@
 from __future__ import annotations
 
 import ast
+import contextlib
+import functools
+import io
 import itertools
+import logging
 import math
 import os
 import sys
@@ -23,7 +30,10 @@ import tempfile
 import time
 import types
 import unittest
+import warnings
+import zipfile
 from pathlib import Path
+from unittest import mock
 
 import numpy as np
 import torch
@@ -775,6 +785,298 @@ class LoaderTests(unittest.TestCase):
             self.assertTrue(torch.equal(fn(x), model(x)))
             y = torch.rand(1, 3, 21, 27)          # spandrel 은 0 으로, 여기는 반사로 채운다
             self.assertFalse(torch.equal(fn(y), model(y)))
+
+
+# ---------------------------------------------------------------------------
+# .pth 안전 — 찾을 때는 torch.load 를 부르지 않고, 불러올 때는 Forge 가 감싸기 전 로더에 str 을 넘기지 않는다
+# ---------------------------------------------------------------------------
+
+FORGE_PATCH_BASIC_PY = FORGE_ROOT / "modules_forge" / "patch_basic.py"
+REAL_MODELS_DIR = FORGE_ROOT / "models"
+
+
+def _simulated_build_loaded(module, loader_name):
+    """Forge 밖(CI)용 ``modules_forge/patch_basic.build_loaded`` 대역 — 같은 동작만: 원래 로더를 ``<name>_origin`` 에 두고,
+    감싼 로더가 실패하면 str 인자 중 파일인 것을 ``<파일>.corrupted`` 로 바꾼 뒤 BufferError."""
+    origin_name = f"{loader_name}_origin"
+    if not hasattr(module, origin_name):
+        setattr(module, origin_name, getattr(module, loader_name))
+    original = getattr(module, origin_name)
+
+    def loader(*args, **kwargs):
+        try:
+            return original(*args, **kwargs)
+        except Exception:
+            for path in list(args) + list(kwargs.values()):
+                if isinstance(path, str) and os.path.isfile(path):
+                    os.replace(path, f"{path}.corrupted")
+            raise BufferError("Failed to load model...") from None
+
+    setattr(module, loader_name, loader)
+
+
+def _forge_build_loaded():
+    """Forge 가 옆에 있으면 실제 ``build_loaded``(import 하지 않고 — gradio·modules.errors 를 끌고 옴 — AST 로 꺼냄), 없으면 대역."""
+    if not FORGE_PATCH_BASIC_PY.is_file():
+        return _simulated_build_loaded
+    tree = ast.parse(FORGE_PATCH_BASIC_PY.read_text(encoding="utf-8"))
+    nodes = [n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "build_loaded"]
+    if len(nodes) != 1:
+        return _simulated_build_loaded
+    namespace = {"os": os, "warnings": warnings, "wraps": functools.wraps, "display": lambda error, task: None}
+    exec(compile(ast.Module(nodes, []), str(FORGE_PATCH_BASIC_PY), "exec"), namespace)
+    return namespace["build_loaded"]
+
+
+class _ForgePatchedLoaders:
+    """``torch.load``·``safetensors.torch.load_file`` 을 Forge 처럼 감싼다(원래 로더는 ``*_origin``). 감싼 로더가 불린 것을
+    ``wrapped_calls`` 에 남기고, 끝나면 둘 다 되돌린다."""
+
+    def __enter__(self):
+        import safetensors.torch as st
+
+        self.wrapped_calls = []
+        self._stack = contextlib.ExitStack()
+        build_loaded = _forge_build_loaded()
+        for module, name in ((torch, "load"), (st, "load_file")):
+            stand_in = types.ModuleType(f"{module.__name__}_stand_in")
+            setattr(stand_in, name, getattr(module, f"{name}_origin", None) or getattr(module, name))
+            build_loaded(stand_in, name)
+
+            def recorded(*args, _wrapped_loader=getattr(stand_in, name), _loader_name=name, **kwargs):
+                self.wrapped_calls.append((_loader_name, args, kwargs))
+                return _wrapped_loader(*args, **kwargs)
+
+            self._stack.enter_context(mock.patch.object(module, name, recorded))
+            self._stack.enter_context(
+                mock.patch.object(module, f"{name}_origin", getattr(stand_in, f"{name}_origin"), create=True))
+        return self
+
+    def __exit__(self, *exc):
+        self._stack.close()
+        return False
+
+
+@contextlib.contextmanager
+def _forbid_loaders():
+    """찾기 동안 가중치 로더(감싼 것·원래 것 모두)가 불리면 기록하고 실패시킨다. 불린 목록을 돌려준다."""
+    import safetensors.torch as st
+
+    calls = []
+
+    def forbidden(*args, **kwargs):
+        calls.append((args, kwargs))
+        raise AssertionError("weights loader called during discovery")
+
+    with contextlib.ExitStack() as stack:
+        for module, name in ((torch, "load"), (torch, "load_origin"), (st, "load_file"), (st, "load_file_origin")):
+            stack.enter_context(mock.patch.object(module, name, forbidden, create=True))
+        yield calls
+
+
+_PICKLED_CALLS: list = []
+
+
+def _record_pickled_call(tag):
+    _PICKLED_CALLS.append(tag)
+    return tag
+
+
+class _PicklePayload:
+    """되살리면 ``_record_pickled_call`` 을 부르는 객체 — 키 읽기가 pickle 속 전역을 부르지 않는지 보는 표식."""
+
+    def __reduce__(self):
+        return (_record_pickled_call, ("called",))
+
+
+class TorchFileDiscoveryTests(unittest.TestCase):
+    """.pth/.pt 찾기는 torch.load 없이 zip 의 data.pkl 만 — 옛 형식 pickle 은 열지 않는다."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self.esrgan = self.root / "ESRGAN"
+        self.esrgan.mkdir()
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _assert_untouched(self, *paths):
+        for path in paths:
+            self.assertTrue(Path(path).is_file(), path)
+        self.assertEqual(sorted(p.name for p in self.root.rglob("*.corrupted")), [])
+
+    def test_legacy_pickle_is_skipped_without_any_load(self):
+        # 옛 형식(zip 아님, 예: 4x-UltraSharp.pth) — 키가 NAFNet 이어도 열지 않는다(DeGrid 는 safetensors·새 형식 pth 로 배포).
+        # 고치기 전에는 torch.load(mmap=True) 가 'mmap can only be used with files saved with ...' 로 실패하고 통째로 다시 읽었다.
+        legacy = self.esrgan / "4x-UltraSharp.pth"
+        torch.save(_fake_nafnet_state(), legacy, _use_new_zipfile_serialization=False)
+        self.assertFalse(vdm.is_torch_zip(legacy))
+        with _forbid_loaders() as calls, self.assertLogs(vdm._LOG, "DEBUG") as logs:
+            self.assertEqual(vdm.discover(self.root), [])
+            self.assertEqual(vdm.discover(self.root), [])   # 두 번째는 판정 캐시 — 로그도 한 줄
+            self.assertIsNone(vdm.read_torch_state_skeleton(legacy))
+        self.assertEqual(calls, [])
+        self.assertEqual([(r.levelno, "4x-UltraSharp.pth" in r.getMessage()) for r in logs.records], [(logging.DEBUG, True)])
+        self._assert_untouched(legacy)
+
+    def test_zip_pth_with_nafnet_keys_is_found_without_any_load(self):
+        degrid = self.root / "DeGrid"
+        degrid.mkdir()
+        torch.save(_fake_nafnet_state(), self.esrgan / "degrid_new_format.pth")
+        # basicsr 학습 체크포인트({"params": sd}, 접두사 module.)도 .pt 로
+        torch.save({"params": {f"module.{k}": v for k, v in _fake_nafnet_state().items()}}, degrid / "net_g_ft.pt")
+        with _forbid_loaders() as calls:
+            entries = vdm.discover(self.root)
+            keys = vdm.read_torch_keys(self.esrgan / "degrid_new_format.pth")
+        self.assertEqual(calls, [])
+        self.assertEqual([e.name for e in entries], ["degrid_new_format", "net_g_ft"])
+        self.assertEqual(sorted(keys), sorted(vdm.NAFNET_KEYS))
+
+    def test_zip_pth_with_other_keys_is_skipped(self):
+        other = self.esrgan / "4x_foolhardy_Remacri.pth"
+        torch.save({"model.0.weight": torch.zeros(4, 3, 3, 3), "model.1.sub.0.RDB1.conv1.0.weight": torch.zeros(1)}, other)
+        self.assertTrue(vdm.is_torch_zip(other))
+        with _forbid_loaders() as calls:
+            self.assertEqual(vdm.discover(self.root), [])
+            self.assertEqual(vdm.read_torch_keys(other), ["model.0.weight", "model.1.sub.0.RDB1.conv1.0.weight"])
+        self.assertEqual(calls, [])
+        self._assert_untouched(other)
+
+    def test_key_reader_never_calls_pickled_globals(self):
+        path = self.esrgan / "payload.pth"
+        torch.save({"state_dict": _fake_nafnet_state(), "extra": _PicklePayload()}, path)
+        _PICKLED_CALLS.clear()
+        with _forbid_loaders() as calls:
+            self.assertTrue(vdm.is_nafnet_file(path))
+        self.assertEqual((calls, _PICKLED_CALLS), ([], []))
+        # 대조: 같은 파일을 torch.load(weights_only=False)로 풀면 그 전역이 실제로 불린다
+        torch.load(path, map_location="cpu", weights_only=False)
+        self.assertEqual(_PICKLED_CALLS, ["called"])
+        _PICKLED_CALLS.clear()
+
+    def test_broken_or_foreign_zip_is_not_a_model(self):
+        truncated = self.esrgan / "truncated.pth"
+        torch.save(_fake_nafnet_state(), truncated)
+        data = truncated.read_bytes()
+        truncated.write_bytes(data[: len(data) // 2])        # 앞은 PK 지만 zip 끝 레코드가 없다
+        foreign = self.esrgan / "archive.pt"
+        with zipfile.ZipFile(foreign, "w") as archive:
+            archive.writestr("readme.txt", "not a checkpoint")
+        with _forbid_loaders() as calls:
+            self.assertEqual(vdm.discover(self.root), [])
+        self.assertEqual(calls, [])
+        self._assert_untouched(truncated, foreign)
+
+
+@unittest.skipUnless(HAVE_SPANDREL, "spandrel 없음(Forge venv 에는 있음)")
+class ForgePatchedLoaderTests(unittest.TestCase):
+    """Forge 가 감싼 ``torch.load``·``load_file``(실패하면 str 파일 경로를 ``.corrupted`` 로 바꿈)이 찾기·불러오기에서 불리지 않는다."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_harness_renames_like_forge(self):
+        # 대조: 고치기 전 찾기처럼 감싼 로더에 str 경로·mmap 으로 옛 형식을 주면 Forge 는 사용자의 파일 이름을 바꾼다
+        legacy = self.root / "4x-UltraSharp.pth"
+        torch.save({"model.0.weight": torch.zeros(1)}, legacy, _use_new_zipfile_serialization=False)
+        with _ForgePatchedLoaders() as forge, contextlib.redirect_stdout(io.StringIO()):
+            with self.assertRaises(BufferError):
+                torch.load(str(legacy), map_location="cpu", weights_only=True, mmap=True)
+        self.assertEqual(len(forge.wrapped_calls), 1)
+        self.assertFalse(legacy.exists())
+        self.assertTrue(Path(f"{legacy}.corrupted").is_file())
+
+    def test_discovery_and_loading_never_reach_the_wrapped_loaders(self):
+        esrgan = self.root / "ESRGAN"
+        esrgan.mkdir()
+        legacy = esrgan / "4x-UltraSharp.pth"
+        torch.save({"model.0.weight": torch.zeros(1)}, legacy, _use_new_zipfile_serialization=False)
+        zip_pth = esrgan / "degrid.pth"
+        torch.save(_tiny_nafnet().state_dict(), zip_pth)
+        st_file = esrgan / "degrid_st.safetensors"
+        _save_safetensors(st_file, _tiny_nafnet().state_dict())
+        broken_pth = esrgan / "broken.pth"
+        broken_pth.write_bytes(b"\x80\x02not a pickle")
+        # 헤더는 NAFNet(목록에 나옴)이지만 텐서 데이터가 잘린 safetensors — 불러오기가 실패한다
+        broken_st = esrgan / "broken.safetensors"
+        _save_safetensors(broken_st, _tiny_nafnet().state_dict())
+        data = broken_st.read_bytes()
+        (length,) = __import__("struct").unpack("<Q", data[:8])
+        broken_st.write_bytes(data[: 8 + length])
+        files = [legacy, zip_pth, st_file, broken_pth, broken_st]
+
+        out = io.StringIO()
+        with _ForgePatchedLoaders() as forge, contextlib.redirect_stdout(out), contextlib.redirect_stderr(out):
+            self.assertEqual([e.name for e in vdm.discover(self.root)], ["broken", "degrid", "degrid_st"])
+            for path in (zip_pth, str(zip_pth), st_file, str(st_file)):
+                self.assertEqual(type(vdm.load_nafnet(path)).__name__, "NAFNet")
+            rt = vdr.DegridRuntime(forge_memory=lambda: None, logger=lambda m: None)
+            self.assertEqual(type(rt.model_for(str(zip_pth))).__name__, "NAFNet")
+            self.assertIsInstance(vdm.torch_load(str(legacy)), dict)   # 옛 형식도 원래 로더로(mmap 없이)는 읽힌다
+            for failing in (lambda: vdm.load_nafnet(str(broken_st)), lambda: vdm.torch_load(str(broken_pth))):
+                with self.assertRaises(Exception) as ctx:
+                    failing()
+                self.assertNotIsInstance(ctx.exception, BufferError)   # 감싼 로더가 아니라 원래 로더의 오류
+        self.assertEqual(forge.wrapped_calls, [])
+        self.assertEqual(out.getvalue(), "")
+        for path in files:
+            self.assertTrue(path.is_file(), path)
+        self.assertEqual(sorted(p.name for p in self.root.rglob("*.corrupted")), [])
+
+    def test_without_an_original_loader_no_str_reaches_the_loader(self):
+        # Forge 밖(원래 로더 없음)에서는 그 로더를 쓰되 str 인자는 넘기지 않는다(경로 Path, map_location torch.device)
+        import safetensors.torch as st
+
+        seen = []
+
+        def spy(*args, **kwargs):
+            seen.append([type(v).__name__ for v in list(args) + list(kwargs.values()) if isinstance(v, str)])
+            raise RuntimeError("spy")
+
+        target = str(self.root / "missing.pth")
+        with mock.patch.object(torch, "load", spy), mock.patch.object(torch, "load_origin", None, create=True), \
+                mock.patch.object(st, "load_file", spy), mock.patch.object(st, "load_file_origin", None, create=True):
+            for load in (vdm.torch_load, vdm.safetensors_load):
+                with self.assertRaises(RuntimeError):
+                    load(target)
+        self.assertEqual(seen, [[], []])
+        origin = lambda *a, **k: None  # noqa: E731
+        self.assertIs(vdm.unpatched_loader(types.SimpleNamespace(load=spy, load_origin=origin), "load"), origin)
+        self.assertIs(vdm.unpatched_loader(types.SimpleNamespace(load=spy), "load"), spy)
+
+
+@unittest.skipUnless(
+    os.environ.get("SAM3_RUN_FORGE_INTEGRATION_TESTS") == "1" and (REAL_MODELS_DIR / "ESRGAN").is_dir(),
+    "실제 models/ESRGAN 목록(읽기만) — SAM3_RUN_FORGE_INTEGRATION_TESTS=1",
+)
+class RealModelFolderTests(unittest.TestCase):
+    def test_listing_reads_only_headers_and_changes_nothing(self):
+        def snapshot():
+            return sorted((str(p), p.stat().st_size, p.stat().st_mtime_ns)
+                          for folder in vdm.model_dirs(REAL_MODELS_DIR) if folder.is_dir() for p in folder.iterdir())
+
+        before = snapshot()
+        with vdm._CACHE_LOCK:
+            vdm._CLASSIFY_CACHE.clear()
+        out = io.StringIO()
+        with _forbid_loaders() as calls, contextlib.redirect_stdout(out), contextlib.redirect_stderr(out), \
+                self.assertNoLogs(level="WARNING"):
+            entries = vdm.discover(REAL_MODELS_DIR)
+        self.assertEqual(calls, [])
+        self.assertEqual(out.getvalue(), "")
+        self.assertEqual(snapshot(), before)
+        paths = [Path(e.path) for e in entries]
+        for path in paths:
+            self.assertTrue(path.suffix.lower() == ".safetensors" or vdm.is_torch_zip(path), path)
+            self.assertTrue(vdm.is_nafnet_file(path), path)
+        for known in (REAL_MODEL, REAL_MODEL_ALT):
+            if known.is_file() and known.parent in vdm.model_dirs(REAL_MODELS_DIR):
+                self.assertIn(known, paths)
 
 
 def _stub_residual(x):

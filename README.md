@@ -640,9 +640,11 @@ Anima(Qwen·Wan VAE)로 만든 이미지에 생기는 **VAE 격자 무늬**를
 - 모델 파일을 `models/ESRGAN/` 또는 `models/DeGrid/`(새로 만들어도 됨)에 넣습니다. 권장은 v1.1
   (`VAE_DeGrid_NAFNet_small_v1.1.safetensors`, Civitai 이름 `qwenVAEDegridNafnet_v11.safetensors`, 117 MB, SHA-256
   `e6f59053acb3…ff470d4e`)입니다(같은 저장소의 v1.0 도 같은 NAFNet-small 구조라 목록에 나오지만, 실제로 돌려 확인한 것은
-  v1.1). 목록에는 **state dict 가 NAFNet 인 파일만** 나옵니다 — 같은 폴더의 일반 업스케일러는 safetensors 헤더(텐서는 읽지
-  않음)·`.pth` 키로 걸러 냅니다. 목록 맨 앞(드롭다운 기본값·API 에서 모델을 비웠을 때)은 metadata 의 `modelspec.version` 이
-  가장 높은 파일입니다(v1.1 은 `1.1` 을 적어 둠 — 버전을 적지 않은 파일은 그 뒤, 폴더·이름 순). 새 파일은 🔄 로 목록에
+  v1.1). 목록에는 **state dict 가 NAFNet 인 파일만** 나옵니다 — 같은 폴더의 일반 업스케일러는 safetensors 헤더·새 형식(zip)
+  `.pth` 의 `data.pkl`(둘 다 텐서는 읽지 않음, `torch.load` 도 부르지 않음)로 걸러 내고, 옛 형식 `.pth`(zip 이 아닌 pickle —
+  예: `4x-UltraSharp.pth`)는 DeGrid 가 아니므로 열지 않고 건너뜁니다. 고른 모델은 Forge 가 감싸기 전 로더
+  (`torch.load_origin`·`load_file_origin`)로 읽으므로, 읽다 실패해도 Forge 가 파일 이름을 `.corrupted` 로 바꾸지 않습니다.
+  목록 맨 앞(드롭다운 기본값·API 에서 모델을 비웠을 때)은 metadata 의 `modelspec.version` 이 가장 높은 파일입니다(v1.1 은 `1.1` 을 적어 둠 — 버전을 적지 않은 파일은 그 뒤, 폴더·이름 순). 새 파일은 🔄 로 목록에
   들어옵니다.
 - ⚠️ **DeGrid(잔차) NAFNet 만** 쓸 수 있습니다. 이미지를 내는 일반 복원 NAFNet(SIDD 노이즈 제거·GoPro 디블러 등)도 키가 같아
   목록에 나오지만(SIDD width 32 는 구성까지 같음), 고르면 출력이 잔차가 아니라 입력을 따라가는 이미지라서 적용하지 않고

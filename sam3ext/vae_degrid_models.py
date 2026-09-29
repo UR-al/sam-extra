@@ -3,8 +3,13 @@
 찾는 곳: ``models/ESRGAN``(civitai·HF 안내대로 넣는 곳)과 ``models/DeGrid``(있으면). 하위 폴더는 보지 않는다.
 ESRGAN 폴더에는 일반 업스케일러가 섞여 있으므로 **state dict 키가 NAFNet 인 파일만** 고른다 — spandrel NAFNet
 아키텍처의 감지 키(``spandrel/architectures/NAFNet/__init__.py`` 15-34줄)를 모두 가진 파일. safetensors 는 헤더만 읽고
-(텐서는 읽지 않음), .pth/.pt 는 ``torch.load(weights_only=True, mmap=True)``(옛 형식이면 mmap 없이)로 키만 본다.
-판정은 (경로, 크기, 수정 시각)으로 캐시한다.
+(텐서는 읽지 않음), .pth/.pt 는 **torch.load 를 부르지 않고** zip(새 형식)의 ``data.pkl`` 만 풀어 키 이름을 본다(텐서·저장소는
+만들지 않는 대역으로 바꾸고, ``collections.OrderedDict`` 밖의 전역은 부르지 않음). zip 이 아닌 옛 형식 pickle(예: 4x-UltraSharp.pth)은
+DeGrid 가 아니므로(DeGrid 는 safetensors·새 형식 pth 로 배포) 열지 않고 건너뛴다. 판정은 (경로, 크기, 수정 시각)으로 캐시한다.
+
+Forge 는 ``torch.load``·``safetensors.torch.load_file`` 을 감싸서(``modules_forge/patch_basic.py`` ``build_loaded``) 실패하면
+인자 중 **str 파일 경로를 모두 ``<파일>.corrupted`` 로 바꿔 버린다**(원래 로더는 ``torch.load_origin``·``load_file_origin``).
+그래서 가중치는 ``torch_load``·``safetensors_load`` 로만 읽는다 — 원래 로더를 쓰고, 어느 로더에도 str 인자를 넘기지 않는다.
 
 목록은 safetensors metadata 의 ``modelspec.version`` 이 높은 파일이 먼저다(v1.1 은 "1.1" 을 적어 두었다. 버전을 적지 않은
 파일은 적은 파일 뒤, 같으면 폴더·이름 순). 모델을 비워 둔 API 호출(auto)과 드롭다운 기본값은 맨 앞 파일이다.
@@ -18,11 +23,16 @@ ESRGAN 폴더에는 일반 업스케일러가 섞여 있으므로 **state dict �
 """
 from __future__ import annotations
 
+import collections
+import io
 import json
+import logging
 import os
+import pickle
 import re
 import struct
 import threading
+import zipfile
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -56,8 +66,11 @@ NAFNET_KEYS = (
 _WRAPPER_KEYS = ("model_state_dict", "state_dict", "params_ema", "params-ema", "params", "model", "net")
 _PREFIXES = ("module.", "netG.", "net_g.")
 
-# .pth 를 mmap 없이 통째로 읽는 것은 이 크기까지만(옛 형식 업스케일러 67 MB 정도는 읽는다).
-_TORCH_FULL_LOAD_LIMIT = 1 << 30
+# zip .pth 의 data.pkl 은 키·모양·저장소 번호만 담아 작다(업스케일러 67 MB 파일에서 147 KB). 이보다 크면 읽지 않는다.
+_PICKLE_READ_LIMIT = 64 << 20
+_ZIP_MAGIC = b"PK\x03\x04"   # torch.serialization._is_zipfile 과 같은 검사(앞 4바이트)
+
+_LOG = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -158,23 +171,84 @@ def _unwrap(state) -> dict | None:
     return state
 
 
-def read_torch_keys(path) -> list[str] | None:
-    """.pth/.pt 의 텐서 이름(감싸개를 벗긴 뒤). mmap 으로 먼저 읽고, 옛 형식이면 1 GiB 이하만 통째로 읽는다."""
+def is_torch_zip(path) -> bool:
+    """torch 새 형식(zip) 파일인지 — 앞 4바이트(``torch.serialization._is_zipfile`` 과 같음)와 zip 끝 레코드만 본다."""
     try:
-        import torch
+        with open(path, "rb") as handle:
+            if handle.read(4) != _ZIP_MAGIC:
+                return False
+        return zipfile.is_zipfile(path)
+    except OSError:
+        return False
+
+
+class _Opaque:
+    """data.pkl 안의 텐서·저장소·그 밖의 전역 대신 들어가는 대역. 받은 인자를 무시하고 아무 코드도 부르지 않는다."""
+
+    def __new__(cls, *args, **kwargs):
+        return object.__new__(cls)
+
+    def __init__(self, *args, **kwargs):
+        pass
+
+    def __setstate__(self, state):
+        pass
+
+
+def _encode_text(text="", encoding="latin1"):
+    """pickle 프로토콜 2 가 bytes 를 적는 ``_codecs.encode(str, 'latin1')`` — str 만 받는다."""
+    if isinstance(text, str) and str(encoding).lower().replace("_", "-") in ("latin1", "latin-1", "utf-8", "utf8", "ascii"):
+        return text.encode(encoding)
+    return _Opaque()
+
+
+_PICKLE_GLOBALS = {
+    ("collections", "OrderedDict"): collections.OrderedDict,
+    ("_codecs", "encode"): _encode_text,
+}
+
+
+class _KeysOnlyUnpickler(pickle.Unpickler):
+    """state dict 의 모양(dict·키 이름)만 되살린다 — 텐서(persistent id)와 OrderedDict 밖의 전역은 ``_Opaque``."""
+
+    def find_class(self, module, name):
+        return _PICKLE_GLOBALS.get((module, name), _Opaque)
+
+    def persistent_load(self, pid):
+        return _Opaque()
+
+
+def _zip_data_pkl(archive: zipfile.ZipFile):
+    for info in archive.infolist():
+        parts = info.filename.replace("\\", "/").split("/")
+        if parts[-1] == "data.pkl" and len(parts) <= 2:
+            return info
+    return None
+
+
+def read_torch_state_skeleton(path):
+    """zip .pth/.pt 의 ``data.pkl`` 만 풀어 state dict 모양을 돌려준다(텐서 자리는 ``_Opaque``). torch 를 쓰지 않는다.
+    zip 이 아니거나(옛 형식 pickle) 풀 수 없으면 None."""
+    if not is_torch_zip(path):
+        return None
+    try:
+        with zipfile.ZipFile(path) as archive:
+            info = _zip_data_pkl(archive)
+            if info is None or info.file_size > _PICKLE_READ_LIMIT:
+                return None
+            data = archive.read(info)
+        return _KeysOnlyUnpickler(io.BytesIO(data), encoding="utf-8", errors="replace").load()
     except Exception:
         return None
-    state = None
-    try:
-        state = torch.load(path, map_location="cpu", weights_only=True, mmap=True)
-    except Exception:
-        try:
-            if os.path.getsize(path) > _TORCH_FULL_LOAD_LIMIT:
-                return None
-            state = torch.load(path, map_location="cpu", weights_only=True)
-        except Exception:
-            return None
-    state = _unwrap(state)
+
+
+def read_torch_keys(path) -> list[str] | None:
+    """.pth/.pt 의 텐서 이름(감싸개를 벗긴 뒤) — ``data.pkl`` 만 읽는다(``torch.load`` 를 부르지 않음).
+    옛 형식(zip 이 아닌 pickle)은 열지 않고 None(디버그 로그 한 줄 — 판정 캐시 덕에 파일마다 한 번)."""
+    if not is_torch_zip(path):
+        _LOG.debug("VAE DeGrid: skipped %s (legacy torch pickle, not a DeGrid model)", Path(path).name)
+        return None
+    state = _unwrap(read_torch_state_skeleton(path))
     if state is None:
         return None
     return [str(key) for key in state]
@@ -288,14 +362,33 @@ def resolve(name, entries) -> ModelEntry | None:
 # ---------------------------------------------------------------------------
 
 
-def _read_state_dict(path):
-    if Path(path).suffix.lower() == ".safetensors":
-        from safetensors.torch import load_file
+def unpatched_loader(module, name: str):
+    """Forge 가 감싸기 전의 로더 — ``build_loaded(module, name)`` 이 ``<name>_origin`` 에 둔다. Forge 밖이면 그 로더 그대로."""
+    original = getattr(module, f"{name}_origin", None)
+    return original if callable(original) else getattr(module, name)
 
-        return load_file(str(path), device="cpu")
+
+def torch_load(path):
+    """``.pth``/``.pt`` 를 CPU 로(weights_only). Forge 가 감싸기 전 ``torch.load`` 를 쓰고, 경로는 ``Path``·
+    ``map_location`` 은 ``torch.device`` 로 넘긴다 — 감싼 로더는 실패하면 str 인자인 파일 이름을 바꾼다."""
     import torch
 
-    return torch.load(str(path), map_location="cpu", weights_only=True)
+    loader = unpatched_loader(torch, "load")
+    return loader(Path(path), map_location=torch.device("cpu"), weights_only=True)
+
+
+def safetensors_load(path):
+    """safetensors 를 CPU 로. ``torch_load`` 와 같은 이유로 감싸기 전 로더에 ``Path`` 만 넘긴다(device 는 기본값 cpu)."""
+    import safetensors.torch
+
+    loader = unpatched_loader(safetensors.torch, "load_file")
+    return loader(Path(path))
+
+
+def _read_state_dict(path):
+    if Path(path).suffix.lower() == ".safetensors":
+        return safetensors_load(path)
+    return torch_load(path)
 
 
 def load_nafnet(path):
