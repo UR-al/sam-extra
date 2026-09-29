@@ -639,10 +639,15 @@ Anima(Qwen·Wan VAE)로 만든 이미지에 생기는 **VAE 격자 무늬**를
 
 - 모델 파일을 `models/ESRGAN/` 또는 `models/DeGrid/`(새로 만들어도 됨)에 넣습니다. 권장은 v1.1
   (`VAE_DeGrid_NAFNet_small_v1.1.safetensors`, Civitai 이름 `qwenVAEDegridNafnet_v11.safetensors`, 117 MB, SHA-256
-  `e6f59053acb3…ff470d4e`)이고 v1.0 도 됩니다. 목록에는 **state dict 가 NAFNet 인 파일만** 나옵니다 — 같은 폴더의 일반
-  업스케일러는 safetensors 헤더(텐서는 읽지 않음)·`.pth` 키로 걸러 냅니다. 목록 맨 앞(드롭다운 기본값·API 에서 모델을 비웠을
-  때)은 metadata 의 `modelspec.version` 이 가장 높은 파일입니다(v1.1 은 `1.1` 을 적어 두었고 v1.0 은 없음). 새 파일은 🔄 로
-  목록에 들어옵니다.
+  `e6f59053acb3…ff470d4e`)입니다(같은 저장소의 v1.0 도 같은 NAFNet-small 구조라 목록에 나오지만, 실제로 돌려 확인한 것은
+  v1.1). 목록에는 **state dict 가 NAFNet 인 파일만** 나옵니다 — 같은 폴더의 일반 업스케일러는 safetensors 헤더(텐서는 읽지
+  않음)·`.pth` 키로 걸러 냅니다. 목록 맨 앞(드롭다운 기본값·API 에서 모델을 비웠을 때)은 metadata 의 `modelspec.version` 이
+  가장 높은 파일입니다(v1.1 은 `1.1` 을 적어 둠 — 버전을 적지 않은 파일은 그 뒤, 폴더·이름 순). 새 파일은 🔄 로 목록에
+  들어옵니다.
+- ⚠️ **DeGrid(잔차) NAFNet 만** 쓸 수 있습니다. 이미지를 내는 일반 복원 NAFNet(SIDD 노이즈 제거·GoPro 디블러 등)도 키가 같아
+  목록에 나오지만(SIDD width 32 는 구성까지 같음), 고르면 출력이 잔차가 아니라 이미지라서 적용하지 않고
+  `Anima DeGrid error: … not a DeGrid residual model …` 을 남깁니다(출력 |평균| 25/255 초과, 또는 2/255 초과이면서 입력과의
+  상관 0.9 초과 — 실제 v1.1 은 |평균| 0.1~0.7/255, 상관 |r| 0.2 안팎 이하).
 - ⚠️ 이 모델은 이미지가 아니라 **잔차**를 냅니다. ESRGAN 폴더에 두면 Forge 의 Hires fix·Extras Upscale 업스케일러 목록에도
   보이지만, 거기서 고르면 잔차만 남은 거의 검은 이미지가 나옵니다(Forge 업스케일러는 출력을 [0,1] 로 자르고 BGR 로
   넣습니다). 이 기능으로만 쓰세요. 헷갈리면 `models/DeGrid/` 에 두세요.
@@ -655,12 +660,21 @@ Anima(Qwen·Wan VAE)로 만든 이미지에 생기는 **VAE 격자 무늬**를
 | DeGrid 모델 | 찾은 NAFNet 파일(🔄 새로 고침). 없으면 `None` 이고 켜도 건너뜁니다 |
 | 적용 방식 | **Full** 잔차 전체 — 어두운·밝은 격자 모두(기본) · **Dark Pixels Mainly** 양의 잔차만 — ComfyUI 기본 노드 경로(Load Upscale Model → Upscale Image → Image Blend)와 같고 Nyquist Notch 셰이더와 비슷 · **Bright Pixels Mainly** 음의 잔차만 |
 | 강도 | 잔차에 곱하는 배율 0~1.5 (1 = 원본 노드) |
-| 타일 크기 | 512 = 원본 노드(겹침 32, 가장자리 feather). 0 = 나누지 않음(VRAM 더 씀). NAFNet 의 채널 어텐션이 타일 평균을 써서 타일 크기에 따라 결과가 조금 다릅니다(512 와 나누지 않음의 차이: 8비트로 최대 2 단계, 픽셀 9% 가 1~2 단계) |
+| 타일 크기 | 512 = 원본 노드(겹침 32, 가장자리 feather). 0 = 나누지 않음(VRAM 더 씀). 슬라이더는 0 과 128 단위(128~4096). NAFNet 의 채널 어텐션이 타일 평균을 써서 타일 크기에 따라 결과가 조금 다릅니다(512 와 나누지 않음의 차이: 8비트로 최대 2 단계, 픽셀 9% 가 1~2 단계) — 그래서 infotext 에는 **실제로 쓴** 타일(메모리 부족으로 줄였으면 줄인 값)이 남습니다 |
 
 - 계산: `결과 = clamp(이미지 + 강도 × f(잔차), 0, 1)` — f 는 방식(전체 / 양수만 / 음수만). 잔차와 중간 합은 자르지 않고
-  마지막 이미지만 자릅니다. 강도 1·같은 타일이면 [ComfyUI-NAFNet-Residual](https://github.com/DraconicDragon/ComfyUI-NAFNet-Residual)
-  의 **NAFNet Restoration** 노드와 비트 단위로 같은 계산이고(`tests/test_vae_degrid.py` 가 노드의 잔차 함수·ComfyUI
-  `tiled_scale` 과 대조), 입력은 RGB [0,1] fp32, 8비트로는 반올림합니다.
+  마지막 이미지만 자릅니다. 강도 1·같은 타일이면 식·타일 위치·feather 가중치가
+  [ComfyUI-NAFNet-Residual](https://github.com/DraconicDragon/ComfyUI-NAFNet-Residual) 의 **NAFNet Restoration** 노드와
+  같습니다(`tests/test_vae_degrid.py` 가 같은 입력 텐서로 노드의 잔차 함수·ComfyUI `tiled_scale` 과 비트 단위 대조). 전체
+  파이프라인은 비트 단위로 같지 않습니다 — 노드는 입력을 channels-last 뷰(`image.movedim(-1,-3)`)로 넣어 float 결과가 1e-6
+  정도(실제 v1.1 CPU 실측 최대 1.9e-6, 8비트로는 50만 값 중 많아야 수십 개) 다르고, 8비트 변환은 여기서 반올림, ComfyUI SaveImage 는
+  버림이라 저장한 PNG 는 값의 약 절반이 1 단계 다릅니다. 입력은 RGB [0,1] fp32 입니다.
+- 16 의 배수가 아닌 크기: 노드(spandrel NAFNet)는 안에서 모자란 칸을 **0** 으로 채워 오른쪽·아래 가장자리 잔차가 커집니다
+  (실제 v1.1 CPU: Anima 250×190 조각 오른쪽 아래 56/255, 1000×1526 오른쪽 끝 45/255). 여기서는 타일마다 반사 패딩으로 16 의
+  배수를 맞추고 잘라 냅니다(저자의 단독 추론 스크립트 NAFNet-c `infer.py` 와 같은 반사) — 같은 조각이 1.6/255 로 안쪽과
+  비슷해집니다. 표준 Anima 크기(1216×1856 등 16 의 배수, 1.5 배 hires 포함)는 타일 512·256·128 의 모든 조각이 16 의 배수라
+  모델을 그대로 불러 노드와 같습니다(1216×1856 은 고치기 전과 비트 단위로 같음). 주로 Extras 의 임의 크기 이미지와 8 의
+  배수 img2img 크기에 해당합니다.
 - 효과는 미세합니다. 개발 PC CPU 실측(1216×1856 Anima 이미지): 잔차 |평균| 약 0.5/255, 최대 약 25/255, Full 로 8비트 값이
   바뀐 픽셀 약 44%(대부분 1 단계, 선화 가장자리 주변이 가장 큼). VAE 를 거친 적 없는 합성 그림(512², 단색 면·선화)을
   Qwen-Image VAE 로 인코드·디코드한 뒤 돌리면 원본과의 PSNR 이 36.7 → 37.7 dB 로 올랐고(강도 1 이 0.5·1.5 보다 좋음,
@@ -673,8 +687,8 @@ Anima(Qwen·Wan VAE)로 만든 이미지에 생기는 **VAE 격자 무늬**를
   `modules/processing.py` 가 이 순서로 부르므로 확장 설치 순서·폴더 이름과 무관합니다(테스트가 Forge 코드로 확인).
 - SAM3 인페인트·ADetailer 의 내부 패스에서는 돌지 않고, 합친 최종 이미지에 한 번만 적용합니다.
 - Settings → Postprocessing 에서 Extras 의 Upscale 을 txt2img·img2img 탭에 켰다면 DeGrid 가 그보다 **먼저** 돕니다
-  (`metadata.ini` 콜백 순서 — 확대하면 격자 간격이 달라짐). 이 확장의 Extras DeGrid 를 메인 탭에도 켜면 두 번 적용되니
-  켜지 마세요.
+  (`metadata.ini` 콜백 순서 — 확대하면 격자 간격이 달라짐). Extras 항목의 이름은 **Anima VAE DeGrid (NAFNet, Extras)** 로
+  생성 탭 아코디언과 달라 API 이름이 겹치지 않지만, 그것을 메인 탭에도 켜면 두 번 적용되니 켜지 마세요.
 - img2img 인페인트('Inpaint only masked' 포함)는 합성한 전체 이미지에 적용합니다 — 마스크 밖 원본도 지나가지만, 격자가
   없는 부분은 거의 바뀌지 않습니다.
 - Anima Tile & Repair·캐릭터 레퍼런스 결과는 Forge 생성 파이프라인 밖의 별도 잡이라 이 아코디언이 붙지 않습니다 —
@@ -695,9 +709,11 @@ Anima(Qwen·Wan VAE)로 만든 이미지에 생기는 **VAE 격자 무늬**를
 ### 기록과 붙여 넣기
 
 infotext 에 `Anima DeGrid model`, `Anima DeGrid mode`(Full / Dark Pixels Mainly / Bright Pixels Mainly),
-`Anima DeGrid strength`, `Anima DeGrid tile` 이 남습니다. 모델이 없거나 실패하면 이미지는 DeGrid 없이 저장되고
-`Anima DeGrid error` 만 남습니다. PNG Info 로 붙여 넣으면 켜짐·방식·강도·타일과 (그 PC 에 있으면) 모델이 되살아나고,
-이 키가 없는 이미지를 붙여 넣으면 꺼집니다. Extras 결과는 PNG 의 `postprocessing` 항목에 같은 키가 남습니다.
+`Anima DeGrid strength`, `Anima DeGrid tile`(**실제로 쓴** 타일 — 메모리 부족으로 512 → 256 → 128 로 줄였으면 줄인 값),
+`Anima DeGrid precision`(`fp32` / `fp16-autocast` — 결과가 최대 0.27/255 다름, 설정이라 붙여 넣지는 않음)이 남습니다. 모델이
+없거나 실패하면 이미지는 DeGrid 없이 저장되고 `Anima DeGrid error` 만 남습니다. PNG Info 로 붙여 넣으면 켜짐·방식·강도·타일과
+(그 PC 에 있으면) 모델이 되살아나고, 이 키가 없는 이미지를 붙여 넣으면 꺼집니다. Extras 결과는 PNG 의 `postprocessing` 항목에
+같은 키가 남습니다.
 
 ### API
 
@@ -705,7 +721,7 @@ infotext 에 `Anima DeGrid model`, `Anima DeGrid mode`(Full / Dark Pixels Mainly
 위치 인자 `[enabled, model, mode, strength, tile]`(뒤는 빼면 기본값: 첫 NAFNet 파일 · full · 1.0 · 512). 키 이름을 적은
 dict 하나도 받습니다: `{"args": [{"enabled": true, "mode": "dark"}]}`. `model` 이 비었거나 `"None"`/`"auto"` 면 찾은 첫
 NAFNet 파일, `mode` 는 `full` / `dark` / `bright` 또는 `Full` / `Dark Pixels Mainly` / `Bright Pixels Mainly`, `strength` 0~1.5,
-`tile` 0 또는 128~4096. 모델을 못 찾으면 로그를 남기고 건너뜁니다(`Anima DeGrid error: model not found: …`). Forge 의 Extras
+`tile` 0 또는 128~4096(1~127 은 128). 모델을 못 찾으면 로그를 남기고 건너뜁니다(`Anima DeGrid error: model not found: …`). Forge 의 Extras
 API(`/sdapi/v1/extra-*`)는 내장 항목(Upscale 등) 인자만 넘기므로 Extras DeGrid 는 UI 전용입니다.
 
 ---

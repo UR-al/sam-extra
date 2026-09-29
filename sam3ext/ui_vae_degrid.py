@@ -14,14 +14,19 @@ from . import vae_degrid as vd
 from . import vae_degrid_models as vdm
 
 TITLE = "Anima VAE DeGrid (NAFNet)"
+# Extras 항목 이름(Settings → Postprocessing 목록·순서의 키). 생성 탭 스크립트와 달라야 한다 — Extras 항목을 메인 탭에도
+# 켜면 Forge 가 ``ScriptPostprocessingForMainUI``(title() = 이 이름)로 감싸 always-on 으로 넣는데, 이름이 같으면
+# API 의 ``alwayson_scripts[TITLE]`` 가 둘 중 어느 것인지 모호해진다.
+EXTRAS_TITLE = "Anima VAE DeGrid (NAFNet, Extras)"
 ARG_NAMES = ("enabled", "model", "mode", "strength", "tile")  # 뒤에만 덧붙인다(API 인자 위치 고정)
 
 KEY_MODEL = "Anima DeGrid model"
 KEY_MODE = "Anima DeGrid mode"
 KEY_STRENGTH = "Anima DeGrid strength"
-KEY_TILE = "Anima DeGrid tile"
+KEY_TILE = "Anima DeGrid tile"            # 실제로 쓴 타일(OOM 으로 줄였으면 줄인 값) — 붙여 넣으면 같은 결과
+KEY_PRECISION = "Anima DeGrid precision"  # fp32 / fp16-autocast — 설정이라 붙여 넣지 않는다(기록만)
 KEY_ERROR = "Anima DeGrid error"
-RESULT_KEYS = (KEY_MODEL, KEY_MODE, KEY_STRENGTH, KEY_TILE)
+RESULT_KEYS = (KEY_MODEL, KEY_MODE, KEY_STRENGTH, KEY_TILE, KEY_PRECISION)
 
 MODE_CHOICES = [
     "Full (전체)",
@@ -30,7 +35,10 @@ MODE_CHOICES = [
 ]
 _MODE_CHOICE = dict(zip(vd.MODES, MODE_CHOICES))
 
-TILE_SLIDER_MAX = 2048
+# 타일 슬라이더: 0(나누지 않음)과 128 단위 — 모든 칸이 ``coerce_tile`` 에서 그대로이고(64 처럼 조용히 128 로 바뀌는 칸이
+# 없음), 최대가 API·붙여 넣기 범위(MAX_TILE)와 같다. 칸 사이 값(API·OOM 으로 줄인 타일)은 숫자 칸에 그대로 들어간다.
+TILE_SLIDER_STEP = vd.MIN_TILE
+TILE_SLIDER_MAX = vd.MAX_TILE
 
 
 @dataclass(frozen=True)
@@ -76,13 +84,24 @@ def format_strength(strength: float) -> str:
     return f"{round(float(strength), 3):g}"
 
 
-def infotext_items(model_name: str, mode: str, strength: float, tile: int) -> dict:
-    return {
+def infotext_items(model_name: str, mode: str, strength: float, tile: int, precision: str | None = None) -> dict:
+    """infotext 항목. ``tile`` 은 **실제로 쓴** 타일(``DegridOutcome.tile_used``)을 넘긴다 — 타일 크기에 따라 결과가
+    달라서(채널 어텐션이 타일 평균을 씀) 요청값을 적으면 OOM 으로 줄인 이미지를 붙여 넣어도 같은 결과가 나오지 않는다.
+    ``precision`` 은 실행 정밀도(``fp32``·``fp16-autocast``, 차이 최대 0.27/255 — 기록만)."""
+    items = {
         KEY_MODEL: model_name,
         KEY_MODE: vd.MODE_LABELS[vd.normalize_mode(mode) or vd.DEFAULT_MODE],
         KEY_STRENGTH: format_strength(strength),
         KEY_TILE: int(tile),
     }
+    if precision and str(precision).strip() not in ("", "-"):
+        items[KEY_PRECISION] = str(precision).strip()
+    return items
+
+
+def outcome_infotext(outcome) -> dict:
+    """``DegridOutcome`` → infotext 항목(실제로 쓴 타일·정밀도). 생성 탭과 Extras 가 같이 쓴다."""
+    return infotext_items(outcome.model_name, outcome.mode, outcome.strength, outcome.tile_used, outcome.precision)
 
 
 def record_success(params: dict, items: dict) -> None:
@@ -148,7 +167,8 @@ HELP_GENERATION = (
     "이미지의 **격자 무늬**를 지웁니다. 이미지마다 ADetailer·SAM3 인페인트 등 **모든 후처리가 끝난 뒤, 저장 직전에** "
     "한 번 적용합니다.\n\n"
     "- 모델: `models/ESRGAN` 또는 `models/DeGrid` 의 NAFNet 파일만 목록에 나옵니다(예: `qwenVAEDegridNafnet_v11`). "
-    "이 모델은 이미지가 아니라 **잔차**를 내므로 Forge 의 일반 업스케일러로 고르면 안 됩니다.\n"
+    "이 모델은 이미지가 아니라 **잔차**를 내므로 Forge 의 일반 업스케일러로 고르면 안 됩니다. 거꾸로 이미지를 내는 일반 "
+    "복원 NAFNet(노이즈 제거 등)도 목록에 보이지만 골라도 적용하지 않습니다.\n"
     "- **Full** 잔차 전체(어두운·밝은 격자 모두) · **Dark Pixels Mainly** 양의 잔차만(ComfyUI 기본 노드 경로와 같음) · "
     "**Bright Pixels Mainly** 음의 잔차만.\n"
     "- 강도: 잔차에 곱하는 배율(1 = 원본 노드). 타일: 512 = 원본 노드, 0 = 나누지 않음(VRAM 더 씀).\n"
@@ -178,7 +198,7 @@ def build_controls(elem_id: Callable[[str], str], *, extras: bool = False):
     import gradio as gr
 
     choices = model_choices()
-    context, fallback = _accordion(TITLE, elem_id("sam3_degrid"))
+    context, fallback = _accordion(EXTRAS_TITLE if extras else TITLE, elem_id("sam3_degrid"))
     with context as enabled:
         if fallback:
             enabled = gr.Checkbox(label="Enable", value=False, elem_classes=["sam3-on"],
@@ -213,10 +233,10 @@ def build_controls(elem_id: Callable[[str], str], *, extras: bool = False):
                 elem_id=elem_id("sam3_degrid_strength"),
             )
             tile = gr.Slider(
-                label="타일 크기 (0 = 나누지 않음)",
+                label=f"타일 크기 (0 = 나누지 않음, {vd.MIN_TILE}~{vd.MAX_TILE})",
                 minimum=0,
                 maximum=TILE_SLIDER_MAX,
-                step=64,
+                step=TILE_SLIDER_STEP,
                 value=vd.DEFAULT_TILE,
                 elem_id=elem_id("sam3_degrid_tile"),
             )

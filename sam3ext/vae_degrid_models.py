@@ -6,8 +6,12 @@ ESRGAN 폴더에는 일반 업스케일러가 섞여 있으므로 **state dict �
 (텐서는 읽지 않음), .pth/.pt 는 ``torch.load(weights_only=True, mmap=True)``(옛 형식이면 mmap 없이)로 키만 본다.
 판정은 (경로, 크기, 수정 시각)으로 캐시한다.
 
-목록은 safetensors metadata 의 ``modelspec.version`` 이 높은 파일이 먼저다(v1.1 파인튜닝은 "1.1" 을 적어 두었고 v1.0 은 적지
-않음 — 같으면 폴더·이름 순). 모델을 비워 둔 API 호출(auto)과 드롭다운 기본값은 맨 앞 파일이다.
+목록은 safetensors metadata 의 ``modelspec.version`` 이 높은 파일이 먼저다(v1.1 은 "1.1" 을 적어 두었다. 버전을 적지 않은
+파일은 적은 파일 뒤, 같으면 폴더·이름 순). 모델을 비워 둔 API 호출(auto)과 드롭다운 기본값은 맨 앞 파일이다.
+
+키만으로는 DeGrid(잔차를 냄)와 일반 복원 NAFNet(이미지를 냄 — SIDD width 32 노이즈 제거는 구성까지 같다)을 가를 수
+없다. 그런 파일도 목록에 나오지만, 런타임이 출력으로 거른다(``vae_degrid.output_looks_like_image`` →
+``NotResidualModelError``).
 
 불러오기는 Forge 의 업스케일러와 같은 spandrel ``ModelLoader`` 를 쓴다(Forge venv 에 이미 있음). NAFNet 이 아니거나
 배율·채널이 맞지 않으면 ValueError. 모델은 CPU fp32 로 한 번에 하나만 캐시한다(약 117 MB).

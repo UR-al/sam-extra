@@ -23,6 +23,10 @@ descriptor 를 부르지 않고 모델(forward)을 직접 부른다(노드 팩�
 ``backend/patcher/vae.py`` 에 ComfyUI v0.3.64 판을 옮겨 둠)와 같은 타일 위치·feather 가중치로 붙인다(배율 1 전용).
 NAFNet 의 채널 어텐션(SCA)은 타일 전체의 평균을 쓰므로 타일로 나누면 나누지 않은 결과와 조금 다르다 — 노드 팩과
 같은 결과를 내려면 같은 타일 크기(512)를 쓴다.
+
+패딩: 노드 팩은 타일을 모델에 그대로 넣어 spandrel 이 16 배수로 0 을 채우고, 그 때문에 16 배수가 아닌 크기에서는
+오른쪽·아래 가장자리 잔차가 커진다. 여기서는 타일마다 반사 패딩으로 배수를 맞추고 자른다(``call_padded``). 16 배수
+크기(표준 Anima 해상도는 타일 512·256·128 의 모든 조각이 16 배수)에서는 모델을 그대로 불러 노드 팩과 같다.
 """
 from __future__ import annotations
 
@@ -67,6 +71,16 @@ TILE_OVERLAP = 32    # 88줄
 MIN_TILE = 128       # 127줄 — 이보다 작아지면 포기
 MAX_TILE = 4096
 
+# NAFNet-small(인코더 4단)이 안에서 맞추는 배수 — spandrel ``padder_size = 2 ** len(encoders)``. 모델에 값이 없을 때 쓴다.
+PAD_MULTIPLE = 16
+
+# 출력이 잔차가 아니라 이미지인지 — 실제 v1.1·다른 DeGrid 파인튜닝은 |평균| 0.1~0.7/255(최대 수십/255)이고 입력과의
+# 상관이 |r| 0.2 안팎 이하다(CPU 실측, Anima 512² 조각 4장: -0.09~+0.19). 복원 이미지를 내는 NAFNet 은 |평균| 이 이미지
+# 밝기(수십~백여/255)이고 상관이 1 에 가깝다.
+IMAGE_LIKE_ABS_MEAN = 25 / 255       # 잔차가 평균 25 단계를 넘으면 이미지로 본다
+IMAGE_LIKE_MIN_ABS_MEAN = 2 / 255    # 이 아래면 상관을 보지 않는다(거의 검은 이미지에서 헛판정 방지)
+IMAGE_LIKE_CORRELATION = 0.9
+
 
 def normalize_mode(value) -> str | None:
     """모드 키·노드 팩 이름·UI 라벨('Full (전체)' 처럼 괄호 설명이 붙은 것) → 모드 키. 모르면 None."""
@@ -97,7 +111,7 @@ def coerce_strength(value, default: float = DEFAULT_STRENGTH) -> float:
 
 
 def coerce_tile(value, default: int = DEFAULT_TILE) -> int:
-    """타일 크기 → 0(나누지 않음) 또는 [128, 4096]. 읽을 수 없으면 ``default``."""
+    """타일 크기 → 0(나누지 않음) 또는 [128, 4096](1~127 은 128). 읽을 수 없으면 ``default``."""
     try:
         tile = int(float(value))
     except (TypeError, ValueError):
@@ -134,6 +148,26 @@ def apply_residual(image: torch.Tensor, delta: torch.Tensor, mode: str, strength
 def finalize(result: torch.Tensor) -> torch.Tensor:
     """마지막 이미지만 [0, 1] 로 자른다(노드 팩 145-149줄)."""
     return torch.clamp(result, min=0.0, max=1.0)
+
+
+def output_looks_like_image(image: torch.Tensor, raw: torch.Tensor) -> bool:
+    """모델 출력(``raw``)이 잔차가 아니라 이미지인가 — 파일 키로는 DeGrid 와 일반 복원 NAFNet(SIDD width 32 노이즈 제거는
+    구성까지 같다)을 가를 수 없어, 출력으로 거른다. |평균| 이 25/255 를 넘거나, 2/255 를 넘으면서 입력과의 상관이
+    0.9 를 넘으면 이미지다. 분산이 0 이라 상관을 정할 수 없으면 잔차로 본다."""
+    mean_abs = float(raw.abs().mean()) if raw.numel() else 0.0
+    if mean_abs > IMAGE_LIKE_ABS_MEAN:
+        return True
+    if not mean_abs > IMAGE_LIKE_MIN_ABS_MEAN:
+        return False
+    # float32 로 충분하다(문턱 0.9) — hires 2432×3712 에서도 사본 두 개 약 0.2 GB.
+    a = image.detach().reshape(-1).to(dtype=torch.float32)
+    b = raw.detach().reshape(-1).to(device=a.device, dtype=torch.float32)
+    a = a - a.mean()
+    b = b - b.mean()
+    denominator = float(a.norm()) * float(b.norm())
+    if not denominator > 0.0:
+        return False
+    return float(torch.dot(a, b)) / denominator > IMAGE_LIKE_CORRELATION
 
 
 # ---------------------------------------------------------------------------
@@ -193,6 +227,35 @@ def tiled_residual(
             weight[:, :, top : top + h, left : left + w].add_(mask)
         out[b : b + 1] = acc / weight
     return out
+
+
+def pad_to_multiple(x: torch.Tensor, multiple: int) -> torch.Tensor:
+    """[B,C,H,W] 의 오른쪽·아래를 ``multiple`` 배수로 반사 패딩한다(이미 배수면 ``x`` 그대로). 채울 칸이 그 축 길이
+    이상이라 반사할 수 없는 아주 작은 입력은 가장자리를 복제한다."""
+    multiple = int(multiple)
+    height, width = int(x.shape[-2]), int(x.shape[-1])
+    pad_h = (-height) % multiple if multiple > 1 else 0
+    pad_w = (-width) % multiple if multiple > 1 else 0
+    if not pad_h and not pad_w:
+        return x
+    mode = "reflect" if pad_h < height and pad_w < width else "replicate"
+    return torch.nn.functional.pad(x, (0, pad_w, 0, pad_h), mode=mode)
+
+
+def call_padded(fn: Callable[[torch.Tensor], torch.Tensor], piece: torch.Tensor, multiple: int) -> torch.Tensor:
+    """``fn`` 을 ``multiple`` 배수로 반사 패딩한 입력으로 부르고 원래 크기로 자른다.
+
+    spandrel NAFNet 은 16 배수가 아니면 안에서 **0** 으로 채운다(``check_image_size``). 이 모델은 ``ending(x) + inp`` 가
+    잔차가 되도록 입력을 상쇄하게 학습돼 있어, 이미지 옆 0 띠가 강한 경계가 되고 오른쪽·아래 가장자리 잔차가 커진다
+    (v1.1 CPU 실측: 250x190 오른쪽 아래 56/255, 반사 패딩 1.6/255 — 256x192 는 1.8/255). 저자의 단독 추론
+    스크립트(NAFNet-c ``infer.py``)도 반사로 채운다. 배수인 입력(표준 Anima 크기의 모든 타일)은 그대로 부르므로 노드
+    팩(ComfyUI-NAFNet-Residual)과 같다.
+    """
+    height, width = int(piece.shape[-2]), int(piece.shape[-1])
+    padded = pad_to_multiple(piece, multiple)
+    if padded is piece:
+        return fn(piece)
+    return fn(padded)[..., :height, :width]
 
 
 def is_oom_error(exc: BaseException) -> bool:

@@ -1,5 +1,6 @@
-"""Anima VAE DeGrid — 잔차 산술(모드·부호·강도·마지막 clamp), 타일(ComfyUI tiled_scale 과 같음), OOM 재시도, PIL 변환,
-NAFNet 파일 찾기, spandrel 로더, 런타임(장치·Forge 메모리 관리). GPU 없이(CPU) 돈다.
+"""Anima VAE DeGrid — 잔차 산술(모드·부호·강도·마지막 clamp), 타일(ComfyUI tiled_scale 과 같음), 16 배수가 아닌 타일의
+반사 패딩, OOM 재시도, PIL 변환, 이미지를 내는 NAFNet 거절, NAFNet 파일 찾기, spandrel 로더, 런타임(장치·Forge 메모리 관리,
+생성 탭(inference_mode)에서 처음 불러 장치로 옮기는 경로). GPU 없이(CPU) 돈다.
 
 대조 오라클
 - 잔차 적용: ComfyUI-NAFNet-Residual(DraconicDragon, Apache-2.0 — LICENSE 에 저작권자 이름 없음, NOTICE 없음)
@@ -156,6 +157,34 @@ class ResidualModeTests(unittest.TestCase):
         self.assertEqual(vd.coerce_tile(None), 512)
 
 
+class ResidualSanityTests(unittest.TestCase):
+    """잔차가 아니라 이미지를 내는 NAFNet(예: SIDD width 32 노이즈 제거 — 키·구성이 DeGrid 와 같아 목록에 나온다)을 거른다."""
+
+    def setUp(self):
+        self.g = torch.Generator().manual_seed(7)
+        self.x = torch.rand((1, 3, 64, 64), generator=self.g)
+
+    def test_degrid_like_residual_is_accepted(self):
+        # 실제 v1.1 은 |평균| 0.1~0.6/255, 최대 수십/255
+        raw = (torch.rand(self.x.shape, generator=self.g) - 0.5) * (4 / 255)
+        raw[..., 10, 10] = 40 / 255
+        self.assertFalse(vd.output_looks_like_image(self.x, raw))
+
+    def test_image_output_is_refused(self):
+        noise = (torch.rand(self.x.shape, generator=self.g) - 0.5) * 0.02
+        self.assertTrue(vd.output_looks_like_image(self.x, self.x + noise))
+
+    def test_dark_image_output_is_refused_by_correlation(self):
+        dark = self.x * 0.06                      # 평균 약 7.6/255 — |평균| 기준(25/255) 아래
+        self.assertTrue(vd.output_looks_like_image(dark, dark * 0.98 + 0.001))
+
+    def test_near_black_and_flat_images_are_not_misjudged(self):
+        black = torch.full((1, 3, 32, 32), 1 / 255)
+        self.assertFalse(vd.output_looks_like_image(black, torch.full_like(black, 1 / 255)))
+        flat = torch.full((1, 3, 32, 32), 0.5)     # 분산 0 — 상관을 정할 수 없으면 잔차로 본다
+        self.assertFalse(vd.output_looks_like_image(flat, torch.full_like(flat, 5 / 255)))
+
+
 def _pointwise(t):
     return t * 0.3 - 0.1
 
@@ -216,6 +245,85 @@ class TilingTests(unittest.TestCase):
                 theirs = tiled_scale(x, nonlocal_fn, tile_x=tile, tile_y=tile, overlap=32, upscale_amount=1,
                                      out_channels=3, output_device="cpu")
                 self.assertTrue(torch.equal(ours, theirs))
+
+
+class _ZeroPaddingNafnetLike(torch.nn.Module):
+    """spandrel NAFNet 처럼 안에서 ``padder_size`` 배수로 0 을 채우고(``check_image_size``) 끝에서 자르는 국소 잔차 모델.
+    잔차 = 3x3 평균(가장자리 복제) − 입력 — 평평한 면에서는 0 이고, 이미지와 0 채움 사이 경계에서만 크다."""
+
+    padder_size = 16
+
+    def __init__(self):
+        super().__init__()
+        self.shapes = []
+
+    def forward(self, x):
+        self.shapes.append(tuple(x.shape[-2:]))
+        h, w = x.shape[-2:]
+        x = torch.nn.functional.pad(x, (0, (-w) % self.padder_size, 0, (-h) % self.padder_size))
+        mean = torch.nn.functional.avg_pool2d(torch.nn.functional.pad(x, (1, 1, 1, 1), mode="replicate"), 3, 1)
+        return (mean - x)[:, :, :h, :w]
+
+
+class TilePaddingTests(unittest.TestCase):
+    """16 배수가 아닌 크기 — spandrel NAFNet 은 안에서 0 으로 채워 오른쪽·아래 가장자리에 큰 잔차가 생긴다(실제 v1.1, 250x190:
+    오른쪽 아래 56/255). 타일마다 반사 패딩으로 배수를 맞추고 자른다(저자 infer.py 와 같은 반사). 16 배수면 그대로 부른다."""
+
+    def test_pad_to_multiple_reflects_right_and_bottom(self):
+        x = torch.rand(1, 3, 190, 250)
+        padded = vd.pad_to_multiple(x, 16)
+        self.assertEqual(tuple(padded.shape), (1, 3, 192, 256))
+        self.assertTrue(torch.equal(padded[..., :190, :250], x))
+        # 반사: 가장자리 줄을 축으로 접는다(가장자리 줄은 되풀이하지 않음)
+        self.assertTrue(torch.equal(padded[..., 190:192, :250], x[..., 187:189, :].flip(-2)))
+        self.assertTrue(torch.equal(padded[..., :190, 250:256], x[..., 243:249].flip(-1)))
+
+    def test_multiples_are_untouched_and_tiny_inputs_replicate(self):
+        x = torch.rand(1, 3, 192, 256)
+        self.assertIs(vd.pad_to_multiple(x, 16), x)
+        self.assertIs(vd.pad_to_multiple(x, 1), x)
+        tiny = torch.rand(1, 3, 5, 7)             # 채울 칸(11·9)이 길이 이상이면 반사할 수 없다 → 가장자리 복제
+        padded = vd.pad_to_multiple(tiny, 16)
+        self.assertEqual(tuple(padded.shape), (1, 3, 16, 16))
+        self.assertTrue(torch.equal(padded[..., :5, :7], tiny))
+        self.assertTrue(torch.equal(padded[..., 15, 6], tiny[..., 4, 6]))
+
+    def test_odd_size_gets_no_edge_residual(self):
+        model = _ZeroPaddingNafnetLike()
+        flat = torch.full((1, 3, 190, 250), 0.5)
+        self.assertGreater(float(model(flat).abs().max()), 0.1)    # 0 채움 경계(고치기 전 동작)
+        fn, _ = vdr.make_residual_fn(model, torch.device("cpu"), False)
+        self.assertLess(float(fn(flat).abs().max()), 1e-6)
+        self.assertEqual(model.shapes[-1], (192, 256))
+
+    def test_multiple_of_16_calls_the_model_unchanged(self):
+        # 노드 팩 동등성: 16 배수면 모델을 그대로 부른다
+        model = _ZeroPaddingNafnetLike()
+        x = torch.rand(1, 3, 192, 256)
+        fn, _ = vdr.make_residual_fn(model, torch.device("cpu"), False)
+        self.assertTrue(torch.equal(fn(x), model(x)))
+        self.assertEqual(model.shapes, [(192, 256), (192, 256)])
+
+    def test_standard_anima_sizes_tile_into_multiples_of_16(self):
+        # 표준 Anima 크기(와 1.5 배 hires)는 타일 512·256·128 의 모든 조각이 16 배수 — 패딩이 끼지 않아 노드와 같다
+        for height, width in ((1856, 1216), (1216, 832), (1024, 1024), (1536, 1536), (2784, 1824)):
+            for tile in (512, 256, 128):
+                sizes = {min(tile, height - top) for top in vd.tile_starts(height, tile, vd.TILE_OVERLAP)}
+                sizes |= {min(tile, width - left) for left in vd.tile_starts(width, tile, vd.TILE_OVERLAP)}
+                with self.subTest(size=(width, height), tile=tile):
+                    self.assertTrue(all(size % 16 == 0 for size in sizes), sizes)
+
+    def test_runtime_keeps_a_flat_odd_sized_image_flat(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "m.safetensors"
+            path.write_bytes(b"x")
+            rt = vdr.DegridRuntime(loader=lambda p: _ZeroPaddingNafnetLike(), forge_memory=lambda: None,
+                                   logger=lambda m: None)
+            image = Image.new("RGB", (250, 190), (128, 128, 128))
+            for tile in (0, 128):
+                with self.subTest(tile=tile):
+                    out = rt.run(image, vdm.ModelEntry("m", str(path)), tile=tile, device="cpu")
+                    self.assertEqual(out.image.tobytes(), image.tobytes())
 
 
 class _Oom(RuntimeError):
@@ -335,7 +443,8 @@ class DiscoveryTests(unittest.TestCase):
         self.assertTrue(vdm.is_nafnet_file(path))
 
     def test_declared_version_goes_first_and_is_the_auto_choice(self):
-        # v1.0 은 modelspec.version 을 적지 않았고 v1.1 파인튜닝은 "1.1" — 이름순이면 v1.0 이 앞이다
+        # v1.1 은 modelspec.version "1.1" 을 적어 두었다. 버전을 적지 않은 NAFNet(여기서는 개발 PC 의 다른 파인튜닝
+        # 'NAFNet-finetune-v2' 메타데이터)은 이름순이면 앞이지만 선언된 버전이 있는 파일 뒤로 간다
         from safetensors.torch import save_file
 
         esrgan = self.root / "ESRGAN"
@@ -449,9 +558,37 @@ class LoaderTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             vdm.load_nafnet(path)
 
+    def test_default_loader_inside_inference_mode_survives_a_device_move(self):
+        # 생성 탭 첫 사용(Forge 가 inference_mode 안에서 부름) → GPU 로 옮김(대역: dtype 이동, 같은 param.data= 경로)
+        path = self.root / "tiny.safetensors"
+        _save_safetensors(path, _tiny_nafnet().state_dict())
+        rt = vdr.DegridRuntime(forge_memory=lambda: None, logger=lambda m: None)
+        with torch.inference_mode():
+            model = rt.model_for(path)
+        self.assertFalse(any(p.is_inference() for p in model.parameters()))
+        vdr.DegridRuntime._move(model, torch.float64)
+        with torch.inference_mode():
+            model(torch.rand(1, 3, 16, 16, dtype=torch.float64))
+
+    def test_pad_multiple_follows_the_model(self):
+        model = _tiny_nafnet()                    # 인코더 2단 → spandrel padder_size 4
+        self.assertEqual(vdr.model_pad_multiple(model), 2 ** len(model.encoders))
+        fn, _ = vdr.make_residual_fn(model, torch.device("cpu"), False)
+        with torch.inference_mode():
+            x = torch.rand(1, 3, 20, 28)          # 4 의 배수 — spandrel 도 여기도 채우지 않는다
+            self.assertTrue(torch.equal(fn(x), model(x)))
+            y = torch.rand(1, 3, 21, 27)          # spandrel 은 0 으로, 여기는 반사로 채운다
+            self.assertFalse(torch.equal(fn(y), model(y)))
+
+
+def _stub_residual(x):
+    """점마다 정해지는 잔차 0.05·cos(8πx) — 부호가 섞이고(|평균| 약 8/255) 입력과 상관이 없어 잔차 검사를 지난다.
+    (x 에 비례하는 잔차는 이미지처럼 보여 ``output_looks_like_image`` 가 거른다.)"""
+    return torch.cos(x * (8 * math.pi)) * 0.05
+
 
 class _ShiftModel(torch.nn.Module):
-    """잔차 = 0.1·(x − 0.5) (국소·결정적). 호출 크기를 기록한다."""
+    """잔차 = ``_stub_residual`` (국소·결정적). 호출 크기를 기록한다."""
 
     def __init__(self):
         super().__init__()
@@ -460,7 +597,7 @@ class _ShiftModel(torch.nn.Module):
 
     def forward(self, x):
         self.shapes.append(tuple(x.shape))
-        return (x - 0.5) * 0.1 + self.p
+        return _stub_residual(x) + self.p
 
 
 class RuntimeTests(unittest.TestCase):
@@ -491,7 +628,7 @@ class RuntimeTests(unittest.TestCase):
         out = self.rt.run(image, self.entry, mode="full", strength=1.0, tile=0, device="cpu", precision="fp32",
                           keep_loaded=False)
         x, _ = vd.pil_to_tensor(image)
-        expected = vd.tensor_to_pil(torch.clamp(x + (x - 0.5) * 0.1, 0, 1))
+        expected = vd.tensor_to_pil(torch.clamp(x + _stub_residual(x), 0, 1))
         self.assertEqual(out.image.tobytes(), expected.tobytes())
         self.assertEqual((out.device, out.precision, out.tile_used), ("cpu", "fp32", 0))
         self.assertGreater(out.stats["changed_pixels"], 0.5)
@@ -500,7 +637,7 @@ class RuntimeTests(unittest.TestCase):
     def test_modes_and_strength_through_the_runtime(self):
         image = self._image()
         x, _ = vd.pil_to_tensor(image)
-        delta = (x - 0.5) * 0.1
+        delta = _stub_residual(x)
         for mode in vd.MODES:
             for strength in (0.5, 1.5):
                 with self.subTest(mode=mode, strength=strength):
@@ -576,6 +713,82 @@ class RuntimeTests(unittest.TestCase):
                 sys.modules.pop("backend.memory_management", None)
             else:
                 sys.modules["backend.memory_management"] = saved
+
+    def test_image_output_model_is_refused_and_the_image_is_not_changed(self):
+        class Identity(torch.nn.Module):      # 복원 이미지를 내는 일반 NAFNet 대역
+            def forward(self, x):
+                return x.clone()
+
+        rt = vdr.DegridRuntime(loader=lambda path: Identity(), forge_memory=lambda: None, logger=self.logs.append)
+        with self.assertRaises(vdr.NotResidualModelError) as caught:
+            rt.run(self._image(), self.entry, device="cpu")
+        self.assertIn("not a DeGrid residual model", str(caught.exception))
+
+
+class _ConvResidual(torch.nn.Module):
+    """작은 3x3 합성곱 잔차(|평균| 1/255 미만). 로더처럼 불릴 때 새로 만들어, 파라미터가 그 문맥(inference_mode 인지)을
+    그대로 가진다 — inference 텐서 합성곱 가중치를 옮긴 뒤 부르면 'Inference tensors do not track version counter.'"""
+
+    def __init__(self):
+        super().__init__()
+        self.conv = torch.nn.Conv2d(3, 3, 3, padding=1)
+        with torch.no_grad():
+            self.conv.weight.mul_(0.005)
+            self.conv.bias.zero_()
+        self.requires_grad_(False)
+
+    def forward(self, x):
+        return self.conv(x)
+
+
+class _RoundTripRuntime(vdr.DegridRuntime):
+    """GPU 경로 대역(CPU): 계산 장치로 올렸다 내리는 것을 dtype 왕복으로 한다 — CPU↔CUDA 이동과 같은
+    ``Module._apply`` 의 ``param.data =`` 경로다(dense CPU·CUDA 텐서는 얕은 복사 호환이라 자리에서 바꾼다)."""
+
+    def _acquire(self, model, device, memory_required):
+        self._move(model, torch.float64)
+        self._move(model, torch.float32)
+
+
+class InferenceModeLoadTests(unittest.TestCase):
+    """Forge 는 ``postprocess_image_after_composite`` 를 ``torch.inference_mode()`` 안에서 부른다(``modules/processing.py``
+    process_images_inner). 생성 탭에서 처음 불러온 모델도 일반 텐서여야 GPU 로 옮긴 뒤에도 계산할 수 있다 — 아니면 그 뒤
+    모든 이미지가(캐시가 파일 기준이라 Extras·CPU 도) Forge 를 다시 켤 때까지 실패한다."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.path = Path(self.tmp.name) / "m.safetensors"
+        self.path.write_bytes(b"x")
+        self.entry = vdm.ModelEntry("m", str(self.path))
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_loader_runs_outside_inference_mode_without_grad(self):
+        seen = []
+
+        def loader(path):
+            seen.append((torch.is_inference_mode_enabled(), torch.is_grad_enabled()))
+            return _ConvResidual()
+
+        rt = vdr.DegridRuntime(loader=loader, forge_memory=lambda: None, logger=lambda m: None)
+        with torch.inference_mode():
+            model = rt.model_for(self.path)
+        self.assertEqual(seen, [(False, False)])
+        self.assertFalse(any(p.is_inference() for p in model.parameters()))
+        vdr.DegridRuntime._move(model, torch.float64)
+        with torch.inference_mode():
+            model(torch.rand(1, 3, 16, 16, dtype=torch.float64))
+
+    def test_generation_tab_first_use_then_every_later_image(self):
+        rt = _RoundTripRuntime(loader=lambda path: _ConvResidual(), forge_memory=lambda: None, logger=lambda m: None)
+        image = Image.fromarray(np.random.default_rng(0).integers(0, 256, (40, 48, 3), dtype=np.uint8), "RGB")
+        outs = []
+        for label in ("txt2img 1", "txt2img 2", "txt2img 3"):
+            with self.subTest(image=label), torch.inference_mode():
+                outs.append(rt.run(image, self.entry, tile=0, device="cpu").image.tobytes())
+        extras = rt.run(image, self.entry, tile=0, device="cpu")   # Extras(inference_mode 밖)
+        self.assertEqual(outs, [extras.image.tobytes()] * 3)
 
 
 class _FakeLoaded:
@@ -768,6 +981,35 @@ class RealWeightsTests(unittest.TestCase):
         diff = (whole - tiled).abs() * 255
         self.assertLess(float(diff.mean()), 0.25)     # 실측 0.03/255
         self.assertLess(float(diff.max()), 4.0)       # 실측 0.4/255 (Anima 생성 이미지 768² 에서는 최대 2/255)
+
+    def test_generation_tab_first_use_survives_a_device_round_trip(self):
+        # 기본 로더(spandrel)로 inference_mode 안에서 처음 불러 GPU 대역 왕복 — 두 번째 이미지까지 같은 결과
+        rt = _RoundTripRuntime(forge_memory=lambda: None, logger=lambda m: None)
+        image = _synthetic_illustration(128)
+        with torch.inference_mode():
+            first = rt.run(image, self.entry, tile=0, device="cpu")
+        with torch.inference_mode():
+            second = rt.run(image, self.entry, tile=0, device="cpu")
+        self.assertEqual(first.image.tobytes(), second.image.tobytes())
+        self.assertFalse(any(p.is_inference() for p in rt.model_for(self.entry.path).parameters()))
+
+    def test_odd_size_edges_are_not_amplified(self):
+        # 16 배수가 아닌 크기: 모델을 바로 부르면(안에서 0 채움) 오른쪽·아래 가장자리 잔차가 커진다 — 반사 패딩으로 안쪽과 비슷하게
+        x, _ = vd.pil_to_tensor(_synthetic_illustration(256, seed=3).crop((3, 5, 253, 195)))   # 250x190
+        with torch.inference_mode():
+            raw = self.model(x)[0].abs().amax(0) * 255
+            fn, _ = vdr.make_residual_fn(self.model, torch.device("cpu"), False)
+            padded = fn(x)[0].abs().amax(0) * 255
+        edge = torch.zeros_like(raw, dtype=torch.bool)
+        edge[-4:, :] = True
+        edge[:, -4:] = True
+        self.assertGreater(float(raw[edge].max()), 3 * float(padded[edge].max()))
+        self.assertLess(float(padded[edge].max()), max(4.0, 2 * float(padded[~edge].max())))
+
+    def test_real_model_output_passes_the_residual_check(self):
+        x, _ = vd.pil_to_tensor(_synthetic_illustration(256, seed=4))
+        with torch.inference_mode():
+            self.assertFalse(vd.output_looks_like_image(x, self.model(x)))
 
     @unittest.skipUnless(FORGE_VAE_PY.is_file(), "Forge 의 backend/patcher/vae.py 가 확장 옆에 없음")
     def test_real_model_tiles_like_comfyui(self):

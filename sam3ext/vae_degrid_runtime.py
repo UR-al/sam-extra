@@ -13,8 +13,11 @@
   Forge 목록에 들어간다. 끝나면 목록에서 빼고 ``model_unload``(→ CPU 로) + ``soft_empty_cache`` 로 VRAM 을 돌려준다.
   설정 ``sam3_degrid_keep_loaded`` 를 켜면 그대로 두어 Forge 가 자리가 필요할 때 내린다. Forge 가 부분 로드만 한 경우
   (``--novram`` 등 — 일반 ``nn.Conv2d`` 는 수동 캐스트가 없어 CPU 에 남음)에는 직접 옮긴다(약 117 MB).
-- 장치 이동은 ``torch.inference_mode(False)`` 에서, 계산은 ``inference_mode`` 안에서 한다(Forge 는 이미지 후처리를
-  inference_mode 안에서 부른다).
+- 모델 생성과 장치 이동은 ``torch.inference_mode(False)`` 에서, 계산은 ``inference_mode`` 안에서 한다(Forge 는 이미지
+  후처리를 inference_mode 안에서 부른다 — ``model_for`` 참고).
+- 타일은 모델의 ``padder_size``(NAFNet-small 16) 배수로 반사 패딩해 넣고 자른다 — spandrel NAFNet 은 안에서 0 으로 채워
+  16 배수가 아닌 크기의 오른쪽·아래 가장자리에 큰 잔차를 낸다. 16 배수면 그대로라 노드 팩과 같다.
+- 모델 출력이 잔차가 아니라 이미지처럼 보이면(일반 복원 NAFNet 을 고른 경우) ``NotResidualModelError`` 로 거절한다.
 """
 from __future__ import annotations
 
@@ -122,20 +125,35 @@ def memory_estimate(height: int, width: int, tile: int) -> float:
     return float(BYTES_PER_PIXEL * height * width)
 
 
+class NotResidualModelError(ValueError):
+    """모델 출력이 잔차가 아니라 이미지다 — DeGrid 가 아닌 일반 NAFNet(노이즈 제거·디블러 등)을 고른 경우."""
+
+
+def model_pad_multiple(model) -> int:
+    """모델이 안에서 0 으로 채워 맞추는 배수 — spandrel NAFNet ``padder_size``(= 2 ** 인코더 단 수, NAFNet-small 16)."""
+    try:
+        multiple = int(getattr(model, "padder_size", vd.PAD_MULTIPLE))
+    except (TypeError, ValueError):
+        multiple = vd.PAD_MULTIPLE
+    return max(1, multiple)
+
+
 def make_residual_fn(model, device: torch.device, use_autocast: bool):
     """타일 → 잔차(float32) 함수와 'fp16 이 넘쳐 fp32 로 다시 한 타일 수' 칸. 타일은 계산 장치로 옮겨 fp32 로 넣는다
-    (노드 팩 ``a.float()``). ``use_autocast`` 면 fp16 autocast 로 돌고, inf/NaN 이 나오면 그 타일만 autocast 없이 다시."""
+    (노드 팩 ``a.float()``). 모델의 패딩 배수로 반사 패딩해 부르고 자른다(``vd.call_padded`` — 배수면 그대로).
+    ``use_autocast`` 면 fp16 autocast 로 돌고, inf/NaN 이 나오면 그 타일만 autocast 없이 다시."""
     retiles = [0]
+    multiple = model_pad_multiple(model)
 
     def residual(piece: torch.Tensor) -> torch.Tensor:
         piece = piece.to(device=device, dtype=torch.float32)
         if use_autocast:
             with torch.autocast(device_type=device.type, dtype=torch.float16):
-                out = model(piece)
+                out = vd.call_padded(model, piece, multiple)
             if bool(torch.isfinite(out).all()):
                 return out.float()
             retiles[0] += 1
-        return model(piece).float()
+        return vd.call_padded(model, piece, multiple).float()
 
     return residual, retiles
 
@@ -193,7 +211,15 @@ class DegridRuntime:
 
     # ── 모델 캐시 ──
     def model_for(self, path):
-        """경로의 NAFNet(CPU fp32). 같은 파일(크기·수정 시각)이면 캐시를 쓰고, 다르면 앞 모델을 내리고 버린다."""
+        """경로의 NAFNet(CPU fp32). 같은 파일(크기·수정 시각)이면 캐시를 쓰고, 다르면 앞 모델을 내리고 버린다.
+
+        부르는 문맥과 상관없이 ``inference_mode(False)`` + ``no_grad`` 에서 만든다 — Forge 는 생성 탭 후처리
+        (``postprocess_image_after_composite``)를 ``torch.inference_mode()`` 안에서 부르므로, 그대로 만들면 파라미터가
+        inference 텐서가 된다. 그것을 GPU 로 옮기면(``load_models_gpu``·``_move`` → ``Module._apply`` 의 ``param.data =``)
+        버전 카운터 없는 파라미터가 되어 다음 계산이 'Inference tensors do not track version counter.' 로 죽고, 캐시가
+        파일 기준이라 Forge 를 다시 켤 때까지 모든 이미지가 실패한다(``anima38/runtime.py`` ``_outside_inference_mode`` 와
+        같은 이유).
+        """
         stat = os.stat(path)
         key = (os.path.abspath(str(path)), int(stat.st_size), int(stat.st_mtime_ns))
         with self._lock:
@@ -201,7 +227,8 @@ class DegridRuntime:
                 return self._model
             self._release_locked()
             self._model = self._model_key = self._patcher = None
-            model = self._loader(path)
+            with torch.inference_mode(False), torch.no_grad():
+                model = self._loader(path)
             self._model, self._model_key = model, key
             return model
 
@@ -331,6 +358,11 @@ class DegridRuntime:
                         x, residual, tile=tile, overlap=vd.TILE_OVERLAP, out_device="cpu", is_oom=is_oom,
                         on_retry=on_retry,
                     )
+                    if vd.output_looks_like_image(x, delta):
+                        raise NotResidualModelError(
+                            f"not a DeGrid residual model: {entry.name} outputs an image, not a residual "
+                            f"(mean |output| {float(delta.abs().mean()) * 255:.1f}/255) - use a VAE DeGrid NAFNet"
+                        )
                     result = vd.finalize(vd.apply_residual(x, delta, mode_key, strength))
             finally:
                 if release_after_run(keep, dev):

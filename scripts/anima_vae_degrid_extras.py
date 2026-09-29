@@ -3,6 +3,10 @@
 Forge 의 Extras 는 ``ScriptPostprocessing.order`` 가 작은 것부터 돈다(Upscale 1000). 확대하면 격자 간격이 달라지므로
 900 으로 Upscale 보다 앞에 둔다(Settings 의 postprocessing_operation_order 로 바꿀 수 있음). 결과 정보(``pp.info``)는
 Extras 가 PNG 의 ``postprocessing`` 항목에 적는다.
+
+이름은 ``Anima VAE DeGrid (NAFNet, Extras)`` 로 생성 탭 스크립트(``Anima VAE DeGrid (NAFNet)``)와 다르다 — Settings 에서
+이 항목을 메인 탭에도 켜면 Forge 가 ``ScriptPostprocessingForMainUI``(title() = name)로 감싸 always-on 으로 넣는데, 이름이
+같으면 API ``alwayson_scripts`` 의 이름이 둘 중 어느 것인지 모호해진다.
 """
 from __future__ import annotations
 
@@ -14,7 +18,7 @@ from sam3ext import vae_degrid_runtime as vdr
 
 
 class ScriptPostprocessingVaeDegrid(scripts_postprocessing.ScriptPostprocessing):
-    name = uvd.TITLE
+    name = uvd.EXTRAS_TITLE   # 생성 탭 스크립트와 다른 이름(메인 탭에 켰을 때 always-on 제목이 겹치지 않게)
     order = 900
 
     def ui(self):
@@ -50,5 +54,5 @@ class ScriptPostprocessingVaeDegrid(scripts_postprocessing.ScriptPostprocessing)
                 pass
             return
         pp.image = outcome.image
-        pp.info.update(uvd.infotext_items(entry.name, cfg.mode, cfg.strength, cfg.tile))
+        pp.info.update(uvd.outcome_infotext(outcome))
         vdr.log(f"Extras: {outcome.summary()}")

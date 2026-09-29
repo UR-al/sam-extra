@@ -96,7 +96,7 @@ class AnimaVaeDegrid(scripts.Script):
                 pass
             return
         pp.image = outcome.image
-        uvd.record_success(_params(p), uvd.infotext_items(entry.name, cfg.mode, cfg.strength, cfg.tile))
+        uvd.record_success(_params(p), uvd.outcome_infotext(outcome))   # 실제로 쓴 타일(OOM 으로 줄였으면 그 값)·정밀도
         vdr.log(outcome.summary())
 
 

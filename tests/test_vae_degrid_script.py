@@ -39,6 +39,7 @@ FORGE_SCRIPTS = FORGE_ROOT / "modules" / "scripts.py"
 FORGE_CALLBACKS = FORGE_ROOT / "modules" / "script_callbacks.py"
 FORGE_UTIL = FORGE_ROOT / "modules" / "util.py"
 FORGE_EXTENSIONS = FORGE_ROOT / "modules" / "extensions.py"
+FORGE_AUTO_POSTPROCESSING = FORGE_ROOT / "modules" / "scripts_auto_postprocessing.py"
 EXTENSION_NAME = "forge_sam3_extension"
 UPSCALE_IN_MAIN_UI = (
     "base/postprocessing_upscale.py/script_postprocess_image_after_composite/ScriptPostprocessingForMainUI"
@@ -114,17 +115,20 @@ ENTRY = vdm.ModelEntry("qwenVAEDegridNafnet_v11", "/m/ESRGAN/qwenVAEDegridNafnet
 
 
 class _FakeRuntime:
-    def __init__(self, fail_on=()):
+    def __init__(self, fail_on=(), tile_used=None, precision="fp32"):
         self.calls = []
         self.fail_on = set(fail_on)
         self.released = 0
+        self.tile_used = tile_used        # None = 요청한 타일 그대로(OOM 없음)
+        self.precision = precision
 
     def run(self, image, entry, *, mode, strength, tile):
         self.calls.append((entry.name, mode, strength, tile))
         if len(self.calls) in self.fail_on:
             raise RuntimeError("CUDA out of memory")
         out = Image.new("RGB", image.size, (1, 2, 3))
-        return vdr.DegridOutcome(out, entry.name, mode, strength, tile, tile, "cpu", "fp32", 0.01)
+        used = tile if self.tile_used is None else self.tile_used
+        return vdr.DegridOutcome(out, entry.name, mode, strength, tile, used, "cpu", self.precision, 0.01)
 
     def release(self):
         self.released += 1
@@ -301,8 +305,18 @@ class ProcessTests(unittest.TestCase):
         self.assertEqual(runtime.calls, [("qwenVAEDegridNafnet_v11", vd.MODE_DARK, 0.75, 256)])
         self.assertEqual(params, {
             uvd.KEY_MODEL: "qwenVAEDegridNafnet_v11", uvd.KEY_MODE: "Dark Pixels Mainly",
-            uvd.KEY_STRENGTH: "0.75", uvd.KEY_TILE: 256,
+            uvd.KEY_STRENGTH: "0.75", uvd.KEY_TILE: 256, uvd.KEY_PRECISION: "fp32",
         })
+
+    def test_infotext_records_the_tile_actually_used_after_an_oom_fallback(self):
+        # 512 를 요청했지만 OOM 으로 128 에서 계산 — 붙여 넣어 같은 결과를 내려면 128 이 남아야 한다
+        p = _p()
+        runtime = _FakeRuntime(tile_used=128, precision="fp16-autocast")
+        [(_, params)] = self._run(p, [Image.new("RGB", (8, 8))], runtime)
+        self.assertEqual(runtime.calls[0][3], 512)
+        self.assertEqual(params[uvd.KEY_TILE], 128)
+        self.assertEqual(params[uvd.KEY_PRECISION], "fp16-autocast")
+        self.assertEqual(uvd.paste_tile({k: str(v) for k, v in params.items()}), 128)
 
     def test_missing_model_is_skipped_with_a_log_and_an_error_key(self):
         p = _p()
@@ -380,6 +394,21 @@ class ArgsAndInfotextTests(unittest.TestCase):
         for fn in (paste_model, uvd.paste_mode, uvd.paste_strength, uvd.paste_tile):
             self.assertIsNone(fn(none))
 
+    def test_outcome_infotext_uses_the_tile_used_and_the_precision(self):
+        outcome = vdr.DegridOutcome(Image.new("RGB", (4, 4)), "m", vd.MODE_FULL, 1.0, 512, 256, "cuda", "fp16-autocast",
+                                    0.1)
+        self.assertEqual(uvd.outcome_infotext(outcome), {
+            uvd.KEY_MODEL: "m", uvd.KEY_MODE: "Full", uvd.KEY_STRENGTH: "1", uvd.KEY_TILE: 256,
+            uvd.KEY_PRECISION: "fp16-autocast",
+        })
+        # 강도 0 으로 건너뛴 경우(정밀도 '-')는 정밀도를 적지 않는다
+        skipped = dataclasses.replace(outcome, strength=0.0, tile_used=512, precision="-", skipped=True)
+        self.assertNotIn(uvd.KEY_PRECISION, uvd.outcome_infotext(skipped))
+        # 실패하면 앞 장의 정밀도도 걷는다
+        params = dict(uvd.outcome_infotext(outcome))
+        uvd.record_failure(params, "boom")
+        self.assertEqual(params, {uvd.KEY_ERROR: "boom"})
+
     def test_every_mode_label_is_a_ui_choice(self):
         for mode in vd.MODES:
             self.assertEqual(vd.normalize_mode(uvd.mode_choice(mode)), mode)
@@ -409,6 +438,20 @@ class UiTests(unittest.TestCase):
         with mock.patch.object(vdm, "discover", return_value=[]), gr.Blocks():
             _enabled, model, *_ = MOD.AnimaVaeDegrid().ui(False)
         self.assertEqual(model.value, vdm.NONE_NAME)
+
+    def test_every_tile_slider_stop_is_used_as_is_and_pasted_tiles_fit(self):
+        import gradio as gr
+
+        with mock.patch.object(vdm, "discover", return_value=[ENTRY]), gr.Blocks():
+            *_rest, tile = MOD.AnimaVaeDegrid().ui(False)
+        self.assertEqual(tile.maximum, vd.MAX_TILE)
+        stops = range(int(tile.minimum), int(tile.maximum) + 1, int(tile.step))
+        self.assertIn(vd.DEFAULT_TILE, stops)
+        for value in stops:     # 조용히 다른 값으로 바뀌는 칸이 없다(예전 step 64 의 64 → 128)
+            self.assertEqual(vd.coerce_tile(value), value)
+        for raw in ("0", "1", "64", "928", "4096", "99999", "-3", "x"):
+            with self.subTest(pasted=raw):
+                self.assertTrue(tile.minimum <= uvd.paste_tile({uvd.KEY_TILE: raw}) <= tile.maximum)
 
     def test_settings_are_registered(self):
         self.assertIn(MOD._on_ui_settings, SETTINGS)
@@ -454,7 +497,28 @@ class ExtrasTests(unittest.TestCase):
 
     def test_runs_before_upscale(self):
         self.assertLess(EXTRAS.ScriptPostprocessingVaeDegrid.order, 1000)
-        self.assertEqual(EXTRAS.ScriptPostprocessingVaeDegrid.name, uvd.TITLE)
+
+    def test_name_differs_from_the_generation_script(self):
+        # Settings → Postprocessing 에서 메인 탭에도 켜면 Forge 는 ScriptPostprocessingForMainUI(title() = name)로 감싼다
+        # (modules/scripts_auto_postprocessing.py). 제목이 같으면 API alwayson_scripts[제목] 이 모호해진다.
+        self.assertEqual(EXTRAS.ScriptPostprocessingVaeDegrid.name, uvd.EXTRAS_TITLE)
+        self.assertNotEqual(uvd.EXTRAS_TITLE, MOD.AnimaVaeDegrid().title())
+        self.assertNotEqual(uvd.EXTRAS_TITLE.lower(), MOD.AnimaVaeDegrid().title().lower())
+
+    @unittest.skipUnless(FORGE_AUTO_POSTPROCESSING.is_file(), "Forge 의 modules/scripts_auto_postprocessing.py 가 없음")
+    def test_forge_main_ui_wrapper_title_is_the_extras_name(self):
+        tree = ast.parse(FORGE_AUTO_POSTPROCESSING.read_text(encoding="utf-8"))
+        wrapper = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "ScriptPostprocessingForMainUI")
+        title = next(n for n in wrapper.body if isinstance(n, ast.FunctionDef) and n.name == "title")
+        self.assertEqual([ast.unparse(s) for s in title.body], ["return self.script.name"])
+
+    def test_extras_accordion_is_labelled_with_the_extras_name(self):
+        import gradio as gr
+
+        with mock.patch.object(uvd, "_accordion", wraps=uvd._accordion) as accordion, gr.Blocks():
+            self.script.ui()
+            MOD.AnimaVaeDegrid().ui(False)
+        self.assertEqual([c.args[0] for c in accordion.call_args_list], [uvd.EXTRAS_TITLE, uvd.TITLE])
 
     def test_ui_keys_match_process_arguments(self):
         import gradio as gr
@@ -476,6 +540,14 @@ class ExtrasTests(unittest.TestCase):
         self.assertEqual(on.image.getpixel((0, 0)), (1, 2, 3))
         self.assertEqual(on.info[uvd.KEY_MODEL], "qwenVAEDegridNafnet_v11")
         self.assertEqual(on.info[uvd.KEY_MODE], "Full")
+
+    def test_info_records_the_tile_actually_used(self):
+        runtime = _FakeRuntime(tile_used=256)
+        with mock.patch.object(vdr, "shared_runtime", return_value=runtime):
+            pp = _PostprocessedImage(Image.new("RGB", (8, 8)))
+            self.script.process(pp, enabled=True, model="", mode="Full", strength=1.0, tile=512)
+        self.assertEqual(runtime.calls[0][3], 512)
+        self.assertEqual((pp.info[uvd.KEY_TILE], pp.info[uvd.KEY_PRECISION]), (256, "fp32"))
 
     def test_api_none_args_mean_off(self):
         pp = _PostprocessedImage(Image.new("RGB", (8, 8)))

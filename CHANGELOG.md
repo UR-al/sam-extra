@@ -321,20 +321,29 @@ v0.21.2 이후 쌓인 큰 업데이트입니다. Anima 3.8B(Qwen3.5 / Semantic C
 - **VAE 격자 제거 (새 기능, 기본 끔)**: txt2img·img2img 의 **Anima VAE DeGrid (NAFNet)** 아코디언과 Extras 탭 항목이 생겼습니다.
   [DraconicDragon/NAFNet-VAE-DeGrid](https://huggingface.co/DraconicDragon/NAFNet-VAE-DeGrid)(Apache-2.0, v1.1 권장,
   `models/ESRGAN` 또는 `models/DeGrid`)가 내는 **잔차**를 이미지에 더해 Qwen/Wan VAE 격자 무늬를 지웁니다. 방식은 Full / Dark Pixels
-  Mainly / Bright Pixels Mainly, 강도 0~1.5, 타일 크기(기본 512). 계산은 ComfyUI-NAFNet-Residual 의 NAFNet Restoration 노드와 같아
-  강도 1·같은 타일에서 비트 단위로 같고, 마지막 이미지만 [0,1] 로 자릅니다. 목록에는 state dict 가 NAFNet 인 파일만 나오고(헤더만
-  읽음, 선언된 버전이 높은 v1.1 이 기본값), 모델은 Forge venv 의 spandrel 로 불러옵니다. 모델 파일이 없으면 로그를 남기고 건너뜁니다.
+  Mainly / Bright Pixels Mainly, 강도 0~1.5, 타일 크기(기본 512, 슬라이더 128 단위). 식·타일 위치·feather 가중치는 ComfyUI-NAFNet-Residual
+  의 NAFNet Restoration 노드와 같고(같은 입력 텐서로 비트 단위 대조 — 노드 전체와는 channels-last 입력 때문에 float 로 ~1e-6, 8비트는
+  여기서 반올림·ComfyUI SaveImage 는 버림), 마지막 이미지만 [0,1] 로 자릅니다. 16 의 배수가 아닌 크기는 타일마다 반사 패딩해
+  (노드·spandrel 은 0 으로 채워 오른쪽·아래 가장자리 잔차가 최대 56/255 까지 커짐) 가장자리도 안쪽과 비슷하고, 표준 Anima 크기는
+  모든 타일이 16 의 배수라 노드와 같습니다. 목록에는 state dict 가 NAFNet 인 파일만 나오고(헤더만 읽음, 선언된 버전이 높은 v1.1 이
+  기본값), 이미지를 내는 일반 복원 NAFNet 을 고르면 출력으로 알아채 적용하지 않습니다. 모델은 Forge venv 의 spandrel 로 불러옵니다.
+  모델 파일이 없으면 로그를 남기고 건너뜁니다.
 - **순서**: 이미지마다 모든 always-on 스크립트의 `postprocess_image`(ADetailer·SAM3 인페인트 등)와 색 보정·인페인트 합성이 끝난 뒤,
   저장 직전(`postprocess_image_after_composite`)에 한 번 돕니다 — 설치 순서와 무관합니다. 메인 탭에 켠 Extras Upscale 보다는
-  앞이고(`metadata.ini` 콜백 순서), SAM3·ADetailer 내부 패스에서는 돌지 않습니다. Extras 탭에서는 Upscale 보다 먼저 돕니다.
-- **infotext·API**: `Anima DeGrid model` / `mode` / `strength` / `tile`(실패·모델 없음은 `Anima DeGrid error`)을 남기고 PNG Info
-  붙여 넣기로 되살립니다. API 는 위치 인자 `[enabled, model, mode, strength, tile]` 또는 dict 하나.
+  앞이고(`metadata.ini` 콜백 순서), SAM3·ADetailer 내부 패스에서는 돌지 않습니다. Extras 탭에서는 Upscale 보다 먼저 돕니다(항목 이름
+  **Anima VAE DeGrid (NAFNet, Extras)** — 메인 탭에 켜도 생성 탭 스크립트와 API 이름이 겹치지 않음).
+- **infotext·API**: `Anima DeGrid model` / `mode` / `strength` / `tile`(실제로 쓴 타일 — 메모리 부족으로 줄였으면 줄인 값) /
+  `precision`(실패·모델 없음은 `Anima DeGrid error`)을 남기고 PNG Info 붙여 넣기로 되살립니다(정밀도는 설정이라 기록만). API 는 위치
+  인자 `[enabled, model, mode, strength, tile]` 또는 dict 하나.
 - **새 설정 섹션 SAM Extra VAE DeGrid**(`sam3_degrid`): 계산 장치(auto / cpu), GPU 정밀도(fp16 autocast 기본 — fp32 가중치, 넘친
   타일만 fp32 로 다시 / fp32), VRAM 에 남기기(기본 끔 — 이미지마다 Forge `load_models_gpu` 로 올렸다가 내리고 캐시를 비움).
-- **검증**: CPU 단위 테스트 73개(실제 가중치 5개는 `SAM3_RUN_FORGE_INTEGRATION_TESTS=1` 일 때만) — 노드의 잔차 함수·Forge/ComfyUI
-  `tiled_scale` 과 비트 단위 대조, Forge `processing.py`·`sort_callbacks`·`metadata.ini` 로 실행 순서 확인. 실제 v1.1 가중치(CPU):
-  Anima 1216×1856 에서 잔차 |평균| 약 0.5/255, 8비트 값이 바뀐 픽셀 약 44%(대부분 1 단계), CPU 로 약 6.5 초. VAE 를 거친 적 없는 합성
-  그림을 Qwen-Image VAE 로 왕복한 뒤 돌리면 PSNR 36.7 → 37.7 dB. GPU(VRAM·속도·fp16 autocast 결과)는 아직 확인하지 않았습니다.
+- **검증**: CPU 단위 테스트 98개(실제 가중치 8개는 `SAM3_RUN_FORGE_INTEGRATION_TESTS=1` 일 때만) — 같은 입력으로 노드의 잔차 함수·
+  Forge/ComfyUI `tiled_scale` 과 비트 단위 대조, Forge `processing.py`·`sort_callbacks`·`metadata.ini` 로 실행 순서 확인, 생성 탭
+  (Forge 가 `torch.inference_mode()` 안에서 부름)에서 처음 불러 장치로 옮긴 뒤에도 계산되는지(CPU 대역: dtype 왕복 — 모델을
+  inference_mode 밖에서 만들지 않으면 'Inference tensors do not track version counter.' 로 그 뒤 모든 이미지가 실패), 16 배수가
+  아닌 크기의 가장자리, 이미지를 내는 NAFNet 거절. 실제 v1.1 가중치(CPU): Anima 1216×1856 에서 잔차 |평균| 약 0.5/255, 8비트 값이
+  바뀐 픽셀 약 44%(대부분 1 단계), CPU 로 약 6.5 초. VAE 를 거친 적 없는 합성 그림을 Qwen-Image VAE 로 왕복한 뒤 돌리면 PSNR
+  36.7 → 37.7 dB. GPU(생성 탭에서 처음 쓸 때 실제 CUDA 이동, VRAM·속도, fp16 autocast 결과)는 아직 확인하지 않았습니다.
 
 ### txt2img 화면 · 도구
 
