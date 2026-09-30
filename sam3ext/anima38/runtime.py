@@ -22,6 +22,7 @@ from . import connector_cache
 from .adapter import ProgressiveCrossAdapter
 from .connector_fp32 import make_connector_patcher
 from .marker import as_rows, read_run_ids, stamp_run_id
+from .native_engine import is_legacy_engine, qwen06_native_inputs
 from .files import (
     ARCHITECTURE,
     CONNECTOR_PREFIX,
@@ -229,7 +230,17 @@ class Anima3BRuntime:
         crossattn, masks, count = [], [], 0
         for line, cond in zip(prompt, conds):
             data = cond.reshape(-1, cond.shape[-1])
-            mask = _build_negpip_mask(engine, str(line), data.shape[0], data.device, data.dtype)
+            try:
+                mask = _build_negpip_mask(engine, str(line), data.shape[0], data.device, data.dtype)
+            except AttributeError as exc:
+                # NegPiP 헬퍼가 옛 엔진 API(tokenize_line)를 부르는데 새 Forge(21886f41~)의 Qwen06Engine 엔 없다
+                if is_legacy_engine(engine):
+                    raise
+                if not getattr(self, "_warned_negpip", False):
+                    self._warned_negpip = True
+                    logger.warning("[Anima38] NegPiP mask helper does not support this Forge text engine (%s); "
+                                   "NegPiP is inactive for v2", exc)
+                return conds
             count += int((mask < 0).sum())
             crossattn.append(data * mask.unsqueeze(-1).to(data))
             masks.append(mask.unsqueeze(-1).to(data))
@@ -402,7 +413,8 @@ class Anima3BRuntime:
           (DoRA 추론 방식 전환도 current_lora_hash=None → 다시 합치기 → 새 uuid). 체크포인트가 바뀌면 새 패처.
         - current_lora_hash 가 None: LoRA 캐시가 막 무효화됐고 아직 다시 합치지 않았다 — 캐시를 비우고 쓰지 않는다.
         - DoRA 합치기 방식 표시: dora_infer_mode 가 방식을 바꾸면 다른 키(파일은 건드리지 않고 표시만 읽는다).
-        - emphasis: _native_inputs 는 엔진이 지금 쥔 방식으로 줄을 파싱한다(opts 가 아니라 엔진 상태).
+        - emphasis: _native_inputs 는 엔진이 지금 쥔 방식으로 줄을 파싱한다(옛 엔진은 엔진 상태, 새 Qwen06Engine 은
+          속성이 opts.emphasis 를 매번 읽는다 — 어느 쪽이든 이 키와 _native_inputs 가 같은 값을 본다).
         """
         patches_uuid = getattr(getattr(native_clip, "patcher", None), "patches_uuid", None)
         if patches_uuid is None:
@@ -519,6 +531,9 @@ class Anima3BRuntime:
 
     @staticmethod
     def _native_inputs(native_engine, line: str, device, dtype):
+        if not is_legacy_engine(native_engine):
+            # 새 Forge(21886f41~)의 Qwen06Engine — tokenize_line/process_tokens 가 없다
+            return qwen06_native_inputs(native_engine, line, device, dtype)
         chunks = native_engine.tokenize_line(line)
         if len(chunks) != 1:
             raise RuntimeError("Anima 3.8B expects one prompt chunk.")

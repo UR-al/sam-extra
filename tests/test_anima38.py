@@ -1993,11 +1993,13 @@ class NativeRowCacheTests(unittest.TestCase):
     """0.6B TE 줄 캐시 — 같은 줄·같은 TE 상태면 TE 를 GPU 로 올리지 않는다(예전엔 생성마다 1.75 GB 왕복).
     결과는 캐시 없이 매번 돌린 옛 계산과 비트 단위로 같아야 하고, LoRA·emphasis·DoRA 방식이 바뀌면 다시 돈다."""
 
+    engine_factory = _FakeNativeEngine   # 새 Forge 엔진(Qwen06Engine) 대역으로 같은 검사를 다시 돌리는 하위 클래스가 바꾼다
+
     def setUp(self):
         self.module = _load_lifecycle_runtime()
         self.load_gpu = mock.Mock()
         self.module.memory_management.load_model_gpu = self.load_gpu
-        self.engine = _FakeNativeEngine()
+        self.engine = self.engine_factory()
         adapter = types.SimpleNamespace(embed=types.SimpleNamespace(weight=torch.zeros(1, dtype=torch.float32)))
         self.clip = types.SimpleNamespace(
             cond_stage_model=types.SimpleNamespace(qwen3_06b=types.SimpleNamespace(llm_adapter=adapter)),
@@ -2102,7 +2104,7 @@ class NativeRowCacheTests(unittest.TestCase):
         # 키의 엔진 id 필드 — 같은 TE 패처(uuid)·emphasis 라도 다른 엔진이면 다른 줄 (값이 다른 엔진으로 확인)
         prompt = ["girl, (smile:1.2)"]
         self._assert_same_as_old(prompt, te_loads=1)
-        other = _FakeNativeEngine()
+        other = self.engine_factory()
         other.te_weight = self.engine.te_weight * 2.0
         self.engine = other
         self._assert_same_as_old(prompt, te_loads=2)
@@ -2114,7 +2116,7 @@ class NativeRowCacheTests(unittest.TestCase):
         self.assertEqual(len(self.runtime._native_cache), self.module.NATIVE_CACHE_LINES)
 
     def test_encode_v2_placeholders_and_runs_match_the_old_path(self):
-        self.engine = _FakeNativeEngine(width=_V2_WIDTH)   # 마커가 들어갈 폭
+        self.engine = self.engine_factory(width=_V2_WIDTH)   # 마커가 들어갈 폭
         old_runtime = self._runtime()
         reference = lambda engine, clip, prompt, sd_model=None: _reference_extract_prompt_features(  # noqa: E731
             old_runtime, engine, clip, prompt)

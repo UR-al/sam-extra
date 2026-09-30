@@ -90,6 +90,13 @@ v0.21.2 이후 쌓인 큰 업데이트입니다. Anima 3.8B(Qwen3.5 / Semantic C
 - **다른 패스·탭과 섞일 때의 수정**: SAM3 In-flight 인페인트 패스 뒤의 ADetailer 패스와 배치의 다음 이미지가 0.6B 조건으로 떨어지지 않고, 다른 탭 생성이 도중에 죽어도
   Bypass 생성이 v2 로 돌지 않습니다. 커넥터·Qwen3.5·v1 어댑터 가중치는 inference_mode 밖에서 만들어, 캐릭터 레퍼런스가 3.8B 에서 `Inference tensors
   do not track version counter` 로 죽지 않습니다.
+- **새 Forge 텍스트 엔진 대응 (결과 같음, 토글 없음)**: Forge `21886f41`("Rewrite TextProcessingEngine")이 Anima 0.6B TE 엔진을
+  `Qwen06Engine`(ComfyUI v0.36 `sd1_clip` 이식)으로 바꿔, 그 뒤 Forge 에서는 3.8B 생성이 전부 `'Qwen06Engine' object has no attribute
+  'tokenize_line'` 으로 죽었습니다. 엔진에 옛 API 가 있으면 예전 경로를, 없으면 `Qwen06Engine.__call__` 의 한 줄 계산(emphasis `None` 은 가중치
+  파싱 끔, `Ignore` 는 T5 가중치 1.0, qwen 가중치는 1.0 강제)을 그대로 따라 합니다 — 실제 Forge 엔진·토크나이저로 CPU 에서 네 emphasis 모두 같은 값을
+  확인했습니다. NegPiP(`sd-forge-negpip`)의 마스크 함수는 아직 옛 API 를 불러, 새 Forge 에서는 v2 생성에 NegPiP 를 끄고 경고를 한 번 남깁니다(생성은
+  계속). NegPiP 자체 래퍼가 도는 경우(우리 위에 설치된 순서, Bypass·0.6B 생성)는 NegPiP 안에서 같은 오류로 실패합니다 — NegPiP 가 새 엔진에
+  맞춰질 때까지 새 Forge 에서는 NegPiP 를 끄세요.
 
 ### 캐릭터 레퍼런스 (이어붙이기 · IP-Adapter)
 
