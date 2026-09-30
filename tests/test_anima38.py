@@ -1673,7 +1673,7 @@ class NegPipAboveUsTests(unittest.TestCase):
             runtime.install(p, "a", 1.0, None)
         ours = model.get_learned_conditioning
 
-        # NegPiP 설치 (lib_negpip/anima.py 와 같은 모양)
+        # NegPiP 설치 (sam3ext/negpip/anima.py — 상류 lib_negpip/anima.py 와 같은 모양)
         model.orig_forward = model.get_learned_conditioning
 
         @wraps(model.orig_forward)
@@ -1686,12 +1686,9 @@ class NegPipAboveUsTests(unittest.TestCase):
         self.assertIs(getattr(negpip_learned_conditioning, "_anima3b_patch", None), runtime, "wraps 가 표시를 복사한다")
         self.assertIs(runtime._our_cond_wrapper(model), ours)
 
-        lib = types.ModuleType("lib_negpip")
-        lib.__path__ = []
-        anima = types.ModuleType("lib_negpip.anima")
-        anima._build_negpip_mask = lambda engine, line, n, device, dtype: torch.ones(n, device=device, dtype=dtype)
         reference = (types.SimpleNamespace(ref_latents=[]), types.SimpleNamespace(anima_do_reference=False))
-        with mock.patch.dict(sys.modules, {"lib_negpip": lib, "lib_negpip.anima": anima}), \
+        # NegPiP 가 위에 있으면 우리는 마스킹하지 않는다 — 내장 헬퍼가 불리면 두 번 마스킹한 것
+        with mock.patch.object(module, "build_negpip_mask", side_effect=AssertionError("masked twice")), \
                 mock.patch.object(module, "_anima_reference_state", return_value=reference), \
                 mock.patch.object(runtime, "_extract_prompt_features", return_value=_v2_features(1)):
             result = model.get_learned_conditioning(_Prompt(["girl"]))

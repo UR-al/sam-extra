@@ -34,11 +34,11 @@ def _tok(text: str) -> list[int]:
 
 
 def _parse(text: str, disable: bool) -> list[tuple[str, float]]:
-    """'(단어:1.2)' 만 읽는 작은 가중치 파서 — disable 이면 원문 그대로 1.0 (ComfyUI disable_weights 와 같은 뜻)."""
+    """'(단어:1.2)'·'(단어:-1)' 만 읽는 작은 가중치 파서 — disable 이면 원문 그대로 1.0 (ComfyUI disable_weights 와 같은 뜻)."""
     if disable:
         return [(text, 1.0)]
     out = []
-    for m in re.finditer(r"\(([^():]*):([0-9.]+)\)|([^()]+)", text):
+    for m in re.finditer(r"\(([^():]*):(-?[0-9.]+)\)|([^()]+)", text):
         out.append((m.group(3), 1.0) if m.group(3) is not None else (m.group(1), float(m.group(2))))
     return out
 
@@ -209,49 +209,77 @@ class Qwen06NativeRowCacheTests(base.NativeRowCacheTests):
 
 
 class NegPipEngineGuardTests(unittest.TestCase):
-    """NegPiP 의 _build_negpip_mask 는 아직 engine.tokenize_line 을 부른다 — 새 엔진이면 경고 한 번 후 조건을 그대로."""
+    """v2 가 아래에 깔린 NegPiP 의 마스킹을 대신할 때 내장 헬퍼(sam3ext/negpip/mask.py)를 쓴다 — 옛·새 엔진 모두 마스크.
+
+    3e35f1e 는 따로 설치된 NegPiP 의 헬퍼가 새 엔진에서 AttributeError 를 내면 경고 후 마스킹을 건너뛰었다. 이제 헬퍼가
+    두 엔진을 다 알므로 건너뛰지 않고, 헬퍼의 오류는 그대로 올라간다(삼키면 NegPiP 가 조용히 꺼진다)."""
+
+    LINE = "girl, (bad:-1)"
 
     def setUp(self):
         self.module = base._load_lifecycle_runtime()
         self.runtime = self.module.Anima3BRuntime()
-        lib = types.ModuleType("lib_negpip")
-        lib.__path__ = []
-        anima = types.ModuleType("lib_negpip.anima")
 
-        def _build_negpip_mask(engine, line, n, device, dtype):   # 상류와 같이 옛 API 를 먼저 부른다
-            engine.tokenize_line(line)
-            return torch.ones(n, device=device, dtype=dtype)
-
-        anima._build_negpip_mask = _build_negpip_mask
-        patcher = mock.patch.dict(sys.modules, {"lib_negpip": lib, "lib_negpip.anima": anima})
-        patcher.start()
-        self.addCleanup(patcher.stop)
-
-    def _apply(self, engine):
+    def _apply(self, engine, rows=16):
         model = types.SimpleNamespace(text_processing_engine_anima=engine)
-        conds = [torch.ones(1, 3, 4)]
-        return conds, self.runtime._apply_negpip(model, base._Prompt(["girl, [:bad:-1]"]), conds)
+        conds = [torch.arange(rows * 4, dtype=torch.float32).reshape(1, rows, 4) + 1.0]
+        return conds, self.runtime._apply_negpip(model, base._Prompt([self.LINE]), conds)
 
-    def test_new_engine_warns_once_and_keeps_conds(self):
-        engine = _FakeQwen06Engine()
-        with self.assertLogs(self.module.logger, "WARNING") as logs:
-            conds, result = self._apply(engine)
-            again_conds, again = self._apply(engine)
-        self.assertIs(result, conds)
-        self.assertIs(again, again_conds)
-        self.assertEqual(len(logs.records), 1)
-        self.assertIn("NegPiP", logs.output[0])
+    def _expected(self, rows=16):
+        plain, bad = _tok("girl, "), _tok("bad")
+        mask = torch.ones(rows)
+        mask[len(plain):len(plain) + len(bad)] = -1.0   # 끝 토큰(_END)과 패딩은 1
+        return mask
+
+    def test_new_engine_masks_the_negative_rows(self):
+        conds, result = self._apply(_FakeQwen06Engine())
+        mask = self._expected()
+        self.assertTrue(torch.equal(result["c_negpip_mask"], mask.reshape(1, -1, 1)))
+        self.assertTrue(torch.equal(result["crossattn"], conds[0] * mask.reshape(1, -1, 1)))
+
+    def test_new_engine_none_and_ignore_leave_every_row(self):
+        for name in ("None", "Ignore"):
+            with self.subTest(emphasis=name):
+                engine = _FakeQwen06Engine()
+                engine.opts.emphasis = name
+                conds, result = self._apply(engine)
+                self.assertTrue(bool((result["c_negpip_mask"] == 1.0).all()))
+                self.assertTrue(torch.equal(result["crossattn"], conds[0]))
+
+    def test_no_warning_is_logged_on_the_new_engine(self):
+        with self.assertNoLogs(self.module.logger, "WARNING"):
+            self._apply(_FakeQwen06Engine())
+        self.assertFalse(hasattr(self.runtime, "_warned_negpip"))
 
     def test_old_engine_still_masks(self):
-        conds, result = self._apply(base._FakeNativeEngine())
-        self.assertIsInstance(result, dict)
-        self.assertEqual(tuple(result["c_negpip_mask"].shape), (1, 3, 1))
-
-    def test_attribute_error_on_an_old_engine_is_not_swallowed(self):
         engine = base._FakeNativeEngine()
-        sys.modules["lib_negpip.anima"]._build_negpip_mask = lambda *args: engine.missing_attribute
-        with self.assertRaises(AttributeError):
+        chunk = types.SimpleNamespace(t5_multipliers=[1.0, -1.0, 1.0])
+        engine.tokenize_line = lambda line: [chunk]
+        _, result = self._apply(engine, rows=3)
+        self.assertEqual(result["c_negpip_mask"].reshape(-1).tolist(), [1.0, -1.0, 1.0])
+
+    def test_uses_the_vendored_helper(self):
+        engine = _FakeQwen06Engine()
+        with mock.patch.object(self.module, "build_negpip_mask", wraps=self.module.build_negpip_mask) as helper:
             self._apply(engine)
+        helper.assert_called_once()
+        self.assertIs(helper.call_args.args[0], engine)
+        self.assertEqual(helper.call_args.args[1], self.LINE)
+        code = self.module.build_negpip_mask.__code__
+        self.assertEqual(Path(code.co_filename).resolve(), (ROOT / "sam3ext/negpip/mask.py").resolve())
+        self.assertEqual(self.module.build_negpip_mask.__module__, "sam3ext.negpip.mask")
+        self.assertNotIn("lib_negpip", (ROOT / "sam3ext/anima38/runtime.py").read_text(encoding="utf-8"))
+
+    def test_helper_errors_are_not_swallowed(self):
+        def broken(*args, **kwargs):
+            raise AttributeError("broken engine")
+
+        new, old = _FakeQwen06Engine(), base._FakeNativeEngine()
+        new.t5_tokenizer.tokenize_with_weights = broken
+        old.tokenize_line = broken
+        for engine in (new, old):
+            with self.subTest(engine=type(engine).__name__), self.assertRaisesRegex(AttributeError, "broken engine"):
+                self._apply(engine)
 
 
 def _methods(cls: ast.ClassDef) -> dict[str, ast.FunctionDef]:

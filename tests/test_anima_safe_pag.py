@@ -1964,7 +1964,7 @@ class AnimaSafePagTests(unittest.TestCase):
 
 
 FORGE_ROOT = ROOT.parents[1]
-NEGPIP_ANIMA = FORGE_ROOT / "extensions" / "sd-forge-negpip" / "lib_negpip" / "anima.py"
+NEGPIP_ANIMA = ROOT / "sam3ext" / "negpip" / "anima.py"   # 내장 NegPiP (sd-forge-negpip 0585496 편입)
 
 
 @contextlib.contextmanager
@@ -2039,9 +2039,9 @@ def _load_real_forge_anima(record):
 
 
 def _load_real_negpip(anima_module):
-    """sd-forge-negpip 의 실제 Anima 훅(DiT forward·cross-attn forward)."""
+    """내장 NegPiP(sam3ext/negpip — 상류 sd-forge-negpip)의 실제 Anima 훅(DiT forward·cross-attn forward)."""
     if not NEGPIP_ANIMA.is_file():
-        raise unittest.SkipTest("sd-forge-negpip 확장이 없다")
+        raise unittest.SkipTest("sam3ext/negpip/anima.py 가 없다")
     backend = types.ModuleType("backend")
     backend.__path__ = []
     nn_pkg = types.ModuleType("backend.nn")

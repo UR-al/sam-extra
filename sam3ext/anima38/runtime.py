@@ -22,7 +22,8 @@ from . import connector_cache
 from .adapter import ProgressiveCrossAdapter
 from .connector_fp32 import make_connector_patcher
 from .marker import as_rows, read_run_ids, stamp_run_id
-from .native_engine import is_legacy_engine, qwen06_native_inputs
+from ..negpip.mask import build_negpip_mask
+from .native_engine import emphasis_infotext, is_legacy_engine, qwen06_native_inputs
 from .files import (
     ARCHITECTURE,
     CONNECTOR_PREFIX,
@@ -96,6 +97,17 @@ def _outside_inference_mode(load):
             return load(*args, **kwargs)
 
     return wrapper
+
+
+def _emphasis_state():
+    """Forge 의 (emphasis 모듈, dynamic_args, opts) — Forge 밖(테스트)이면 None. 테스트에서 바꿔 끼운다."""
+    try:
+        from backend.args import dynamic_args
+        from backend.text_processing import emphasis
+        from modules.shared import opts
+    except ImportError:
+        return None
+    return emphasis, dynamic_args, opts
 
 
 def _anima_reference_state():
@@ -218,29 +230,25 @@ class Anima3BRuntime:
         return conds
 
     def _apply_negpip(self, sd_model, prompt, conds):
-        """NegPiP 의 negpip_learned_conditioning 과 같은 변환: 줄별 ±1 마스크를 곱하고 마스크를 함께 돌려준다."""
-        try:
-            from lib_negpip.anima import _build_negpip_mask
-        except Exception as exc:  # pragma: no cover - NegPiP 가 없거나 내부가 바뀜
-            if not getattr(self, "_warned_negpip", False):
-                self._warned_negpip = True
-                logger.warning("[Anima38] NegPiP mask helper unavailable (%s); NegPiP is inactive for v2", exc)
-            return conds
+        """NegPiP 의 negpip_learned_conditioning 과 같은 변환: 줄별 ±1 마스크를 곱하고 마스크를 함께 돌려준다.
+
+        마스크는 내장 NegPiP(sam3ext/negpip/mask.py)로 만든다 — 옛·새 Forge 엔진 모두, 그 엔진의 emphasis 방식대로.
+        아래에 깔린 NegPiP 가 따로 설치된 sd-forge-negpip 여도 이 내장 규칙을 쓴다 — 그 확장 자신의 _build_negpip_mask 가
+        아니다(내장 스크립트는 쉬지만 마스킹은 여기서 한다). 그래서 단독판과의 관계는 엔진·emphasis 에 따라 다르다:
+
+        - 옛 엔진(AnimaTextProcessingEngine, Forge ad88b6b4 까지): 상류 b3673ce 와 같다(둘 다 tokenize_line 의 t5_multipliers,
+          emphasis 무관). 0585496 의 마스크 함수는 옛 엔진에서 돌지 못한다(t5_tokenizer.tokenize_with_weights 없음).
+        - 새 엔진(Qwen06Engine, 21886f41~), emphasis Original·No norm: 상류 0585496 과 같다(t5_tokenizer.tokenize_with_weights).
+        - 새 엔진, emphasis None·Ignore: 0585496 과 **다르다**. 엔진이 음수 가중치를 조건에 곱하지 않으므로 내장은 모두 1(뒤집는
+          행 없음)을 돌려주는데, 0585496 은 그래도 가중치를 파싱해 None 이면 엔진 행과 어긋난 마스크를, Ignore 면 K 만 뒤집히는
+          마스크를 만든다. 즉 이 두 방식에서 3.8B 가 단독 0585496 위에 있으면 0585496 혼자 돌 때와 결과가 다르다(내장 쪽이 엔진과
+          맞는다). b3673ce 의 마스크 함수는 새 엔진에서 돌지 못한다(tokenize_line 없음).
+        """
         engine = sd_model.text_processing_engine_anima
         crossattn, masks, count = [], [], 0
         for line, cond in zip(prompt, conds):
             data = cond.reshape(-1, cond.shape[-1])
-            try:
-                mask = _build_negpip_mask(engine, str(line), data.shape[0], data.device, data.dtype)
-            except AttributeError as exc:
-                # NegPiP 헬퍼가 옛 엔진 API(tokenize_line)를 부르는데 새 Forge(21886f41~)의 Qwen06Engine 엔 없다
-                if is_legacy_engine(engine):
-                    raise
-                if not getattr(self, "_warned_negpip", False):
-                    self._warned_negpip = True
-                    logger.warning("[Anima38] NegPiP mask helper does not support this Forge text engine (%s); "
-                                   "NegPiP is inactive for v2", exc)
-                return conds
+            mask = build_negpip_mask(engine, str(line), data.shape[0], data.device, data.dtype)
             count += int((mask < 0).sum())
             crossattn.append(data * mask.unsqueeze(-1).to(data))
             masks.append(mask.unsqueeze(-1).to(data))
@@ -274,6 +282,24 @@ class Anima3BRuntime:
             references.insert(0, sd_model.ini_latent)
             sd_model.ini_latent = None
         dynamic_args.ref_latents = references.copy()
+
+    @staticmethod
+    def _record_emphasis(native_engine, prompt) -> None:
+        """순정 엔진 __call__ 이 남기는 'Emphasis' 생성 정보를 v1/v2 경로에서도 같은 규칙으로 남긴다.
+
+        v1/v2 는 엔진 __call__ 을 건너뛰어 그 기록이 빠졌다. 규칙은 엔진마다 다르다(native_engine.emphasis_infotext).
+        옛 엔진은 __call__ 처럼 먼저 opts 에서 방식을 다시 읽는다 — tokenize_line·줄 캐시 키·NegPiP 마스크가 모두
+        엔진이 쥔 방식을 보므로, 순정 생성과 같은 방식으로 파싱된다. 새 엔진은 속성이 opts 를 매번 읽는다.
+        """
+        state = _emphasis_state()
+        if state is None:
+            return
+        emphasis, dynamic_args, opts = state
+        if is_legacy_engine(native_engine):
+            native_engine.emphasis = emphasis.get_current_option(opts.emphasis)()
+        value = emphasis_infotext(native_engine, [str(line) for line in prompt], emphasis.uses_emphasis)
+        if value is not None:
+            dynamic_args.last_extra_generation_params["Emphasis"] = value
 
     @staticmethod
     def _checkpoint_path(sd_model) -> str:
@@ -1042,6 +1068,7 @@ class Anima3BRuntime:
 
         if not is_negative:
             self._hand_off_native_reference(sd_model)
+        self._record_emphasis(native_engine, prompt)
         if self._active_bundle_metadata is not None:
             return self._encode_v2(native_engine, native_clip, prompt, sd_model=sd_model)
 

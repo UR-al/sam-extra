@@ -9,8 +9,8 @@ v0.21.2 이후 쌓인 큰 업데이트입니다. Anima 3.8B(Qwen3.5 / Semantic C
 방식)이 생겼습니다. Anima LoRA 는 Base 1.0(28)·2.9B(40)·3.8B(52) 사이를 자동으로 옮기고, DoRA 합치는 방식을 고를 수 있습니다. 그 밖에 TIPO 프롬프트
 확장(🪄)·SAM3 빠른 버튼(🎯)·txt2img 섹션 정리·VAE 격자 제거(Anima VAE DeGrid, NAFNet)가 추가됐고, SAM3·가이던스·3.8B 생성 시간을 줄였습니다 — 대부분은 결과가 픽셀 단위로 같고, PAG/SEG 의 두 가지 최적화만 잔
 디테일이 달라집니다(설정으로 끌 수 있음). 가이던스(Detail Daemon·Safe PAG·Skimmed CFG·DCW(+a)·DAVE·CNS)와 Tile-Repair 는 가져온 원본 ComfyUI
-노드·sd-scripts 와 같은 값·범위·적용 구간으로 맞춰 같은 설정에서도 결과가 달라지고, Tile-Repair HTTP API 와 Notebook 메모장이 생겼습니다. 이 확장 전체의 라이선스는
-이제 **GPL-3.0-only** 입니다.
+노드·sd-scripts 와 같은 값·범위·적용 구간으로 맞춰 같은 설정에서도 결과가 달라지고, Tile-Repair HTTP API 와 Notebook 메모장이 생겼습니다. 이 확장의 라이선스는
+이제 **GPL-3.0-only** 입니다(편입한 NegPiP 파일만 **AGPL-3.0-or-later** — **설치 · 라이선스 · 개발** 절).
 
 괄호 표시: (결과 변화) = v0.21.2 와 같은 설정·시드에서 이미지가 달라짐, (결과 같음) = 이미지 동일, (새 기능) = v0.21.2 에 없던 기능이라 비교 대상 없음, 토글 = 끌 수
 있는 설정이 있음(뒤에 기본값), 토글 없음 = 끌 수 없음.
@@ -38,6 +38,9 @@ v0.21.2 이후 쌓인 큰 업데이트입니다. Anima 3.8B(Qwen3.5 / Semantic C
   - 3.8B v2 번들 체크포인트는 Qwen3.5 커넥터가 자동으로 켜집니다. 끄려면 `Anima 3.8B (Qwen3.5 / v2)` 아코디언의 Bypass.
   - Tile-Repair 는 sd-scripts 원본처럼 원본 비율을 지키는 Short Side 슬라이더·디코드(uint8 버림)·빈 네거티브를 쓰고, SAM3 ControlNet 에 Tile &
     Repair LLLite 를 고르면 preprocessor 가 늘 `None` 이 됩니다(토글 없음).
+- NegPiP 가 이 확장에 들어왔습니다. 따로 설치한 `extensions/sd-forge-negpip` 는 지우고(또는 끄고) 재시작하세요 — 남아 있으면 내장 NegPiP 가
+  쉬고 경고를 한 번 남깁니다(두 번 적용 방지). 예전 판(`b3673ce`)과 음수 항을 찾는 규칙이 조금 다르고, 새 Forge 에서 emphasis 가
+  `None`/`Ignore` 면 Anima NegPiP 는 켜지지 않습니다(**NegPiP 내장** 절).
 - 메모리: 3.8B 는 생성 사이 VRAM 에 최대 약 6~8 GB 를 남기고(`sam3_anima38_keep_resident`), SAM3 'Unload after' 는 모델을 RAM 에 약
   3.4 GB 로 보관합니다(`sam3_unload_keep_in_ram`). 3.8B 샘플링 중에는 커넥터 fp32 상주 (`sam3_anima38_connector_fp32`, VRAM 약
   +1.5 GB, 여유가 있을 때만)와 run 캐시(`sam3_anima38_connector_run_cache`, 최대 512 MB)도 씁니다. 넷 다 기본 켬이고 끌 수 있습니다.
@@ -94,9 +97,47 @@ v0.21.2 이후 쌓인 큰 업데이트입니다. Anima 3.8B(Qwen3.5 / Semantic C
   `Qwen06Engine`(ComfyUI v0.36 `sd1_clip` 이식)으로 바꿔, 그 뒤 Forge 에서는 3.8B 생성이 전부 `'Qwen06Engine' object has no attribute
   'tokenize_line'` 으로 죽었습니다. 엔진에 옛 API 가 있으면 예전 경로를, 없으면 `Qwen06Engine.__call__` 의 한 줄 계산(emphasis `None` 은 가중치
   파싱 끔, `Ignore` 는 T5 가중치 1.0, qwen 가중치는 1.0 강제)을 그대로 따라 합니다 — 실제 Forge 엔진·토크나이저로 CPU 에서 네 emphasis 모두 같은 값을
-  확인했습니다. NegPiP(`sd-forge-negpip`)의 마스크 함수는 아직 옛 API 를 불러, 새 Forge 에서는 v2 생성에 NegPiP 를 끄고 경고를 한 번 남깁니다(생성은
-  계속). NegPiP 자체 래퍼가 도는 경우(우리 위에 설치된 순서, Bypass·0.6B 생성)는 NegPiP 안에서 같은 오류로 실패합니다 — NegPiP 가 새 엔진에
-  맞춰질 때까지 새 Forge 에서는 NegPiP 를 끄세요.
+  확인했습니다. NegPiP 는 이제 이 확장에 들어 있어(아래 **NegPiP 내장**) 옛·새 Forge 모두에서 v2 생성에도 적용됩니다(새 Forge 의 emphasis
+  `None`/`Ignore` 는 엔진이 음수 가중치를 쓰지 않아 NegPiP 도 없음 — 아래) — 개발 빌드 한때처럼 새 Forge 에서 NegPiP 를 끄지 않아도 됩니다. v1/v2 경로는 엔진 `__call__` 을 건너뛰어 순정 엔진이 남기는 `Emphasis` 생성 정보가
+  빠졌는데, 이제 엔진마다 같은 규칙으로 남깁니다(옛 엔진: 가중치 문법이 있으면 늘, 새 엔진: 방식이 `None`/`Ignore` 일 때만. 옛 엔진은 순정처럼
+  방식을 설정에서 다시 읽어 파싱합니다).
+
+### NegPiP 내장 (sd-forge-negpip 편입)
+
+- **NegPiP 를 확장에 넣었습니다 (대부분 결과 같음 — 아래 세 경우만 결과 변화, 토글 없음)**: [Haoming02/sd-forge-negpip](https://github.com/Haoming02/sd-forge-negpip)
+  이 2026-09-30 보관(archive)돼, 마지막 커밋 `0585496` 을 `sam3ext/negpip/`·`scripts/negpip.py` 로 편입했습니다(AGPL-3.0-or-later, 고지는
+  `THIRD_PARTY_NOTICES.md`, 전문은 `sam3ext/negpip/LICENSE`). 스크립트 제목 `NegPiP`·UI 없음·always-on 과 파일 이름 `negpip.py` 가 그대로라
+  API·UR_IV·SAM3 안쪽 패스 복사와 ADetailer 패스(설정 `ad_script_names` 가 파일 이름 `negpip` 으로 고른다)가 예전처럼 동작합니다. 쓰는 법도 같습니다 — 긍정 프롬프트의 `(단어:-1.0)` 은 개념을 빼고, 부정 프롬프트의 음수 가중치는 개념을
+  강제합니다(SD1·SDXL·Anima). 스크립트 순서도 예전 자리(`sd-dynamic-thresholding` 뒤)를 `metadata.ini` 로 지킵니다 — Dynamic Thresholding 이
+  `p.sampler_name` 을 `…_dynthres<N>` 로 바꾼 뒤에 NegPiP 가 cond/uncond 절반을 고르므로, 이 확장 폴더 자리(앞)에서 돌면 UniPC + Dynamic
+  Thresholding 의 SD1/SDXL 에서 반대 절반을 골랐을 것입니다.
+- **음수 항 찾기 규칙 — 상류 수정 (결과 변화, SD1/SDXL)**: 대부분이 쓰던 예전 sd-forge-negpip(`b3673ce`)과 달리 상류 `75b81b4` 의 `NEG_PATTERN`
+  을 씁니다. 예전 패턴은 괄호 안에 `:` 만 없으면 무엇이든 삼켜 `(smile), (aqua hair:-1)` 을 통째로 한 음수 항으로 잡았고(SD1/SDXL 에서 `(smile)` 까지
+  프롬프트에서 빠져 음수 항에 들어감), 이제는 `(aqua hair:-1)` 만 잡습니다. 앞의 escape 괄호에서 시작해 삼키던 것도(`\(escaped\) text, (x:-1)` → 예전 `(escaped\) text, (x:-1)`) 이제
+  `(x:-1)` 만 잡습니다. 상류 저자의 버그 수정이라 그대로 두었습니다. Anima 는 이 패턴을 켤지 판단에만 쓰고 마스크는 엔진 가중치로 만들어 영향이 없습니다.
+- **새 Forge 의 SD1/SDXL — BOS 행을 뒤집지 않음 (결과 변화, 상류와 다름)**: Forge `21886f41` 의 `sd_engine.ClipEngine.tokenize` 가
+  `add_special_tokens=False` 를 넘기지 않아 프롬프트 조각마다 BOS/EOS 가 붙습니다. 상류(두 판 모두)의 `_cond_dealer` 자르기 `cond[1:token_len+2]`
+  는 그 엔진에서 `[단어…, EOS]` 대신 `[BOS, 단어…, EOS, EOS]` 행을 잡아 BOS(어텐션 싱크) 행의 V 까지 뒤집습니다. 내장은 엔진 자신에게 물어(빈 글자를
+  토큰화하면 특수 토큰이 나오는가 — 판 번호가 아님) 그런 엔진이면 옛 엔진과 같은 `[단어…, EOS]` 행만 고릅니다. 옛 엔진(`ad88b6b4` 까지)과 Forge
+  가 이 동작을 고친 뒤에는 상류 자르기 그대로입니다. 실제 SD1.5 CLIP 토크나이저와 두 세대 엔진 코드(CPU, 가짜 인코더)로 두 엔진이 같은 행을
+  고르는 것을 확인했습니다(음수 항이 한 청크, 75토큰 이하일 때. 더 긴 항은 옛 엔진의 상류 자르기가 청크 경계의 채움 EOS·BOS
+  행까지 잡고, 내장은 새 엔진에서 단어 행과 마지막 EOS 만 잡아 서로 다릅니다). 새 Forge 자체가 조건에 조각마다 BOS/EOS 를 넣으므로 옛 Forge 와 이미지까지 같지는 않습니다.
+- **옛·새 Forge 의 Anima 마스크 (결과 같음)**: Anima 마스크가 Forge 의 옛 텍스트 엔진(`AnimaTextProcessingEngine`)과 새 엔진(`Qwen06Engine`, Forge
+  `21886f41`)을 둘 다 압니다. 상류 마지막 판은 새 엔진만, 그 전 판은 옛 엔진만 알았습니다. 실제 Forge 엔진·토크나이저(CPU)로 두 세대 모두 마스크
+  행이 엔진이 조건에 곱한 가중치와 한 칸도 어긋나지 않음을 확인했습니다.
+- **새 Forge 의 emphasis `None`·`Ignore` 에서는 Anima NegPiP 가 켜지지 않습니다 (결과 변화)**: 새 엔진은 `None` 이면 괄호·`:-1` 을 글자로
+  토큰화하고, `Ignore` 면 괄호는 먹되 가중치를 1.0 으로 둡니다 — 엔진이 음수 가중치를 적용하지 않습니다. 상류 `0585496` 은 여기서도 마스크를
+  만들어 `None` 이면 행이 어긋나고 `Ignore` 면 K 만 뒤집혀 뜻이 반대가 됐습니다. 이제 콘솔에 `NegPiP Disabled (Emphasis: None)` 을 남기고
+  건너뜁니다(Forge 가 `Emphasis` 생성 정보를 남깁니다). 옛 엔진은 `Ignore` 에서도 가중치를 곱하므로 예전처럼 켜집니다. SD1/SDXL 은 NegPiP 가
+  음수 항을 프롬프트에서 빼 따로 인코딩하므로 이 판단이 없습니다(상류 그대로).
+- **sd-forge-negpip 를 지우세요**: 따로 설치된 `sd-forge-negpip` 가 함께 로드돼 있으면 두 개가 같은 훅을 두 번 걸어(Anima 는 -1 마스크가 두 번
+  곱해져 NegPiP 가 상쇄됨) 내장 쪽이 쉬고 콘솔에 경고를 한 번 남깁니다. 판별은 스크립트 러너의 `NegPiP` 스크립트 객체와 모델에 남은 NegPiP 패치
+  흔적입니다(남아 있는 `lib_negpip` 모듈만으로는 쉬지 않음 — 확장을 꺼도 재시작 전까지 남기 때문). `extensions/sd-forge-negpip` 를 지우고(또는 끄고)
+  Forge 를 재시작하면 내장이 대신합니다.
+- **Anima 3.8B**: 3.8B 런타임이 NegPiP 마스킹을 대신할 때(3.8B 가 NegPiP 위에 있는 순서) 내장 마스크 규칙을 씁니다 — 아래에 깔린 것이 따로 설치된
+  sd-forge-negpip 여도 그렇습니다. 옛 엔진에서는 `b3673ce` 와 같고, 새 엔진에서는 emphasis `Original`·`No norm` 이면 `0585496` 과 같으며
+  `None`·`Ignore` 면 위 규칙대로 뒤집는 행이 없습니다(단독 `0585496` 과 다름). 개발 빌드 한때의 '새 엔진이면 경고 후 건너뛰기'는 없앴습니다 — 헬퍼가
+  두 엔진을 다 알고, 헬퍼 오류를 삼키면 NegPiP 가 조용히 꺼지기 때문입니다.
 
 ### 캐릭터 레퍼런스 (이어붙이기 · IP-Adapter)
 
@@ -465,11 +506,13 @@ v0.21.2 이후 쌓인 큰 업데이트입니다. Anima 3.8B(Qwen3.5 / Semantic C
   에서 받아 씁니다(예전에는 FileNotFoundError). `--sam3-no-huggingface` 면 넣을 위치와 플래그를 안내하는 FileNotFoundError 입니다. 확장 폴더명이
   `forge_sam3_extension` 이 아니면 시작 로그에 경고합니다(`metadata.ini` 콜백 순서가 폴더명에 묶임). LoRA Manager vendor 는 새로 clone 할 때
   커밋 `303cca0`(1.2.0)으로 고정하고 판이 다르면 알립니다.
-- **라이선스를 GPL-3.0-only 로**: 확장 전체를 GNU GPL 3판만(SPDX `GPL-3.0-only`, 'or later' 없음)으로 배포합니다. 루트 `LICENSE` 를 추가하고
-  README 라이선스 절·`THIRD_PARTY_NOTICES.md` 에 반영했으며, `package.json` 에 SPDX `GPL-3.0-only` 를 적고 README 의 '내부 사용' 문구를
-  뺐습니다. 원본 동등성 작업으로 편입한 상류 코드 — Skimmed CFG 수식(Apache-2.0), Detail Daemon 스케줄·σ 조회와 Safe PAG 적용 구간·번호 파싱, DAVE
+- **라이선스를 GPL-3.0-only 로**: 이 확장의 코드를 GNU GPL 3판만(SPDX `GPL-3.0-only`, 'or later' 없음)으로 배포합니다. 루트 `LICENSE` 를 추가하고
+  README 라이선스 절·`THIRD_PARTY_NOTICES.md` 에 반영했으며, `package.json` 에 SPDX `GPL-3.0-only AND AGPL-3.0-or-later`(편입한 NegPiP 몫)를 적고
+  README 의 '내부 사용' 문구를 뺐습니다. 원본 동등성 작업으로 편입한 상류 코드 — Skimmed CFG 수식(Apache-2.0), Detail Daemon 스케줄·σ 조회와 Safe PAG 적용 구간·번호 파싱, DAVE
   초반 스텝 게이트(MIT), CNS 재색칠(GPL-3.0) — 와 대조 테스트용 ComfyUI-DCW 원본 사본(GPL-3.0)의 출처·커밋·고지를 `THIRD_PARTY_NOTICES.md` 에
-  적었습니다.
+  적었습니다. 편입한 NegPiP(`sam3ext/negpip/` 의 상류 파일, `scripts/negpip.py`)는 **AGPL-3.0-or-later** 를 그대로 따르며(확장 전체가 GPL-3.0-only
+  인 것이 아님) 라이선스 전문을 코드 옆에 두었습니다. GPL-3.0 13조로 결합해 배포하므로, 결합된 작업을 네트워크 너머 사용자에게 서비스하면 AGPL-3.0
+  13조의 네트워크 상호작용 요건(원격 사용자에게 대응 소스를 받을 기회 제공)이 NegPiP 부분만이 아니라 결합된 작업 그 자체에 적용됩니다.
 - **새 설정 섹션**: **SAM Extra SAM3**(`sam3_mask`)·**SAM Extra Anima 3.8B**(`sam3_anima38`)·**SAM Extra LoRA**
   (`sam3_lora`)·**SAM Extra Guidance**(`sam3_guidance`)·**SAM Extra Character Reference**(`sam3_reference`)·
   **SAM Extra VAE DeGrid**(`sam3_degrid`) 가

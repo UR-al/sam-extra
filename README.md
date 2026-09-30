@@ -42,7 +42,8 @@ speckle↓·skin/hair 정리(`scripts/anima_vae_2x.py`). Qwen/Wan VAE latent 공
 - 별도 기능: [ANIMA LoRA 블록 호환 변환](#별도-기능-anima-lora-블록-호환-변환) ·
   [DoRA 추론 방식](#별도-기능-dora-추론-방식) · [Anima VAE DeGrid](#별도-기능-anima-vae-degrid-nafnet) ·
   [Anima Guidance Suite](#별도-기능-anima-guidance-suite) ·
-  [txt2img 화면 정리](#txt2img-화면-정리-) · [TIPO 프롬프트 확장](#별도-기능-tipo-프롬프트-확장-)
+  [txt2img 화면 정리](#txt2img-화면-정리-) · [TIPO 프롬프트 확장](#별도-기능-tipo-프롬프트-확장-) ·
+  [NegPiP (내장)](#별도-기능-negpip-내장)
 - 참고: [출처 / 크레딧](#출처--크레딧-credits)
 
 ---
@@ -1058,7 +1059,7 @@ Forge 가 읽지 못해 이전 버전은 `Anima 3.8B …` 대신 `Anima38 …` �
 `[enabled, adapter, strength, negative, negative_strength, bypass]` 또는 SAM3 처럼 dict 하나
 `{"args": [{"enabled": true, "negative": false}]}` 를 보낼 수 있습니다. v2 번들은 인자를
 안 보내도 켜집니다. 끄려면 아코디언의 **Bypass** 체크박스 또는 `{"args": [{"bypass": true}]}`.
-- **NegPiP 와 함께 쓸 수 있다 (설치 순서 무관).** v2 조건은 Forge 네이티브 계약(줄마다 텐서 하나)을 지키고 run id 는 마지막 토큰 행의 마커로 실어 보내므로 `get_learned_conditioning` 을 감싸는 확장이 있어도 죽지 않는다. NegPiP 이 우리 아래에 깔리는 순서에서는 NegPiP 의 가중치 마스킹을 우리가 대신 적용해 어느 순서에서도 결과가 같다. 패치는 생성이 끝나도 자리에 남되 꺼진 상태로 투명하게 위임하므로, 두 확장이 서로 다른 순서로 해제해도 사고가 없다.
+- **NegPiP(이제 [내장](#별도-기능-negpip-내장))와 함께 쓸 수 있다 (설치 순서 무관).** v2 조건은 Forge 네이티브 계약(줄마다 텐서 하나)을 지키고 run id 는 마지막 토큰 행의 마커로 실어 보내므로 `get_learned_conditioning` 을 감싸는 확장이 있어도 죽지 않는다. NegPiP 이 우리 아래에 깔리는 순서에서는 NegPiP 의 가중치 마스킹을 우리가 대신 적용해 어느 순서에서도 결과가 같다(내장 NegPiP 기준 — 따로 설치한 sd-forge-negpip 가 아래에 깔리면 내장 마스크 규칙을 쓰므로 새 Forge 의 emphasis `None`·`Ignore` 에서는 그 판 단독과 다르다). 패치는 생성이 끝나도 자리에 남되 꺼진 상태로 투명하게 위임하므로, 두 확장이 서로 다른 순서로 해제해도 사고가 없다.
 
 ### 동작·한계
 - 두 인코더는 순차로 돕니다. 같은 프롬프트 줄의 0.6B TE 결과는 CPU 에 최근 32줄까지 캐시해 TE 를 다시
@@ -1168,6 +1169,35 @@ txt2img 도구 줄(붙여넣기·지우기·스타일 적용 버튼)의 **🪄**
 - **모델 받기**는 한 번에 하나만 돕니다 — 받는 중에 다른 창에서 또 누르면 바로 알려 주고 다시 받지 않습니다. 새로 고친 뒤
   상태 줄이 예전 내용이면 🪄 나 **모델 받기**를 한 번 누르면 맞춰집니다.
 
+## 별도 기능: NegPiP (내장)
+
+프롬프트 안에서 음수 가중치로 개념을 빼거나 강제합니다 — 긍정 프롬프트의 `(aqua hair:-1.0)` 은 그 개념을 **빼고**, 부정 프롬프트의
+`(단어:-1.0)` 은 그 개념을 **강제**합니다. SD1·SDXL·Anima 에서 돕니다. [Haoming02/sd-forge-negpip](https://github.com/Haoming02/sd-forge-negpip)
+(AGPL-3.0-or-later, 2026-09-30 보관)의 마지막 판 `0585496` 을 이 확장에 넣은 것이라 따로 설치할 필요가 없습니다.
+
+- **켜고 끄기 없음**: 프롬프트에 음수 가중치가 있을 때만 돕니다(always-on, UI 없음). 켜지면 생성 정보에 `NegPiP: True` 가 남습니다.
+  API 에서는 예전처럼 스크립트 제목 `NegPiP`(인자 0개)입니다.
+- **sd-forge-negpip 는 지우세요**: 따로 설치한 `extensions/sd-forge-negpip` 가 함께 로드돼 있으면 NegPiP 가 두 번 걸리므로(Anima 는 서로
+  상쇄) 내장 NegPiP 가 쉬고 콘솔에 `built-in NegPiP is standing down` 경고를 한 번 남깁니다. 폴더를 지우거나 Extensions 탭에서 끄고
+  Forge 를 재시작하세요.
+- **Forge 옛·새 텍스트 엔진 모두**: Forge `21886f41`(텍스트 엔진 재작성) 전후 어느 Forge 에서도 돕니다. Anima 마스크는 두 엔진 모두
+  엔진이 조건에 곱한 가중치를 그대로 따릅니다. SD1/SDXL 은 새 엔진(`sd_engine.ClipEngine`)이 프롬프트 조각마다 BOS/EOS 를 붙여,
+  상류 코드대로면 음수 항 조건에서 `[BOS, 단어…, EOS, EOS]` 행을 잡아 BOS 행까지 뒤집습니다 — 내장은 엔진에 물어 옛 엔진과 같은
+  `[단어…, EOS]` 행만 고릅니다(음수 항이 75토큰 이하일 때 옛 엔진과 같은 행. 상류와 다른 점. Forge 가 고치면 저절로 상류 자르기로 돌아갑니다). 새 Forge 는 조건 자체가 옛 Forge 와
+  달라 이미지까지 같지는 않습니다.
+- **예전 sd-forge-negpip(`b3673ce`)와 다른 점 — 음수 항 찾기**: 상류 `75b81b4` 에서 고친 패턴을 씁니다. 예전에는
+  `(smile), (aqua hair:-1)` 을 통째로 한 음수 항으로 잡아 SD1/SDXL 에서 `(smile)` 까지 프롬프트에서 빠졌는데, 이제 `(aqua hair:-1)` 만
+  잡습니다(앞의 escape 괄호 `\(` 부터 삼키던 경우도 고쳐짐). 같은 프롬프트라도 SD1/SDXL 결과가 달라질 수 있습니다. Anima 는 영향 없음.
+- **스크립트 순서**: 예전처럼 Dynamic Thresholding(`sd-dynamic-thresholding`) 뒤에 돕니다(`metadata.ini`). NegPiP 는 샘플러 이름으로
+  cond/uncond 절반을 고르는데, Dynamic Thresholding 이 이름을 바꾼 뒤에 봐야 예전과 같습니다(UniPC).
+- **emphasis 설정 (Anima)**: 새 Forge 에서 Settings 의 emphasis 가 `None`(괄호를 글자로 읽음)이나 `Ignore`(가중치 무시)면 엔진이 음수
+  가중치를 적용하지 않으므로 Anima NegPiP 는 켜지지 않고 콘솔에 `NegPiP Disabled (Emphasis: …)` 가 남습니다. `Original`·`No norm` 에서
+  씁니다. 옛 Forge 는 `None` 에서만 꺼집니다. SD1/SDXL 에는 이 emphasis 판단이 없습니다(상류와 같음).
+- **Forge Couple** 과는 함께 쓰지 않습니다(상류와 같이 Forge Couple 이 켜져 있으면 `NegPiP Disabled`).
+- Anima 3.8B(워크플로 7)·Safe PAG·캐릭터 레퍼런스 IP-Adapter 와 함께 돕니다. 3.8B 가 NegPiP 보다 위에 설치되는 순서에서는 3.8B 런타임이
+  같은 마스크를 대신 적용합니다. 아래에 깔린 것이 따로 설치한 sd-forge-negpip 여도 내장 규칙을 쓰므로, 새 Forge 의 emphasis
+  `None`·`Ignore` 에서는 그 판(`0585496`) 단독과 결과가 다릅니다(내장은 뒤집는 행 없음).
+
 ## 출처 / 크레딧 (Credits)
 
 이 확장은 아래 외부 프로젝트를 **그대로 가져와(vendored, shallow clone)** Forge에 통합합니다. 핵심 기능의 저작권은 각 원저자에게 있으며, 본 확장은 Forge 통합 레이어만 제공합니다. vendor 디렉터리는 저장소에 포함되지 않고 `install.py`가 첫 실행 시 자동으로 clone합니다.
@@ -1177,6 +1207,7 @@ txt2img 도구 줄(붙여넣기·지우기·스타일 적용 버튼)의 **🪄**
 | **LoRA Manager** (워크플로 4) | [willmiao/ComfyUI-Lora-Manager](https://github.com/willmiao/ComfyUI-Lora-Manager) | GPL-3.0 | `lora_manager_vendor/` |
 | **Anima Tile-Repair** (워크플로 3) | [kohya-ss/sd-scripts](https://github.com/kohya-ss/sd-scripts) (`anima_minimal_inference*`) | Apache-2.0 | `anima_vendor/` |
 | **Anima Character Reference / ReStyler** (워크플로 6) | [Anima ReStyler workflow](https://civitai.com/models/2803070/anima-restyler) · [원 아이디어 Reddit 게시물](https://www.reddit.com/r/StableDiffusion/s/0Az0DgoaKj) | 워크플로 페이지 조건 참고 | 동작을 Forge 네이티브 img2img/reference로 재구현 (vendor·코드 복사 없음) |
+| **NegPiP** (별도 기능) | [Haoming02/sd-forge-negpip](https://github.com/Haoming02/sd-forge-negpip) (commit `0585496`, 2026-09-30 보관) · 원작 hako-mikan | AGPL-3.0-or-later | `sam3ext/negpip/`·`scripts/negpip.py` 에 편입 (라이선스 전문 `sam3ext/negpip/LICENSE`, 수정 사항은 `THIRD_PARTY_NOTICES.md`) |
 | **Anima 3.8B (Qwen3.5 / v2)** (워크플로 7) | [GumGum10/forge-anima-3.8B](https://github.com/GumGum10/forge-anima-3.8B) (commit `59c27e5`) | MIT | `sam3ext/anima38/` 에 편입 (저장소에 포함, 수정 사항은 `THIRD_PARTY_NOTICES.md`) |
 | **TIPO 프롬프트 확장** (별도 기능) | [KBlueLeaf/TIPO-v2.1-1B-A200M](https://huggingface.co/KBlueLeaf/TIPO-v2.1-1B-A200M) · 모델 코드 [KohakUwULLM](https://github.com/KohakuBlueleaf/KohakUwULLM) | 가중치 Kohaku License 1.0 · 코드 Apache-2.0 | `sam3ext/tipo/kohaku/` 에 모델 코드만 편입, 가중치는 사용자가 받을 때 HF 에서 |
 | **Anima Safe PAG** (별도 기능) | [iljung1106/comfyui-anima-safe-pag](https://github.com/iljung1106/comfyui-anima-safe-pag) (commit `905b0107`) | MIT | Anima 배치·블록 선택을 이식, σ 적용 구간·번호 파싱 편입(`sam3ext/guidance/sigma_window.py`) |
@@ -1221,16 +1252,23 @@ LoRA Manager(GPL-3.0)는 vendor 그대로 실행하되, `lora_manager_core.py`�
 | [docs/EXPERIMENTAL_STATUS.md](docs/EXPERIMENTAL_STATUS.md) | 실험 기능(Refine · Tile-Repair) 진단 체크리스트 |
 | [design.md](design.md) | UI 디자인 토큰·규칙(개발용) |
 | [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) | 저장소에 포함된 제3자 코드·자산의 출처와 라이선스 |
-| [LICENSE](LICENSE) | 이 확장의 라이선스(GPL-3.0-only) 전문 |
+| [LICENSE](LICENSE) | 이 확장의 라이선스(GPL-3.0-only) 전문 — 편입한 NegPiP 파일은 [sam3ext/negpip/LICENSE](sam3ext/negpip/LICENSE)(AGPL-3.0-or-later) |
 
 ## 라이선스
 
-이 확장 전체는 **GNU General Public License 3판만(SPDX `GPL-3.0-only`)** 으로 배포합니다. 이후 판("or later")으로
-바꿔 쓰는 것은 허용하지 않습니다. 전문은 [LICENSE](LICENSE) 에 있습니다.
+이 확장의 코드는 **GNU General Public License 3판만(SPDX `GPL-3.0-only`)** 으로 배포합니다. 이후 판("or later")으로
+바꿔 쓰는 것은 허용하지 않습니다. 전문은 [LICENSE](LICENSE) 에 있습니다. **예외는 편입한 NegPiP** 입니다 — 아래 둘째 항목과
+같이 그 파일들은 AGPL-3.0-or-later 를 따르므로, 저장소 전체를 SPDX 로 적으면 `GPL-3.0-only AND AGPL-3.0-or-later` 입니다(`package.json`).
 
 - 저장소에 함께 들어 있는 제3자 코드·자산(`sam3ext/anima38/` 의 MIT 코드, TIPO 모델 코드(Apache-2.0),
   `assets/` 의 Qwen3.5 토크나이저(Apache-2.0)·CLIP BPE 어휘(MIT))는 원래 고지를 그대로 유지합니다 — 목록과 조건은
   [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) 참고.
+- 편입한 NegPiP(`sam3ext/negpip/` 의 `__init__.py`·`anima.py`·`sd.py`·`utils.py`·`mask.py`, `scripts/negpip.py`)는
+  **AGPL-3.0-or-later**(Copyright 2025 hako-mikan, 2026 Haoming02)를 그대로 따릅니다 — 이 확장의 GPL-3.0-only 로 바뀌지 않습니다.
+  같은 폴더의 `coexist.py` 는 이 확장이 새로 쓴 코드(GPL-3.0-only)입니다. 전문은 `sam3ext/negpip/LICENSE` 에 있습니다.
+  GPL-3.0 13조(AGPL-3.0 13조도 같은 뜻)에 따라 한 작업으로 결합해 배포합니다. 그 조항대로, 결합된 작업을 네트워크 너머 사용자가 원격으로
+  쓰게 하면 AGPL-3.0 13조의 네트워크 상호작용 요건(그 사용자에게 대응 소스를 받을 기회 제공)이 NegPiP 부분만이 아니라 **결합된 작업
+  그 자체**에 적용됩니다.
 - `install.py` 가 첫 실행 때 받는 vendor(LoRA Manager: GPL-3.0, kohya-ss/sd-scripts: Apache-2.0)는 저장소에 포함되지
   않으며 각자의 라이선스를 따릅니다.
 - 사용자가 따로 받는 모델 가중치(SAM3, TIPO, IP-Adapter, Modulation Guidance 어댑터 등)는 이 라이선스의 대상이 아니며

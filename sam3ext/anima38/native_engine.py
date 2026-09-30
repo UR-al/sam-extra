@@ -42,3 +42,17 @@ def qwen06_native_inputs(engine, line: str, device, dtype):
         dtype=dtype,
     ).reshape(1, -1, 1)
     return cond.to(device=device, dtype=dtype), target_ids, target_weights
+
+
+def emphasis_infotext(engine, lines, uses_emphasis) -> str | None:
+    """이 엔진의 __call__ 이 'Emphasis' 생성 정보에 쓸 값 — 쓰지 않으면 None. uses_emphasis 는 Forge 의 함수를 받는다.
+
+    - 옛 엔진(Forge ad88b6b4 까지): 어느 줄이든 emphasis 를 쓰면 지금 방식 이름을 쓴다.
+    - 새 Qwen06Engine(21886f41~): 어느 줄이든 emphasis 를 쓰고 방식이 None/Ignore 일 때만 쓴다.
+    """
+    if not any(uses_emphasis(line) for line in lines):
+        return None
+    name = engine.emphasis.name
+    if is_legacy_engine(engine) or name in ("None", "Ignore"):
+        return name
+    return None

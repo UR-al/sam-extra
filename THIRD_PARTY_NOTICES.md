@@ -1,8 +1,9 @@
 # Third-party notices
 
-이 확장 전체는 GPL-3.0-only(GNU GPL 3판만) 로 배포합니다(루트 [LICENSE](LICENSE)). 아래는 저장소에 함께 들어 있는 제3자 코드·자산과
-그 원래 조건입니다. 편입한 파일에는 원래 고지가 그대로 남고, 확장 전체의 GPL-3.0-only 는 이 파일들의 상류 조건을
-대체하지 않습니다(MIT·Apache-2.0 은 GPL-3.0 과 함께 배포할 수 있는 조건입니다). `install.py` 가 첫 실행 때 받는
+이 확장의 코드는 GPL-3.0-only(GNU GPL 3판만) 로 배포합니다(루트 [LICENSE](LICENSE)). 예외로 편입한 NegPiP 파일은 AGPL-3.0-or-later
+를 따르므로 저장소 전체는 SPDX `GPL-3.0-only AND AGPL-3.0-or-later` 입니다(아래 절). 아래는 저장소에 함께 들어 있는 제3자 코드·자산과
+그 원래 조건입니다. 편입한 파일에는 원래 고지가 그대로 남고, 이 확장의 GPL-3.0-only 는 이 파일들의 상류 조건을
+대체하지 않습니다(MIT·Apache-2.0 은 GPL-3.0 과 함께 배포할 수 있는 조건이고, AGPL-3.0 인 NegPiP 는 GPL-3.0 13조로 결합합니다 — 아래 절). `install.py` 가 첫 실행 때 받는
 vendor(`lora_manager_vendor/`, `anima_vendor/`)와 사용자가 따로 받는 모델 가중치는 저장소에 없으며 README 의
 출처 / 크레딧 절에 적었습니다.
 
@@ -19,14 +20,62 @@ vendor(`lora_manager_vendor/`, `anima_vendor/`)와 사용자가 따로 받는 �
 - `runtime.py` — NegPiP 와 함께 도는 run id 마커 프로토콜(`marker.py`, 신규), 플래그로 켜고 끄는
   멱등 패치, 공용 런타임(`shared_runtime`), inference_mode 밖에서 만드는 가중치, Anima 레퍼런스
   인계, 인코더 파일 사전 확인, 이전 모델을 붙잡지 않는 캐시, Qwen3.5 의미 특징 캐시, LoRA 복제본에
-  따라가는 커넥터 패처, 커넥터 전용 `llm_adapter` 사본과 LoRA 패치 동기화, 새 Forge TE 엔진 대응.
-- `native_engine.py` (신규) — Forge `21886f41` 의 `Qwen06Engine` 에서 커넥터 원본 입력을 뽑는 경로(이 확장의 코드).
+  따라가는 커넥터 패처, 커넥터 전용 `llm_adapter` 사본과 LoRA 패치 동기화, 새 Forge TE 엔진 대응, 아래에 깔린 NegPiP 의
+  마스킹 대행(내장 `sam3ext/negpip/mask.py` 사용), v1/v2 경로의 `Emphasis` 생성 정보 기록.
+- `native_engine.py` (신규) — Forge `21886f41` 의 `Qwen06Engine` 에서 커넥터 원본 입력을 뽑는 경로와 엔진별 `Emphasis` 기록
+  규칙(이 확장의 코드).
 - `layers.py` — 부분 로드 때 CPU 에 남은 RMSNorm 가중치를 계산 장치로 옮겨 씀.
 - `loader_filter.py` (신규) — VAE/Text Encoder 목록의 Qwen3.5 파일을 Forge 로더에서 건너뜀.
 - `connector_fp32.py`, `connector_cache.py` (신규) — 커넥터 fp32 상주와 run 단위 계산 캐시(상류에 없는 이 확장의 코드).
 - `scripts/anima_3_8b.py` — 이 확장에 맞게 다시 작성(API dict 인자, Bypass, 상태 기록·붙여 넣기).
 - 상류의 `bundle_v2.py`(번들 제작 도구)와 `install.py` 는 포함하지 않았습니다.
 - `adapter.py`, `qwen35.py`, `semantic_v2.py`, `tokenizer.py` 는 상류와 같습니다.
+
+## sd-forge-negpip — NegPiP (AGPL-3.0-or-later)
+
+`sam3ext/negpip/`(`__init__.py`·`anima.py`·`sd.py`·`utils.py`·`mask.py`)와 `scripts/negpip.py` 는
+[Haoming02/sd-forge-negpip](https://github.com/Haoming02/sd-forge-negpip) (branch `classic`, commit `0585496`, 2026-09-30)
+의 `lib_negpip/` 패키지와 `scripts/negpip.py` 를 편입한 것입니다. 저자가 같은 날(2026-09-30) 저장소를 보관(archive)해 더 이상
+갱신되지 않으므로 이 확장이 이어 받았습니다. 원 저작권은 Copyright (C) 2025 hako-mikan, Copyright (C) 2026 Haoming02 이고
+라이선스는 **GNU Affero General Public License 3판 또는 그 이후 판(AGPL-3.0-or-later)** 입니다. 전문은 코드 옆
+`sam3ext/negpip/LICENSE`(상류 `LICENSE` 무수정 사본, `tests/test_negpip_vendor.py` 가 SHA-256 을 고정)에 있습니다.
+
+이 확장(GPL-3.0-only)과 AGPL-3.0 코드는 GPL-3.0 13조(AGPL-3.0 13조도 같은 허락)에 따라 한 작업으로 결합해 배포할 수 있습니다.
+편입한 파일은 계속 AGPL-3.0-or-later 를 따르고(이 확장의 GPL-3.0-only 가 대체하지 않음), 이 확장의 나머지 파일은 GPL-3.0-only 그대로입니다.
+다만 GPL-3.0 13조는 AGPL-3.0 13조의 네트워크 상호작용 요건이 "결합된 작업 그 자체(the combination as such)"에 적용된다고 정합니다 —
+결합된 작업을 네트워크 너머 사용자가 원격으로 쓰게 하면, NegPiP 부분만이 아니라 결합된 작업 전체의 대응 소스를 받을 기회를 그 사용자에게
+제공해야 합니다. 편입한 파일마다 머리에 원래 저작권·라이선스 고지와 수정 고지(AGPL-3.0 5조 a항,
+`MODIFIED by sam-extra, 2026-09-30`)를 달았습니다.
+
+이 확장에서 바꾼 부분:
+
+- 이름: 패키지 `lib_negpip` → `sam3ext.negpip`. import 경로만 바꿨습니다. 스크립트 파일 이름 `scripts/negpip.py` 는 그대로입니다 —
+  ADetailer 는 패스에 넣을 always-on 스크립트를 파일 이름(`ad_script_names` 기본값의 `negpip`)으로 고릅니다. Forge 는 확장 스크립트를
+  `확장 이름/파일 이름` 으로 구별하고 경로로 불러오므로(`sys.modules` 에 넣지 않음) 따로 설치된 확장의 같은 이름 파일과 부딪히지 않습니다.
+- `mask.py`(새 파일) — 상류 `anima.py` 의 `_build_negpip_mask` 를 Forge 를 import 하지 않는 모듈로 옮기고, Forge 의 두 Anima 텍스트
+  엔진을 모두 지원합니다: 옛 `AnimaTextProcessingEngine`(Forge `ad88b6b4` 까지)은 `tokenize_line` 의 `t5_multipliers`(상류 `b3673ce`
+  방식), 새 `Qwen06Engine`(Forge `21886f41` 부터)은 `t5_tokenizer.tokenize_with_weights`(상류 `0585496` 방식). 새 엔진의 emphasis
+  `None`(가중치를 파싱하지 않아 토큰 행부터 다름)·`Ignore`(T5 가중치 1.0)에서는 음수 행을 만들지 않습니다 — 엔진이 뒤집지 않은 행을
+  NegPiP 가 뒤집으면 뜻이 반대가 됩니다. `anima.py` 의 `_build_negpip_mask` 는 이것을 부릅니다.
+- `__init__.py` — 패치 상태 `PATCHED` 를 패키지에 두어 Reload UI 로 스크립트 클래스가 새로 생겨도 유지합니다.
+- `scripts/negpip.py` — `_patched` 로 `PATCHED` 를 쓰고, 따로 설치된 NegPiP 가 로드돼 있으면 쉬며(경고 한 번), Anima 에서
+  emphasis 가 음수 가중치를 적용하지 않는 방식이면 켜지 않습니다.
+- **상류와 다른 동작 — SD1/SDXL `_cond_dealer`**: Forge `21886f41` 의 `sd_engine.ClipEngine.tokenize` 는 `add_special_tokens=False` 를
+  넘기지 않아 프롬프트 조각마다 BOS/EOS 를 붙입니다. 상류의 자르기 `cond[1 : token_len + 2]` 는 옛 엔진(`classic_engine`, `ad88b6b4` 까지)
+  에서 `[단어…, EOS]` 행이지만 새 엔진에서는 `[BOS, 단어…, EOS, EOS]` 가 되어 NegPiP 가 BOS(어텐션 싱크) 행의 V 까지 뒤집습니다. 편입본은
+  `process_batch` 에서 엔진에 빈 글자를 토큰화해 특수 토큰이 나오는지 묻고(`utils.clip_fragment_specials`, 판 번호가 아님), 그렇다면
+  `_cond_dealer` 가 청크의 특수 토큰이 아닌 행과 마지막 단어 바로 뒤 EOS 행(`utils.clip_word_rows`) — 옛 엔진과 같은 `[단어…, EOS]` — 을
+  고릅니다. 옛 엔진·`IS_NEO` 가 아닌 경로·Forge 가 이 동작을 고친 뒤에는 상류 자르기 그대로입니다. 두 헬퍼는 `utils.py` 에 더했고(상류 함수는
+  그대로), `tests/test_negpip_clip_rows.py` 가 실제 SD1.5 CLIP 토크나이저와 두 세대 엔진 코드로 확인합니다.
+- 로드 순서 — 확장 루트 `metadata.ini` 의 `[scripts/negpip.py] After = sd-dynamic-thresholding`: 따로 설치된 sd-forge-negpip 는 폴더
+  이름순으로 Dynamic Thresholding 뒤였고, NegPiP `process_batch` 는 Dynamic Thresholding 이 바꾼 `p.sampler_name` 으로 cond/uncond 절반을
+  고릅니다. 이 확장 폴더 자리에서도 그 순서를 지킵니다.
+- `coexist.py` 는 이 확장이 새로 쓴 코드(GPL-3.0-only)로, 상류 코드가 아닙니다.
+- 나머지 — SD1/SDXL·Anima 훅, 프롬프트 파싱, `NEG_PATTERN`, 스크립트 제목 `NegPiP`·UI 없음 — 는 상류 `0585496` 과 같습니다.
+  `NEG_PATTERN` 은 상류 `75b81b4` 에서 바뀐 것으로, 그 전 판(`b3673ce`)을 쓰던 설치와는 잡는 음수 항이 다릅니다
+  (예: `(smile), (aqua hair:-1)` 에서 예전엔 전체, 이제 `(aqua hair:-1)` 만) — 상류의 수정이라 그대로 둡니다.
+  `tests/test_negpip_vendor.py` 가 바꾸지 않은 함수 본문의 해시를 상류 `0585496` 과 대조합니다.
+- 상류의 `README.md`·`img/`·`.gitignore` 는 포함하지 않았습니다.
 
 ## TIPO-v2.1-1B-A200M model code (Apache-2.0) and weights (Kohaku License 1.0)
 
