@@ -1,7 +1,7 @@
 """내장 NegPiP 훅(sam3ext/negpip/anima.py·sd.py)과 스크립트가 기대는 Forge 이름·서명이 설치된 Forge 에 있는지 (AST).
 
-sd.py·anima.py 의 훅은 상류 0585496 그대로다(test_negpip_vendor 가 글자까지 고정). 여기서는 반대쪽 — 그 훅이 패치하는
-Forge 소스 — 가 아직 같은 모양인지 본다. Forge 는 텍스트 엔진을 두 번 바꿨다(ad88b6b4 까지 classic_engine /
+sd.py·anima.py 의 훅에서 바꾸지 않은 함수는 상류 0585496 그대로다(test_negpip_vendor 가 글자까지 고정). 여기서는 반대쪽 —
+그 훅이 패치하고 기대는 Forge 소스(SD 훅이 읽는 transformer_options["cond_or_uncond"] 포함) — 가 아직 같은 모양인지 본다. Forge 는 텍스트 엔진을 두 번 바꿨다(ad88b6b4 까지 classic_engine /
 AnimaTextProcessingEngine, 21886f41 부터 sd_engine.ClipEngine / Qwen06Engine). 둘 중 어느 쪽이 깔려 있어도 통과해야 하고,
 Forge 가 없는 CI 에서는 건너뛴다. 깨지면 Forge 가 훅 대상을 바꾼 것 — 훅을 새 Forge 에 맞춘다.
 """
@@ -103,6 +103,24 @@ class SdHookTargetTests(unittest.TestCase):
         self.assertEqual(_params(_methods(cls)["forward"])[:5], ["self", "x", "context", "value", "mask"])
         self.assertLessEqual({"heads", "to_q", "to_k", "to_v", "to_out"}, _self_attrs(cls))
         self.assertIn("attn2", ast.unparse(_tree("backend/nn/unet.py")))
+
+    def test_cond_or_uncond_reaches_attn2(self):
+        # 훅은 cond/uncond 조각을 Forge 가 넘기는 transformer_options["cond_or_uncond"] 로 가린다(sd.py _chunk_labels) —
+        # calc_cond_uncond_batch 가 그것을 적어 apply_model 에 넘기고, BasicTransformerBlock 이 attn2 에 transformer_options 로 넘긴다
+        sampling = _tree("backend/sampling/sampling_function.py")
+        calc = next(n for n in sampling.body if isinstance(n, ast.FunctionDef) and n.name == "calc_cond_uncond_batch")
+        source = ast.unparse(calc)
+        self.assertIn("transformer_options['cond_or_uncond'] = cond_or_uncond[:]", source)
+        self.assertIn("c['transformer_options'] = transformer_options", source)
+        self.assertIn("COND = 0", source)
+        self.assertIn("UNCOND = 1", source)
+        block = _classes(_tree("backend/nn/unet.py"))["BasicTransformerBlock"]
+        calls = [
+            n for n in ast.walk(block) if isinstance(n, ast.Call) and ast.unparse(n.func) == "self.attn2"
+        ]
+        self.assertTrue(calls)
+        for call in calls:
+            self.assertIn("transformer_options", {k.arg for k in call.keywords})
 
     def test_attention_function_exists(self):
         source = ast.unparse(_tree("backend/attention.py"))

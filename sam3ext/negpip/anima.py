@@ -13,7 +13,10 @@
 # @ 0585496 (archived 2026-09-30), lib_negpip/anima.py.
 # MODIFIED by sam-extra, 2026-09-30 (AGPL-3.0 section 5a): import paths (lib_negpip -> sam3ext.negpip);
 # _build_negpip_mask now calls sam3ext/negpip/mask.py, which supports both Forge Anima text engines and the
-# engine's emphasis mode. Hooks are unchanged.
+# engine's emphasis mode. negpip_learned_conditioning returns one {"crossattn", "c_negpip_mask"} dict per schedule line
+# (sam3ext/negpip/mask.py negpip_line_conds) instead of torch.stack-ing every line into one dict — Forge's per-line
+# contract, so prompt-editing variants longer than 512 rows with different lengths no longer fail with "stack expects
+# each tensor to be equal size". The other hooks are unchanged.
 
 # https://github.com/david419kr/sd-webui-negpip/blob/main/scripts/negpip.py
 
@@ -34,7 +37,7 @@ from einops import rearrange
 from backend.nn.anima import SelfCrossAttention
 from backend.sampling import condition, sampling_function
 from modules import shared
-from sam3ext.negpip.mask import build_negpip_mask
+from sam3ext.negpip.mask import build_negpip_mask, negpip_line_conds
 
 
 def patch_anima_negpip(cls: "NegPiP", *, unpatch=False):
@@ -71,38 +74,17 @@ def _hook_get_learned_conditioning(model: "AnimaEngine", remove: bool):
         conds = model.orig_forward(prompt)
         assert isinstance(conds, list)
         assert len(prompt) == len(conds)
+        assert all(isinstance(cond, torch.Tensor) for cond in conds)
 
-        crossattn = []
-        negpip_mask = []
-        _count = 0
-
-        for line, cond in zip(prompt, conds):
-            assert isinstance(cond, torch.Tensor)
-
-            cond_data = cond.reshape(-1, cond.shape[-1])
-            assert cond_data.ndim == 2
-
-            mask = _build_negpip_mask(
-                engine,
-                line,
-                cond_data.shape[0],
-                cond_data.device,
-                cond_data.dtype,
-            )
-
-            _count += int((mask < 0).sum())
-
-            crossattn.append(cond_data * mask.unsqueeze(-1).to(cond_data))
-            negpip_mask.append(mask.unsqueeze(-1).to(cond_data))
+        # sam-extra: 줄마다 dict 하나(길이도 줄마다) — 상류는 모든 줄을 torch.stack 해, 512 행을 넘는 프롬프트 편집 줄들의
+        # 길이가 다르면 조건 단계에서 죽었다. 스텝마다 줄 고르기·배치 맞추기는 prompt_parser 가 순정과 같게 한다 (mask.py)
+        lines, _count = negpip_line_conds(engine, prompt, conds, build_mask=_build_negpip_mask)
 
         if _count > 0:
             key = "Negative" if prompt.is_negative_prompt else "Positive"
             print(f"NegPiP Enable ({key}: {_count})")
 
-        return {
-            "crossattn": torch.stack(crossattn, dim=0),
-            "c_negpip_mask": torch.stack(negpip_mask, dim=0),
-        }
+        return lines
 
     model.get_learned_conditioning = negpip_learned_conditioning
 

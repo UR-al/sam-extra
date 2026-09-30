@@ -65,13 +65,60 @@ vendor(`lora_manager_vendor/`, `anima_vendor/`)와 사용자가 따로 받는 �
   에서 `[단어…, EOS]` 행이지만 새 엔진에서는 `[BOS, 단어…, EOS, EOS]` 가 되어 NegPiP 가 BOS(어텐션 싱크) 행의 V 까지 뒤집습니다. 편입본은
   `process_batch` 에서 엔진에 빈 글자를 토큰화해 특수 토큰이 나오는지 묻고(`utils.clip_fragment_specials`, 판 번호가 아님), 그렇다면
   `_cond_dealer` 가 청크의 특수 토큰이 아닌 행과 마지막 단어 바로 뒤 EOS 행(`utils.clip_word_rows`) — 옛 엔진과 같은 `[단어…, EOS]` — 을
-  고릅니다. 옛 엔진·`IS_NEO` 가 아닌 경로·Forge 가 이 동작을 고친 뒤에는 상류 자르기 그대로입니다. 두 헬퍼는 `utils.py` 에 더했고(상류 함수는
-  그대로), `tests/test_negpip_clip_rows.py` 가 실제 SD1.5 CLIP 토크나이저와 두 세대 엔진 코드로 확인합니다.
+  고릅니다. 두 헬퍼는 `utils.py` 에 더했고(상류 함수는 그대로), `tests/test_negpip_clip_rows.py` 가 실제 SD1.5 CLIP 토크나이저와 두 세대
+  엔진 코드로 확인합니다.
+- **상류와 다른 동작 — `_cond_dealer` 가 행을 세는 글자와 옛 엔진의 행 규칙**: 상류는 `"(글:-w)"` 를 인코딩하면서 행 수는 맨 글 `글`(가중치 1)을
+  토큰화해 셉니다. Forge 의 `parse_prompt_attention` 은 `BREAK` 를 `["BREAK", -1]` 로 내고 묶음 가중치를 그 -1 에도 곱하며, 엔진은 가중치가
+  정확히 -1 인 `BREAK` 에서만 청크를 나눕니다 — `(cat BREAK dog:2)` 는 한 청크(글자 `break`), 맨 글 `cat BREAK dog` 는 두 청크라 행 번호가 조건과
+  어긋납니다(상류: 새 엔진에선 조건 밖을 잘라 채움 행 76개, 옛 엔진에선 채움 EOS 와 다음 청크 BOS 76~77 행. 위 새 엔진 행 규칙만 쓰면
+  `IndexError` 로 NegPiP 가 조용히 꺼짐). 편입본은 인코딩한 바로 그 글자(첫 스케줄 줄)를 토큰화해 행을 세고, 옛 엔진·`IS_NEO` 가 아닌 경로도
+  같은 행 규칙(엔진의 `id_start`·`id_end` 를 건너뛴 단어 행 + 뒤 EOS, `utils.clip_row_specials`·`encoded_clip_rows`)을 씁니다 — 한 청크 항은
+  상류 자르기 `cond[1 : token_len + 2]` 와 한 행도 다르지 않고(Emphasis `None` 은 예외 — 괄호·가중치가 글자로 인코딩돼
+  이제 그 글자 행 전부를 잡는다), 여러 청크 항(묶음 가중치 -1 의 `BREAK`, 75토큰 초과)은 청크 경계의 채움·BOS 행
+  대신 단어 행만 잡아 두 엔진이 같은 행을 고릅니다. 엔진이 `id_start`·`id_end` 를 알리지 않으면 상류 자르기 그대로입니다. 방어로, 토큰화한
+  청크의 행 수가 조건 행 수와 다르면 그 생성에서 물러나며(`NegPiP Disabled (condition rows: …)`) 지웠던 음수 항을 프롬프트에 되돌립니다
+  (`utils.snapshot_prompts`·`restore_prompts`). `tests/test_negpip_clip_rows.py` 가 두 세대 실제 엔진 코드로 확인합니다.
+- **상류와 다른 동작 — Anima 조건 훅의 반환 모양**: 상류 `negpip_learned_conditioning` 은 스케줄 줄들을 `torch.stack` 해 dict 하나로 돌려줍니다.
+  Anima 엔진(옛·새)은 줄마다 `max(512, T5 토큰 수)` 행이라, 프롬프트 편집 `[a:b:N]`·`[a|b]` 줄이 512 를 넘어 길이가 다르면
+  `stack expects each tensor to be equal size` 로 조건 단계에서 죽습니다(Forge 순정은 스텝마다 한 줄을 골라 문제없음). 편입본은 Forge 의
+  줄별 계약대로 줄마다 `{"crossattn": (L_i, D), "c_negpip_mask": (L_i, 1)}` dict 하나의 list 를 돌려줍니다(`mask.py` 의 `negpip_line_conds`,
+  3.8B 런타임의 NegPiP 대행 `_apply_negpip` 도 같은 헬퍼). 스텝마다 줄 고르기와 배치 길이 맞추기는 Forge `prompt_parser` 가 순정과 같게
+  하므로(`stack_conds` 끝 행 반복, 조건·마스크에 같게) 512 행 이하 줄은 예전과 같은 값입니다. `tests/test_negpip_anima_schedule.py` 가 실제
+  `Qwen06Engine`·Anima 토크나이저·`prompt_parser` 로 확인합니다.
+- **상류와 다른 동작 — SD1/SDXL 음수 항을 어텐션에 붙이는 방식 (`sd.py` `_hook_forward`, `scripts/negpip.py` `_cond_dealer`·
+  `_calc_conds`·`denoiser_callback`·`process_batch` 의 로그, `utils.py` 의 `join_term_rows`·`active_rows`·`context_rows`)**. 상류
+  `0585496` 에는 세 가지 결함이 있었습니다(모두 상류부터). (1) 한 프롬프트에 음수 항이 둘 이상이면 첫 항만 붙었습니다 — `554c122`
+  재작성 뒤 `_calc_conds` 가 항마다 텐서 하나를 만들고 훅은 목록의 `[0]` 만 넘겼습니다(hako-mikan 원본은 한 영역의 항들을 `torch.cat`
+  한 텐서 하나). 나머지 항은 프롬프트에서 지워진 채 어디에도 들어가지 않았습니다. 부정 쪽 `denoiser_callback` 은 `break` 가 안쪽
+  반복에 있어 부정 프롬프트의 `[(x:-1):5]` 가 0 스텝부터 걸렸습니다(hako-mikan 원본부터). (2) 배치 항목 0 의 스케줄만 골라
+  `batch_size` 로 반복했습니다 — 항목마다 프롬프트가 다르면(sd-dynamic-prompts 와일드카드 + Batch size ≥ 2) 뒤 항목은 항목 0 의 음수 항을
+  받거나 제 음수 항을 잃었습니다. (3) cond/uncond 를 샘플러 이름(`rev`)·`x.shape[0] == 2*batch_size`·모듈마다의 호출 수(`Counter`, 한도
+  16/70 은 원래 UNet 전체의 attn2 수라 모듈마다 두면 16/70 패스마다 뒤집힘)·문맥 길이로 추정했습니다 — Forge 의 `calc_cond_uncond_batch`
+  는 샘플러와 무관하게 `[U, C]` 로 묶고(DDIM/PLMS/UniPC 는 반대 절반에 붙음), 메모리가 모자라면 U·C 를 따로, 문맥 청크 수의 lcm 비가
+  4 를 넘으면 C·U 를 따로, CFG 1·Skip Early CFG·NGMS 면 C 만, AND 프롬프트면 C 조각을 여럿 돌립니다(이때 음수 항이 8 스텝씩 켜졌다
+  꺼지거나 반대쪽에 붙음). 편입본은: `_cond_dealer` 가 반복하지 않은 `[행 수, D]` 를 돌려주고, `_calc_conds` 가 항목·스케줄 줄마다 그 줄의
+  항 전부를 토큰 축으로 이은 `(행 | None, 행 수)` 하나를 만들며(같은 항·같은 줄은 한 번 인코딩해 같은 텐서), `denoiser_callback` 이 항목마다
+  제 스케줄에서 긍정·부정 같은 문턱(상류 긍정 쪽의 `step >= sampling_step + 2`)으로 고르고 이 스텝 조건의 원래 문맥 길이를 적습니다.
+  훅은 Forge 가 attn2 까지 넘기는 `transformer_options["cond_or_uncond"]`(Forge `ad88b6b4`·`ceff5168` 같음)로 조각마다 C/U 를 알고,
+  조각의 행 r 에 항목 r(행 수가 항목 수와 다르면 Forge `repeat_to_batch_size` 처럼 r % 항목 수)의 행을 붙여 그 행들의 V 만 뒤집습니다.
+  덧붙일 것이 같은 행끼리 한 번에 계산하고(흔한 경우 호출 수는 상류와 같음), 음수 항이 없는 행은 원래 `forward` 로 계산합니다(NegPiP 가
+  없을 때와 같은 계산 — 차이는 배치 크기에 따른 부동소수 반올림뿐). Forge 가 cond·uncond 를 묶으며 문맥을 lcm 길이로 반복했으면 붙일 행도
+  같은 배수로 반복해 음수 항의 softmax 몫을 원래 문맥 + 음수 항과 같게 둡니다(상류는 반복 문맥 뒤에 한 번만 붙여 반대쪽 프롬프트가 길면
+  음수 항이 약해졌음). attn2_patch 가 `value` 를 따로 넘기면 거기에도 같은 행을 붙입니다(상류는 K 만 길어져 모양이 어긋남).
+  `transformer_options` 에 표시가 없는 호출자(표시를 넘기지 않는 Forge 등)에서는 상류의 추정을 그대로 쓰고 콘솔에 경고를 한 번 남깁니다.
+  어텐션 마스크를 받은 호출(Forge 의 attn2 는 넘기지 않음)은 그 호출만 NegPiP 없이 원래 `forward` 로 돌리고 경고를 한 번 남깁니다.
+  `NegPiP Enable (Positive/Negative: N)` 의 N 은 어느 항목·줄이든 이은 행 수의 최대입니다(상류: 항목 0 의 첫 항, 항목 0 에 없으면 줄 없음).
+  `Counter`·`patch_sd_negpip`·`_main_forward` 는 상류 그대로입니다. `tests/test_negpip_sd_batching.py` 가 실제 Forge
+  `calc_cond_uncond_batch`·`condition.py`·`CrossAttention`·`prompt_parser`·파서와 SD1.5 CLIP 토크나이저(CPU)로 묶음·메모리 나눔(U, C)·
+  모양 나눔(C, U)·CFG 1·AND·lcm 반복(긍정·부정 어느 쪽이 짧든 `denoiser_callback` 이 `text_cond`/`text_uncond` — SDXL 은
+  `DictWithShape` 의 `crossattn` — 에서 원래 길이를 읽는 데까지)·항목별·스케줄·하이레스를 확인합니다.
 - 로드 순서 — 확장 루트 `metadata.ini` 의 `[scripts/negpip.py] After = sd-dynamic-thresholding`: 따로 설치된 sd-forge-negpip 는 폴더
-  이름순으로 Dynamic Thresholding 뒤였고, NegPiP `process_batch` 는 Dynamic Thresholding 이 바꾼 `p.sampler_name` 으로 cond/uncond 절반을
-  고릅니다. 이 확장 폴더 자리에서도 그 순서를 지킵니다.
+  이름순으로 Dynamic Thresholding 뒤였고, 상류 NegPiP `process_batch` 는 Dynamic Thresholding 이 바꾼 `p.sampler_name` 으로 cond/uncond
+  절반을 골랐습니다. 편입본의 훅은 Forge 의 조각 표시를 읽고 샘플러 이름은 표시가 없는 호출자의 대체 경로에서만 쓰지만, 그 경로를 위해
+  이 확장 폴더 자리에서도 그 순서를 지킵니다.
 - `coexist.py` 는 이 확장이 새로 쓴 코드(GPL-3.0-only)로, 상류 코드가 아닙니다.
-- 나머지 — SD1/SDXL·Anima 훅, 프롬프트 파싱, `NEG_PATTERN`, 스크립트 제목 `NegPiP`·UI 없음 — 는 상류 `0585496` 과 같습니다.
+- 나머지 — SD1/SDXL 훅의 `Counter`·`patch_sd_negpip`·`_main_forward`, Anima 의 조건 외 훅, 프롬프트 파싱, `NEG_PATTERN`, 스크립트
+  제목 `NegPiP`·UI 없음 — 는 상류 `0585496` 과 같습니다.
   `NEG_PATTERN` 은 상류 `75b81b4` 에서 바뀐 것으로, 그 전 판(`b3673ce`)을 쓰던 설치와는 잡는 음수 항이 다릅니다
   (예: `(smile), (aqua hair:-1)` 에서 예전엔 전체, 이제 `(aqua hair:-1)` 만) — 상류의 수정이라 그대로 둡니다.
   `tests/test_negpip_vendor.py` 가 바꾸지 않은 함수 본문의 해시를 상류 `0585496` 과 대조합니다.

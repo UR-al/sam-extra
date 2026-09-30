@@ -22,7 +22,7 @@ from . import connector_cache
 from .adapter import ProgressiveCrossAdapter
 from .connector_fp32 import make_connector_patcher
 from .marker import as_rows, read_run_ids, stamp_run_id
-from ..negpip.mask import build_negpip_mask
+from ..negpip.mask import build_negpip_mask, negpip_line_conds
 from .native_engine import emphasis_infotext, is_legacy_engine, qwen06_native_inputs
 from .files import (
     ARCHITECTURE,
@@ -232,6 +232,10 @@ class Anima3BRuntime:
     def _apply_negpip(self, sd_model, prompt, conds):
         """NegPiP 의 negpip_learned_conditioning 과 같은 변환: 줄별 ±1 마스크를 곱하고 마스크를 함께 돌려준다.
 
+        반환은 줄마다 dict 하나({"crossattn": (L_i, D), "c_negpip_mask": (L_i, 1)})의 list — 내장 NegPiP 훅과 같은 공용
+        헬퍼(sam3ext/negpip/mask.py negpip_line_conds)다. 줄들을 torch.stack 하지 않는다: 프롬프트 편집 줄 길이가 512 를 넘어
+        서로 다르면 stack 이 실패하고, 줄 길이는 스텝마다 prompt_parser 가 순정과 같게 맞춘다.
+
         마스크는 내장 NegPiP(sam3ext/negpip/mask.py)로 만든다 — 옛·새 Forge 엔진 모두, 그 엔진의 emphasis 방식대로.
         아래에 깔린 NegPiP 가 따로 설치된 sd-forge-negpip 여도 이 내장 규칙을 쓴다 — 그 확장 자신의 _build_negpip_mask 가
         아니다(내장 스크립트는 쉬지만 마스킹은 여기서 한다). 그래서 단독판과의 관계는 엔진·emphasis 에 따라 다르다:
@@ -245,17 +249,11 @@ class Anima3BRuntime:
           맞는다). b3673ce 의 마스크 함수는 새 엔진에서 돌지 못한다(tokenize_line 없음).
         """
         engine = sd_model.text_processing_engine_anima
-        crossattn, masks, count = [], [], 0
-        for line, cond in zip(prompt, conds):
-            data = cond.reshape(-1, cond.shape[-1])
-            mask = build_negpip_mask(engine, str(line), data.shape[0], data.device, data.dtype)
-            count += int((mask < 0).sum())
-            crossattn.append(data * mask.unsqueeze(-1).to(data))
-            masks.append(mask.unsqueeze(-1).to(data))
+        lines, count = negpip_line_conds(engine, prompt, conds, build_mask=build_negpip_mask)
         if count > 0:
             key = "Negative" if getattr(prompt, "is_negative_prompt", False) else "Positive"
             print(f"[Anima38] NegPiP Enable ({key}: {count})")
-        return {"crossattn": torch.stack(crossattn, dim=0), "c_negpip_mask": torch.stack(masks, dim=0)}
+        return lines
 
     @staticmethod
     def _require_anima(sd_model):

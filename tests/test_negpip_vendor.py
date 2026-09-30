@@ -35,12 +35,13 @@ ANIMA_TOKENIZERS = FORGE_ROOT / "backend" / "huggingface" / "circlestone-labs" /
 UPSTREAM_NEG_PATTERN = r"\(\s*(?:[^\\(:)]|\\[\(\)])+?\s*\:\s*-\s*\d*\.?\d+\s*\)"
 
 # 상류 0585496 함수 본문의 SHA-256 앞 16자 (ast.get_source_segment, LF). 편입하며 바꾸지 않은 것만 — 훅이 그대로인지 지킨다.
-# 바꾼 것(anima._build_negpip_mask, NegPiP.__init__·process_batch·_cond_dealer)은 THIRD_PARTY_NOTICES.md 와 파일 머리에 적었다.
-# _cond_dealer 는 옛 엔진에서 상류 자르기 그대로임을 test_negpip_clip_rows 가 실제 엔진 코드로 확인한다.
+# 바꾼 것(anima._build_negpip_mask·_hook_get_learned_conditioning, sd._hook_forward, NegPiP.__init__·process_batch·
+# denoiser_callback·_cond_dealer·_calc_conds)은 THIRD_PARTY_NOTICES.md 와 파일 머리에 적었다. _cond_dealer 가 한 청크 항에서
+# 옛 엔진의 상류 자르기와 같은 행임을 test_negpip_clip_rows 가, Anima 훅이 줄별 조건을 돌려주는 것을 test_negpip_anima_schedule
+# 이, SD1/SDXL 훅이 Forge 의 조각 표시로 행마다 제 항목의 음수 항 전부를 붙이는 것을 test_negpip_sd_batching 이 확인한다.
 UPSTREAM_FUNCTION_HASHES = {
     "sam3ext/negpip/anima.py": {
         "patch_anima_negpip": "9b25a350d0e5f66d",
-        "_hook_get_learned_conditioning": "66bd4a8c672ec1da",
         "_hook_dit_forward": "5cb4e3529587da7f",
         "_hook_forwards": "267b1f26acb1a129",
         "_hook_compile_conditions": "79a8194e3171278b",
@@ -48,7 +49,6 @@ UPSTREAM_FUNCTION_HASHES = {
     "sam3ext/negpip/sd.py": {
         "patch_sd_negpip": "75917b5ce83eb773",
         "Counter": "1009e90596b56daa",
-        "_hook_forward": "99c0b0425398269e",
         "_main_forward": "0ffc3eaaf0697c4b",
     },
     "sam3ext/negpip/utils.py": {
@@ -66,9 +66,7 @@ UPSTREAM_FUNCTION_HASHES = {
         "NegPiP.ui": "bd3674fe74081e30",
         "NegPiP.postprocess": "393b912221ad2f89",
         "NegPiP.before_hr": "02f0d9f535b538b4",
-        "NegPiP.denoiser_callback": "406d1d0acd18b638",
         "NegPiP._getScheduledNegPip": "f7f57a1293668259",
-        "NegPiP._calc_conds": "fb8c29416a249264",
     },
 }
 # 상류 LICENSE (AGPL-3.0 전문) 의 SHA-256
@@ -437,7 +435,7 @@ def _function_hashes(path: Path) -> dict[str, str]:
 
 
 class UpstreamParityTests(unittest.TestCase):
-    """편입하며 바꾸지 않은 함수는 상류 0585496 과 글자까지 같다 — 훅(sd.py·anima.py)은 import 경로 말고 손대지 않았다."""
+    """편입하며 바꾸지 않은 함수는 상류 0585496 과 글자까지 같다 — 바꾼 함수는 목록에서 빼고 파일 머리·THIRD_PARTY_NOTICES 에 적는다."""
 
     def test_unmodified_functions_match_upstream(self):
         for rel, expected in UPSTREAM_FUNCTION_HASHES.items():

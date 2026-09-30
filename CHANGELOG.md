@@ -104,13 +104,28 @@ v0.21.2 이후 쌓인 큰 업데이트입니다. Anima 3.8B(Qwen3.5 / Semantic C
 
 ### NegPiP 내장 (sd-forge-negpip 편입)
 
-- **NegPiP 를 확장에 넣었습니다 (대부분 결과 같음 — 아래 세 경우만 결과 변화, 토글 없음)**: [Haoming02/sd-forge-negpip](https://github.com/Haoming02/sd-forge-negpip)
+- **NegPiP 를 확장에 넣었습니다 (대부분 결과 같음 — 아래 "결과 변화" 로 적은 경우만 달라짐, 토글 없음)**: [Haoming02/sd-forge-negpip](https://github.com/Haoming02/sd-forge-negpip)
   이 2026-09-30 보관(archive)돼, 마지막 커밋 `0585496` 을 `sam3ext/negpip/`·`scripts/negpip.py` 로 편입했습니다(AGPL-3.0-or-later, 고지는
   `THIRD_PARTY_NOTICES.md`, 전문은 `sam3ext/negpip/LICENSE`). 스크립트 제목 `NegPiP`·UI 없음·always-on 과 파일 이름 `negpip.py` 가 그대로라
   API·UR_IV·SAM3 안쪽 패스 복사와 ADetailer 패스(설정 `ad_script_names` 가 파일 이름 `negpip` 으로 고른다)가 예전처럼 동작합니다. 쓰는 법도 같습니다 — 긍정 프롬프트의 `(단어:-1.0)` 은 개념을 빼고, 부정 프롬프트의 음수 가중치는 개념을
-  강제합니다(SD1·SDXL·Anima). 스크립트 순서도 예전 자리(`sd-dynamic-thresholding` 뒤)를 `metadata.ini` 로 지킵니다 — Dynamic Thresholding 이
-  `p.sampler_name` 을 `…_dynthres<N>` 로 바꾼 뒤에 NegPiP 가 cond/uncond 절반을 고르므로, 이 확장 폴더 자리(앞)에서 돌면 UniPC + Dynamic
-  Thresholding 의 SD1/SDXL 에서 반대 절반을 골랐을 것입니다.
+  강제합니다(SD1·SDXL·Anima). 스크립트 순서도 예전 자리(`sd-dynamic-thresholding` 뒤)를 `metadata.ini` 로 지킵니다 — 상류는 Dynamic
+  Thresholding 이 `p.sampler_name` 을 `…_dynthres<N>` 로 바꾼 뒤에 cond/uncond 절반을 골랐습니다. 내장은 Forge 가 넘기는 cond/uncond 표시를
+  읽고(아래) 샘플러 이름은 표시가 없는 호출자의 대체 경로에서만 쓰지만, 그 경로를 위해 순서를 지킵니다.
+- **SD1/SDXL: 두 번째 음수 항부터 아무 효과가 없던 문제 (결과 변화, 상류에도 있던 버그)**: `1girl, (hat:-1), (glasses:-0.8)` 처럼 음수 항이
+  둘 이상이면 첫 항만 어텐션에 들어가고, 나머지 항은 프롬프트에서 지워진 채 어디에도 들어가지 않았습니다(빼지도 넣지도 않음). 콘솔의
+  `NegPiP Enable (Positive: N)` 도 첫 항의 행 수만 보여 드러나지 않았습니다. 이제 한 프롬프트의 음수 항 전부가 들어가고 N 은 이은 행 수입니다.
+  부정 프롬프트의 프롬프트 편집 `[(x:-1):5]` 가 0 스텝부터 걸리던 것도 긍정 쪽과 같은 스텝부터 걸리게 고쳤습니다.
+- **SD1/SDXL: 배치 안에서 프롬프트가 다르면 항목 0 의 음수 항이 모두에게 가던 문제 (결과 변화, 상류에도 있던 버그)**: sd-dynamic-prompts
+  와일드카드·`{a|b}` 에 Batch size 2 이상처럼 항목마다 프롬프트가 다를 때, 뒤 항목은 항목 0 의 음수 항을 받거나(항목 0 에 음수 항이 없으면)
+  제 음수 항을 조용히 잃었습니다. 하이레스 프롬프트·부정 프롬프트도 같았습니다. 이제 항목마다 제 음수 항이 붙고, 음수 항이 없는 항목은
+  NegPiP 가 없을 때와 같은 계산입니다.
+- **SD1/SDXL: cond/uncond 를 Forge 의 실제 배치로 가림 (결과 변화, 상류에도 있던 버그)**: 상류는 cond/uncond 를 샘플러 이름·배치 크기·호출
+  수·문맥 길이로 추정했습니다. Forge 가 VRAM 이 모자라(SDXL 고해상도·하이레스, GPU 를 다른 작업과 나눌 때) cond·uncond 를 따로 돌리거나,
+  긍정·부정 프롬프트의 청크 수 비가 커서(예: 75 토큰 이하 긍정 + 300 토큰 넘는 부정) 따로 돌리거나, CFG 1(Lightning·DMD·Hyper)·Skip Early
+  CFG·NGMS 로 cond 만 돌리면 음수 항이 8 스텝씩 켜졌다 꺼지거나 긍정 쪽 음수 항이 uncond 에 붙었습니다. DDIM/PLMS/UniPC 는 평소 배치에서도
+  부정 쪽 음수 항이 cond 에 붙었습니다. 이제 Forge 가 어텐션까지 넘기는 cond/uncond 표시로 가려 어느 경우에나 cond 에는 긍정 쪽, uncond
+  에는 부정 쪽 음수 항만 붙습니다(AND 프롬프트 포함). 긍정·부정 청크 수가 달라 Forge 가 짧은 쪽 문맥을 반복해 묶을 때 음수 항이 약해지던
+  것도 원래 세기로 맞췄습니다. 표시를 넘기지 않는 호출자에서는 예전 추정을 쓰고 콘솔에 경고를 한 번 남깁니다.
 - **음수 항 찾기 규칙 — 상류 수정 (결과 변화, SD1/SDXL)**: 대부분이 쓰던 예전 sd-forge-negpip(`b3673ce`)과 달리 상류 `75b81b4` 의 `NEG_PATTERN`
   을 씁니다. 예전 패턴은 괄호 안에 `:` 만 없으면 무엇이든 삼켜 `(smile), (aqua hair:-1)` 을 통째로 한 음수 항으로 잡았고(SD1/SDXL 에서 `(smile)` 까지
   프롬프트에서 빠져 음수 항에 들어감), 이제는 `(aqua hair:-1)` 만 잡습니다. 앞의 escape 괄호에서 시작해 삼키던 것도(`\(escaped\) text, (x:-1)` → 예전 `(escaped\) text, (x:-1)`) 이제
@@ -118,10 +133,23 @@ v0.21.2 이후 쌓인 큰 업데이트입니다. Anima 3.8B(Qwen3.5 / Semantic C
 - **새 Forge 의 SD1/SDXL — BOS 행을 뒤집지 않음 (결과 변화, 상류와 다름)**: Forge `21886f41` 의 `sd_engine.ClipEngine.tokenize` 가
   `add_special_tokens=False` 를 넘기지 않아 프롬프트 조각마다 BOS/EOS 가 붙습니다. 상류(두 판 모두)의 `_cond_dealer` 자르기 `cond[1:token_len+2]`
   는 그 엔진에서 `[단어…, EOS]` 대신 `[BOS, 단어…, EOS, EOS]` 행을 잡아 BOS(어텐션 싱크) 행의 V 까지 뒤집습니다. 내장은 엔진 자신에게 물어(빈 글자를
-  토큰화하면 특수 토큰이 나오는가 — 판 번호가 아님) 그런 엔진이면 옛 엔진과 같은 `[단어…, EOS]` 행만 고릅니다. 옛 엔진(`ad88b6b4` 까지)과 Forge
-  가 이 동작을 고친 뒤에는 상류 자르기 그대로입니다. 실제 SD1.5 CLIP 토크나이저와 두 세대 엔진 코드(CPU, 가짜 인코더)로 두 엔진이 같은 행을
-  고르는 것을 확인했습니다(음수 항이 한 청크, 75토큰 이하일 때. 더 긴 항은 옛 엔진의 상류 자르기가 청크 경계의 채움 EOS·BOS
-  행까지 잡고, 내장은 새 엔진에서 단어 행과 마지막 EOS 만 잡아 서로 다릅니다). 새 Forge 자체가 조건에 조각마다 BOS/EOS 를 넣으므로 옛 Forge 와 이미지까지 같지는 않습니다.
+  토큰화하면 특수 토큰이 나오는가 — 판 번호가 아님) 그런 엔진이면 옛 엔진과 같은 `[단어…, EOS]` 행만 고릅니다. 실제 SD1.5 CLIP 토크나이저와
+  두 세대 엔진 코드(CPU, 가짜 인코더)로 두 엔진이 같은 행을 고르는 것을 확인했습니다. 새 Forge 자체가 조건에 조각마다 BOS/EOS 를 넣으므로
+  옛 Forge 와 이미지까지 같지는 않습니다.
+- **가중치 묶음 안의 `BREAK`·75토큰 넘는 음수 항 (결과 변화, 상류와 다름, SD1/SDXL)**: 상류는 `(글:-w)` 를 인코딩하면서 행 수는 맨 글(가중치 1)로
+  셉니다. Forge 파서는 가중치가 1 이 아닌 묶음 안의 `BREAK` 를 청크 구분이 아닌 글자 `break` 로 남기므로 `(red eyes BREAK blue hair:-1.5)`·
+  `(x BREAK y:-0.5)` 같은 항은 두 글의 청크 배치가 달랐습니다 — 새 Forge 에서는 `IndexError` 가 콘솔에 찍히고 NegPiP 가 조용히 꺼져 음수 항이
+  프롬프트에서 그냥 사라진 채 생성됐고, 옛 Forge·상류에서는 채움 EOS 와 다음 청크 BOS 76~77 행을 뒤집었습니다(`-1` 이면 뒤 단어를 잃음).
+  이제 인코딩한 바로 그 글자로 행을 세고, 옛 엔진도 새 엔진과 같은 행 규칙(엔진의 시작·끝 토큰을 건너뛴 단어 행 + 뒤 EOS)을 써 두 엔진이 같은
+  행을 고릅니다 — 75토큰 이하·`BREAK` 없는 항은 예전(상류 자르기)과 한 행도 다르지 않고(Forge 설정 Emphasis 가 `None` 이면 예외:
+  괄호·가중치가 글자로 인코딩되므로 이제 그 글자 행 전부를 잡습니다 — 상류는 맨 글 길이만큼 잘라 `(` 같은 앞 글자 행을 잡았습니다), 75토큰 넘는 항은 청크 경계의 채움·BOS 행 대신 단어
+  행만 뒤집습니다. 만일 토큰화한 행 수가 조건과 다르면 틀린 행을 뒤집는 대신 그 생성에서 NegPiP 가 물러나고(`NegPiP Disabled (condition rows: …)`)
+  지웠던 음수 항을 프롬프트에 되돌립니다.
+- **Anima: 긴 프롬프트의 프롬프트 편집이 NegPiP 와 함께 죽던 문제 (상류에도 있던 버그)**: Anima 는 줄마다 `max(512, T5 토큰 수)` 행이라
+  `[짧은:아주 긴:0.5]`·`[a|b]` 줄이 512 를 넘어 길이가 다르면, 음수 가중치가 있을 때 NegPiP 가 줄들을 한 텐서로 쌓다가
+  `stack expects each tensor to be equal size` 로 생성이 조건 단계에서 죽었습니다(순정 Forge 는 됨). 이제 줄마다 조건을 따로 돌려주고 스텝마다
+  줄 고르기·배치 길이 맞추기는 Forge 가 순정과 같게 합니다 — 512 행 이하 줄은 결과가 예전과 같습니다. 3.8B 런타임이 NegPiP 마스킹을 대신할 때도
+  같습니다.
 - **옛·새 Forge 의 Anima 마스크 (결과 같음)**: Anima 마스크가 Forge 의 옛 텍스트 엔진(`AnimaTextProcessingEngine`)과 새 엔진(`Qwen06Engine`, Forge
   `21886f41`)을 둘 다 압니다. 상류 마지막 판은 새 엔진만, 그 전 판은 옛 엔진만 알았습니다. 실제 Forge 엔진·토크나이저(CPU)로 두 세대 모두 마스크
   행이 엔진이 조건에 곱한 가중치와 한 칸도 어긋나지 않음을 확인했습니다.

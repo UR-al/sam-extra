@@ -7,6 +7,8 @@ Qwen06Engine(ComfyUI sd1_clip 이식: tokenize_with_weights·encode_token_weight
 from __future__ import annotations
 
 import ast
+import contextlib
+import io
 import re
 import sys
 import types
@@ -234,8 +236,9 @@ class NegPipEngineGuardTests(unittest.TestCase):
     def test_new_engine_masks_the_negative_rows(self):
         conds, result = self._apply(_FakeQwen06Engine())
         mask = self._expected()
-        self.assertTrue(torch.equal(result["c_negpip_mask"], mask.reshape(1, -1, 1)))
-        self.assertTrue(torch.equal(result["crossattn"], conds[0] * mask.reshape(1, -1, 1)))
+        self.assertEqual(len(result), 1, "줄마다 dict 하나 (Forge 의 줄별 계약)")
+        self.assertTrue(torch.equal(result[0]["c_negpip_mask"], mask.reshape(-1, 1)))
+        self.assertTrue(torch.equal(result[0]["crossattn"], conds[0][0] * mask.reshape(-1, 1)))
 
     def test_new_engine_none_and_ignore_leave_every_row(self):
         for name in ("None", "Ignore"):
@@ -243,8 +246,8 @@ class NegPipEngineGuardTests(unittest.TestCase):
                 engine = _FakeQwen06Engine()
                 engine.opts.emphasis = name
                 conds, result = self._apply(engine)
-                self.assertTrue(bool((result["c_negpip_mask"] == 1.0).all()))
-                self.assertTrue(torch.equal(result["crossattn"], conds[0]))
+                self.assertTrue(bool((result[0]["c_negpip_mask"] == 1.0).all()))
+                self.assertTrue(torch.equal(result[0]["crossattn"], conds[0][0]))
 
     def test_no_warning_is_logged_on_the_new_engine(self):
         with self.assertNoLogs(self.module.logger, "WARNING"):
@@ -256,7 +259,18 @@ class NegPipEngineGuardTests(unittest.TestCase):
         chunk = types.SimpleNamespace(t5_multipliers=[1.0, -1.0, 1.0])
         engine.tokenize_line = lambda line: [chunk]
         _, result = self._apply(engine, rows=3)
-        self.assertEqual(result["c_negpip_mask"].reshape(-1).tolist(), [1.0, -1.0, 1.0])
+        self.assertEqual(result[0]["c_negpip_mask"].reshape(-1).tolist(), [1.0, -1.0, 1.0])
+
+    def test_lines_of_different_length_keep_their_length(self):
+        # 프롬프트 편집 줄 길이가 512 를 넘어 다르면 예전의 torch.stack 은 실패했다 — 줄마다 길이 그대로 (NegPiP 훅과 같은 헬퍼)
+        model = types.SimpleNamespace(text_processing_engine_anima=_FakeQwen06Engine())
+        conds = [torch.ones(1, 16, 4), torch.ones(1, 20, 4)]
+        with contextlib.redirect_stdout(io.StringIO()):
+            result = self.runtime._apply_negpip(model, base._Prompt([self.LINE, self.LINE]), conds)
+        self.assertEqual([tuple(x["crossattn"].shape) for x in result], [(16, 4), (20, 4)])
+        self.assertEqual([tuple(x["c_negpip_mask"].shape) for x in result], [(16, 1), (20, 1)])
+        for line in result:
+            self.assertTrue(torch.equal(line["c_negpip_mask"][:16], self._expected().reshape(-1, 1)))
 
     def test_uses_the_vendored_helper(self):
         engine = _FakeQwen06Engine()

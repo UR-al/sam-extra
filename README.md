@@ -1183,13 +1183,24 @@ txt2img 도구 줄(붙여넣기·지우기·스타일 적용 버튼)의 **🪄**
 - **Forge 옛·새 텍스트 엔진 모두**: Forge `21886f41`(텍스트 엔진 재작성) 전후 어느 Forge 에서도 돕니다. Anima 마스크는 두 엔진 모두
   엔진이 조건에 곱한 가중치를 그대로 따릅니다. SD1/SDXL 은 새 엔진(`sd_engine.ClipEngine`)이 프롬프트 조각마다 BOS/EOS 를 붙여,
   상류 코드대로면 음수 항 조건에서 `[BOS, 단어…, EOS, EOS]` 행을 잡아 BOS 행까지 뒤집습니다 — 내장은 엔진에 물어 옛 엔진과 같은
-  `[단어…, EOS]` 행만 고릅니다(음수 항이 75토큰 이하일 때 옛 엔진과 같은 행. 상류와 다른 점. Forge 가 고치면 저절로 상류 자르기로 돌아갑니다). 새 Forge 는 조건 자체가 옛 Forge 와
-  달라 이미지까지 같지는 않습니다.
+  `[단어…, EOS]` 행만 고릅니다(상류와 다른 점). 행은 인코딩한 바로 그 `(단어:w)` 글자에서 세므로 `(red eyes BREAK blue hair:-1.5)`
+  처럼 가중치 묶음 안의 `BREAK`(Forge 파서가 가중치 1 이 아닌 묶음에선 글자 `break` 로 남김)도 두 엔진에서 같은 행이고, 75토큰을
+  넘는 항도 옛·새 엔진 모두 단어 행과 마지막 EOS 만 잡습니다(상류는 새 Forge 에서 IndexError 로 NegPiP 가 조용히 꺼지거나, 옛 Forge 에서
+  채움 EOS·다음 청크 BOS 행을 잡았음). 새 Forge 는 조건 자체가 옛 Forge 와 달라 이미지까지 같지는 않습니다.
+- **Anima 프롬프트 편집(`[a:b:N]`·`[a|b]`) + 긴 프롬프트**: 편집 줄들이 512 T5 토큰을 넘어 길이가 서로 다르면 상류 NegPiP 는 조건 단계에서
+  `stack expects each tensor to be equal size` 로 생성이 죽었습니다. 내장은 줄마다 조건을 따로 돌려줘(Forge 순정과 같은 계약) 스텝마다
+  순정처럼 그 줄의 길이를 씁니다.
 - **예전 sd-forge-negpip(`b3673ce`)와 다른 점 — 음수 항 찾기**: 상류 `75b81b4` 에서 고친 패턴을 씁니다. 예전에는
   `(smile), (aqua hair:-1)` 을 통째로 한 음수 항으로 잡아 SD1/SDXL 에서 `(smile)` 까지 프롬프트에서 빠졌는데, 이제 `(aqua hair:-1)` 만
   잡습니다(앞의 escape 괄호 `\(` 부터 삼키던 경우도 고쳐짐). 같은 프롬프트라도 SD1/SDXL 결과가 달라질 수 있습니다. Anima 는 영향 없음.
-- **스크립트 순서**: 예전처럼 Dynamic Thresholding(`sd-dynamic-thresholding`) 뒤에 돕니다(`metadata.ini`). NegPiP 는 샘플러 이름으로
-  cond/uncond 절반을 고르는데, Dynamic Thresholding 이 이름을 바꾼 뒤에 봐야 예전과 같습니다(UniPC).
+- **SD1/SDXL 음수 항 (상류와 다른 점)**: 한 프롬프트의 음수 항 전부가 들어갑니다(상류는 첫 항만 — 나머지는 프롬프트에서 지워진 채 효과
+  없음). 배치 안에서 항목마다 프롬프트가 다르면(sd-dynamic-prompts 등) 항목마다 제 음수 항이 붙습니다(상류는 항목 0 의 것을 모두에게).
+  cond/uncond 는 Forge 가 어텐션까지 넘기는 표시로 가립니다 — VRAM 이 모자라 cond·uncond 를 따로 돌리거나, 긍정·부정 길이 차이로 따로
+  돌리거나, CFG 1 이거나, DDIM/PLMS/UniPC 여도 긍정 쪽 음수 항은 cond 에, 부정 쪽은 uncond 에만 붙습니다(상류는 이런 경우 8 스텝씩
+  켜졌다 꺼지거나 반대쪽에 붙음).
+- **스크립트 순서**: 예전처럼 Dynamic Thresholding(`sd-dynamic-thresholding`) 뒤에 돕니다(`metadata.ini`). 상류 NegPiP 는 샘플러 이름으로
+  cond/uncond 절반을 골라 Dynamic Thresholding 이 이름을 바꾼 뒤에 봐야 했습니다. 내장은 Forge 의 표시를 읽고, 샘플러 이름은 표시를
+  넘기지 않는 호출자의 대체 경로(콘솔 경고 한 번)에서만 씁니다.
 - **emphasis 설정 (Anima)**: 새 Forge 에서 Settings 의 emphasis 가 `None`(괄호를 글자로 읽음)이나 `Ignore`(가중치 무시)면 엔진이 음수
   가중치를 적용하지 않으므로 Anima NegPiP 는 켜지지 않고 콘솔에 `NegPiP Disabled (Emphasis: …)` 가 남습니다. `Original`·`No norm` 에서
   씁니다. 옛 Forge 는 `None` 에서만 꺼집니다. SD1/SDXL 에는 이 emphasis 판단이 없습니다(상류와 같음).

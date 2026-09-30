@@ -3,7 +3,9 @@
 상류 _cond_dealer 는 "(단어:w)" 조건에서 cond[1 : token_len + 2] 를 자른다. 옛 엔진(classic_engine.ClassicTextProcessingEngine,
 Forge ad88b6b4 까지)은 tokenize 가 add_special_tokens=False 라 이것이 [단어…, EOS] 다. 새 엔진(sd_engine.ClipEngine, 21886f41~)은
 조각마다 BOS/EOS 가 붙어 같은 자르기가 [BOS, 단어…, EOS, EOS] 가 되고 NegPiP 가 BOS(어텐션 싱크) 행의 V 를 뒤집는다.
-내장은 엔진 자신에게 물어(빈 글자에 특수 토큰이 나오는가) 새 엔진에서만 옛 엔진과 같은 행을 고른다(sam3ext/negpip/utils.py).
+내장은 엔진 자신에게 물어(빈 글자에 특수 토큰이 나오는가) 옛·새 엔진 모두 엔진의 특수 토큰을 건너뛴 같은 [단어…, EOS] 행을
+고른다(sam3ext/negpip/utils.py) — 옛 엔진 한 청크 항에선 상류 자르기와 같은 행. 행은 인코딩한 바로 그 "(단어:w)" 글자에서 센다:
+상류는 맨 글자로 세어 가중치 묶음 안 BREAK 에서 청크 배치가 조건과 달랐다(새 엔진 IndexError, 옛 엔진 채움 EOS·BOS 행).
 
 - 순수 로직: clip_fragment_specials·clip_word_rows (가짜 청크).
 - 실제 SD1.5 CLIP 토크나이저 + 실제 Forge 엔진 코드(새: 작업 트리 sd_engine, 옛: 작업 트리에 없으면 git show ad88b6b4)
@@ -290,24 +292,35 @@ class RealClipEngineRowTests(unittest.TestCase):
         text = target.replace("[", "").replace("]", "")
         return self.tok(text, add_special_tokens=False)["input_ids"] + [EOS]
 
-    def _run(self, engine, target, *, xl=False):
+    def _process(self, engine, target, *, xl=False, weight="-1.0", neo=True, engine_l=None):
+        """스크립트의 process_batch 를 한 번 — (스크립트, p, 콘솔 출력). neo=False 는 IS_NEO 가 아닌 경로(cond_stage_model).
+
+        engine_l: SDXL 에서 스크립트가 토큰화에 쓰는 엔진(text_processing_engine_l) — 조건은 늘 engine 으로 인코딩한다."""
         module = _load_script(engine)
+        module.IS_NEO = neo
         script = module.NegPiP()
         model = types.SimpleNamespace(
             is_webui_legacy_model=lambda: True, is_sdxl=xl,
-            text_processing_engine=engine, text_processing_engine_l=engine,
+            text_processing_engine=engine, text_processing_engine_l=engine_l or engine,
+            cond_stage_model=engine, conditioner=types.SimpleNamespace(embedders=[engine]),
         )
         p = types.SimpleNamespace(
             sd_model=model, scripts=types.SimpleNamespace(scripts=[], alwayson_scripts=[script]), script_args=[],
-            prompts=[f"1girl, ({target}:-1.0)"], negative_prompts=[""], steps=20, batch_size=1, sampler_name="Euler a",
-            width=512, height=512, extra_generation_params={}, cached_c=[None] * 3, cached_uc=[None] * 3,
+            prompts=[f"1girl, ({target}:{weight})"], negative_prompts=[""], steps=20, batch_size=1,
+            sampler_name="Euler a", width=512, height=512, extra_generation_params={},
+            cached_c=[None] * 3, cached_uc=[None] * 3,
         )
-        with contextlib.redirect_stdout(io.StringIO()):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
             script.process_batch(p)
+        return script, p, out.getvalue()
+
+    def _run(self, engine, target, *, xl=False, weight="-1.0", neo=True):
+        script, _, _ = self._process(engine, target, xl=xl, weight=weight, neo=neo)
         self.assertTrue(script.active)
-        conds, rows = script.conds_all[0][0][1][0]
-        self.assertEqual(conds.shape[1], rows)
-        ids = torch.round(conds[0, :, 0] / conds[0, :, 2]).to(torch.int64).tolist()
+        conds, rows = script.conds_all[0][0][1]   # 항목 0, 첫 스케줄 줄의 (항을 이은 [행 수, D], 행 수)
+        self.assertEqual(conds.shape[0], rows)
+        ids = torch.round(conds[:, 0] / conds[:, 2]).to(torch.int64).tolist()
         return script, ids
 
     def test_new_engine_wraps_fragments_and_the_builtin_picks_the_old_rows(self):
@@ -330,18 +343,95 @@ class RealClipEngineRowTests(unittest.TestCase):
         words = self.tok("aqua hair", add_special_tokens=False)["input_ids"]
         self.assertEqual(upstream, [BOS, *words, EOS, EOS])
 
-    def test_old_engine_keeps_the_upstream_slice(self):
+    def test_old_engine_single_chunk_rows_equal_the_upstream_slice(self):
+        # 옛 엔진도 같은 행 규칙(엔진의 id_start·id_end 를 건너뜀)을 쓴다 — 한 청크 항에선 상류 자르기와 한 행도 다르지 않다.
+        # neo=False 는 IS_NEO 가 아닌 경로(cond_stage_model·conditioner.embedders[0] 의 tokenize_line)
         engine = self._engine("old")
         self.assertEqual(engine.tokenize([""])[0], [])
-        for xl in (False, True):
-            for target in self.TARGETS:
-                with self.subTest(target=target, xl=xl):
-                    script, ids = self._run(engine, target, xl=xl)
-                    self.assertIsNone(script.clip_specials, "옛 엔진은 상류 자르기 그대로")
-                    self.assertEqual(ids, self._words(target))
-                    # 같은 청크에 새 규칙을 대도 상류 자르기와 같은 행 — 두 경로가 같은 뜻이다
-                    chunks, token_len = engine.tokenize_line(target)
-                    self.assertEqual(negpip_utils.clip_word_rows(chunks, frozenset({BOS, EOS})), list(range(1, token_len + 2)))
+        for neo in (True, False):
+            for xl in (False, True):
+                for target in self.TARGETS:
+                    with self.subTest(target=target, xl=xl, neo=neo):
+                        script, ids = self._run(engine, target, xl=xl, neo=neo)
+                        self.assertEqual(script.clip_specials, frozenset({BOS, EOS}), "엔진의 시작·끝 토큰")
+                        self.assertEqual(ids, self._words(target))
+                        chunks, token_len = engine.tokenize_line(f"({target}:1.0)")
+                        self.assertEqual(len(chunks), 1)
+                        self.assertEqual(negpip_utils.clip_word_rows(chunks, frozenset({BOS, EOS})), list(range(1, token_len + 2)))
+
+    def test_engine_without_start_end_ids_falls_back_to_the_upstream_slice(self):
+        plain = types.SimpleNamespace(tokenize=lambda texts: [[] for _ in texts])
+        self.assertIsNone(negpip_utils.clip_row_specials(plain))
+        self.assertIsNone(negpip_utils.clip_row_specials(None))
+        plain.id_start, plain.id_end = BOS, EOS
+        self.assertEqual(negpip_utils.clip_row_specials(plain), frozenset({BOS, EOS}))
+
+    # ---- BREAK 가 든 음수 묶음 — 행은 인코딩한 바로 그 글자 "(글:-w)" 의 청크에서 고른다 ----
+    # Forge parse_prompt_attention 은 BREAK 를 ["BREAK", -1] 로 내고 묶음 가중치를 그 -1 에도 곱한다. 엔진은 가중치가 정확히 -1 일 때만
+    # 청크를 나누므로 "(cat BREAK dog:2)" 는 한 청크(글자 'break'), 맨 글 "cat BREAK dog" 는 두 청크다. 상류는 맨 글로 행을 세어
+    # 새 엔진에선 [2, 79, 80] 을 77 행 조건에 대 IndexError(NegPiP 조용히 꺼짐), 옛 엔진에선 채움 EOS·BOS 76~77 행을 골랐다.
+
+    BREAK_TARGETS = (("cat BREAK dog", "-2"), ("x BREAK y", "-0.5"), ("red eyes BREAK blue hair", "-1.5"),
+                     ("cat BREAK dog", "-1"), ("cat BREAK dog", "-1.0"))
+
+    def _encoded_words(self, text, weight):
+        """인코딩한 "(text:-w)" 의 단어 토큰 + EOS — 묶음 가중치가 1 이면 BREAK 가 청크를 나누고(글자 없음), 아니면 글자 'break'."""
+        if float(weight) == -1.0:
+            text = " ".join(word for word in text.split() if word != "BREAK")
+        return self.tok(text, add_special_tokens=False)["input_ids"] + [EOS]
+
+    def test_break_inside_a_weighted_group_selects_the_encoded_rows(self):
+        for name in ("new", "old"):
+            engine = self._engine(name)
+            for xl in (False, True):
+                for text, weight in self.BREAK_TARGETS:
+                    with self.subTest(engine=name, xl=xl, target=text, weight=weight):
+                        _, ids = self._run(engine, text, xl=xl, weight=weight)
+                        self.assertEqual(ids, self._encoded_words(text, weight))
+                        self.assertNotIn(BOS, ids)
+
+    def test_break_rows_are_the_same_on_both_engines(self):
+        self._engine("new")
+        self._engine("old")
+        for text, weight in self.BREAK_TARGETS:
+            with self.subTest(target=text, weight=weight):
+                new = self._run(self.engines["new"], text, weight=weight)[1]
+                old = self._run(self.engines["old"], text, weight=weight)[1]
+                self.assertEqual(new, old)
+
+    def test_bare_text_and_encoded_text_have_different_chunk_layouts(self):
+        # 고치기 전 원인이 여전히 Forge 파서·엔진에 있는지 — 없어지면 위 회귀 테스트들이 뜻을 잃는다
+        for name in ("new", "old"):
+            engine = self._engine(name)
+            with self.subTest(engine=name):
+                self.assertEqual(len(engine.tokenize_line("cat BREAK dog")[0]), 2)
+                self.assertEqual(len(engine.tokenize_line("(cat BREAK dog:2.0)")[0]), 1)
+
+    def test_long_targets_take_only_word_rows_on_both_engines(self):
+        # 75 토큰을 넘는 항 — 상류 자르기는 옛 엔진에서 첫 청크 끝 EOS·둘째 청크 BOS 를 잡고 마지막 단어를 잃었다
+        text = "a " * 80 + "cat"
+        words = self.tok(text, add_special_tokens=False)["input_ids"] + [EOS]
+        self.assertGreater(len(words), 77)
+        for name in ("new", "old"):
+            engine = self._engine(name)
+            with self.subTest(engine=name):
+                self.assertEqual(self._run(engine, text, weight="-1.5")[1], words)
+
+    def test_row_count_mismatch_disables_negpip_and_restores_the_prompt(self):
+        # 방어: 토큰화한 청크의 행 수가 조건 행 수와 다르면 틀린 행을 잡거나 IndexError 를 내는 대신 끄고 프롬프트를 되돌린다
+        engine = self._engine("new")
+
+        class Doubled(type(engine)):
+            def tokenize_line(self, line):
+                chunks, count = super().tokenize_line(line)
+                return chunks + chunks, count
+
+        doubled = object.__new__(Doubled)
+        doubled.__dict__.update(engine.__dict__)
+        script, p, out = self._process(engine, "cat", weight="-1.5", xl=True, engine_l=doubled)
+        self.assertFalse(script.active)
+        self.assertEqual(p.prompts, ["1girl, (cat:-1.5)"])
+        self.assertIn("NegPiP Disabled", out)
 
     def test_both_engines_give_the_same_rows(self):
         self._engine("new")

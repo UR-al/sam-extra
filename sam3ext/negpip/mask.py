@@ -13,7 +13,10 @@
 # @ 0585496 (archived 2026-09-30); this file is _build_negpip_mask from lib_negpip/anima.py.
 # MODIFIED by sam-extra, 2026-09-30 (AGPL-3.0 section 5a): moved into its own Forge-free module; supports both
 # Forge Anima text engines (old AnimaTextProcessingEngine path from upstream b3673ce, new Qwen06Engine path
-# from 0585496); new engine follows the engine's emphasis mode (None/Ignore -> no negative rows).
+# from 0585496); new engine follows the engine's emphasis mode (None/Ignore -> no negative rows). Added
+# negpip_line_conds: the per-line conditioning of the Anima hook (one {"crossattn", "c_negpip_mask"} dict per schedule line,
+# each keeping its own row count) — upstream torch.stack-ed all lines into one dict, which fails when prompt-editing
+# variants encode to different lengths above 512 rows.
 """NegPiP 의 Anima 행 마스크 — Forge 0.6B TE 엔진 두 세대 공용. Forge 를 import 하지 않는다.
 
 Anima 조건 행 i 는 엔진이 T5 토큰 i 에 가중치를 곱한 결과다. 마스크는 **엔진이 실제로 곱한 가중치** 가 음수인 행만 -1 이다.
@@ -26,6 +29,10 @@ NegPiP 는 그 행에 -1 을 한 번 더 곱해 K 의 부호를 되돌리고 V �
   ``None`` 이면 가중치를 파싱하지 않고(괄호·``:-1`` 이 토큰으로 남아 행 수부터 다르다), ``Ignore`` 면 괄호는 먹되 T5 가중치를 1.0 으로
   둔다 — 어느 쪽도 행을 뒤집지 않으므로 마스크는 모두 1 이다. 상류 0585496 은 여기서도 가중치를 파싱해 ``None`` 이면 행이 어긋나고,
   ``Ignore`` 면 K 만 뒤집혀(V 는 양수) NegPiP 와 반대 뜻이 된다.
+
+조건은 줄(스케줄 줄)마다 따로 돌려준다(``negpip_line_conds``). Forge 의 ``model.get_learned_conditioning`` 계약은 줄마다 항목
+하나이고, 엔진은 줄마다 ``max(512, T5 토큰 수)`` 행이라 프롬프트 편집 ``[a:b:N]``·``[a|b]`` 의 줄 길이가 다를 수 있다. 줄 길이는
+스텝마다 ``prompt_parser.reconstruct_*`` 가 순정과 같게 맞춘다(배치 사이 ``stack_conds`` 끝 행 반복 — 조건과 마스크에 같게).
 """
 from __future__ import annotations
 
@@ -87,3 +94,21 @@ def build_negpip_mask(
         mask = mask[:token_length]
 
     return mask
+
+
+def negpip_line_conds(text_processing_engine, lines, conds, build_mask=build_negpip_mask):
+    """NegPiP 의 줄별 조건 — (줄마다 {"crossattn": cond·mask (L_i, D), "c_negpip_mask": mask (L_i, 1)}, 뒤집힌 행 수).
+
+    Forge 의 get_learned_conditioning 계약(스케줄 줄마다 하나, 길이는 줄마다 다를 수 있음)을 그대로 지킨다 — 줄들을
+    torch.stack 하지 않는다. prompt_parser.get_learned_conditioning 은 dict 가 아닌 반환에서 conds[i] 를 줄의 조건으로 쓴다.
+    build_mask 는 줄 하나의 ±1 마스크(기본 build_negpip_mask) — 호출하는 쪽이 자기 이름으로 넘겨 테스트에서 바꿔 끼울 수 있다.
+    """
+    out = []
+    count = 0
+    for line, cond in zip(lines, conds):
+        data = cond.reshape(-1, cond.shape[-1])
+        mask = build_mask(text_processing_engine, str(line), data.shape[0], data.device, data.dtype)
+        count += int((mask < 0).sum())
+        mask = mask.unsqueeze(-1).to(data)
+        out.append({"crossattn": data * mask, "c_negpip_mask": mask})
+    return out, count
