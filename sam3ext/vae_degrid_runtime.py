@@ -3,10 +3,16 @@
 - 장치(설정 ``sam3_degrid_device``): ``auto`` 는 Forge 가 쓰는 장치(``backend.memory_management.get_torch_device``,
   Forge 밖이면 CUDA 가 있을 때 CUDA), ``cpu`` 는 늘 CPU. ``backend`` 는 여기서 새로 import 하지 않는다 — Forge 에서는 이미
   올라와 있고, 테스트에서 import 하면 CUDA 를 조회한다.
-- 정밀도(설정 ``sam3_degrid_precision``): CUDA 에서 ``fp16`` 이면 가중치는 fp32 로 두고 ``torch.autocast(fp16)`` 로 돈다 —
+- 정밀도(설정 ``sam3_degrid_gpu_precision``, 기본 ``fp32``): ``fp32`` 는 ComfyUI 노드와 같은 계산(``a.float()``)이다.
+  합성곱의 TF32 는 torch 설정 그대로 둔다 — ``cudnn.allow_tf32`` 는 torch 기본이 켬이고 Forge 도 바꾸지 않으며(노드도 같은
+  기본으로 돈다), 프로세스 전역 설정이라 여기서 바꾸면 Forge 모델에도 번진다. RTX 5090 실측(1216×1856, 타일 512)에서 TF32 와
+  엄격 fp32 는 잔차가 최대 0.11/255 다르고 속도는 같았다(둘 다 0.275 초). NAFNet 에는 행렬곱(Linear)이 없어
+  ``matmul.allow_tf32`` 는 상관없다. CUDA 에서 ``fp16`` 을 고르면 가중치는 fp32 로 두고 ``torch.autocast(fp16)`` 로 돈다 —
   모델이 fp16 AMP 로 학습됐고(NAFNet-c QDG 설정 ``use_amp: true, amp_dtype: fp16``), autocast 는 LayerNorm 의 제곱·평균을
-  fp32 로 두고 마지막 ``x + inp`` 도 fp32 로 더한다. 값이 넘친 타일(inf/NaN)은 그 타일만 fp32 로 다시 한다. ``fp32`` 는
-  ComfyUI 노드와 같은 계산(``a.float()``)이다. CPU 는 늘 fp32. bf16 은 쓰지 않는다(CPU 실측: 잔차 오차가 평균 0.36/255 로
+  fp32 로 두고 마지막 ``x + inp`` 도 fp32 로 더한다. 값이 넘친 타일(inf/NaN)은 그 타일만 fp32 로 다시 한다. 같은 GPU 에서
+  fp16 autocast 가 더 느리고(0.362 초 대 0.275 초) VRAM 도 거의 같아(타일 512 최대 활성 276 대 292 MiB) 기본이 아니다 —
+  옛 GPU 에서는 더 빠를 수 있어 선택지로 남긴다(측정 안 함). fp32 와의 잔차 차이는 GPU 최대 0.32~0.43/255(8비트로 픽셀
+  2~18% 가 1 단계), CPU 최대 0.27/255. CPU 는 늘 fp32. bf16 은 쓰지 않는다(CPU 실측: 잔차 오차가 평균 0.36/255 로
   잔차 크기와 비슷, fp16 은 0.04/255).
 - 메모리: GPU 로 돌 때는 ComfyUI 노드(``load_models_gpu([patcher], memory_required, force_full_load=True)``)·이 확장의
   VAE 2x 처럼 Forge ``ModelPatcher`` 로 감싸 ``load_models_gpu`` 로 올린다 — 모자라면 Forge 가 다른 모델을 내리고, 이 모델도
@@ -37,7 +43,11 @@ from . import vae_degrid as vd
 from .vae_degrid_models import ModelEntry, load_nafnet
 
 OPT_DEVICE = "sam3_degrid_device"
-OPT_PRECISION = "sam3_degrid_precision"
+# 예전 키 ``sam3_degrid_precision``(기본 fp16)은 읽지 않는다 — Forge 는 ``add_option`` 때 기본값을 ``opts.data`` 에 넣어
+# 설정을 저장할 때 config.json 에 함께 적으므로(``modules/options.py``), 같은 키로 기본만 fp32 로 바꾸면 이미 쓰던 설치에는
+# 저장된 fp16 이 그대로 남는다. fp16 autocast 를 쓰려면 Settings 에서 다시 고른다.
+OPT_PRECISION = "sam3_degrid_gpu_precision"
+LEGACY_OPT_PRECISION = "sam3_degrid_precision"
 OPT_KEEP_LOADED = "sam3_degrid_keep_loaded"
 
 DEVICE_AUTO = "auto"
@@ -45,11 +55,12 @@ DEVICE_CPU = "cpu"
 PRECISION_FP16 = "fp16"
 PRECISION_FP32 = "fp32"
 DEFAULT_DEVICE = DEVICE_AUTO
-DEFAULT_PRECISION = PRECISION_FP16
+DEFAULT_PRECISION = PRECISION_FP32
 DEFAULT_KEEP_LOADED = False
 
-# load_models_gpu 의 memory_required — 타일 픽셀당 바이트. CPU fp32 실측 최대 활성 1148 B/px(타일 256·512 같음)에
-# cudnn 작업 공간 여유를 더했다. fp16 autocast 는 이보다 작다. 타일 512 → 약 384 MiB.
+# load_models_gpu 의 memory_required — 타일 픽셀당 바이트. 최대 활성 실측: CPU fp32 1148 B/px(타일 256·512 같음), GPU
+# (RTX 5090, 타일 512) fp32 292 MiB = 1168 B/px · fp16 autocast 276 MiB. 여기에 cudnn 작업 공간 여유를 더했다. 타일 512 →
+# 384 MiB.
 BYTES_PER_PIXEL = 1536
 
 LOG_PREFIX = "[AnimaDeGrid]"
@@ -108,6 +119,11 @@ def choose_device(requested) -> torch.device:
     except Exception:
         pass
     return torch.device("cpu")
+
+
+def use_fp16_autocast(device, requested) -> bool:
+    """CUDA 에서 ``fp16`` 을 고른 경우만 fp16 autocast. 그 밖(기본 fp32·CPU·모르는 값)은 fp32."""
+    return torch.device(device).type == "cuda" and str(requested or "").strip().lower() == PRECISION_FP16
 
 
 def is_oom(exc: BaseException) -> bool:
@@ -388,9 +404,9 @@ class DegridRuntime:
         with self._lock:
             model = self.model_for(entry.path)
             dev = choose_device(device if device is not None else read_option(OPT_DEVICE, DEFAULT_DEVICE))
-            wanted = str(precision if precision is not None else read_option(OPT_PRECISION, DEFAULT_PRECISION)).lower()
+            wanted = precision if precision is not None else read_option(OPT_PRECISION, DEFAULT_PRECISION)
             keep = bool(read_option(OPT_KEEP_LOADED, DEFAULT_KEEP_LOADED) if keep_loaded is None else keep_loaded)
-            use_autocast = dev.type == "cuda" and wanted == PRECISION_FP16
+            use_autocast = use_fp16_autocast(dev, wanted)
             precision_label = "fp16-autocast" if use_autocast else "fp32"
             x, alpha = vd.pil_to_tensor(image)
             height, width = int(x.shape[-2]), int(x.shape[-1])

@@ -1,5 +1,5 @@
 """Anima VAE DeGrid 스크립트 — 실행 순서(모든 postprocess_image 뒤), 내부 패스 건너뛰기, 모델이 없을 때 건너뛰기,
-infotext 기록·붙여 넣기, API 인자, Extras 스크립트, 설정 등록.
+infotext 기록·붙여 넣기, API 인자, Extras 스크립트, 설정 등록, ADetailer 가 복사본에 process 를 다시 불러도 콘솔 줄은 한 번.
 
 순서는 Forge 코드로 확인한다(확장 옆에 Forge 가 있을 때만 — CI 에서는 건너뜀):
 - ``modules/processing.py`` 이미지 루프에서 ``postprocess_image_after_composite`` 가 모든 ``postprocess_image`` ·색 보정·
@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import ast
 import configparser
+import copy
 import dataclasses
 import importlib.util
 import os
@@ -42,6 +43,7 @@ FORGE_CALLBACKS = FORGE_ROOT / "modules" / "script_callbacks.py"
 FORGE_UTIL = FORGE_ROOT / "modules" / "util.py"
 FORGE_EXTENSIONS = FORGE_ROOT / "modules" / "extensions.py"
 FORGE_AUTO_POSTPROCESSING = FORGE_ROOT / "modules" / "scripts_auto_postprocessing.py"
+ADETAILER_SCRIPTS = sorted((FORGE_ROOT / "extensions").glob("*/scripts/!adetailer.py"))
 EXTENSION_NAME = "forge_sam3_extension"
 UPSCALE_IN_MAIN_UI = (
     "base/postprocessing_upscale.py/script_postprocess_image_after_composite/ScriptPostprocessingForMainUI"
@@ -433,6 +435,161 @@ class ProcessTests(unittest.TestCase):
         self.assertEqual((cfg.mode, cfg.strength, cfg.tile), (vd.MODE_BRIGHT, 1.5, 0))
 
 
+class _FakeADetailer:
+    """aadetailer-neoforge ``postprocess_image`` 의 끝(``need_call_process``) — 배치의 마지막 장이면 모든 스크립트의
+    ``process`` 를 ``copy(p)``(얕은 복사본)에 다시 부른다."""
+
+    def __init__(self):
+        self.copies = []
+
+    def process(self, p, *args):
+        pass
+
+    def postprocess_image(self, p, pp, *args):
+        if p.batch_index == p.batch_size - 1:
+            copy_p = copy.copy(p)
+            self.copies.append(copy_p)
+            p.scripts.before_process(copy_p)
+            p.scripts.process(copy_p)
+
+
+class _FakeScriptRunner:
+    """Forge ``ScriptRunner`` 의 모양 — 스크립트마다 자기 인자로 부른다(ADetailer 먼저: 폴더 이름순)."""
+
+    def __init__(self, entries):
+        self.entries = entries   # [(script, args)]
+
+    def _each(self, method, p, *extra):
+        for script, args in self.entries:
+            fn = getattr(script, method, None)
+            if fn is not None:
+                fn(p, *extra, *args)
+
+    def before_process(self, p):
+        self._each("before_process", p)
+
+    def process(self, p):
+        self._each("process", p)
+
+    def postprocess_image(self, p, pp):
+        self._each("postprocess_image", p, pp)
+
+    def postprocess_image_after_composite(self, p, pp):
+        self._each("postprocess_image_after_composite", p, pp)
+
+
+def _process_images(p, n_iter, batch_size):
+    """Forge ``process_images_inner`` 의 뼈대 — process 한 번, 배치마다 이미지마다 postprocess_image(ADetailer) →
+    postprocess_image_after_composite(DeGrid) → 저장."""
+    p.batch_size = batch_size
+    p.scripts.process(p)
+    saved = []
+    for _n in range(n_iter):
+        for index in range(batch_size):
+            p.batch_index = index
+            pp = types.SimpleNamespace(image=Image.new("RGB", (8, 8), (9, 9, 9)))
+            p.scripts.postprocess_image(p, pp)
+            p.scripts.postprocess_image_after_composite(p, pp)
+            saved.append((pp.image, dict(p.extra_generation_params)))
+    return saved
+
+
+class ADetailerReprocessTests(unittest.TestCase):
+    """ADetailer 를 같이 켜면 DeGrid 의 ``켬`` 줄이 이미지마다 두 번 찍히던 문제 — 적용은 원래도 한 번이었다."""
+
+    ARGS = (True, "", "Full (전체)", 1.0, 512)
+
+    def setUp(self):
+        self.degrid = MOD.AnimaVaeDegrid()
+        self.adetailer = _FakeADetailer()
+        self.runtime = _FakeRuntime()
+        self.logs = []
+        self.patches = [
+            mock.patch.object(vdm, "discover", return_value=[ENTRY]),
+            mock.patch.object(vdr, "log", side_effect=self.logs.append),
+            mock.patch.object(vdr, "shared_runtime", return_value=self.runtime),
+        ]
+        for patch in self.patches:
+            patch.start()
+
+    def tearDown(self):
+        for patch in self.patches:
+            patch.stop()
+
+    def _job(self, args=ARGS):
+        p = _p()
+        p.scripts = _FakeScriptRunner([(self.adetailer, ()), (self.degrid, args)])
+        return p
+
+    def _on_lines(self):
+        return [line for line in self.logs if line.startswith("켬 — ")]
+
+    def test_on_line_is_logged_once_per_job_and_degrid_still_runs_once_per_image(self):
+        p = self._job()
+        saved = _process_images(p, n_iter=2, batch_size=2)
+        self.assertEqual(len(self.adetailer.copies), 2)             # 배치마다 한 번씩 복사본에 process 를 다시 부름
+        self.assertEqual(len(self._on_lines()), 1)
+        self.assertEqual(len(self.runtime.calls), 4)                # 적용은 이미지마다 한 번
+        self.assertEqual(len(self.logs), 1 + 4)                     # 켬 한 줄 + 이미지마다 요약 한 줄
+        for image, params in saved:
+            self.assertEqual(image.getpixel((0, 0)), (1, 2, 3))
+            self.assertEqual(params[uvd.KEY_MODEL], ENTRY.name)
+        # 동작은 전과 같다: 복사본에도 설정이 들고, 원본의 설정은 그대로
+        cfg, entry = p._sam3_degrid
+        self.assertEqual((cfg, entry), (uvd.coerce_args(self.ARGS), ENTRY))
+        for copy_p in self.adetailer.copies:
+            self.assertEqual(copy_p._sam3_degrid, (cfg, ENTRY))
+            self.assertIsNot(copy_p, p)
+
+    def test_a_new_job_and_the_same_p_run_again_are_announced_again(self):
+        _process_images(self._job(), n_iter=1, batch_size=1)
+        _process_images(self._job(), n_iter=1, batch_size=1)       # 새 작업(새 p)
+        self.assertEqual(len(self._on_lines()), 2)
+        p = self._job()
+        _process_images(p, n_iter=1, batch_size=1)
+        _process_images(p, n_iter=1, batch_size=1)                 # 같은 p 로 다시(Loopback 등)
+        self.assertEqual(len(self._on_lines()), 4)
+        self.assertEqual(len(self.runtime.calls), 4)
+
+    def test_missing_model_is_logged_once(self):
+        with mock.patch.object(vdm, "discover", return_value=[]):
+            p = self._job()
+            saved = _process_images(p, n_iter=1, batch_size=2)
+        self.assertEqual(len(self.adetailer.copies), 1)
+        self.assertEqual(len(self.logs), 1)
+        self.assertIn("찾지 못해", self.logs[0])
+        self.assertEqual(self.runtime.calls, [])
+        for _image, params in saved:
+            self.assertEqual(params, {uvd.KEY_ERROR: "model not found: auto"})
+
+    def test_disabled_and_inner_passes_stay_silent(self):
+        p = self._job(args=(False, "", "Full", 1.0, 512))
+        _process_images(p, n_iter=1, batch_size=1)
+        inner = self._job()
+        inner._ad_inner = True
+        _process_images(inner, n_iter=1, batch_size=1)
+        self.assertEqual(self.logs, [])
+        self.assertEqual(self.runtime.calls, [])
+
+    def test_reprocessed_copy(self):
+        p = _p()
+        self.assertFalse(MOD.reprocessed_copy(p))
+        self.degrid.process(p, *self.ARGS)
+        self.assertFalse(MOD.reprocessed_copy(p))                   # 같은 p — 다시 부르면 다시 알린다
+        self.assertTrue(MOD.reprocessed_copy(copy.copy(p)))
+
+    @unittest.skipUnless(ADETAILER_SCRIPTS, "aadetailer-neoforge 가 확장 옆에 없음")
+    def test_installed_adetailer_reprocesses_a_shallow_copy(self):
+        # 위 대역이 설치된 ADetailer 와 같은 모양인지 — postprocess_image 끝에서 copy(p)(copy.copy)에 process 를 다시 부른다
+        tree = ast.parse(ADETAILER_SCRIPTS[0].read_text(encoding="utf-8"))
+        self.assertTrue(any(isinstance(n, ast.ImportFrom) and n.module == "copy" and any(a.name == "copy" for a in n.names)
+                            for n in tree.body))
+        method = next(n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == "postprocess_image")
+        source = ast.unparse(method)
+        self.assertIn("copy_p = copy(p)", source)
+        self.assertIn("p.scripts.process(copy_p)", source)
+
+
 class ArgsAndInfotextTests(unittest.TestCase):
     def test_arg_names_are_fixed(self):
         self.assertEqual(uvd.ARG_NAMES, ("enabled", "model", "mode", "strength", "tile"))
@@ -542,13 +699,17 @@ class UiTests(unittest.TestCase):
         modules_stub.shared = shared
         with _SysModules({"modules": modules_stub}):
             MOD._on_ui_settings()
-        self.assertEqual(set(added), {vdr.OPT_DEVICE, vdr.OPT_PRECISION, vdr.OPT_KEEP_LOADED})
+        self.assertEqual(set(added), {"sam3_degrid_device", "sam3_degrid_gpu_precision", "sam3_degrid_keep_loaded"})
         self.assertEqual(added[vdr.OPT_DEVICE].default, "auto")
-        self.assertEqual(added[vdr.OPT_PRECISION].default, "fp16")
+        self.assertEqual(added[vdr.OPT_PRECISION].default, "fp32")      # RTX 5090 에서 fp16 autocast 보다 빠르고 노드와 같음
         self.assertIs(added[vdr.OPT_KEEP_LOADED].default, False)
         for info in added.values():
             self.assertEqual(info.section, ("sam3_degrid", "SAM Extra VAE DeGrid"))
         self.assertEqual([v for _l, v in added[vdr.OPT_DEVICE].component_args["choices"]], ["auto", "cpu"])
+        self.assertEqual([v for _l, v in added[vdr.OPT_PRECISION].component_args["choices"]], ["fp32", "fp16"])
+        # 예전 키(Forge 가 기본 fp16 을 config.json 에 적어 둠)는 등록하지 않는다 — 새 기본이 기존 설치에도 먹게
+        self.assertNotIn(vdr.LEGACY_OPT_PRECISION, added)
+        self.assertNotEqual(vdr.OPT_PRECISION, vdr.LEGACY_OPT_PRECISION)
 
 
 class ExtrasTests(unittest.TestCase):

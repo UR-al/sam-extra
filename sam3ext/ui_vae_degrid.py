@@ -24,7 +24,7 @@ KEY_MODEL = "Anima DeGrid model"
 KEY_MODE = "Anima DeGrid mode"
 KEY_STRENGTH = "Anima DeGrid strength"
 KEY_TILE = "Anima DeGrid tile"            # 실제로 쓴 타일(OOM 으로 줄였으면 줄인 값) — 붙여 넣으면 같은 결과
-KEY_PRECISION = "Anima DeGrid precision"  # fp32 / fp16-autocast — 설정이라 붙여 넣지 않는다(기록만)
+KEY_PRECISION = "Anima DeGrid precision"  # fp32(기본) / fp16-autocast — 설정이라 붙여 넣지 않는다(기록만)
 KEY_ERROR = "Anima DeGrid error"
 RESULT_KEYS = (KEY_MODEL, KEY_MODE, KEY_STRENGTH, KEY_TILE, KEY_PRECISION)
 
@@ -87,7 +87,7 @@ def format_strength(strength: float) -> str:
 def infotext_items(model_name: str, mode: str, strength: float, tile: int, precision: str | None = None) -> dict:
     """infotext 항목. ``tile`` 은 **실제로 쓴** 타일(``DegridOutcome.tile_used``)을 넘긴다 — 타일 크기에 따라 결과가
     달라서(채널 어텐션이 타일 평균을 씀) 요청값을 적으면 OOM 으로 줄인 이미지를 붙여 넣어도 같은 결과가 나오지 않는다.
-    ``precision`` 은 실행 정밀도(``fp32``·``fp16-autocast``, 차이 최대 0.27/255 — 기록만)."""
+    ``precision`` 은 실행 정밀도(``fp32``·``fp16-autocast`` — 잔차 차이 GPU 최대 0.43/255, 8비트로 많아야 1 단계. 기록만)."""
     items = {
         KEY_MODEL: model_name,
         KEY_MODE: vd.MODE_LABELS[vd.normalize_mode(mode) or vd.DEFAULT_MODE],

@@ -342,13 +342,18 @@ v0.21.2 이후 쌓인 큰 업데이트입니다. Anima 3.8B(Qwen3.5 / Semantic C
 - **순서**: 이미지마다 모든 always-on 스크립트의 `postprocess_image`(ADetailer·SAM3 인페인트 등)와 색 보정·인페인트 합성이 끝난 뒤,
   저장 직전(`postprocess_image_after_composite`)에 한 번 돕니다 — 설치 순서와 무관합니다. 메인 탭에 켠 Extras Upscale 보다는
   앞이고(`metadata.ini` 콜백 순서), SAM3·ADetailer 내부 패스에서는 돌지 않습니다. Extras 탭에서는 Upscale 보다 먼저 돕니다(항목 이름
-  **Anima VAE DeGrid (NAFNet, Extras)** — 메인 탭에 켜도 생성 탭 스크립트와 API 이름이 겹치지 않음).
+  **Anima VAE DeGrid (NAFNet, Extras)** — 메인 탭에 켜도 생성 탭 스크립트와 API 이름이 겹치지 않음). 콘솔의 `[AnimaDeGrid] 켬` 줄은
+  작업마다 한 번입니다 — ADetailer 가 배치의 마지막 장마다 `p.scripts.process(copy(p))` 로 process 를 다시 불러 이미지마다 두 번
+  찍히던 것을 고쳤습니다(적용은 원래도 한 번).
 - **infotext·API**: `Anima DeGrid model` / `mode` / `strength` / `tile`(실제로 쓴 타일 — 메모리 부족으로 줄였으면 줄인 값) /
   `precision`(실패·모델 없음은 `Anima DeGrid error`)을 남기고 PNG Info 붙여 넣기로 되살립니다(정밀도는 설정이라 기록만). API 는 위치
   인자 `[enabled, model, mode, strength, tile]` 또는 dict 하나.
-- **새 설정 섹션 SAM Extra VAE DeGrid**(`sam3_degrid`): 계산 장치(auto / cpu), GPU 정밀도(fp16 autocast 기본 — fp32 가중치, 넘친
-  타일만 fp32 로 다시 / fp32), VRAM 에 남기기(기본 끔 — 이미지마다 Forge `load_models_gpu` 로 올렸다가 내리고 캐시를 비움).
-- **검증**: CPU 단위 테스트 134개(실제 가중치 14개와 실제 `models/ESRGAN` 목록(읽기만) 1개는 `SAM3_RUN_FORGE_INTEGRATION_TESTS=1`
+- **새 설정 섹션 SAM Extra VAE DeGrid**(`sam3_degrid`): 계산 장치(auto / cpu), GPU 정밀도(`sam3_degrid_gpu_precision` — fp32 기본,
+  ComfyUI 노드와 같은 계산 / fp16 autocast — fp32 가중치, 넘친 타일만 fp32 로 다시), VRAM 에 남기기(기본 끔 — 이미지마다 Forge
+  `load_models_gpu` 로 올렸다가 내리고 캐시를 비움). 개발 중에는 키가 `sam3_degrid_precision`(기본 fp16 autocast)이었습니다 — RTX 5090
+  에서 fp32 가 더 빨라(계산만 0.275 초 대 0.362 초) 기본을 바꾸면서, Forge 가 config.json 에 적어 둔 예전 기본 fp16 이 남지 않게 키도
+  바꿨습니다(예전 키는 읽지 않음). 합성곱 TF32 는 torch 기본(켬) 그대로 둡니다(엄격 fp32 와 잔차 최대 0.11/255, 속도 같음).
+- **검증**: CPU 단위 테스트 143개(실제 가중치 14개와 실제 `models/ESRGAN` 목록(읽기만) 1개는 `SAM3_RUN_FORGE_INTEGRATION_TESTS=1`
   일 때만, 그중 실제 Anima 조각은 `SAM3_DEGRID_ANIMA_IMAGES` 에 PNG 를 줄 때만) — Forge `patch_basic.build_loaded` 로 감싼 로더가 찾기·
   불러오기에서 불리지 않고 파일 이름도 바뀌지 않는지, 같은 입력으로 노드의 잔차 함수·
   Forge/ComfyUI `tiled_scale` 과 비트 단위 대조, Forge `processing.py`·`sort_callbacks`·`metadata.ini` 로 실행 순서 확인, 생성 탭
@@ -358,7 +363,12 @@ v0.21.2 이후 쌓인 큰 업데이트입니다. Anima 3.8B(Qwen3.5 / Semantic C
   같은 망이 복원 이미지를 내거나 흐림·median 이미지 모델이면 입자·스크린톤에서도 거절), 잔차 폭주 건너뛰기(실제 가중치로 화면을 채운
   1px 줄무늬·3px 세로줄·저대비 1px 줄무늬 — 원본 유지, infotext 문구), GPU 에 올릴 때 Forge 가 자리를 내려고 자기 모델을 옮겨도 부른 문맥(생성 탭은 inference_mode)에서 옮기는지. 실제
   v1.1 가중치(CPU): Anima 1216×1856 에서 잔차 |평균| 약 0.5/255, 8비트 값이 바뀐 픽셀 약 44%(대부분 1 단계), CPU 로 약 6.5 초. VAE 를 거친 적 없는 합성 그림을 Qwen-Image VAE 로 왕복한 뒤 돌리면 PSNR
-  36.7 → 37.7 dB. GPU(생성 탭에서 처음 쓸 때 실제 CUDA 이동, VRAM·속도, fp16 autocast 결과)는 아직 확인하지 않았습니다.
+  36.7 → 37.7 dB. GPU(RTX 5090, Forge 생성 탭, 1216×1856 — 그때 기본이던 fp16 autocast): 결과가 같은 이미지에 오프라인으로
+  돌린 DeGrid 와 비트 단위로 같고(8 쌍), SAM3 인페인트·ADetailer 가 끝난 이미지에 돌며(SAM3 내부 패스에서는 안 돎), DeGrid 단계는
+  한 장 0.77~0.96 초(모델 올리기·내리기 포함, Forge 를 켜고 처음은 4.1 초), VRAM 약 0.4 GB(가중치 111 MiB + 최대 활성 276~292 MiB).
+  계산만은 fp32 0.27~0.30 초·fp16 autocast 0.34~0.38 초이고, fp16 autocast 와 fp32 는 잔차가 최대 0.32~0.43/255(8비트로 픽셀
+  2~18% 가 1 단계) 다릅니다. ADetailer 복사본 재호출·정밀도 기본값·예전 설정 키 무시는 단위 테스트로 확인했습니다(fp32 기본으로
+  Forge 에서 다시 재지는 않음).
 
 ### txt2img 화면 · 도구
 

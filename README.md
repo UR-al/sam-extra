@@ -702,6 +702,9 @@ Anima(Qwen·Wan VAE)로 만든 이미지에 생기는 **VAE 격자 무늬**를
   img2img 색 보정·인페인트 합성이 끝난 뒤(`postprocess_image_after_composite`), 저장·infotext 직전에 돕니다. Forge
   `modules/processing.py` 가 이 순서로 부르므로 확장 설치 순서·폴더 이름과 무관합니다(테스트가 Forge 코드로 확인).
 - SAM3 인페인트·ADetailer 의 내부 패스에서는 돌지 않고, 합친 최종 이미지에 한 번만 적용합니다.
+- 콘솔에는 작업마다 `[AnimaDeGrid] 켬 …` 한 줄, 이미지마다 결과 요약 한 줄이 찍힙니다. ADetailer 는 배치의 마지막 장마다 모든
+  스크립트의 `process` 를 복사본에 다시 부르는데(`p.scripts.process(copy(p))`), 그때는 `켬` 줄을 다시 찍지 않습니다(DeGrid 는
+  원래도 이미지마다 한 번만 적용).
 - Settings → Postprocessing 에서 Extras 의 Upscale 을 txt2img·img2img 탭에 켰다면 DeGrid 가 그보다 **먼저** 돕니다
   (`metadata.ini` 콜백 순서 — 확대하면 격자 간격이 달라짐). Extras 항목의 이름은 **Anima VAE DeGrid (NAFNet, Extras)** 로
   생성 탭 아코디언과 달라 API 이름이 겹치지 않지만, 그것을 메인 탭에도 켜면 두 번 적용되니 켜지 마세요.
@@ -715,18 +718,34 @@ Anima(Qwen·Wan VAE)로 만든 이미지에 생기는 **VAE 격자 무늬**를
 | 설정 | 기본 | 뜻 |
 |---|---|---|
 | `sam3_degrid_device` | auto | auto = Forge 가 쓰는 GPU, cpu = VRAM 을 쓰지 않음(학습과 같이 쓸 때 등, 1216×1856 한 장 약 6.5 초 — 개발 PC) |
-| `sam3_degrid_precision` | fp16 | GPU 에서 fp32 가중치 + fp16 autocast(모델이 fp16 AMP 로 학습됨, 넘친 타일은 fp32 로 다시). fp32 = 노드와 같은 계산. CPU 는 늘 fp32 |
+| `sam3_degrid_gpu_precision` | fp32 | fp32 = ComfyUI 노드와 같은 계산. fp16 = fp32 가중치 + fp16 autocast(모델이 fp16 AMP 로 학습됨, 넘친 타일은 fp32 로 다시). CPU 는 늘 fp32 |
 | `sam3_degrid_keep_loaded` | 끔 | 끄면 이미지마다 Forge `load_models_gpu` 로 올렸다 내리고 VRAM 캐시를 비웁니다. 켜면 Forge 메모리 관리에 맡겨 남깁니다(약 117 MB) |
 
-- VRAM: 가중치 117 MB + 타일 512 에서 활성 메모리 약 0.3 GB(CPU fp32 실측 1148 B/px 로 추정, fp16 은 더 적음). 모자라면
-  (OOM) 타일을 반씩 줄여 128 까지 다시 합니다(노드와 같음). `--novram` 처럼 Forge 가 모델을 일부만 올리면 직접 옮깁니다.
+- GPU 실측(RTX 5090, 1216×1856, 타일 512):
+  - Forge 생성 탭의 DeGrid 단계는 한 장 0.77 초(같은 모델)~0.96 초(v1.1 ↔ Anzhc 로 바꿔 파일에서 다시 읽음)입니다 — 모델을
+    올리고 내리는 시간 포함, 그때 기본이던 fp16 autocast 로 잰 값. Forge 를 켜고 처음 한 번은 모델 읽기·CUDA/cudnn 초기화로
+    4.1 초. 요청 전체(약 41 초)에서는 요청 사이의 흔들림에 묻힙니다.
+  - 계산만(동기화해 잼): v1.1 fp32 0.27~0.30 초, fp16 autocast 0.34~0.38 초(Anzhc 파인튜닝은 0.31~0.36 · 0.38~0.46 초). 이
+    GPU 에서는 fp32 가 더 빨라서 기본이 fp32 입니다.
+  - VRAM(torch): 가중치 111 MiB + 최대 활성 fp32 292 MiB · fp16 276 MiB, 합계 약 0.4 GB. fp16 autocast 는 VRAM 을 거의 줄이지
+    않습니다 — VRAM 을 아끼려면 `sam3_degrid_device` 를 cpu 로. 모자라면(OOM) 타일을 반씩 줄여 128 까지 다시 합니다(노드와
+    같음). `--novram` 처럼 Forge 가 모델을 일부만 올리면 직접 옮깁니다.
+- fp16 autocast 와 fp32 의 차이: GPU(RTX 5090) 에서 잔차 최대 0.32~0.43/255 — 8비트 결과로는 픽셀 2~18% 가 1 단계이고 그보다
+  큰 차이는 없습니다. CPU 로 재면 최대 0.27/255(평균 0.04/255)입니다. fp16 autocast 는 옛 GPU 에서 더 빠를 수 있어
+  선택지로 남겼습니다(측정 안 함).
+- TF32: fp32 는 합성곱의 TF32 를 torch 설정 그대로 둡니다 — `torch.backends.cudnn.allow_tf32` 는 torch 기본이 켬이고 Forge 도
+  바꾸지 않습니다(ComfyUI 노드도 같은 기본으로 돎). 프로세스 전역 설정이라 DeGrid 만 따로 바꾸면 Forge 모델에도 번지고, 엄격
+  fp32(TF32 끔)와는 잔차가 최대 0.11/255 다를 뿐 속도도 같아서(둘 다 0.275 초) 건드리지 않습니다.
+- 설정 키가 `sam3_degrid_precision`(기본 fp16) 에서 `sam3_degrid_gpu_precision`(기본 fp32) 으로 바뀌었습니다. Forge 는 설정을
+  저장할 때 기본값까지 `config.json` 에 적어 두어, 같은 키로는 새 기본이 이미 쓰던 설치에 먹지 않기 때문입니다. 예전 키는
+  읽지 않으니 fp16 autocast 를 쓰려면 Settings 에서 다시 고르세요.
 - bf16 은 쓰지 않습니다 — CPU 실측에서 잔차 오차(평균 0.36/255)가 잔차 크기와 비슷했습니다(fp16 은 0.04/255).
 
 ### 기록과 붙여 넣기
 
 infotext 에 `Anima DeGrid model`, `Anima DeGrid mode`(Full / Dark Pixels Mainly / Bright Pixels Mainly),
 `Anima DeGrid strength`, `Anima DeGrid tile`(**실제로 쓴** 타일 — 메모리 부족으로 512 → 256 → 128 로 줄였으면 줄인 값),
-`Anima DeGrid precision`(`fp32` / `fp16-autocast` — 결과가 최대 0.27/255 다름, 설정이라 붙여 넣지는 않음)이 남습니다. 모델이
+`Anima DeGrid precision`(`fp32` / `fp16-autocast` — 8비트 결과로 많아야 1 단계 다름, 설정이라 붙여 넣지는 않음)이 남습니다. 모델이
 없거나, 이미지를 내는 모델이거나, 잔차가 폭주했거나, 실패하면 이미지는 DeGrid 없이 저장되고 `Anima DeGrid error` 만 남습니다
 (앞의 셋은 `model not found: …` · `not a DeGrid residual model: …` · `output blew up (…)` 문구만, 그 밖의 오류는 예외 이름을 붙여). PNG Info 로 붙여 넣으면 켜짐·방식·강도·타일과
 (그 PC 에 있으면) 모델이 되살아나고, 이 키가 없는 이미지를 붙여 넣으면 꺼집니다. Extras 결과는 PNG 의 `postprocessing` 항목에

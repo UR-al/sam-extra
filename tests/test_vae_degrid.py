@@ -1202,6 +1202,44 @@ class RuntimeTests(unittest.TestCase):
             torch.testing.assert_close(fn32(torch.rand(1, 3, 4, 4)), torch.full((1, 3, 4, 4), 0.01))
         self.assertEqual(retiles32[0], 0)
 
+    def test_gpu_precision_defaults_to_fp32(self):
+        # RTX 5090 실측: fp32(TF32 기본) 0.275 초 · fp16 autocast 0.362 초, fp32 가 노드와 같다 — fp16 은 고를 때만
+        cuda = torch.device("cuda")
+        self.assertEqual(vdr.DEFAULT_PRECISION, vdr.PRECISION_FP32)
+        self.assertFalse(vdr.use_fp16_autocast(cuda, vdr.DEFAULT_PRECISION))
+        self.assertTrue(vdr.use_fp16_autocast(cuda, vdr.PRECISION_FP16))
+        self.assertTrue(vdr.use_fp16_autocast("cuda:0", " FP16 "))
+        self.assertFalse(vdr.use_fp16_autocast(torch.device("cpu"), vdr.PRECISION_FP16))   # CPU 는 늘 fp32
+        for other in (None, "", "bf16", "fp32"):
+            with self.subTest(requested=other):
+                self.assertFalse(vdr.use_fp16_autocast(cuda, other))
+
+    def test_run_reads_the_new_precision_key_and_ignores_the_legacy_one(self):
+        # Forge 는 add_option 때 예전 기본(fp16)을 opts.data 에 넣어 config.json 에 적어 둔다 — 그 값이 남아 있어도 새 기본 fp32
+        opts = types.SimpleNamespace(**{vdr.LEGACY_OPT_PRECISION: "fp16"})
+        modules_stub = types.ModuleType("modules")
+        modules_stub.shared = types.SimpleNamespace(opts=opts)
+        seen = []
+
+        def spy(device, requested):
+            seen.append((torch.device(device).type, requested))
+            return False
+
+        saved = sys.modules.get("modules")
+        sys.modules["modules"] = modules_stub
+        try:
+            with mock.patch.object(vdr, "use_fp16_autocast", side_effect=spy):
+                self.assertEqual(vdr.read_option(vdr.OPT_PRECISION, vdr.DEFAULT_PRECISION), "fp32")
+                self.rt.run(self._image(), self.entry, device="cpu")
+                setattr(opts, vdr.OPT_PRECISION, "fp16")
+                self.rt.run(self._image(), self.entry, device="cpu")
+        finally:
+            if saved is None:
+                sys.modules.pop("modules", None)
+            else:
+                sys.modules["modules"] = saved
+        self.assertEqual(seen, [("cpu", "fp32"), ("cpu", "fp16")])
+
     def test_release_policy(self):
         self.assertTrue(vdr.release_after_run(False, "cuda"))
         self.assertFalse(vdr.release_after_run(True, "cuda"))
