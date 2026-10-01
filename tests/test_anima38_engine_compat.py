@@ -102,6 +102,84 @@ class _FakeQwen06Engine:
         return len(self.text_encoder.calls)
 
 
+class _FakeQwenOnlyEngine:
+    """Z-Image·Flux2(Klein)·Krea2·Qwen-Image 엔진 대역 — Forge 2.29.2 에서 Anima 와 같은 text_processing_engine_qwen 에 달리지만
+    T5 토크나이저가 없다."""
+
+    def __init__(self):
+        self.tokenizer = _FakeTokenizer(pad_token=_PAD)
+
+
+class _NewForgeModel:
+    """Forge 2.29.2 의 Anima 대역 — 엔진이 text_processing_engine_qwen 에만 달린다(옛 이름 없음)."""
+
+    filename = "test-bundle.safetensors"
+
+    def __init__(self, engine):
+        self.text_processing_engine_qwen = engine
+        self.forge_objects = types.SimpleNamespace(unet=base._LifecycleUnet(), clip=object())
+
+    def get_learned_conditioning(self, prompt):
+        return []
+
+
+class AnimaTextEngineLookupTests(unittest.TestCase):
+    """모델에서 Anima 텍스트 엔진 찾기(native_engine.anima_text_engine).
+
+    Forge 2.29.2(46365871)가 속성 이름을 text_processing_engine_anima → text_processing_engine_qwen 으로 바꿨다. 옛 이름만 읽으면
+    3.8B 설치가 "requires a loaded Anima checkpoint" 로 실패해 순정 0.6B 로 조용히 물러나고, Anima 의 NegPiP 가 죽는다.
+    공용 이름에는 다른 모델 엔진도 달리므로 T5 토크나이저를 가진 엔진(Anima 0.6B 엔진 두 세대)만 Anima 로 본다."""
+
+    def test_both_forge_attribute_names_find_the_anima_engine(self):
+        engine = _FakeQwen06Engine()
+        for attr in (native_engine.LEGACY_ENGINE_ATTR, native_engine.SHARED_ENGINE_ATTR):
+            with self.subTest(attr=attr):
+                self.assertIs(native_engine.anima_text_engine(types.SimpleNamespace(**{attr: engine})), engine)
+        self.assertEqual(
+            set(native_engine.ANIMA_ENGINE_ATTRS), {"text_processing_engine_anima", "text_processing_engine_qwen"},
+        )
+
+    def test_old_name_is_trusted_without_the_t5_check(self):
+        # 옛 이름은 Anima 만 썼다 — ad88b6b4 까지의 옛 엔진(대역엔 t5_tokenizer 가 없다)도 그대로 돌려준다
+        engine = base._FakeNativeEngine()
+        self.assertIs(native_engine.anima_text_engine(types.SimpleNamespace(text_processing_engine_anima=engine)), engine)
+
+    def test_other_models_on_the_shared_name_are_not_anima(self):
+        self.assertIsNone(native_engine.anima_text_engine(types.SimpleNamespace(text_processing_engine_qwen=_FakeQwenOnlyEngine())))
+        self.assertFalse(native_engine.is_anima_text_engine(_FakeQwenOnlyEngine()))
+        self.assertTrue(native_engine.is_anima_text_engine(_FakeQwen06Engine()))
+        self.assertFalse(native_engine.is_anima_text_engine(None))
+
+    def test_missing_or_empty_engine_is_none(self):
+        for model in (None, types.SimpleNamespace(), types.SimpleNamespace(text_processing_engine_anima=None),
+                      types.SimpleNamespace(text_processing_engine_qwen=None)):
+            with self.subTest(model=model):
+                self.assertIsNone(native_engine.anima_text_engine(model))
+
+    def test_require_anima_on_the_new_name(self):
+        runtime_cls = base._load_lifecycle_runtime().Anima3BRuntime
+        engine = _FakeQwen06Engine()
+        model = _NewForgeModel(engine)
+        self.assertEqual(runtime_cls._require_anima(model), (engine, model.forge_objects.clip))
+        with self.assertRaisesRegex(RuntimeError, "requires a loaded Anima checkpoint"):
+            runtime_cls._require_anima(_NewForgeModel(_FakeQwenOnlyEngine()))
+
+    def test_install_on_the_new_forge_does_not_fall_back_to_native(self):
+        # 3.8B 스크립트는 install 의 예외를 "install failed … continuing with native Anima" 로 삼킨다 — 여기서 실제로 깔리는지
+        module = base._load_lifecycle_runtime()
+        runtime = module.Anima3BRuntime()
+        model = _NewForgeModel(_FakeQwen06Engine())
+        p = base._LifecycleProcessing(types.SimpleNamespace(sd_model=model))
+        with mock.patch.object(module, "bundle_metadata", return_value={"bundle": "v2"}), \
+                mock.patch.object(runtime, "_load_v2_models", return_value=object()), \
+                mock.patch.object(runtime, "_unload_patchers"):
+            runtime.install(p, "adapter.safetensors", 1.0, None)
+            self.assertIsNotNone(runtime._v2_sampling_patcher)
+            self.assertIs(runtime._installed_processing, p)
+            runtime.restore(p)
+        self.assertIsNone(runtime._v2_sampling_patcher)
+
+
 class Qwen06InputsTests(unittest.TestCase):
     """새 경로가 Qwen06Engine.__call__ 의 한 줄 계산(_preprocess 앞까지)과 같은지 — 기대값은 식에서 따로 만든다."""
 
@@ -222,8 +300,8 @@ class NegPipEngineGuardTests(unittest.TestCase):
         self.module = base._load_lifecycle_runtime()
         self.runtime = self.module.Anima3BRuntime()
 
-    def _apply(self, engine, rows=16):
-        model = types.SimpleNamespace(text_processing_engine_anima=engine)
+    def _apply(self, engine, rows=16, attr="text_processing_engine_anima"):
+        model = types.SimpleNamespace(**{attr: engine})
         conds = [torch.arange(rows * 4, dtype=torch.float32).reshape(1, rows, 4) + 1.0]
         return conds, self.runtime._apply_negpip(model, base._Prompt([self.LINE]), conds)
 
@@ -239,6 +317,15 @@ class NegPipEngineGuardTests(unittest.TestCase):
         self.assertEqual(len(result), 1, "줄마다 dict 하나 (Forge 의 줄별 계약)")
         self.assertTrue(torch.equal(result[0]["c_negpip_mask"], mask.reshape(-1, 1)))
         self.assertTrue(torch.equal(result[0]["crossattn"], conds[0][0] * mask.reshape(-1, 1)))
+
+    def test_new_forge_attribute_name_masks_the_same_rows(self):
+        # Forge 2.29.2 는 엔진을 text_processing_engine_qwen 에 단다 — 옛 이름과 같은 마스크·조건
+        engine = _FakeQwen06Engine()
+        _, old = self._apply(engine)
+        _, new = self._apply(engine, attr="text_processing_engine_qwen")
+        self.assertTrue(torch.equal(new[0]["c_negpip_mask"], self._expected().reshape(-1, 1)))
+        self.assertTrue(torch.equal(new[0]["c_negpip_mask"], old[0]["c_negpip_mask"]))
+        self.assertTrue(torch.equal(new[0]["crossattn"], old[0]["crossattn"]))
 
     def test_new_engine_none_and_ignore_leave_every_row(self):
         for name in ("None", "Ignore"):

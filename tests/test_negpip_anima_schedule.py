@@ -26,10 +26,12 @@ import torch
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
+from sam3ext.anima38.native_engine import ANIMA_ENGINE_ATTRS  # noqa: E402
 from sam3ext.negpip import mask as negpip_mask  # noqa: E402
 
 FORGE = ROOT.parents[1]
 ANIMA_HOOK = ROOT / "sam3ext" / "negpip" / "anima.py"
+ANIMA_MODEL = FORGE / "backend" / "diffusion_engine" / "anima.py"
 ANIMA_TOKENIZERS = FORGE / "backend" / "huggingface" / "circlestone-labs" / "Anima"
 PROMPT_PARSER = FORGE / "modules" / "prompt_parser.py"
 
@@ -113,6 +115,11 @@ class AnimaScheduledConditioningTests(unittest.TestCase):
             raise unittest.SkipTest("Forge 소스·Anima 토크나이저 없음")
         if "class Qwen06Engine" not in engine_file.read_text(encoding="utf-8"):
             raise unittest.SkipTest("21886f41 이전 Forge (옛 엔진)")
+        # 설치된 Forge 의 Anima 가 엔진을 다는 속성 — 2.29.1 까지 text_processing_engine_anima, 2.29.2 부터 _qwen
+        model_source = ANIMA_MODEL.read_text(encoding="utf-8") if ANIMA_MODEL.is_file() else ""
+        cls.engine_attr = next((a for a in ANIMA_ENGINE_ATTRS if f"self.{a} =" in model_source), None)
+        if cls.engine_attr is None:
+            raise unittest.SkipTest(f"Anima 엔진 속성을 모른다: {ANIMA_MODEL}")
         try:
             import einops  # noqa: F401  (훅 모듈이 import)
             from transformers import Qwen2Tokenizer, T5TokenizerFast
@@ -136,16 +143,15 @@ class AnimaScheduledConditioningTests(unittest.TestCase):
         sys.modules.pop("_test_negpip_anima_schedule_hook", None)
         cls._stubs.__exit__(None, None, None)
 
-    def _model(self, *, hooked):
+    def _model(self, *, hooked, attr=None):
         engine = self.engine
 
         class Model:
-            text_processing_engine_anima = engine
-
             def get_learned_conditioning(self, prompt):
                 return engine(prompt)
 
         model = Model()
+        setattr(model, attr or self.engine_attr, engine)
         if hooked:
             self.hook._hook_get_learned_conditioning(model, False)
         return model
@@ -212,6 +218,16 @@ class AnimaScheduledConditioningTests(unittest.TestCase):
         self.assertTrue(torch.equal(mask[1, 512:], mask[1, 511:512].expand(mask.shape[1] - 512, -1)))
         self.assertGreater(int((mask[0] < 0).sum()), 0)
         self.assertGreater(int((mask[1] < 0).sum()), 0)
+
+    def test_hook_finds_the_engine_on_either_forge_attribute_name(self):
+        # Forge 2.29.2 는 엔진을 text_processing_engine_qwen 에 단다(2.29.1 까지 text_processing_engine_anima) — 같은 조건·마스크
+        hooked = {attr: self._conditioning(self._model(hooked=True, attr=attr), [SHORT])[0] for attr in ANIMA_ENGINE_ATTRS}
+        first, second = (hooked[attr] for attr in ANIMA_ENGINE_ATTRS)
+        self.assertEqual(len(first), len(second))
+        for a, b in zip(first, second):
+            self.assertTrue(torch.equal(a.cond["c_negpip_mask"], b.cond["c_negpip_mask"]))
+            self.assertTrue(torch.equal(a.cond["crossattn"], b.cond["crossattn"]))
+        self.assertGreater(int((first[0].cond["c_negpip_mask"] < 0).sum()), 0, "(bad:-1) 행이 뒤집힌다")
 
 
 class NoStackAcrossLinesTests(unittest.TestCase):

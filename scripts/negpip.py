@@ -31,6 +31,9 @@
 # 'NegPiP Enable' line reports the largest joined row count of any item. Load order after sd-dynamic-thresholding via
 # metadata.ini. File name (scripts/negpip.py — ADetailer's ad_script_names selects always-on scripts by this stem),
 # title, UI and behaviour otherwise unchanged.
+# MODIFIED by sam-extra, 2026-10-02: the Anima emphasis gate looks the text engine up with
+# sam3ext.anima38.native_engine.anima_text_engine (Forge 2.29.2 renamed sd_model.text_processing_engine_anima to the
+# text_processing_engine_qwen name that Flux2/Krea2/Qwen-Image/Z-Image share).
 
 import re
 from typing import TYPE_CHECKING
@@ -39,6 +42,7 @@ if TYPE_CHECKING:
     from modules.processing import StableDiffusionProcessing
 
 import torch
+from sam3ext.anima38.native_engine import anima_text_engine
 from sam3ext.negpip import INCOMPATIBLE_EXTENSIONS, IS_NEO, PATCHED
 from sam3ext.negpip.anima import patch_anima_negpip
 from sam3ext.negpip.coexist import BUILTIN_ATTR, standalone_reason, warn_once
@@ -177,7 +181,7 @@ class NegPiP(scripts.Script):
             if self.is_anima:
                 # sam-extra: 엔진이 음수 가중치를 조건에 곱하지 않는 emphasis 면 NegPiP 는 뜻이 없다 (mask.py)
                 name = _emphasis_name()
-                if not negpip_effective(p.sd_model.text_processing_engine_anima, name):
+                if not negpip_effective(anima_text_engine(p.sd_model), name):
                     print(f"NegPiP Disabled (Emphasis: {name})")
                     self.is_anima = False
                     return

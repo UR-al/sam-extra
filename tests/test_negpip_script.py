@@ -95,7 +95,14 @@ def _load_script():
 
 
 class _NewEngine:
-    """Qwen06Engine 대역 (tokenize_line 없음)."""
+    """Qwen06Engine 대역 (tokenize_line 없음). 진짜처럼 T5 토크나이저를 쥔다 — 공용 속성 이름에서 Anima 엔진을 가르는 표시."""
+
+    emphasis = types.SimpleNamespace(name="Original")
+    t5_tokenizer = object()
+
+
+class _QwenOnlyEngine:
+    """Z-Image·Flux2 처럼 text_processing_engine_qwen 를 같이 쓰는 엔진 대역 — T5 토크나이저가 없다."""
 
     emphasis = types.SimpleNamespace(name="Original")
 
@@ -115,11 +122,12 @@ class _DiT:
         return [(f"m{i}", m) for i, m in enumerate(self._modules_list)]
 
 
-def _anima_model(engine, dit=None):
+def _anima_model(engine, dit=None, attr="text_processing_engine_anima"):
+    """attr: Forge ~2.29.1 은 text_processing_engine_anima, 2.29.2~ 는 text_processing_engine_qwen."""
     model = type("Anima", (), {})()
     model.is_webui_legacy_model = lambda: False
     model.is_sdxl = False
-    model.text_processing_engine_anima = engine
+    setattr(model, attr, engine)
     model.forge_objects = types.SimpleNamespace(
         unet=types.SimpleNamespace(model=types.SimpleNamespace(diffusion_model=dit or _DiT())),
     )
@@ -369,6 +377,43 @@ class AnimaEmphasisGateTests(ScriptTestCase):
                 patched, _, _ = self._gate(_OldEngine(), name)
                 self.assertIs(patched, expected)
                 self.script.reset()
+
+
+class NewForgeEngineAttributeTests(ScriptTestCase):
+    """Forge 2.29.2 는 Anima 텍스트 엔진을 text_processing_engine_qwen(Flux2·Krea2·Qwen-Image·Z-Image 공용)에 단다.
+    옛 이름만 읽으면 Anima 생성에서 게이트가 AttributeError 로 죽는다 — anima_text_engine 이 두 이름을 다 찾는다."""
+
+    NEW_NAME = "text_processing_engine_qwen"
+
+    def test_gate_reads_the_engine_on_the_new_name(self):
+        engine = _NewEngine()
+        p = self._p(model=_anima_model(engine, attr=self.NEW_NAME))
+        with mock.patch.object(self.module, "negpip_effective", wraps=self.module.negpip_effective) as gate:
+            self._run(p)
+        gate.assert_called_once()
+        self.assertIs(gate.call_args.args[0], engine)
+        self.assertEqual(self.module._test_calls, [("anima", False)])
+        self.assertTrue(self.script.active)
+        self.assertIs(p.extra_generation_params.get("NegPiP"), True)
+
+    def test_new_name_gates_like_the_old_name(self):
+        for name in ("Original", "No norm", "None", "Ignore"):
+            results = {}
+            for attr in ("text_processing_engine_anima", self.NEW_NAME):
+                self.shared.opts.emphasis = name
+                self.module._test_calls.clear()
+                self._run(self._p(model=_anima_model(_NewEngine(), attr=attr)))
+                results[attr] = bool(self.module._test_calls)
+                self.script.reset()
+            with self.subTest(emphasis=name):
+                self.assertEqual(results[self.NEW_NAME], results["text_processing_engine_anima"], results)
+
+    def test_engine_without_t5_tokenizer_on_the_new_name_is_not_read_as_anima(self):
+        # 공용 이름의 다른 모델 엔진은 Anima 엔진으로 넘기지 않는다(None) — 게이트는 Anima 클래스 이름으로만 들어온다
+        from sam3ext.anima38.native_engine import anima_text_engine
+
+        self.assertIsNone(anima_text_engine(_anima_model(_QwenOnlyEngine(), attr=self.NEW_NAME)))
+        self.assertIsNotNone(anima_text_engine(_anima_model(_NewEngine(), attr=self.NEW_NAME)))
 
 
 if __name__ == "__main__":

@@ -101,6 +101,12 @@ v0.21.2 이후 쌓인 큰 업데이트입니다. Anima 3.8B(Qwen3.5 / Semantic C
   `None`/`Ignore` 는 엔진이 음수 가중치를 쓰지 않아 NegPiP 도 없음 — 아래) — 개발 빌드 한때처럼 새 Forge 에서 NegPiP 를 끄지 않아도 됩니다. v1/v2 경로는 엔진 `__call__` 을 건너뛰어 순정 엔진이 남기는 `Emphasis` 생성 정보가
   빠졌는데, 이제 엔진마다 같은 규칙으로 남깁니다(옛 엔진: 가중치 문법이 있으면 늘, 새 엔진: 방식이 `None`/`Ignore` 일 때만. 옛 엔진은 순정처럼
   방식을 설정에서 다시 읽어 파싱합니다).
+- **Forge 2.29.2 의 엔진 속성 이름 (결과 같음, 토글 없음)**: Forge 2.29.2(`46365871`)가 Anima 텍스트 엔진을 `sd_model.text_processing_engine_anima`
+  에서 Flux2(Klein)·Krea2·Qwen-Image·Z-Image 와 같은 `text_processing_engine_qwen` 으로 옮겼습니다. 옛 이름만 읽으면 그 Forge 에서 3.8B 설치가
+  `Anima 3.8B requires a loaded Anima checkpoint.` 로 실패해, 콘솔에 `install failed … continuing with native Anima` 만 남기고 순정 0.6B 로
+  조용히 물러납니다(Anima 의 NegPiP 는 아래 **NegPiP 내장**). 이제 두 이름을 다 찾되, 공용 이름에서는 T5 토크나이저를 가진 엔진(Anima 0.6B
+  엔진 두 세대만 가짐)만 Anima 로 봐 Z-Image·Flux2 모델을 Anima 로 잘못 알아보지 않습니다. 설치된 Forge 소스에서 이 판별이 서는지(공용 이름에
+  달리는 엔진 가운데 Anima 엔진만 `t5_tokenizer` 를 가짐)를 테스트가 지킵니다.
 
 ### NegPiP 내장 (sd-forge-negpip 편입)
 
@@ -130,12 +136,13 @@ v0.21.2 이후 쌓인 큰 업데이트입니다. Anima 3.8B(Qwen3.5 / Semantic C
   을 씁니다. 예전 패턴은 괄호 안에 `:` 만 없으면 무엇이든 삼켜 `(smile), (aqua hair:-1)` 을 통째로 한 음수 항으로 잡았고(SD1/SDXL 에서 `(smile)` 까지
   프롬프트에서 빠져 음수 항에 들어감), 이제는 `(aqua hair:-1)` 만 잡습니다. 앞의 escape 괄호에서 시작해 삼키던 것도(`\(escaped\) text, (x:-1)` → 예전 `(escaped\) text, (x:-1)`) 이제
   `(x:-1)` 만 잡습니다. 상류 저자의 버그 수정이라 그대로 두었습니다. Anima 는 이 패턴을 켤지 판단에만 쓰고 마스크는 엔진 가중치로 만들어 영향이 없습니다.
-- **새 Forge 의 SD1/SDXL — BOS 행을 뒤집지 않음 (결과 변화, 상류와 다름)**: Forge `21886f41` 의 `sd_engine.ClipEngine.tokenize` 가
+- **새 Forge 의 SD1/SDXL — BOS 행을 뒤집지 않음 (결과 변화, 상류와 다름)**: Forge `21886f41` 부터 2.29.1 까지 `sd_engine.ClipEngine.tokenize` 가
   `add_special_tokens=False` 를 넘기지 않아 프롬프트 조각마다 BOS/EOS 가 붙습니다. 상류(두 판 모두)의 `_cond_dealer` 자르기 `cond[1:token_len+2]`
   는 그 엔진에서 `[단어…, EOS]` 대신 `[BOS, 단어…, EOS, EOS]` 행을 잡아 BOS(어텐션 싱크) 행의 V 까지 뒤집습니다. 내장은 엔진 자신에게 물어(빈 글자를
-  토큰화하면 특수 토큰이 나오는가 — 판 번호가 아님) 그런 엔진이면 옛 엔진과 같은 `[단어…, EOS]` 행만 고릅니다. 실제 SD1.5 CLIP 토크나이저와
-  두 세대 엔진 코드(CPU, 가짜 인코더)로 두 엔진이 같은 행을 고르는 것을 확인했습니다. 새 Forge 자체가 조건에 조각마다 BOS/EOS 를 넣으므로
-  옛 Forge 와 이미지까지 같지는 않습니다.
+  토큰화하면 특수 토큰이 나오는가 — 판 번호가 아님) 그런 엔진이면 옛 엔진과 같은 `[단어…, EOS]` 행만 고릅니다. 그 판은 Forge 자체가 조건에 조각마다
+  BOS/EOS 를 넣으므로 옛 Forge 와 이미지까지 같지는 않습니다. Forge 2.29.2(`0b1783c7`)는 `add_special_tokens=False` 를 되살려 행 배치가 옛 엔진과
+  같아졌고, 내장은 그 판에서 옛 엔진과 같은 경로로 같은 행을 고릅니다(75토큰 이하·`BREAK` 없는 항은 상류 자르기와 같은 행). 실제 SD1.5 CLIP
+  토크나이저와 세 판 엔진 코드(옛 엔진·`21886f41`·`0b1783c7`, CPU, 가짜 인코더)로 모두 같은 행을 고르는 것을 확인했습니다.
 - **가중치 묶음 안의 `BREAK`·75토큰 넘는 음수 항 (결과 변화, 상류와 다름, SD1/SDXL)**: 상류는 `(글:-w)` 를 인코딩하면서 행 수는 맨 글(가중치 1)로
   셉니다. Forge 파서는 가중치가 1 이 아닌 묶음 안의 `BREAK` 를 청크 구분이 아닌 글자 `break` 로 남기므로 `(red eyes BREAK blue hair:-1.5)`·
   `(x BREAK y:-0.5)` 같은 항은 두 글의 청크 배치가 달랐습니다 — 새 Forge 에서는 `IndexError` 가 콘솔에 찍히고 NegPiP 가 조용히 꺼져 음수 항이
@@ -153,6 +160,9 @@ v0.21.2 이후 쌓인 큰 업데이트입니다. Anima 3.8B(Qwen3.5 / Semantic C
 - **옛·새 Forge 의 Anima 마스크 (결과 같음)**: Anima 마스크가 Forge 의 옛 텍스트 엔진(`AnimaTextProcessingEngine`)과 새 엔진(`Qwen06Engine`, Forge
   `21886f41`)을 둘 다 압니다. 상류 마지막 판은 새 엔진만, 그 전 판은 옛 엔진만 알았습니다. 실제 Forge 엔진·토크나이저(CPU)로 두 세대 모두 마스크
   행이 엔진이 조건에 곱한 가중치와 한 칸도 어긋나지 않음을 확인했습니다.
+- **Forge 2.29.2 의 Anima — NegPiP 가 빠지던 문제 (결과 같음)**: 2.29.2 가 Anima 텍스트 엔진을 `text_processing_engine_qwen` 으로 옮겨(위
+  **Anima 3.8B**), 옛 이름을 바로 읽던 Anima 경로(상류 그대로)가 생성마다 `Error running process_batch: …negpip.py`(속성 오류)를 남기고 NegPiP
+  없이 생성됐습니다. 이제 3.8B 와 같은 헬퍼로 두 이름을 다 찾습니다(emphasis 판단·조건 훅). SD1/SDXL 은 이 속성을 쓰지 않아 영향이 없었습니다.
 - **새 Forge 의 emphasis `None`·`Ignore` 에서는 Anima NegPiP 가 켜지지 않습니다 (결과 변화)**: 새 엔진은 `None` 이면 괄호·`:-1` 을 글자로
   토큰화하고, `Ignore` 면 괄호는 먹되 가중치를 1.0 으로 둡니다 — 엔진이 음수 가중치를 적용하지 않습니다. 상류 `0585496` 은 여기서도 마스크를
   만들어 `None` 이면 행이 어긋나고 `Ignore` 면 K 만 뒤집혀 뜻이 반대가 됐습니다. 이제 콘솔에 `NegPiP Disabled (Emphasis: None)` 을 남기고

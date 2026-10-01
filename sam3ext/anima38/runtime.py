@@ -23,7 +23,7 @@ from .adapter import ProgressiveCrossAdapter
 from .connector_fp32 import make_connector_patcher
 from .marker import as_rows, read_run_ids, stamp_run_id
 from ..negpip.mask import build_negpip_mask, negpip_line_conds
-from .native_engine import emphasis_infotext, is_legacy_engine, qwen06_native_inputs
+from .native_engine import anima_text_engine, emphasis_infotext, is_legacy_engine, qwen06_native_inputs
 from .files import (
     ARCHITECTURE,
     CONNECTOR_PREFIX,
@@ -248,7 +248,7 @@ class Anima3BRuntime:
           마스크를 만든다. 즉 이 두 방식에서 3.8B 가 단독 0585496 위에 있으면 0585496 혼자 돌 때와 결과가 다르다(내장 쪽이 엔진과
           맞는다). b3673ce 의 마스크 함수는 새 엔진에서 돌지 못한다(tokenize_line 없음).
         """
-        engine = sd_model.text_processing_engine_anima
+        engine = anima_text_engine(sd_model)   # Forge 2.29.2 부터 text_processing_engine_qwen (native_engine 참고)
         lines, count = negpip_line_conds(engine, prompt, conds, build_mask=build_negpip_mask)
         if count > 0:
             key = "Negative" if getattr(prompt, "is_negative_prompt", False) else "Positive"
@@ -257,7 +257,7 @@ class Anima3BRuntime:
 
     @staticmethod
     def _require_anima(sd_model):
-        engine = getattr(sd_model, "text_processing_engine_anima", None)
+        engine = anima_text_engine(sd_model)   # 옛·새 Forge 속성 이름 모두, Anima 엔진만 (native_engine 참고)
         clip = getattr(getattr(sd_model, "forge_objects", None), "clip", None)
         if engine is None or clip is None:
             raise RuntimeError("Anima 3.8B requires a loaded Anima checkpoint.")

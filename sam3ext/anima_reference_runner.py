@@ -236,11 +236,13 @@ def _is_anima_engine(model: Any) -> bool:
     if model is None:
         return False
     cls = type(model)
-    return (
-        cls.__name__.lower() == "anima"
-        or cls.__module__.endswith(".anima")
-        or hasattr(model, "text_processing_engine_anima")
-    )
+    if cls.__name__.lower() == "anima" or cls.__module__.endswith(".anima"):
+        return True
+    # 속성 이름은 Forge 판마다 다르고(2.29.2 부터 Z-Image·Flux2 와 같은 text_processing_engine_qwen), 지연 import 로
+    # 이 모듈은 torch 없이 불러오게 둔다
+    from .anima38.native_engine import anima_text_engine
+
+    return anima_text_engine(model) is not None
 
 
 def _model_block_count(model: Any) -> int | None:

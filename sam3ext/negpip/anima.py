@@ -17,6 +17,9 @@
 # (sam3ext/negpip/mask.py negpip_line_conds) instead of torch.stack-ing every line into one dict — Forge's per-line
 # contract, so prompt-editing variants longer than 512 rows with different lengths no longer fail with "stack expects
 # each tensor to be equal size". The other hooks are unchanged.
+# MODIFIED by sam-extra, 2026-10-02: the Anima text engine is looked up with sam3ext.anima38.native_engine.anima_text_engine
+# (Forge 2.29.2 renamed sd_model.text_processing_engine_anima to the text_processing_engine_qwen name that Flux2/Krea2/
+# Qwen-Image/Z-Image share; upstream read the old attribute directly).
 
 # https://github.com/david419kr/sd-webui-negpip/blob/main/scripts/negpip.py
 
@@ -37,6 +40,7 @@ from einops import rearrange
 from backend.nn.anima import SelfCrossAttention
 from backend.sampling import condition, sampling_function
 from modules import shared
+from sam3ext.anima38.native_engine import anima_text_engine
 from sam3ext.negpip.mask import build_negpip_mask, negpip_line_conds
 
 
@@ -66,7 +70,7 @@ def _hook_get_learned_conditioning(model: "AnimaEngine", remove: bool):
 
     model.orig_forward = model.get_learned_conditioning
 
-    engine: "Qwen06Engine" = model.text_processing_engine_anima
+    engine: "Qwen06Engine" = anima_text_engine(model)
 
     @torch.inference_mode()
     @wraps(model.orig_forward)

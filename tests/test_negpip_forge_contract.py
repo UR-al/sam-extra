@@ -4,15 +4,21 @@ sd.py·anima.py 의 훅에서 바꾸지 않은 함수는 상류 0585496 그대�
 그 훅이 패치하고 기대는 Forge 소스(SD 훅이 읽는 transformer_options["cond_or_uncond"] 포함) — 가 아직 같은 모양인지 본다. Forge 는 텍스트 엔진을 두 번 바꿨다(ad88b6b4 까지 classic_engine /
 AnimaTextProcessingEngine, 21886f41 부터 sd_engine.ClipEngine / Qwen06Engine). 둘 중 어느 쪽이 깔려 있어도 통과해야 하고,
 Forge 가 없는 CI 에서는 건너뛴다. 깨지면 Forge 가 훅 대상을 바꾼 것 — 훅을 새 Forge 에 맞춘다.
+Anima 엔진이 달린 모델 속성도 2.29.2 에 text_processing_engine_anima → text_processing_engine_qwen(Flux2·Krea2·Qwen-Image·Z-Image
+공용)으로 바뀌었다 — anima_text_engine(sam3ext/anima38/native_engine.py)이 둘 다 찾고 t5_tokenizer 로 Anima 만 고른다.
 """
 from __future__ import annotations
 
 import ast
+import sys
 import unittest
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 FORGE = ROOT.parents[1]
+sys.path.insert(0, str(ROOT))
+
+from sam3ext.anima38.native_engine import ANIMA_ENGINE_ATTRS, SHARED_ENGINE_ATTR  # noqa: E402
 
 
 def _tree(rel: str) -> ast.Module:
@@ -41,6 +47,26 @@ def _self_attrs(cls: ast.ClassDef) -> set[str]:
         for target in node.targets
         if isinstance(target, ast.Attribute) and isinstance(target.value, ast.Name) and target.value.id == "self"
     }
+
+
+def _engines_on(tree: ast.Module, attr: str) -> list[str]:
+    """self.<attr> = 클래스(...) 로 단 엔진 클래스 이름들."""
+    return [
+        node.value.func.id
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Assign) and isinstance(node.value, ast.Call) and isinstance(node.value.func, ast.Name)
+        for target in node.targets
+        if isinstance(target, ast.Attribute) and isinstance(target.value, ast.Name) and target.value.id == "self"
+        and target.attr == attr
+    ]
+
+
+def _import_source(tree: ast.Module, name: str) -> str | None:
+    """from backend.x.y import name 의 소스 경로(backend/x/y.py)."""
+    for node in tree.body:
+        if isinstance(node, ast.ImportFrom) and node.module and any(alias.name == name for alias in node.names):
+            return node.module.replace(".", "/") + ".py"
+    return None
 
 
 class AnimaHookTargetTests(unittest.TestCase):
@@ -75,9 +101,31 @@ class AnimaHookTargetTests(unittest.TestCase):
         self.assertIn("compile_conditions", imports)
 
     def test_anima_engine_attribute_and_conditioning(self):
+        # ~2.29.1 text_processing_engine_anima, 2.29.2~ text_processing_engine_qwen — anima_text_engine 이 찾는 이름이어야 한다
         cls = _classes(_tree("backend/diffusion_engine/anima.py"))["Anima"]
         self.assertIn("get_learned_conditioning", _methods(cls))
-        self.assertIn("text_processing_engine_anima", _self_attrs(cls))
+        self.assertTrue(set(ANIMA_ENGINE_ATTRS) & _self_attrs(cls), f"Anima 텍스트 엔진 속성이 {ANIMA_ENGINE_ATTRS} 에 없다")
+
+    def test_only_the_anima_engine_on_the_shared_attribute_holds_a_t5_tokenizer(self):
+        # text_processing_engine_qwen 에는 Flux2·Krea2·Qwen-Image·Z-Image 엔진도 달린다. anima_text_engine 은 t5_tokenizer 를 가진
+        # 엔진만 Anima 로 보므로, 이 이름에 달리는 엔진 가운데 Anima 엔진만 t5_tokenizer 를 가져야 한다
+        engine_dir = FORGE / "backend" / "diffusion_engine"
+        if not engine_dir.is_dir():
+            self.skipTest(f"Forge 소스 없음: {engine_dir}")
+        holds_t5 = {}
+        for path in sorted(engine_dir.glob("*.py")):
+            tree = ast.parse(path.read_text(encoding="utf-8"))
+            for name in _engines_on(tree, SHARED_ENGINE_ATTR):
+                source = _import_source(tree, name)
+                if source is None:
+                    self.fail(f"{path.name}: {name} 를 어디서 가져오는지 모른다")
+                holds_t5[f"{path.stem}.{name}"] = "t5_tokenizer" in _self_attrs(_classes(_tree(source))[name])
+        if not holds_t5:
+            self.skipTest(f"이 Forge 엔 {SHARED_ENGINE_ATTR} 가 없다")
+        anima = {key: value for key, value in holds_t5.items() if key.startswith("anima.")}
+        others = {key: value for key, value in holds_t5.items() if not key.startswith("anima.")}
+        self.assertTrue(all(anima.values()), f"Anima 엔진이 t5_tokenizer 를 잃었다 — Anima 를 못 알아본다: {anima}")
+        self.assertFalse(any(others.values()), f"Anima 가 아닌 엔진이 t5_tokenizer 를 가진다 — Anima 로 잘못 알아본다: {others}")
 
     def test_anima_text_engine_is_one_the_mask_builder_knows(self):
         classes = _classes(_tree("backend/text_processing/anima_engine.py"))

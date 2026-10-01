@@ -1044,5 +1044,24 @@ class ReferenceIpaAnima38Tests(unittest.TestCase):
         self.assertEqual(result.diagnostics["anima38"], runner_module.ANIMA38_IPA_OFF)
 
 
+class AnimaModelDetectionTests(unittest.TestCase):
+    """_is_anima_engine — Forge 의 Anima 클래스는 이름으로, 그 밖의 모델(대역·래퍼)은 텍스트 엔진 속성으로 알아본다.
+    Forge 2.29.2 는 그 속성을 text_processing_engine_qwen(Flux2·Krea2·Qwen-Image·Z-Image 공용)으로 바꿨다."""
+
+    def test_new_forge_attribute_with_the_anima_engine(self):
+        engine = types.SimpleNamespace(qwen_tokenizer=object(), t5_tokenizer=object())   # Qwen06Engine 처럼
+        self.assertTrue(runner_module._is_anima_engine(types.SimpleNamespace(text_processing_engine_qwen=engine)))
+
+    def test_other_models_on_the_shared_attribute_are_not_anima(self):
+        engine = types.SimpleNamespace(tokenizer=object())   # Z-Image·Flux2 엔진처럼 T5 토크나이저가 없다
+        self.assertFalse(runner_module._is_anima_engine(types.SimpleNamespace(text_processing_engine_qwen=engine)))
+
+    def test_old_attribute_and_class_name_still_count(self):
+        self.assertTrue(runner_module._is_anima_engine(types.SimpleNamespace(text_processing_engine_anima=object())))
+        self.assertTrue(runner_module._is_anima_engine(type("Anima", (), {})()))
+        self.assertFalse(runner_module._is_anima_engine(types.SimpleNamespace()))
+        self.assertFalse(runner_module._is_anima_engine(None))
+
+
 if __name__ == "__main__":
     unittest.main()

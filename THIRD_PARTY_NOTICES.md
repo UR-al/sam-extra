@@ -20,10 +20,11 @@ vendor(`lora_manager_vendor/`, `anima_vendor/`)와 사용자가 따로 받는 �
 - `runtime.py` — NegPiP 와 함께 도는 run id 마커 프로토콜(`marker.py`, 신규), 플래그로 켜고 끄는
   멱등 패치, 공용 런타임(`shared_runtime`), inference_mode 밖에서 만드는 가중치, Anima 레퍼런스
   인계, 인코더 파일 사전 확인, 이전 모델을 붙잡지 않는 캐시, Qwen3.5 의미 특징 캐시, LoRA 복제본에
-  따라가는 커넥터 패처, 커넥터 전용 `llm_adapter` 사본과 LoRA 패치 동기화, 새 Forge TE 엔진 대응, 아래에 깔린 NegPiP 의
-  마스킹 대행(내장 `sam3ext/negpip/mask.py` 사용), v1/v2 경로의 `Emphasis` 생성 정보 기록.
-- `native_engine.py` (신규) — Forge `21886f41` 의 `Qwen06Engine` 에서 커넥터 원본 입력을 뽑는 경로와 엔진별 `Emphasis` 기록
-  규칙(이 확장의 코드).
+  따라가는 커넥터 패처, 커넥터 전용 `llm_adapter` 사본과 LoRA 패치 동기화, 새 Forge TE 엔진·엔진 속성 이름 대응, 아래에 깔린
+  NegPiP 의 마스킹 대행(내장 `sam3ext/negpip/mask.py` 사용), v1/v2 경로의 `Emphasis` 생성 정보 기록.
+- `native_engine.py` (신규) — Forge `21886f41` 의 `Qwen06Engine` 에서 커넥터 원본 입력을 뽑는 경로, 엔진별 `Emphasis` 기록
+  규칙, Forge 판마다 다른 속성 이름(2.29.1 까지 `text_processing_engine_anima`, 2.29.2 부터 Flux2·Krea2·Qwen-Image·Z-Image 와
+  같은 `text_processing_engine_qwen`)에서 Anima 엔진만 찾는 `anima_text_engine`(이 확장의 코드).
 - `layers.py` — 부분 로드 때 CPU 에 남은 RMSNorm 가중치를 계산 장치로 옮겨 씀.
 - `loader_filter.py` (신규) — VAE/Text Encoder 목록의 Qwen3.5 파일을 Forge 로더에서 건너뜀.
 - `connector_fp32.py`, `connector_cache.py` (신규) — 커넥터 fp32 상주와 run 단위 계산 캐시(상류에 없는 이 확장의 코드).
@@ -45,7 +46,7 @@ vendor(`lora_manager_vendor/`, `anima_vendor/`)와 사용자가 따로 받는 �
 다만 GPL-3.0 13조는 AGPL-3.0 13조의 네트워크 상호작용 요건이 "결합된 작업 그 자체(the combination as such)"에 적용된다고 정합니다 —
 결합된 작업을 네트워크 너머 사용자가 원격으로 쓰게 하면, NegPiP 부분만이 아니라 결합된 작업 전체의 대응 소스를 받을 기회를 그 사용자에게
 제공해야 합니다. 편입한 파일마다 머리에 원래 저작권·라이선스 고지와 수정 고지(AGPL-3.0 5조 a항,
-`MODIFIED by sam-extra, 2026-09-30`)를 달았습니다.
+`MODIFIED by sam-extra, 2026-09-30` — 그 뒤에 고친 파일은 고친 날짜의 줄을 더함: `anima.py`·`scripts/negpip.py` 2026-10-02)를 달았습니다.
 
 이 확장에서 바꾼 부분:
 
@@ -60,13 +61,18 @@ vendor(`lora_manager_vendor/`, `anima_vendor/`)와 사용자가 따로 받는 �
 - `__init__.py` — 패치 상태 `PATCHED` 를 패키지에 두어 Reload UI 로 스크립트 클래스가 새로 생겨도 유지합니다.
 - `scripts/negpip.py` — `_patched` 로 `PATCHED` 를 쓰고, 따로 설치된 NegPiP 가 로드돼 있으면 쉬며(경고 한 번), Anima 에서
   emphasis 가 음수 가중치를 적용하지 않는 방식이면 켜지 않습니다.
-- **상류와 다른 동작 — SD1/SDXL `_cond_dealer`**: Forge `21886f41` 의 `sd_engine.ClipEngine.tokenize` 는 `add_special_tokens=False` 를
+- Anima 텍스트 엔진 찾기 — `scripts/negpip.py`(emphasis 판단)와 `anima.py`(조건 훅)는 엔진을 `sam3ext.anima38.native_engine` 의
+  `anima_text_engine` 으로 찾습니다. 상류는 `sd_model.text_processing_engine_anima` 를 바로 읽는데, Forge 2.29.2(`46365871`)가 그 속성을
+  Flux2·Krea2·Qwen-Image·Z-Image 와 같은 `text_processing_engine_qwen` 으로 옮겨 Anima 생성마다 속성 오류로 NegPiP 가 빠졌습니다. 헬퍼는
+  두 이름을 다 찾고, 공용 이름에서는 T5 토크나이저를 가진 엔진(Anima 엔진만 가짐)만 돌려줍니다.
+- **상류와 다른 동작 — SD1/SDXL `_cond_dealer`**: Forge `21886f41` 부터 2.29.1 까지 `sd_engine.ClipEngine.tokenize` 는 `add_special_tokens=False` 를
   넘기지 않아 프롬프트 조각마다 BOS/EOS 를 붙입니다. 상류의 자르기 `cond[1 : token_len + 2]` 는 옛 엔진(`classic_engine`, `ad88b6b4` 까지)
-  에서 `[단어…, EOS]` 행이지만 새 엔진에서는 `[BOS, 단어…, EOS, EOS]` 가 되어 NegPiP 가 BOS(어텐션 싱크) 행의 V 까지 뒤집습니다. 편입본은
+  에서 `[단어…, EOS]` 행이지만 그 엔진에서는 `[BOS, 단어…, EOS, EOS]` 가 되어 NegPiP 가 BOS(어텐션 싱크) 행의 V 까지 뒤집습니다. 편입본은
   `process_batch` 에서 엔진에 빈 글자를 토큰화해 특수 토큰이 나오는지 묻고(`utils.clip_fragment_specials`, 판 번호가 아님), 그렇다면
   `_cond_dealer` 가 청크의 특수 토큰이 아닌 행과 마지막 단어 바로 뒤 EOS 행(`utils.clip_word_rows`) — 옛 엔진과 같은 `[단어…, EOS]` — 을
-  고릅니다. 두 헬퍼는 `utils.py` 에 더했고(상류 함수는 그대로), `tests/test_negpip_clip_rows.py` 가 실제 SD1.5 CLIP 토크나이저와 두 세대
-  엔진 코드로 확인합니다.
+  고릅니다. Forge 2.29.2(`0b1783c7`)는 `add_special_tokens=False` 를 되살려 행 배치가 옛 엔진과 같고, 편입본은 그 판에서 옛 엔진과 같은
+  경로(아래 `id_start`·`id_end` 규칙)를 탑니다. 두 헬퍼는 `utils.py` 에 더했고(상류 함수는 그대로), `tests/test_negpip_clip_rows.py` 가 실제
+  SD1.5 CLIP 토크나이저와 세 판 엔진 코드(옛 엔진·`21886f41`·`0b1783c7`)로 확인합니다.
 - **상류와 다른 동작 — `_cond_dealer` 가 행을 세는 글자와 옛 엔진의 행 규칙**: 상류는 `"(글:-w)"` 를 인코딩하면서 행 수는 맨 글 `글`(가중치 1)을
   토큰화해 셉니다. Forge 의 `parse_prompt_attention` 은 `BREAK` 를 `["BREAK", -1]` 로 내고 묶음 가중치를 그 -1 에도 곱하며, 엔진은 가중치가
   정확히 -1 인 `BREAK` 에서만 청크를 나눕니다 — `(cat BREAK dog:2)` 는 한 청크(글자 `break`), 맨 글 `cat BREAK dog` 는 두 청크라 행 번호가 조건과
@@ -77,7 +83,7 @@ vendor(`lora_manager_vendor/`, `anima_vendor/`)와 사용자가 따로 받는 �
   이제 그 글자 행 전부를 잡는다), 여러 청크 항(묶음 가중치 -1 의 `BREAK`, 75토큰 초과)은 청크 경계의 채움·BOS 행
   대신 단어 행만 잡아 두 엔진이 같은 행을 고릅니다. 엔진이 `id_start`·`id_end` 를 알리지 않으면 상류 자르기 그대로입니다. 방어로, 토큰화한
   청크의 행 수가 조건 행 수와 다르면 그 생성에서 물러나며(`NegPiP Disabled (condition rows: …)`) 지웠던 음수 항을 프롬프트에 되돌립니다
-  (`utils.snapshot_prompts`·`restore_prompts`). `tests/test_negpip_clip_rows.py` 가 두 세대 실제 엔진 코드로 확인합니다.
+  (`utils.snapshot_prompts`·`restore_prompts`). `tests/test_negpip_clip_rows.py` 가 세 판 실제 엔진 코드로 확인합니다.
 - **상류와 다른 동작 — Anima 조건 훅의 반환 모양**: 상류 `negpip_learned_conditioning` 은 스케줄 줄들을 `torch.stack` 해 dict 하나로 돌려줍니다.
   Anima 엔진(옛·새)은 줄마다 `max(512, T5 토큰 수)` 행이라, 프롬프트 편집 `[a:b:N]`·`[a|b]` 줄이 512 를 넘어 길이가 다르면
   `stack expects each tensor to be equal size` 로 조건 단계에서 죽습니다(Forge 순정은 스텝마다 한 줄을 골라 문제없음). 편입본은 Forge 의
