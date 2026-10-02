@@ -820,6 +820,30 @@ def build_standalone_scripts_runner():
     return runner, script_args
 
 
+class RefineResults(list):
+    """Image/infotext pairs with outcome facts; remains a list for callers."""
+
+    def __init__(self, *, reason: str = "", detected_masks: int = 0):
+        super().__init__()
+        self.reason = reason
+        self.detected_masks = detected_masks
+        self.attempted_passes = 0
+        self.failed_passes = 0
+        self.empty_passes = 0
+        self.interrupted = False
+
+    def finish(self):
+        if self.interrupted:
+            self.reason = "interrupted"
+        elif self:
+            self.reason = "partial" if self.failed_passes or self.empty_passes else "ok"
+        elif self.failed_passes:
+            self.reason = "passes_failed"
+        elif self.detected_masks:
+            self.reason = "no_images"
+        return self
+
+
 def run_sam3_refine(
     image: Image.Image,
     args: dict[str, Any],
@@ -840,7 +864,8 @@ def run_sam3_refine(
     ``generation_info`` JSON so clicking the new image in the gallery shows
     the real transformed prompt, not the original t2i prompt.
 
-    Returns ``[]`` when SAM3 finds nothing or every pass is interrupted.
+    Returns a list-compatible ``RefineResults`` carrying empty-mask,
+    interruption, and failed-pass facts for the UI.
     """
     # Standalone refine always overrides the t2i sampler/steps/scheduler/seed
     # — there's no parent process to inherit from. Set the use_* flags so
@@ -858,7 +883,7 @@ def run_sam3_refine(
     scripts_runner, script_args_template = build_standalone_scripts_runner()
     if scripts_runner is None:
         print("[-] SAM3 Refine: t2i scripts runner not initialized; aborting.", file=sys.stderr)
-        return []
+        return RefineResults(reason="runner_unavailable")
 
     allow_huggingface = not getattr(shared.cmd_opts, "sam3_no_huggingface", False)
 
@@ -896,6 +921,54 @@ def run_sam3_refine(
         shared.state.textinfo = ""
         shared.state.job = prev_job
         shared.state.job_count = prev_job_count
+
+
+def _refine_generation_params(args: dict[str, Any], result, mask: Image.Image, user_mask, index: int) -> dict[str, Any]:
+    """Describe detection and the exact pre-blur/pre-invert mask sent to Forge.
+
+    A mask digest is provenance, not a stored mask or a replayable asset.
+    """
+    import hashlib
+    from .__version__ import __version__
+
+    def mask_identity(value: Image.Image) -> tuple[str, str]:
+        value = value.convert("L")
+        dimensions = f"{value.width}x{value.height}"
+        payload = dimensions.encode("ascii") + b"\0" + value.tobytes()
+        return dimensions, hashlib.sha256(payload).hexdigest()
+
+    dimensions, mask_digest = mask_identity(mask)
+    params = {
+        "SAM3 Refine": True,
+        "SAM3 Version": __version__,
+        "SAM3 Refine Target": str(args.get("sam3_prompt") or ""),
+        "SAM3 Refine Exclude": str(args.get("sam3_exclude_prompt") or ""),
+        "SAM3 Refine Threshold": float(args.get("sam3_threshold", 0.4)),
+        "SAM3 Refine Checkpoint Requested": str(args.get("sam3_checkpoint") or "sam3.pt"),
+        "SAM3 Refine Checkpoint Used": result.checkpoint,
+        "SAM3 Refine Device": result.device,
+        "SAM3 Refine Mask Processing": str(args.get("sam3_mask_mode") or "Combined"),
+        "SAM3 Refine Pass": index,
+        "SAM3 Refine Mask Dilation": int(args.get("sam3_mask_dilation", 0)),
+        "SAM3 Refine Mask Hull": bool(args.get("sam3_mask_hull", False)),
+        "SAM3 Refine Mask Outline": int(args.get("sam3_mask_outline_px", 0)),
+        "SAM3 Refine Mask Blur": int(args.get("sam3_mask_blur", 4)),
+        "SAM3 Refine Mask Invert": bool(args.get("sam3_mask_invert", False)),
+        "SAM3 Refine Resize Mode": str(args.get("sam3_resize_mode") or "Just Resize"),
+        "SAM3 Refine Only Masked": bool(args.get("sam3_inpaint_only_masked", False)),
+        "SAM3 Refine Padding": int(args.get("sam3_inpaint_only_masked_padding", 32)),
+        "SAM3 Refine Masked Content": _resolve_inpainting_fill(args.get("sam3_inpainting_fill")),
+        "SAM3 Refine Mask Dimensions": dimensions,
+        "SAM3 Refine Mask SHA256": mask_digest,
+        "SAM3 Refine Mask Stage": "pre-blur/pre-invert",
+        "SAM3 Refine Manual Mask": user_mask is not None,
+    }
+    if user_mask is not None:
+        manual_image = Image.fromarray(user_mask.astype("uint8") * 255, mode="L")
+        manual_dimensions, manual_digest = mask_identity(manual_image)
+        params["SAM3 Refine Manual Mask Dimensions"] = manual_dimensions
+        params["SAM3 Refine Manual Mask SHA256"] = manual_digest
+    return params
 
 
 def _run_sam3_refine_passes(
@@ -939,7 +1012,7 @@ def _run_sam3_refine_passes(
     masks = [sam3_result.mask] if not masks_source else masks_source
     if not masks or not any(np_any(m) for m in masks):
         print("[-] SAM3 Refine: detection returned an empty mask; nothing to do.", file=sys.stderr)
-        return []
+        return RefineResults(reason="empty_mask")
 
     # Diagnostic: per-mask coverage so the user can see if SAM3 caught a tiny
     # sliver vs the whole garment, plus the key inpaint knobs in effect.
@@ -974,7 +1047,7 @@ def _run_sam3_refine_passes(
     prompt = copy_prompt(args.get("sam3_inpaint_prompt"), "")
     negative_prompt = copy_prompt(args.get("sam3_negative_prompt"), "")
 
-    results: list[tuple[Image.Image, str]] = []
+    results = RefineResults(detected_masks=len(masks))
     # Initialize Forge's progress state so the gallery's spinner/progress
     # bar advances during the refine pass. job_count being -1 (no active
     # job) means the standard UI won't render a percentage; setting it
@@ -988,6 +1061,7 @@ def _run_sam3_refine_passes(
     with pause_total_tqdm():
         for index, mask in enumerate(masks, start=1):
             if shared.state.interrupted or shared.state.skipped:
+                results.interrupted = True
                 break
             shared.state.textinfo = f"SAM3 Refine: pass {index}/{len(masks)} — preparing"
             shared.state.job = f"SAM3 Refine pass {index}/{len(masks)}"
@@ -1005,6 +1079,9 @@ def _run_sam3_refine_passes(
             p2.image_mask = mask
             p2.prompt = prompt
             p2.negative_prompt = negative_prompt
+            p2.extra_generation_params.update(
+                _refine_generation_params(args, sam3_result, mask, user_mask, index)
+            )
             inject_controlnet_unit(p2, args)
             override_sampler_script_slot(p2, args)
             shared.state.textinfo = f"SAM3 Refine: pass {index}/{len(masks)} — sampling"
@@ -1022,9 +1099,11 @@ def _run_sam3_refine_passes(
             import time as _time
 
             t0 = _time.perf_counter()
+            results.attempted_passes += 1
             try:
                 processed = process_images(p2)
             except Exception:
+                results.failed_passes += 1
                 error = traceback.format_exc()
                 print(
                     f"[-] SAM3 Refine: pass {index} failed inside process_images "
@@ -1041,9 +1120,12 @@ def _run_sam3_refine_passes(
                     file=sys.stderr,
                 )
 
+            if shared.state.interrupted or shared.state.skipped:
+                results.interrupted = True
             if processed is None:
                 continue
             if not processed.images:
+                results.empty_passes += 1
                 print(f"[-] SAM3 Refine: pass {index} returned no images.", file=sys.stderr)
                 continue
             # Use the per-image infotext when available (Forge populates this
@@ -1078,7 +1160,7 @@ def _run_sam3_refine_passes(
             print(f"[-] SAM3 Refine: pass {index} completed.", file=sys.stderr)
             shared.state.textinfo = f"SAM3 Refine: pass {index}/{len(masks)} — done"
 
-    return results
+    return results.finish()
 
 
 def np_any(mask) -> bool:

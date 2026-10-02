@@ -1011,6 +1011,43 @@ def stop_refine():
     stop_if_job(_REFINE_JOB_PREFIXES)
 
 
+def _refine_empty_message(results) -> str:
+    """Use outcome facts; legacy plain-list callers receive a neutral fallback."""
+    reason = getattr(results, "reason", "")
+    if reason == "empty_mask":
+        text = "SAM3 Refine: 검출된 마스크가 없습니다. Target·Exclude·임계값을 확인하세요."
+    elif reason == "interrupted":
+        text = "SAM3 Refine: 사용자가 작업을 중단했습니다."
+    elif reason == "runner_unavailable":
+        text = "SAM3 Refine: img2img 스크립트가 준비되지 않았습니다. 콘솔을 확인하세요."
+    elif reason == "passes_failed":
+        failed = getattr(results, "failed_passes", 0)
+        attempted = getattr(results, "attempted_passes", 0)
+        text = f"SAM3 Refine: 결과가 없습니다. 시도 {attempted}개 중 {failed}개 패스가 오류로 실패했습니다. 콘솔을 확인하세요."
+    elif reason == "no_images":
+        text = "SAM3 Refine: 마스크는 검출했지만 인페인트가 이미지를 반환하지 않았습니다. 콘솔을 확인하세요."
+    else:
+        text = "SAM3 Refine: 결과가 없습니다. 콘솔을 확인하세요."
+    return f"<span style='color:#c80'>{text}</span>"
+
+
+def _refine_success_message(results) -> str:
+    count = len(results)
+    failed = getattr(results, "failed_passes", 0)
+    empty = getattr(results, "empty_passes", 0)
+    interrupted = getattr(results, "interrupted", False)
+    details = []
+    if failed:
+        details.append(f"오류 {failed}개")
+    if empty:
+        details.append(f"이미지 미반환 {empty}개")
+    if interrupted:
+        details.append("작업 중단")
+    suffix = f" ({', '.join(details)}; 콘솔 확인)" if details else ""
+    color = "#c80" if details else "#383"
+    return f"<span style='color:{color}'>SAM3 Refine: 결과 {count}개를 추가했습니다{suffix}.</span>"
+
+
 def handle_refine_click(
     gallery_value, selected_index, *all_values, progress=gr.Progress(track_tqdm=True)
 ):
@@ -1222,7 +1259,7 @@ def handle_refine_click(
     if not new_pairs:
         return _refine_error_return(
             gallery_value,
-            "<span style='color:#c80'>SAM3 Refine: no result (empty mask or interrupted).</span>",
+            _refine_empty_message(new_pairs),
         )
 
     new_images = [img for img, _ in new_pairs]
@@ -1261,7 +1298,7 @@ def handle_refine_click(
 
     return (
         updated,
-        f"<span style='color:#383'>SAM3 Refine: added {len(new_images)} image(s). Click the new thumbnail to recheck infotext.</span>",
+        _refine_success_message(new_pairs),
         latest_html,
         new_info_json,
     )

@@ -829,6 +829,41 @@ def _clean_split_masks(masks: np.ndarray, boxes: np.ndarray, height: int, width:
     return cleaned_masks
 
 
+def _manual_mask_result(image: Image.Image, user_mask: np.ndarray) -> Sam3Result:
+    """Return the same pre-blur manual mask contract without loading SAM3.
+
+    The existing fallback uses the scribble after text-side hull/outline/
+    dilation, so those operations must not be added to this manual-only path.
+    Inpaint blur and inversion still happen downstream in Forge.
+    """
+    pil_image = image.convert("RGB")
+    rgb = np.asarray(pil_image)
+    h, w = rgb.shape[:2]
+    manual = np.asarray(user_mask, dtype=bool)
+    if manual.ndim != 2:
+        raise ValueError("SAM3 manual mask must be a two-dimensional array")
+    if manual.shape != (h, w):
+        resized = Image.fromarray(manual.astype(np.uint8) * 255, mode="L").resize(
+            (w, h), Image.NEAREST
+        )
+        manual = np.asarray(resized) > 127
+    mask = Image.fromarray(manual.astype(np.uint8) * 255, mode="L")
+    overlay = rgb.copy()
+    overlay[manual] = (
+        overlay[manual] * 0.35 + np.array([30, 210, 255]) * 0.65
+    ).astype(np.uint8)
+    print("[-] SAM3: manual mask only; text detection and checkpoint loading skipped", file=sys.stderr)
+    return Sam3Result(
+        mask=mask,
+        masks=[mask.copy()] if bool(manual.any()) else [],
+        overlay=Image.fromarray(overlay),
+        boxes=[],
+        scores=[],
+        device="manual",
+        checkpoint="not used (manual mask)",
+    )
+
+
 def run_sam3_on_pil(
     image: Image.Image,
     prompt: str,
@@ -842,6 +877,11 @@ def run_sam3_on_pil(
     exclude_prompt: str = "",
     user_mask: np.ndarray | None = None,
 ) -> Sam3Result:
+    # Target empty + no Exclude means the user requested their drawn mask.
+    # Branch before Torch import/device checks/checkpoint download or load.
+    if user_mask is not None and not (prompt or "").strip() and not (exclude_prompt or "").strip():
+        return _manual_mask_result(image, user_mask)
+
     import torch
 
     resolved_device = _resolve_device(device)

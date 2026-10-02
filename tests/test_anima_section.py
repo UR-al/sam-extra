@@ -123,13 +123,15 @@ class ScriptSectionTests(unittest.TestCase):
 class OnClassTests(unittest.TestCase):
     # RDC has no own switch any more (upstream: on when DCW is on and tau > 0),
     # so it rides on the DCW badge.
-    FEATURES = {"pag", "slg", "apg", "adg", "dcw", "cwm", "smc", "dave", "cns", "mod"}
+    FEATURES = {"pag", "slg", "apg", "adg", "dcw", "cwm", "smc", "dave", "cns", "mod",
+                "tsr", "mg", "higs", "hiflow"}
 
     def test_simple_enables_carry_sam3_on(self):
         sources = {
             "scripts/anima_detail_daemon.py": "anima_dd_enable",
             "scripts/anima_skimmed_cfg.py": "anima_skim_enable",
             "scripts/anima_vae_2x.py": "anima_vae2x_enable",
+            "scripts/anima_cfg_optimal_scale.py": "anima_optimal_scale_enable",
             "scripts/anima_ref_poc.py": "anima_ref_poc_enable",
             "sam3ext/ui.py": 'eid("enable")',
         }

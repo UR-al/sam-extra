@@ -3,14 +3,15 @@
 버전 태그는 GitHub Releases에도 발행됩니다. 아래는 요약이며, guidance/속도 기능의
 상세는 [docs/GUIDANCE.md](docs/GUIDANCE.md)를 참고하세요.
 
-## v0.30.0 — Anima 3.8B + 캐릭터 레퍼런스 IP-Adapter + 28/40/52블록 LoRA·DoRA
+## v0.30.0 — Anima 3.8B + 캐릭터 레퍼런스 IP-Adapter + 28/40/52블록 LoRA·DoRA + 디테일 가이던스
 
 v0.21.2 이후 쌓인 큰 업데이트입니다. Anima 3.8B(Qwen3.5 / Semantic Connector v2) 런타임을 들여왔고, 캐릭터 레퍼런스 패널(이어붙이기 · IP-Adapter
 방식)이 생겼습니다. Anima LoRA 는 Base 1.0(28)·2.9B(40)·3.8B(52) 사이를 자동으로 옮기고, DoRA 합치는 방식을 고를 수 있습니다. 그 밖에 TIPO 프롬프트
 확장(🪄)·SAM3 빠른 버튼(🎯)·txt2img 섹션 정리·VAE 격자 제거(Anima VAE DeGrid, NAFNet)가 추가됐고, SAM3·가이던스·3.8B 생성 시간을 줄였습니다 — 대부분은 결과가 픽셀 단위로 같고, PAG/SEG 의 두 가지 최적화만 잔
 디테일이 달라집니다(설정으로 끌 수 있음). 가이던스(Detail Daemon·Safe PAG·Skimmed CFG·DCW(+a)·DAVE·CNS)와 Tile-Repair 는 가져온 원본 ComfyUI
-노드·sd-scripts 와 같은 값·범위·적용 구간으로 맞춰 같은 설정에서도 결과가 달라지고, Tile-Repair HTTP API 와 Notebook 메모장이 생겼습니다. 이 확장의 라이선스는
-이제 **GPL-3.0-only** 입니다(편입한 NegPiP 파일만 **AGPL-3.0-or-later** — **설치 · 라이선스 · 개발** 절).
+노드·sd-scripts 와 같은 값·범위·적용 구간으로 맞춰 같은 설정에서도 결과가 달라지고, Tile-Repair HTTP API 와 Notebook 메모장이 생겼습니다. 가이던스에는
+디테일 단계(S²-Guidance·Adaptive SMC·TSR·Momentum Guidance·HiGS·HiFlow)와 Anima Optimal Scale 이 더해졌고, 모두 기본으로 꺼져 있습니다. 이 확장의
+라이선스는 이제 **GPL-3.0-only** 입니다(편입한 NegPiP 파일만 **AGPL-3.0-or-later** — **설치 · 라이선스 · 개발** 절).
 
 괄호 표시: (결과 변화) = v0.21.2 와 같은 설정·시드에서 이미지가 달라짐, (결과 같음) = 이미지 동일, (새 기능) = v0.21.2 에 없던 기능이라 비교 대상 없음, 토글 = 끌 수
 있는 설정이 있음(뒤에 기본값), 토글 없음 = 끌 수 없음.
@@ -176,6 +177,15 @@ v0.21.2 이후 쌓인 큰 업데이트입니다. Anima 3.8B(Qwen3.5 / Semantic C
   sd-forge-negpip 여도 그렇습니다. 옛 엔진에서는 `b3673ce` 와 같고, 새 엔진에서는 emphasis `Original`·`No norm` 이면 `0585496` 과 같으며
   `None`·`Ignore` 면 위 규칙대로 뒤집는 행이 없습니다(단독 `0585496` 과 다름). 개발 빌드 한때의 '새 엔진이면 경고 후 건너뛰기'는 없앴습니다 — 헬퍼가
   두 엔진을 다 알고, 헬퍼 오류를 삼키면 NegPiP 가 조용히 꺼지기 때문입니다.
+- **내장 NegPiP 스위치 (결과 같음, 토글, 기본 켬)**: Settings → **SAM Extra NegPiP** → "내장 NegPiP 사용 (음수 가중치가 있으면 자동
+  적용)"(`sam3_builtin_negpip_enabled`)이 생겼습니다.
+  - 기본 켬은 지금까지와 같습니다.
+  - 끄면 내장 NegPiP 만 건너뛰고 음수 가중치는 순정 Forge 가 처리하며, infotext 에 `SAM Extra NegPiP enabled: False` 가 남습니다. 붙여
+    넣기·`override_settings` 로 복원됩니다.
+  - `NegPiP` infotext 키는 내장본이 쓴 것만 지웁니다.
+  - 스크립트 인수 0개(`ui()` 없음) 계약은 그대로이고, 따로 설치한 sd-forge-negpip 에는 적용되지 않습니다.
+  - 2026-10-02 검토 제안을 편입했습니다. 실제 Forge 에서 Settings 항목(기본 켬)과, 끈 요청의 `SAM Extra NegPiP enabled: False`
+    기록·NegPiP 미적용을 확인했습니다.
 
 ### 캐릭터 레퍼런스 (이어붙이기 · IP-Adapter)
 
@@ -337,6 +347,50 @@ v0.21.2 이후 쌓인 큰 업데이트입니다. Anima 3.8B(Qwen3.5 / Semantic C
   원본처럼 제자리에서 바꿔 NGMS·soft inpainting 도 바뀐 σ 를 봅니다. infotext `Anima Detail Daemon` 에
   exponent·offset·fade·smooth·hires 까지 남깁니다. Amount 라벨이 바뀌어 `ui-config.json` 에 저장된 v0.21.2 의 Amount 값·범위는 적용되지
   않습니다(기본 0.10 으로 시작).
+- **디테일 단계 — TSR · Momentum Guidance · HiGS · HiFlow (새 기능, 토글, 기본 끔)**: Guidance 아코디언의 CNS 아래에 넷을 더했습니다.
+  PAG/SEG/SLG 항 뒤, DCW 앞에서 켜진 것만 `HiFlow → Momentum → HiGS → TSR` 순서로 돌고, 추가 모델 호출이 없습니다.
+  - TSR: ComfyUI `nodes_eps.py` 의 Temporal Score Rescaling 을 옮겼습니다(GPL-3.0). k 0.95, sigma 1.0.
+  - Momentum Guidance: arXiv 2602.20360 을 논문 식으로 다시 구현했습니다. α 0.5, β 0.6, 노이즈 수준 창 0.30–0.95.
+  - HiGS: arXiv 2509.22300 을 다시 구현했습니다. w 1.75, η 0, α 0.75, R_c 0.05, t 0.40–1.00.
+  - HiFlow: Bujiazi/HiFlow 공식 코드의 방향·가속도 정렬을 옮겼습니다(Apache-2.0). txt2img hires fix 전용이며 α 1.0, β 0.5, cutoff 0.2
+    입니다. 1차 패스의 x0 를 σ 별로 기록했다가 hires 패스에서 씁니다.
+
+  넷 다 끄면 예전과 같은 경로입니다. 다음이 새로 생겼습니다.
+  - infotext: `Anima TSR`·`Anima Momentum Guidance`·`Anima HiGS`·`Anima HiFlow`
+  - XYZ: `[Anima TSR]`·`[Anima MG]`·`[Anima HiGS]`·`[Anima HiFlow]`
+  - 검증 로그: `[VERIFY] detail`
+
+  CPU 단위 테스트(원본 식 대조·경계 조건·post-CFG 경로)와 실제 Forge(neo 2.29.2, Anima 3.8B) 한 시드 실행으로 넷 모두 실제로
+  적용되는 것을 확인했습니다. 화질 비교는 아직입니다. **HiGS 기본 w 1.75 는 Res Multistep 샘플러에서 이미지를 무너뜨립니다** —
+  멀티스텝 샘플러에서는 w 0.5 이하부터 쓰세요(docs/GUIDANCE.md 9절).
+- **S²-Guidance (새 기능, SLG mode, 기본 `Fixed`)**: SLG mode 를 `Stochastic (S²)` 로 고르면, 모델 호출마다 블록을 무작위로 골라 건너뛴
+  weak 예측으로 `ω·(cond − drop)` 을 더합니다(arXiv 2508.12880, 공식 코드가 없어 논문으로 다시 구현). 기본값은 다음과 같습니다.
+  - ω 0.25, drop ratio 0.05(28·40·52 블록에서 1·2·3 블록), 블록 0 제외, 구간 0.10–0.90
+  - 뽑기는 시드로 재현됩니다.
+  - 비용은 고정 SLG 와 같습니다.
+  - XYZ `[Anima Pert] SLG Mode`·`[Anima S2]` 를 더했습니다.
+- **Adaptive SMC (새 기능, SMC controller, 기본 `Unit-L2`)**: SMC controller 를 `Adaptive sign` 으로 고르면, sorryhyun 의 Anima 판(anima_lora
+  `smc_cfg.py`, MIT)처럼 원소별 sign 과 이득 `α·mean|e|` 를 씁니다. 기본값은 α 0.2, λ 5 입니다.
+  - 속도 공간 식을 x0 공간에서 같게 계산합니다(`σ_t/σ_prev` 보정, 원본 식과 대조하는 테스트).
+  - 기존 `Unit-L2`(원본 DCW(+a) 식)는 1 MP Anima 에서 원소당 보정이 약 4e-4 라 거의 효과가 없어 이 선택지를 더했습니다.
+  - XYZ `[Anima SMC] Controller`·`Adaptive Alpha`·`Adaptive Lambda` 를 더했습니다.
+- **PAG 강도 곡선 (자체 실험, 토글, 기본 끔)**: Settings → **SAM Extra Guidance** → "PAG 강도를 sigma 구간 양끝에서 부드럽게 줄이기
+  (자체 실험)"(`sam3_guidance_pag_cosine_envelope`)입니다.
+  - 켜면 PAG 항에만 PAG σ 창 안의 `sin²(π·u)` 를 곱합니다. 양끝은 0 이고, 그 호출에는 PAG weak 행도 만들지 않습니다.
+  - 논문 기법이 아닌 이 확장의 실험이며, 꺼 두면 결과가 같습니다.
+  - infotext `Anima PAG cosine envelope`·`Anima PAG envelope status` 가 남습니다.
+  - 2026-10-02 검토 제안을 편입했습니다. 실제 Forge 에서 곡선 적용(PAG 적용 스텝 24 → 23)은 확인했고, 화질 비교는 하지
+    않았습니다.
+- **Anima Optimal Scale (새 기능, 실험, 기본 끔)**: 새 아코디언 `Anima Optimal Scale (실험 · CFG-Zero* optimized-scale)`
+  (`scripts/anima_cfg_optimal_scale.py`)입니다.
+  - CFG-Zero*(arXiv 2503.18886)의 optimized-scale 식만 구현했고, **zero-init 은 넣지 않았습니다**.
+  - Anima · CFG > 1 · 선형 CFG 결과에서만 `blend`(기본 0.25)만큼 더합니다.
+  - Skimmed CFG, 다른 CFG 함수, 앞선 post-CFG 보정이 있으면 건너뛰고, 그 이유를 `Anima Optimal Scale status` 에 남깁니다.
+  - 자기 콜백만 붙이고 떼므로 다른 확장의 콜백·wrapper 는 그대로입니다.
+  - 2026-10-02 검토 제안을 편입했습니다. 실제 Forge 에서 28번 모두 적용됐고(PAG 와 함께 켜도 Suite 보다 먼저 돌아 같음),
+    화질 비교는 하지 않았습니다.
+- **Safe PAG 스크립트 인수 62 → 91개**: 새 입력(S²·Adaptive SMC·디테일 단계)은 맨 뒤 62–90 자리에 붙였습니다. 기존 인덱스는 그대로이고,
+  62개만 보내는 예전 API 호출은 새 자리를 기본값(전부 끔)으로 둡니다.
 
 ### SAM3
 
@@ -388,6 +442,29 @@ v0.21.2 이후 쌓인 큰 업데이트입니다. Anima 3.8B(Qwen3.5 / Semantic C
   `SAM3 Source: output (<이유>)` 입니다. 키가 없으면(Forge UI·🎯·XYZ·예전 호출자) 동작과 infotext 가 그대로입니다(결과 같음). Sam3Args 밖에서 state
   로만 읽어 예전 빌드도 이 키를 오류 없이 무시합니다. `scripts/!sam3.py` 만 바뀌어 Settings → Reload UI 로 적용됩니다. 자세한 내용은 README
   워크플로 1 의 'API: 이미 만든 이미지에 SAM3 만'.
+- **수동 마스크만 있으면 SAM3 를 불러오지 않음 (드물게 결과 변화)**: Target·Exclude 가 비어 있고 그린 마스크가 있으면 다음을 모두 건너뛰고 그
+  마스크를 씁니다.
+  - torch import·장치 확인·체크포인트 찾기(Hugging Face 받기 포함)·모델 빌드
+  - 빈 글자 검출
+
+  마스크·overlay 는 예전 '검출과 겹치지 않으면 그린 마스크 그대로' 경로와 같습니다. 다만 다음 두 경우는 결과가 다를 수 있습니다.
+  - 예전에는 빈 글자 검출이 그린 마스크와 겹치면 교집합으로 좁혔습니다. 이제는 좁히지 않습니다.
+  - 빈 마스크는 이제 패스를 만들지 않습니다.
+
+  콘솔에는 `[-] SAM3: manual mask only; text detection and checkpoint loading skipped` 가 남고, 결과의 장치·체크포인트는
+  `manual`·`not used (manual mask)` 입니다.
+- **Refine: PNG 기록과 결과 안내 (새 기능)**: Refine 결과 PNG 에 검출·마스크 설정과 마스크 해시를 남깁니다.
+  - 검출: `SAM3 Refine Target`·`Exclude`·`Threshold`·`Checkpoint Requested/Used`·`Device`·`Pass`
+  - 마스크 설정: `Mask Dilation/Hull/Outline/Blur/Invert`·`Masked Content` 등
+  - blur·invert 전 마스크의 SHA-256: `SAM3 Refine Mask SHA256`·`Mask Dimensions`·`Mask Stage`
+  - 그린 마스크를 썼으면 `SAM3 Refine Manual Mask SHA256`
+
+  결과가 없을 때는 이유를 나눠 알립니다.
+  - 검출된 마스크 없음 / 사용자 중단 / img2img 스크립트 준비 안 됨 / 이미지 미반환 / 시도 N개 중 M개 패스 오류
+  - 일부만 성공하면 추가한 개수 옆에 오류·미반환·중단 수를 붙입니다.
+
+  내부 결과는 list 와 호환되는 `RefineResults` 라 예전 호출자는 그대로 동작하며, 화면 문구에 예외 원문은 넣지 않습니다. 2026-10-02 검토
+  제안(02+03 병합본)을 편입했습니다.
 
 ### TIPO 프롬프트 확장 (🪄)
 
@@ -401,6 +478,8 @@ v0.21.2 이후 쌓인 큰 업데이트입니다. Anima 3.8B(Qwen3.5 / Semantic C
   쓸 수 없어 GPU 에 남기지 않았습니다' 를 표시합니다. 쉴 때는 RAM 에 fp16 약 2 GB(CPU 로 돌린 뒤에는 fp32 약 4 GB) 사본을 두어, GPU 에서 내릴 때
   GPU→CPU 복사를 하지 않고 CPU 로 다시 돌릴 때 fp16↔fp32 캐스트를 반복하지 않습니다. 장치 라디오는 브라우저가 기억하고, 체크박스는 새로 고치면 기본값으로
   돌아갑니다.
+- **↩ 되돌리기가 그 뒤의 편집을 덮어쓰지 않음 (버그 수정)**: 확장 전·후 프롬프트를 함께 기억해, 프롬프트가 확장 결과 그대로일 때만 되돌립니다.
+  그 뒤에 프롬프트를 고쳤으면 되돌리지 않고 안내합니다(2026-10-02 검토 제안).
 
 ### Anima VAE DeGrid (NAFNet)
 
@@ -509,6 +588,15 @@ v0.21.2 이후 쌓인 큰 업데이트입니다. Anima 3.8B(Qwen3.5 / Semantic C
   보호를 걸었습니다. 헤더 `X-SAM3-Notebook: 1` 이 없으면 403, `--gradio-auth` 로그인이나 (Forge 가 API 를 띄울 때) `--api-auth`
   HTTP Basic 이 없거나 틀리면 401 이고, 거절된 `/sam3-lora/spawn` 은 매니저 서버를 띄우지 않습니다. 페이지의 Manage 탭은 Gradio 버튼
   브리지를 써서 그대로 동작하고, 이 경로를 부르는 외부 도구는 헤더(와 자격 증명)를 보내야 합니다.
+- **Notebook Apply/Undo 를 한 줄로 (버그 수정)**: Apply 와 Undo 를 같은 대기열에서 차례로 처리합니다. 처리 중에는 버튼을 잠그므로, 빠르게
+  연속으로 눌러도 두 레시피의 값이 섞여 들어가지 않습니다(2026-10-02 검토 제안, JSDOM 테스트).
+- **LoRA Manager 메시지 보낸 쪽 확인 (보안)**: LoRA 를 프롬프트에 넣는 메시지는 이 페이지가 띄운 LoRA Manager iframe 이 매니저 주소에서 보낸 것만
+  받습니다(`event.source`·origin 확인). 다른 창·frame 이나 다른 포트가 보낸 메시지는 무시합니다(2026-10-02 검토 제안, JSDOM 테스트).
+- **Anima VAE 2x 실제 decode 결과 기록 (새 기능)**: `Anima VAE 2x` infotext 끝에 `decode=pending|applied|stock fallback` 을 붙이고, 패스마다
+  `Anima VAE 2x main outcome`·`Anima VAE 2x hires outcome`(`applied_calls=…; stock_fallback_calls=…; last=…`)을 남깁니다.
+  - 순정 decode 로 폴백한 이유는 `… last error` 한 줄(240자 이내)로 남깁니다.
+  - 기록이 실패해도 decode 결과는 바뀌지 않습니다.
+  - 2026-10-02 검토 제안을 편입했습니다. 실제 GPU 생성 확인은 아직입니다.
 - **Forge 라이트박스 도구줄이 늘 보이던 문제 (버그 수정)**: 전역 테마(Settings → **SAM Extra Appearance**)를 켜면 테마 배경이 Forge 라이트박스의
   도구줄(`.modalControls`, 이것도 `.gradio-container`)까지 칠해, 마우스를 올리지 않아도 바가 배경색으로 늘 보였습니다. 도구줄을 테마 배경에서 뺐습니다.
 

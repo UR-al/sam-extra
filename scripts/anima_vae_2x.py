@@ -362,17 +362,58 @@ def _log_decode_failure(e, decoder, dev) -> None:
 # ---------------------------------------------------------------------------
 
 
+class _VAE2xDecodeReport:
+    """Small pass-local report: no tensors, model references, or global state.
+
+    Counts decode calls, including intermediate decodes. 'last' records the
+    latest completed decode; counts are not per-image quality evidence.
+    """
+
+    def __init__(self, params, settings, pass_name):
+        self.params = params
+        self.settings = settings
+        self.key = f"Anima VAE 2x {pass_name} outcome"
+        self.applied = self.fallback = 0
+        self.params["Anima VAE 2x"] = settings + ", decode=pending"
+        self.params[self.key] = "pending decode"
+
+    def record(self, applied, error=None):
+        if applied:
+            self.applied += 1
+            last = "applied"
+        else:
+            self.fallback += 1
+            last = "stock fallback"
+        self.params["Anima VAE 2x"] = self.settings + f", decode={last}"
+        self.params[self.key] = (
+            f"applied_calls={self.applied}; stock_fallback_calls={self.fallback}; last={last}"
+        )
+        if error is not None:
+            # Keep exception class and one bounded line. No tensor is stored.
+            reason = f"{type(error).__name__}: {error}"
+            self.params[self.key + " last error"] = " ".join(reason.split())[:240]
+
+
 class _VAE2xWrapper:
     """Duck-types Forge's VAE object: overrides ``decode`` to use the 12ch
     spacepxl decoder + pixel shuffle, and delegates every other attribute /
     method (encode, device, dtype, ratios, …) to the original VAE."""
 
-    def __init__(self, orig, decoder, refine_1x, blur_sigma, renorm):
+    def __init__(self, orig, decoder, refine_1x, blur_sigma, renorm, report=None):
         object.__setattr__(self, "_orig", orig)
         object.__setattr__(self, "_decoder", decoder)
         object.__setattr__(self, "_refine_1x", refine_1x)
         object.__setattr__(self, "_blur_sigma", blur_sigma)
         object.__setattr__(self, "_renorm", renorm)
+        object.__setattr__(self, "_decode_report", report)
+
+    def _record_decode(self, applied, error=None):
+        report = object.__getattribute__(self, "_decode_report")
+        if report is not None:
+            try:
+                report.record(applied, error)
+            except Exception:
+                pass  # Metadata must never turn a successful decode into a fallback.
 
     def decode(self, samples_in, *args, **kwargs):
         decoder = dev = None   # 실패 진단(_log_decode_failure)용
@@ -406,15 +447,19 @@ class _VAE2xWrapper:
                     f"{tuple(samples_in.shape)}"
                 )
             out_dev = getattr(self._orig, "output_device", None) or samples_in.device
-            return px.to(device=out_dev, dtype=torch.float32)
+            result = px.to(device=out_dev, dtype=torch.float32)
+            self._record_decode(True)
+            return result
         except Exception as e:
             _log_decode_failure(e, decoder, dev)
-            return self._orig.decode(samples_in, *args, **kwargs)
+            result = self._orig.decode(samples_in, *args, **kwargs)
+            self._record_decode(False, e)
+            return result
 
     def clone(self):
         return _VAE2xWrapper(
             self._orig.clone(), self._decoder, self._refine_1x,
-            self._blur_sigma, self._renorm,
+            self._blur_sigma, self._renorm, self._decode_report,
         )
 
     def __getattr__(self, name):
@@ -572,14 +617,16 @@ class AnimaVAE2x(scripts.Script):
 
         try:
             refine_1x = mode.startswith("1x")
-            p.sd_model.forge_objects.vae = _VAE2xWrapper(
-                orig_vae, decoder, refine_1x, blur_sigma, renorm
-            )
             if not hasattr(p, "extra_generation_params"):
                 p.extra_generation_params = {}
-            p.extra_generation_params["Anima VAE 2x"] = (
+            settings = (
                 f"{vae_name}, {'1x-refined' if refine_1x else '2x'}, "
                 f"blur={blur_sigma}, renorm={renorm}"
+            )
+            pass_name = "hires" if bool(getattr(p, "is_hr_pass", False)) else "main"
+            report = _VAE2xDecodeReport(p.extra_generation_params, settings, pass_name)
+            p.sd_model.forge_objects.vae = _VAE2xWrapper(
+                orig_vae, decoder, refine_1x, blur_sigma, renorm, report=report
             )
             _log(f"attached ✅ vae={vae_name} mode={'1x' if refine_1x else '2x'} "
                  f"blur={blur_sigma} renorm={renorm}")

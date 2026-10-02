@@ -163,8 +163,9 @@ class ApplyTests(unittest.TestCase):
 
     def test_applies_when_the_prompt_is_unchanged(self):
         text, undo, status, pending = self._apply(PROMPT, {"before": PROMPT, "after": EXPANDED})
-        self.assertEqual((text, undo, status, pending), (EXPANDED, PROMPT, NO_CHANGE, None),
-                         "되돌리기는 확장 전 프롬프트, 상태 줄은 확장 단계가 쓴 그대로")
+        self.assertEqual((text, undo, status, pending),
+                         (EXPANDED, {"before": PROMPT, "after": EXPANDED}, NO_CHANGE, None),
+                         "되돌리기는 적용 전후 프롬프트를 기억해 후속 편집을 보호한다")
 
     def test_edits_made_while_waiting_are_kept(self):
         text, undo, status, pending = self._apply(PROMPT + ", night", {"before": PROMPT, "after": EXPANDED})
@@ -178,10 +179,30 @@ class ApplyTests(unittest.TestCase):
 class UndoAndDownloadTests(unittest.TestCase):
     def test_undo(self):
         with mock.patch.dict(sys.modules, {"gradio": _gradio()}):
-            self.assertEqual(ui_tipo.handle_undo("before", "after")[:2], ("before", None))
+            self.assertEqual(ui_tipo.handle_undo({"before": "before", "after": "after"}, "after")[:2],
+                             ("before", None))
             text, undo, status = ui_tipo.handle_undo(None, "after")
         self.assertEqual((text, undo), (NO_CHANGE, None))
         self.assertIn("없습니다", status)
+
+    def test_undo_preserves_edits_made_after_expansion(self):
+        record = {"before": PROMPT, "after": EXPANDED}
+        with mock.patch.dict(sys.modules, {"gradio": _gradio()}):
+            text, undo, status = ui_tipo.handle_undo(record, EXPANDED + ", night")
+        self.assertEqual((text, undo), (NO_CHANGE, record))
+        self.assertIn("현재 편집", status)
+
+    def test_legacy_undo_record_does_not_overwrite_current_text(self):
+        with mock.patch.dict(sys.modules, {"gradio": _gradio()}):
+            text, undo, status = ui_tipo.handle_undo(PROMPT, EXPANDED + ", night")
+        self.assertEqual((text, undo), (NO_CHANGE, None))
+        self.assertIn("이전 형식", status)
+
+    def test_malformed_undo_record_is_tolerated(self):
+        with mock.patch.dict(sys.modules, {"gradio": _gradio()}):
+            text, undo, status = ui_tipo.handle_undo({"before": PROMPT}, EXPANDED)
+        self.assertEqual((text, undo), (NO_CHANGE, None))
+        self.assertIn("복원하지 않았습니다", status)
 
     def test_download(self):
         runtime = _FakeRuntime(missing=["model.safetensors"])

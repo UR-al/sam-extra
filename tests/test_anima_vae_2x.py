@@ -305,6 +305,45 @@ class WrapperDecodeTests(unittest.TestCase):
         self.assertEqual(stock.decode_calls, [((1, 16, 1, 8, 8), ("extra",), {"key": "v"})])
         self.assertIn("stock decode", log.call_args[0][0])
 
+    def test_decode_outcome_is_recorded_per_pass(self):
+        # 2026-10-02 review (generation/vae2x_decode_status): pending at attach, then the real result
+        params = {}
+        report = vae2x._VAE2xDecodeReport(params, "spacepxl_2x.safetensors, 2x, blur=0.5, renorm=False", "main")
+        self.assertEqual(params["Anima VAE 2x"], "spacepxl_2x.safetensors, 2x, blur=0.5, renorm=False, decode=pending")
+        self.assertEqual(params["Anima VAE 2x main outcome"], "pending decode")
+        stock = FakeStockVAE()
+        ok = vae2x._VAE2xWrapper(stock, FakeDecoder(), False, 0.5, False, report=report)
+        ok.decode(torch.randn(1, 16, 1, 8, 8))
+        self.assertTrue(params["Anima VAE 2x"].endswith("decode=applied"))
+        self.assertEqual(params["Anima VAE 2x main outcome"], "applied_calls=1; stock_fallback_calls=0; last=applied")
+        failing = vae2x._VAE2xWrapper(stock, FakeDecoder(fail=True), False, 0.5, False, report=report)
+        with mock.patch.object(vae2x, "_log"):
+            failing.clone().decode(torch.randn(1, 16, 1, 8, 8))   # clones share the pass report
+        self.assertTrue(params["Anima VAE 2x"].endswith("decode=stock fallback"))
+        self.assertEqual(params["Anima VAE 2x main outcome"],
+                         "applied_calls=1; stock_fallback_calls=1; last=stock fallback")
+        self.assertIn("Anima VAE 2x main outcome last error", params)
+        self.assertLessEqual(len(params["Anima VAE 2x main outcome last error"]), 240)
+
+    def test_hires_pass_gets_its_own_outcome_key(self):
+        params = {}
+        vae2x._VAE2xDecodeReport(params, "s", "main")
+        hires = vae2x._VAE2xDecodeReport(params, "s", "hires")
+        hires.record(True)
+        self.assertEqual(params["Anima VAE 2x main outcome"], "pending decode")
+        self.assertEqual(params["Anima VAE 2x hires outcome"], "applied_calls=1; stock_fallback_calls=0; last=applied")
+
+    def test_report_errors_never_turn_a_decode_into_a_fallback(self):
+        class Broken:
+            def record(self, applied, error=None):
+                raise RuntimeError("metadata failure")
+
+        stock = FakeStockVAE()
+        wrapper = vae2x._VAE2xWrapper(stock, FakeDecoder(), False, 0.5, False, report=Broken())
+        out = wrapper.decode(torch.randn(1, 16, 1, 8, 8))
+        self.assertEqual(tuple(out.shape), (1, 1, 128, 128, 3))
+        self.assertEqual(stock.decode_calls, [])
+
     def test_wrong_rank_from_transform_falls_back(self):
         # 래퍼 밖에서 터질 shape(4D) 가 나오면 래퍼 안에서 잡아 순정으로 넘긴다.
         wrapper, stock, _ = self._wrapper(False)
@@ -645,10 +684,13 @@ class ScriptEntryTests(unittest.TestCase):
         self.assertEqual(vae._blur_sigma, 0.7)
         self.assertTrue(vae._renorm)
         self.assertEqual(self.built, [("/models/VAE/spacepxl_2x.safetensors", torch.device("cuda:0"), torch.float32)])
+        # Attach records the settings with decode=pending; the real decode rewrites it
+        # (applied / stock fallback) together with the per-pass outcome key.
         self.assertEqual(
             p.extra_generation_params["Anima VAE 2x"],
-            "spacepxl_2x.safetensors, 1x-refined, blur=0.7, renorm=True",
+            "spacepxl_2x.safetensors, 1x-refined, blur=0.7, renorm=True, decode=pending",
         )
+        self.assertEqual(p.extra_generation_params["Anima VAE 2x main outcome"], "pending decode")
 
     def test_rewrap_guard_wraps_stock_not_wrapper(self):
         stock = FakeStockVAE()

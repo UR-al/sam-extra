@@ -35,7 +35,13 @@ SAM3 처리 모듈은 초기화하지 않고 `sam3ext.guidance`의 경량 수학
 | `sam3ext/guidance/dave_gate.py` | DAVE 초반 스텝 게이트(원본 노드의 σ 스케줄 판정) |
 | `sam3ext/guidance/cns.py` | 기존 sampler noise의 wavelet 재색칠(원본 `color_noise_wavelet` 편입) |
 | `sam3ext/guidance/modulation.py` | 보조 CLIP-L·공식 어댑터 로드와 block AdaLN 투영 |
+| `sam3ext/guidance/s2.py` | S²-Guidance 블록 뽑기(재현 가능한 비복원 추출) |
+| `sam3ext/guidance/sigmas.py` | 디테일 단계 공용: flow/eps 판별, 샘플러 σ·σ 스케줄 조회 |
+| `sam3ext/guidance/tsr.py` | TSR(ComfyUI `nodes_eps.py` 이식) |
+| `sam3ext/guidance/history.py` | Momentum Guidance·HiGS 공용 기록과 식 |
+| `sam3ext/guidance/hiflow.py`, `trajectory.py` | HiFlow 방향·가속도 정렬, 1차 패스 x0 궤적 기록 |
 | `scripts/anima_detail_daemon.py` | 별도 Detail Daemon 기능 |
+| `scripts/anima_cfg_optimal_scale.py` | 별도 Anima Optimal Scale 기능(실험, CFG-Zero* optimized-scale만) |
 | `sam3ext/guidance/ui_config_migration.py` | 원본 기본값·범위로 바뀐 슬라이더의 `ui-config.json` 1회 이전 |
 
 ## 실제 처리 순서
@@ -51,8 +57,11 @@ shared.state.sampling_step / sampling_steps (한 스텝 지연 — 아래 참고
       1. CNS x_t 폴백 저장(기본 출처는 sampler step callback)
       2. ADG skip이면 APG momentum만 비우고 3·4 건너뜀(SMC 상태 유지, incoming = cond)
       3. CFG base 토글(SMC → APG → CWM, 켜진 것만)
-      4. PAG/SEG/SLG delta 가산
-      5. DCW / RDC
+      4. PAG/SEG/SLG delta 가산(자체 실험 PAG 강도 곡선은 PAG 항에만 곱함)
+      5. 디테일 단계(켜진 것만): HiFlow(hires 패스) → Momentum → HiGS → TSR
+      6. DCW / RDC
+      7. HiFlow 기록(hires fix 생성의 1차 패스, DCW까지 끝난 x0)
+  → post-CFG (순서 미보장): Anima Optimal Scale(별도 스크립트, 켰을 때만)
   → ancestral/SDE noise sampler: CNS 재색칠
 ```
 
@@ -119,6 +128,57 @@ Forge 스텝 비율(한 스텝 늦음)로 잽니다. infotext `Anima Perturbatio
 `pag_sigma_window=<상한>-<하한>`으로 남습니다.
 
 PAG 자체를 A/B 할 때는 `Rescale=0`, SLG/APG/ADG off로 두어야 원인을 분리할 수 있습니다.
+
+### S²-Guidance (SLG mode = Stochastic)
+
+`Enable SLG`를 켜고 **SLG mode**를 `Stochastic (S²)`로 고르면, 고정 블록 대신 **모델 호출마다 블록을 새로
+무작위로 골라** 건너뛴 weak 예측을 씁니다([S²-Guidance](https://arxiv.org/abs/2508.12880), ICLR 2026).
+식은 논문 본문(v3/v4 식 4·알고리즘 1)의 `CFG + ω·(cond − drop)`이며 SLG 항과 같은 꼴이라 SLG weak 행을
+그대로 씁니다. 공식 코드가 없어(저장소에 코드·LICENSE 없음) 논문으로 다시 구현했습니다. v1/v2와 v4 부록의
+`… − ω·D̂` 꼴은 예측 전체를 `1 − ω`배 하는 오기라 따르지 않습니다(`sam3ext/guidance/s2.py`).
+
+| 필드 | 기본값 | 내용 |
+|---|---:|---|
+| SLG mode | `Fixed` | `Fixed` = 기존 SLG, `Stochastic (S²)` = 아래 값만 쓰고 SLG scale·블록 칸은 쓰지 않음 |
+| S² scale ω | 0.25 | 논문 권장(SD3·SD3.5·Wan). 논문 그래프는 0.25–0.5가 최고점, 1 이상은 떨어짐 |
+| S² drop ratio | 0.05 | 호출마다 건너뛸 블록 비율(최소 1). 28·40·52블록 Anima에서 1·2·3블록 |
+| S² eligible blocks | 빈칸 | 빈칸 = 블록 1–마지막(논문: 블록 0을 빼면 결과가 나빠짐) |
+| S² start / end | 0.10 / 0.90 | 전체 과정의 가운데 80%(논문 4.5절), SLG처럼 스텝 비율(한 스텝 늦음) |
+
+- 블록 수는 논문 표 4(24블록 SD3.5에서 0·1·2·3·4블록 → 1–2블록이 가장 좋음)를 따라 정수 개수를 비복원 추출합니다.
+  비율 0.05는 블록 1–2개 근방이 되도록 고른 값입니다(본문의 "≈10%"는 표에서 효과가 거의 없었음).
+- 뽑기는 재현됩니다: `random.Random("s2:<시드>:<base|hires>:<호출 순번>")`(문자열 시드는 SHA-512로 들어가
+  기기·버전이 달라도 같은 수열). 배치는 한 마스크를 같이 씁니다(논문은 밝히지 않음).
+- 비용은 고정 SLG와 같습니다 — weak 행 하나(S² 구간 안에서만). 논문 측정은 +40% 시간이며 이 확장은 같은 배치에
+  접어 돌려 대신 활성 VRAM이 늘어납니다. PAG/SEG와 함께 켜면 weak 행이 둘입니다.
+- infotext: `Anima Perturbation Guidance: …; S2 scale=… ratio=… drop=1/27 eligible=1-27 window=0.10-0.90 seed=…:base`.
+  진단을 켜면 `[VERIFY] S2: draws=… last_drop=[…]`가 남습니다.
+- 2026-10-02 실제 Forge(neo 2.29.2, Anima 3.8B, Res Multistep · Linear Quadratic · CFG 5, 832×1216, 28 steps, 한 시드)에서 S² 가 실제로 돌았습니다.
+  - 52블록 3.8B 에서 호출마다 블록 3개를 새로 뽑아(`[VERIFY] S2: draws=28`) 구간 안 22스텝에 적용됐습니다.
+  - 비용은 고정 SLG 와 같았습니다(13.2초 대 13.0초, 최대 VRAM 같음).
+  - 화질 비교는 아직입니다(논문 수치는 SD3·SD3.5·Wan·SiT).
+
+### PAG 강도 곡선 (Settings → SAM Extra Guidance · 자체 실험)
+
+설정 키 `sam3_guidance_pag_cosine_envelope`, **기본 끔**입니다. 꺼 두면 지금까지와 똑같이 PAG 구간 안에서 Scale을
+그대로 씁니다. **논문 기법이 아니라 이 확장의 자체 실험**입니다.
+
+```text
+factor = sin²(π·u),  u = (σ_hi − σ) / (σ_hi − σ_lo)      (PAG σ 창, 선형 σ 기준)
+PAG 항 = factor × scale × (cond − weak)
+```
+
+- 창 양끝에서 0, 가운데에서 1입니다. 그래서 Scale 전체가 걸리는 것은 구간 가운데뿐이고, 평균 보정량은 줄어듭니다.
+  곡선 값이 0인 양끝 호출에는 PAG weak 행도 만들지 않습니다.
+- PAG에만 곱합니다. SEG·SLG(S² 포함)와 Rescale 계산 방식은 그대로입니다.
+- σ 창을 만들 수 없는 모델(predictor 없음 → 스텝 비율 판정)이거나 상·하한이 같으면, 곡선 없이 기존 상수 강도로
+  돌아갑니다.
+- infotext(PAG일 때만): `Anima PAG cosine envelope: True`를 붙여넣으면 설정이 복원됩니다.
+  `Anima PAG envelope status`에는 실제 동작이 적힙니다.
+  - `cosine-squared in linear sigma window`: 곡선을 적용함.
+  - `constant fallback: no usable sigma window`: 위 폴백으로 상수 강도를 씀.
+- 2026-10-02 실제 Forge 에서 곡선이 적용됐습니다(`Anima PAG envelope status: cosine-squared…`). 창 양끝에서 weak 행을
+  만들지 않아 PAG 적용 스텝이 24에서 23으로 줄었습니다. 화질 비교는 하지 않았습니다.
 
 ### 속도 설정 (Settings → SAM Extra Guidance)
 
@@ -201,6 +261,42 @@ SMC·CWM은 원본 DCW(+a) ([namemechan/ComfyUI-DCW@66aaf9dd](https://github.com
   `Skimmed → Safe PAG`로 고정합니다. Forge 코어 파일은 수정하지 않습니다.
 - 적용 구간(start/end) 밖이거나 CFG=1이라 건너뛴 스텝에서는 예측을 건드리지 않습니다.
 
+### Anima Optimal Scale (별도 아코디언 · 실험)
+
+[CFG-Zero*](https://arxiv.org/abs/2503.18886)의 **optimized-scale 식만** 구현한 독립 스크립트입니다
+(`scripts/anima_cfg_optimal_scale.py`). 초반 solver 스텝을 0으로 만드는 **zero-init은 넣지 않았습니다**. 짧은
+스텝, img2img, hires, 한 스텝에 여러 번 평가하는 sampler에서 zero-init이 무엇을 뜻하는지 먼저 확인해야 하기
+때문입니다. 원작 코드가 아니라 논문 식을 따로 구현한 것이며, 2026-10-02 검토 제안
+(`docs/review_proposals_20261002/generation/`)을 편입했습니다.
+
+```text
+s* = ⟨v_c, v_u⟩ / ‖v_u‖²,   v = s*·v_u + w·(v_c − s*·v_u)
+x0 공간(Anima x0 = x − σ·v):  표준 CFG와의 차이 = (w − 1)·(s* − 1)·r_u,   r = x − x0
+결과 = incoming + blend × 위 차이
+```
+
+| 필드 | 기본값 | 내용 |
+|---|---:|---|
+| Enable Anima Optimal Scale | off | |
+| Optimal-scale blend | 0.25 | 0–1. 표준 CFG일 때 1이면 식 그대로입니다. 블렌드 값은 이 확장이 더한 실험 조절값입니다 |
+| Optimal-scale start / end (%) | 0.0 / 1.0 | 모델의 `percent_to_sigma`로 만든 σ 창(양 끝 포함) |
+
+- 쓰는 조건: Anima(`prediction_type == "const"`)이고 CFG > 1이며, 그 스텝에서 negative가 평가됐어야 합니다.
+  incoming 결과가 Forge 선형 CFG와 같을 때만 보정합니다.
+- 건너뛰는 경우: 다른 확장의 `sampler_cfg_function`, Skimmed CFG, 앞선 post-CFG 보정(APG·PAG·DCW 등)이 이미
+  결과를 바꾼 스텝, 창 밖 σ, 결과가 유한하지 않을 때. 이때는 incoming 결과를 그대로 둡니다.
+- 켜면 이 스크립트의 post-CFG 콜백 하나만 붙입니다. 끄면 예전 생성에서 남은 **자기 콜백만** 떼고, 다른 확장의
+  콜백·wrapper는 그대로 둡니다.
+- Forge가 post-CFG 콜백 순서를 보장하지 않습니다. 그래서 Guidance Suite 뒤에 돌면 Suite가 바꾼 스텝은 건너뜁니다.
+  2026-10-02 이 설치(Forge neo 2.29.2)에서는 Optimal Scale 이 Suite 보다 먼저 돌았습니다. 그래서 PAG 와 함께 켜도
+  `applied=28; skipped=0`이었고, PAG 항은 그 결과 위에 더해졌습니다. 뒤따르는 단계와 섞인 화질은 비교하지 않았습니다.
+- infotext:
+  - `Anima Optimal Scale: blend=…; start=…; end=…; zero_init=omitted`: 붙여넣으면 켜짐과 세 값이 복원됩니다.
+  - `Anima Optimal Scale status: applied=N; skipped=M; last_skip=<이유>`: 실제로 보정한 호출 수와 마지막으로
+    건너뛴 이유입니다. 붙이기만 하고 모델 호출 전이면 `pending model evaluation`입니다.
+- XYZ 축은 없습니다. 실제 Forge 에서 적용 횟수(status)와 이미지 변화(끔과의 평균 픽셀 차이 12/255)는 확인했지만,
+  화질이 나아지는지는 비교하지 않았습니다.
+
 ### APG
 
 - `Enable APG` 체크박스는 이제 다른 토글과 무관하게 독립적으로 동작합니다.
@@ -252,6 +348,27 @@ SMC/CWM 입력의 NaN·양/음의 Inf는 reference 구현처럼 0으로 정리�
 
 화면 패널은 찾기 쉽도록 `DCW → RDC → CWM → SMC` 순서입니다. 이는 수학적 실행 순서를
 바꾸는 설정이 아니며 실제 처리는 원본 정의대로 `SMC → APG → CWM`, 그 뒤 DCW/RDC입니다.
+
+#### SMC controller — Unit-L2 / Adaptive sign
+
+| 필드 | 기본값 | 내용 |
+|---|---:|---|
+| SMC controller | `Unit-L2` | `Unit-L2` = 위 프리셋·Custom 값의 원본 ComfyUI-DCW 식. `Adaptive sign` = 아래 α·λ |
+| Adaptive SMC α | 0.2 | 이득 `k_t = α·mean|e|`. 범위 0–1, 0이면 보정 없음 |
+| Adaptive SMC λ | 5.0 | 미끄럼면 `s = (e − e_prev) + λ·e_prev`. 범위 0.5–30 |
+
+`Unit-L2`는 미끄럼면을 L2 노름으로 나눠 보정 전체 크기가 k가 되므로, 원소 하나당 보정은 `k/√N`입니다.
+1 MP Anima 잠재(16×1×128×128, N = 262,144)에서는 k = 0.2라도 원소당 약 4e-4로 **매우 작습니다**
+(CFG-Ctrl 논문 v1 표기의 오기에서 온 형태 — v2 와 공식 코드는 원소별 `sign`). 다만 샘플링이 작은 차이도 키워 최종
+이미지는 달라집니다. 2026-10-02 실제 Forge(neo 2.29.2, Anima 3.8B, Res Multistep · Linear Quadratic · CFG 5, 832×1216, 28 steps, 한 시드)에서 SMC 를 끈 결과와의 평균 픽셀 차이는 Unit-L2 13/255, Adaptive sign 21/255였습니다.
+이 차이가 의도한 오차 억제 효과라는 근거는 아닙니다. `Adaptive sign`은
+sorryhyun의 Anima 판(anima_lora `library/inference/corrections/smc_cfg.py`, MIT)입니다: 속도 공간
+오차 `e = v_c − v_u`에 `Δe = −α·mean|e|·sign(s)`를 더하고, 다음 스텝 비교값으로는 보정 **전** 오차를
+저장합니다(논문·공식 코드는 보정 후). 확장은 같은 식을 denoised(x0) 공간에서 계산합니다 — x0 = x_t − σ·v
+이므로 저장한 오차에 `σ_t/σ_prev`를 곱하면 속도 공간 원본과 같고(테스트가 원본 식과 대조),
+σ는 Detail Daemon이 바꾸기 전 샘플러 σ입니다. 평균은 원본처럼 배치 전체에서 하나입니다. 원작자는 CFG 4
+Anima에서 손가락·눈·작은 글자가 선명해지고 약간 어두워진다고 보고했습니다(λ를 낮추면 덜 어두워짐 —
+지표·비교 이미지는 공개되지 않음). infotext: `Anima CFG Orchestrator: …, smc=Adaptive sign(alpha=…,lambda=…)`.
 
 ## 3. DCW / RDC
 
@@ -442,6 +559,161 @@ sigma' = sigma × max(1e-6, 1 − schedule(sigma) × 0.1 × CFG)
 `[Detail Daemon]` Enable·Amount·Start·End·Bias, infotext는 `Anima Detail Daemon`(amount·range·bias·exponent·offset·
 fade·smooth·hires)입니다.
 
+## 9. 디테일 단계 — TSR · Momentum · HiGS · HiFlow
+
+Guidance 아코디언의 CNS 아래에 있는 묶음입니다. PAG/SEG/SLG 항 뒤, DCW 앞에서 켜진 것만
+**HiFlow → Momentum → HiGS → TSR** 순서로 돕니다. 추가 모델 호출이 없고 모두 기본 OFF입니다. 넷 다 끄면 post-CFG
+진입 조건에도 들어가지 않아 예전과 같은 경로입니다. 단계 하나가 예외를 내면 그 단계만 건너뛰고(콘솔 1회) 앞 단계의
+결과를 그대로 둡니다. 다른 모델(SDXL 등)에서도 돕니다. flow/eps 판별은 Forge 모델의 `predictor.prediction_type`
+(`const` = flow)으로 합니다. API·XYZ 값은 아래 UI 범위보다 넓게만 자릅니다.
+
+- TSR k·sigma: 0.01–100(원본 노드 입력 범위)
+- MG β: 0–0.99
+- HiGS α: 0.01–0.99
+- 나머지: UI 범위와 같음
+
+> [!WARNING]
+> 논문·원본 코드의 식을 옮겼고 CPU 단위 테스트(원본 식 대조·경계 조건·훅 경로)로 확인했습니다. 2026-10-02 실제 Forge(neo 2.29.2, Anima 3.8B, Res Multistep · Linear Quadratic · CFG 5, 832×1216, 28 steps, 한 시드)에서는
+> 넷 모두 실제로 적용되는 것(아래 검증 로그의 적용 횟수)과 이미지가 바뀌는 것만 확인했고, 화질이 나아지는지는
+> 비교하지 않았습니다. **HiGS 기본 w 1.75 는 Res Multistep 샘플러에서 이미지를 무너뜨렸습니다**(아래 HiGS 절).
+> XYZ 고정 시드 비교부터 하세요.
+
+### TSR — Temporal Score Rescaling
+
+[TSR](https://arxiv.org/abs/2510.01184)를 ComfyUI `comfy_extras/nodes_eps.py`의 `TemporalScoreRescaling`
+(GPL-3.0)에서 이식했습니다(`sam3ext/guidance/tsr.py`).
+
+```text
+snr = exp(2·half_log_snr(σ)),  r = (snr·v + 1) / (snr·v/k + 1),  v = tsr_sigma²
+α   = σ·exp(half_log_snr(σ))        (flow: 1 − σ, eps/v: 1)
+x0' = lerp(x/α, x0, r)
+```
+
+| 필드 | 기본값 | 범위 · step |
+|---|---:|---|
+| Enable TSR | off | |
+| TSR k | 0.95 | 0.5–1.5 · 0.005. 1이면 아무것도 하지 않음. 낮을수록 디테일, 높을수록 매끈함(원본 노드 설명). 논문 SD3 최적 0.93 |
+| TSR sigma | 1.0 | 0.1–10 · 0.05. 클수록 일찍 걸림(Anima에서 1.0은 σ≈0.5부터, 논문 SD3 최적 3.0은 σ≈0.75부터) |
+
+- 노이즈가 많을 때는 r ≈ 1이라 그대로 두고, 노이즈가 사라질수록 r → k입니다.
+- σ는 원본 노드처럼 모델 호출의 σ(Detail Daemon이 바꾼 뒤)를 씁니다. Forge는 행마다 σ를 넘기므로 r·α도 행마다
+  계산하고, σ ≤ 0 이나 flow σ ≥ 1 행은 원본의 "보정 없음" 경우처럼 그대로 둡니다.
+- Forge 기본 Epsilon scaling은 eps 모델에서만 돌아 Anima·v-pred에는 없습니다. 모델의 parameterisation을 모르면
+  TSR을 건너뜁니다(콘솔 1회).
+- infotext `Anima TSR: k=…, sigma=…`
+
+### Momentum Guidance (MG)
+
+[Momentum Guidance](https://arxiv.org/abs/2602.20360)를 논문 식으로 다시 구현했습니다(공식 코드 없음,
+`sam3ext/guidance/history.py`). 앞 스텝 속도의 지수평균 `m`에서 멀어지는 쪽으로 현재 속도를 밉니다.
+
+```text
+v = (D − x)/σ,   D̃ = D + α·σ·(v − m),   m ← (1 − β)·v + β·m   (m₀ = v₀, 첫 호출은 기록만)
+```
+
+| 필드 | 기본값 | 범위 · step |
+|---|---:|---|
+| Enable Momentum Guidance | off | |
+| MG α | 0.5 | 0–3 · 0.05. 논문 FLUX CFG 2.5–3.5 예시 0.5, 낮은 CFG에서는 1–1.5 |
+| MG β | 0.6 | 0–0.95 · 0.05. 논문 예시 0.6 |
+| Normalize momentum | off | 논문 §8.2: 샘플마다 `m ← (‖v‖/‖m‖)·m` |
+| MG window min / max | 0.30 / 0.95 | 노이즈 수준(flow는 σ, eps/v는 σ/(1+σ)). 논문 t∈[0.05, 0.7]을 σ로 바꾼 값. 창 밖에서도 `m`은 갱신 |
+
+- flow 모델 + Euler에서는 Forge의 Euler 한 스텝이 논문 식 13과 정확히 같아집니다. eps/v 모델에서는 같은 식이
+  ε-momentum이 되며, 논문은 flow 모델만 다룹니다.
+- 논문 기준으로 CFG가 낮을수록 효과가 크고, 2차·멀티스텝 sampler는 이미 외삽을 하므로 효과가 겹칩니다.
+- pamparamm/sd-perturbed-attention의 `mg_nodes.py`(MIT)는 σ를 곱하지 않고 x0를 외삽하는 다른 식이라 따르지
+  않았습니다.
+- infotext `Anima Momentum Guidance: alpha=…, beta=…, normalize=…, window=…`
+
+### HiGS — History-Guided Sampling
+
+[HiGS](https://arxiv.org/abs/2509.22300)(ICLR 2026)를 논문 식·알고리즘 2–3으로 다시 구현했습니다. 논문 코드는
+arXiv 라이선스라 쓰지 않았습니다. 앞 스텝 예측의 지수평균과의 차이 중 **고주파**만 더합니다.
+
+```text
+g    = α·D + (1 − α)·g        (g = 0에서 시작, 첫 호출은 g = α·D₀ 기록만)
+ΔD   = D − g,   ΔD(η) = ΔD − ΔD∥ + η·ΔD∥     (ΔD∥ = D 방향 성분, 샘플마다 float64)
+w(t) = w·√((t − t_min)/(t_max − t_min))     (t_min < t ≤ t_max, 아니면 0)
+D'   = D + w(t)·iDCT(H·DCT(ΔD(η))),   H = sigmoid(50·(R − R_c))   (정규직교 2-D DCT)
+```
+
+| 필드 | 기본값 | 범위 · step |
+|---|---:|---|
+| Enable HiGS | off | weight 0이면 켜도 꺼짐 |
+| HiGS weight w | 1.75 | 0–3 · 0.05. 논문 1.75(≤ 3) |
+| HiGS η | 0.0 | 0–1 · 0.05. 0 = 예측과 수직 성분만(논문 FID 설정), 1 = 그대로(선호도 설정) |
+| HiGS history α (Advanced) | 0.75 | 0.05–0.95 · 0.05. 논문 0.5 또는 0.75 |
+| HiGS high-pass cutoff R_c (Advanced) | 0.05 | 0–0.5 · 0.005. 논문 0.05 |
+| HiGS t min / t max (Advanced) | 0.40 / 1.00 | 노이즈 수준(MG와 같은 정의). 논문 0.3–0.5 / 0.9–1.0 |
+
+- Anima는 CFG 4–5로 논문 실험(2.5)보다 높아, 과채도를 막는 η = 0을 기본으로 했습니다.
+- **멀티스텝 샘플러 주의.** 2026-10-02 실제 Forge(neo 2.29.2, Anima 3.8B, Res Multistep · Linear Quadratic · CFG 5, 832×1216, 28 steps, 한 시드)에서 측정한 결과입니다.
+  - Res Multistep + Linear Quadratic, w 1.75: 이미지가 형태 없는 얼룩으로 무너졌습니다. t min 을 0.7로 올려도
+    같았습니다.
+  - 같은 조합, w 1.0·0.5: 그림은 정상이지만 색이 크게 바뀌었습니다(끔과의 평균 픽셀 차이 35·27/255).
+  - w 1.75, Euler + Linear Quadratic: 정상이었습니다.
+  - w 1.75, Res Multistep + Simple: 무너지지는 않았지만 머리 위 고리 같은 이상한 형태가 생겼습니다.
+
+  구현은 논문 식 5·6·9와 같습니다(히스토리에는 HiGS 결과가 아니라 CFG 예측을 넣음). HiGS 의 히스토리 외삽이
+  이전 스텝 예측을 다시 쓰는 멀티스텝 샘플러의 2차 보정과 겹친 것으로 추정합니다. 논문(표 6)은 DPM++ 같은
+  멀티스텝에서도 개선을 보고했지만, Anima·Linear Quadratic 조합은 다루지 않았습니다. 멀티스텝 샘플러에서는
+  w 0.5 이하부터 시작하세요.
+- infotext `Anima HiGS: w=…, eta=…, alpha=…, cutoff=…, t=…-…`
+
+### Momentum·HiGS 공통 규칙
+
+- 속도·기록은 Detail Daemon이 바꾸기 **전** 샘플러 σ로 계산합니다(Adaptive SMC와 같음).
+- 어떤 호출을 기록에 넣을지는 Forge의 `sampling_sigmas`로 판정합니다.
+  - 목록에 없는 σ(2차 sampler의 중간점): 보정도 기록 갱신도 하지 않습니다.
+  - 바로 앞과 같은 σ(Heun의 보정 단계를 다음 예측으로 다시 쓰는 경우): 보정만 하고 기록은 그대로 둡니다.
+  - σ가 다시 커질 때(새 샘플링): 기록을 비웁니다. 패스가 바뀔 때와 Adaptive Guidance가 uncond를 생략한 스텝에서도
+    비웁니다.
+- 둘은 같은 기록을 따라 외삽하므로 함께 켜면 두 번 미는 셈입니다(붙일 때 콘솔 안내). MG와 APG momentum을 함께
+  켜도 같은 안내가 나옵니다.
+
+### HiFlow — hires 패스 흐름 정렬
+
+[HiFlow](https://arxiv.org/abs/2504.06232)(NeurIPS 2025)의 공식 코드(Bujiazi/HiFlow@31cc2b1, Apache-2.0)를
+옮겼습니다(`sam3ext/guidance/hiflow.py`). 논문 본문과 공개 코드가 다른 곳은 코드를 따랐습니다. **txt2img hires fix
+전용**이며, hires fix를 켜지 않은 생성과 img2img에서는 아무것도 하지 않습니다.
+
+1. 1차(저해상도) 패스: 모델 호출마다 DCW까지 끝난 최종 x0를 샘플러 σ와 함께 기록합니다. CPU fp16으로 두고, 같은
+   σ는 마지막 값으로 바꿉니다.
+2. hires 패스: 같은 σ의 기록을 찾습니다. 기록 사이 σ는 선형 보간하고, 범위를 넘으면 가장자리 값을 씁니다. 찾은
+   기록을 latent bicubic으로 키워 기준 `R`로 삼습니다.
+
+```text
+방향:   D_k = X_k + α_k·LPF(R_k − X_k)            (Butterworth n = 4, cutoff D)
+가속도: O_k = D_k − β_k·[(D_k − R_k) − (σ_k/σ_{k−1})·(O_{k−1} − R_{k−1})],  O_0 = D_0
+가중치: α_k = α·(N − k)/N,  β_k = β·(N − k)/N    (N = hires 스텝 수)
+```
+
+| 필드 | 기본값 | 범위 · step |
+|---|---:|---|
+| Enable HiFlow (hires fix) | off | |
+| HiFlow direction α | 1.0 | 0–2 · 0.05. 공식 2K 단계 값. 1차 구도에 너무 묶이면 낮춤 |
+| HiFlow acceleration β | 0.5 | 0–1 · 0.05. 공식 값 |
+| HiFlow low-pass cutoff D | 0.2 | 0.05–1 · 0.01. 공식 코드 0.2(논문 본문 0.4) |
+
+- 공식 실험 설정은 1차 30스텝, hires 16스텝, denoise 0.53 근처입니다.
+- 초기화 정렬(1차 결과를 키워 다시 노이즈를 입히는 과정)은 Forge hires fix가 이미 하므로 다시 하지 않습니다.
+  공식 실행의 모델 쪽 고해상도 기법(NTK RoPE, 비례 attention, swin padding)과 여러 단계 cascade는 포함하지
+  않았습니다.
+- hires 스케줄 밖의 σ(2차 sampler 중간점)와 바로 앞과 같은 σ는 방향 정렬만 하고, 가속도 상태는 건드리지 않습니다.
+- ADetailer 내부 img2img처럼 그 요청 안에서 따로 도는 샘플링은 `on_cfg_denoiser`로 가려 기록·정렬하지 않습니다.
+- 1차 기록과 hires latent의 배치·채널이 다르면(예: 다른 계열 hires 체크포인트) 건너뜁니다(콘솔 1회).
+- 붙일 때 콘솔에 `HiFlow=record|align` 또는 꺼진 이유(`no hires fix`, `no base-pass trajectory`)가 나옵니다.
+  infotext `Anima HiFlow: alpha=…, beta=…, cutoff=…, reference=<기록 σ 수> sigmas`는 hires 패스에서 정렬할 때만
+  남습니다.
+
+### 검증 로그
+
+`Log Guidance verification summary`를 켜면 `[VERIFY] detail: TSR=APPLIED(n evals), MG=…, HiGS=…,
+HiFlow=recorded n sigmas, direction n / acceleration n evals, flow=True|False`가 남습니다. 여기서 n은 **실제로 결과를
+바꾼 호출 수**입니다. 붙기만 하고 한 번도 적용되지 않으면 0입니다. 첫 호출은 기록만 하므로 MG·HiGS는 호출 수보다
+적고, 창 밖 호출도 세지 않습니다.
+
 ## 조합 원칙
 
 - 처음에는 기능 하나씩, 같은 seed로 비교합니다.
@@ -449,6 +721,12 @@ fade·smooth·hires)입니다.
   직접 조절합니다.
 - CFG base 토글은 하나씩 켜서 효과를 익힌 뒤 조합하세요. 셋을 한 번에 켜면 서로 영향을 줍니다.
 - DCW는 Suite 내부 마지막입니다. 다른 확장의 post-CFG callback과의 전역 순서는 보장할 수 없습니다.
+- 디테일 단계 중 효과가 비슷한 것들은 한 번에 하나씩 비교하세요.
+  - 늦은 스텝의 잔디테일: TSR, Detail Daemon, DCW lambda high.
+  - 스텝 간 외삽: Momentum, HiGS, APG momentum.
+- HiFlow는 hires fix 전용이고 나머지와 겹치지 않습니다. 다만 hires 패스의 디테일 단계 결과는 HiFlow가 정렬한 x0
+  위에서 계산됩니다.
+- Anima Optimal Scale은 CFG 보정이라 SMC·APG·CWM과 같은 자리를 다룹니다. 처음에는 CFG base를 모두 끄고 비교하세요.
 - Modulation Guidance는 cond/uncond/PAG weak 행에 같은 block modulation을 적용합니다.
 - CNS는 ancestral/SDE에서만 의미가 있습니다.
 - TeaCache는 이 Suite에 포함하지 않습니다. ADG `keep_every`의 batch 크기 진동 및 stateful guidance와
@@ -459,13 +737,18 @@ fade·smooth·hires)입니다.
 기존 축에 새 Suite 축도 등록됩니다. `Enable=True,False`로 즉시 A/B할 수 있습니다.
 
 - `[Anima Pert]`: Enable, Method, Attn Scale, 공식/Legacy strength, SEG sigma,
-  block/head, SLG, Start/End, Rescale/Mode
+  block/head, SLG, SLG Mode, Start/End, Rescale/Mode
+- `[Anima S2]`: Scale, Drop Ratio, Eligible Blocks, Start, End
 - `[Anima APG]`, `[Anima AdaptiveG]`
 - `[Anima CFG]`: Base Mode, Experimental Stack
-- `[Anima CWM]`, `[Anima SMC]`
+- `[Anima CWM]`, `[Anima SMC]` — SMC에는 Controller, Adaptive Alpha, Adaptive Lambda도 있습니다
 - `[Anima DCW]`, `[Anima RDC]`, `[Anima DAVE]`, `[Anima CNS]` — `[Anima RDC] Enable`은 예전 RDC 스위치 자리라
   `False`일 때만 RDC를 끄고, `True`면 `Enable DCW + tau > 0` 규칙을 따릅니다
 - `[Anima Mod]`: Enable, Direction Weight, Start/End Block
+- `[Anima TSR]`: Enable, K, Sigma
+- `[Anima MG]`: Enable, Alpha, Beta, Normalize, Window Min/Max
+- `[Anima HiGS]`: Enable, Weight, Eta, History Alpha, Cutoff, T Min/Max
+- `[Anima HiFlow]`: Enable, Alpha, Beta, Cutoff
 - `[Anima Skim]`(Skimmed CFG, 7축): Enable, Skimming CFG, Full Skim Negative, Disable Flipping Filter, Start, End,
   Flip At
 - `[Detail Daemon]`
@@ -486,11 +769,18 @@ Anima RDC
 Anima DAVE
 Anima CNS Wavelet Noise
 Anima Modulation Guidance
+Anima TSR
+Anima Momentum Guidance
+Anima HiGS
+Anima HiFlow                (hires 패스에서 정렬할 때)
 Anima PAG prefix dedup      (PAG/SEG/SLG 켤 때)
 Anima SEG separable blur    (공식 SEG blur 를 쓸 때)
+Anima PAG cosine envelope   (자체 실험 PAG 강도 곡선을 켰을 때, PAG만)
+Anima PAG envelope status   (위와 함께, 실제 곡선/상수 폴백)
 Anima Perturbation ControlNet guard  (ControlNet 가드로 PAG/SEG/SLG 가 막힌 패스)
 Anima Skimmed CFG           (별도 스크립트)
 Anima Detail Daemon         (별도 스크립트)
+Anima Optimal Scale         (별도 스크립트, + Anima Optimal Scale status)
 ```
 
 `Anima DCW`는 DCW가 실제로 돌 때(lambda가 0이 아니거나 RDC가 켜짐), `Anima RDC`는 RDC가 켜졌을 때(Enable DCW +
@@ -530,6 +820,14 @@ SMC/CWM 비정상 수치 정리, ADG state flush, CNS 결정성·RNG 비소비,
 Skimmed callback 실제 prepend 순서와 PAG scale 반응, CLIP adapter 수식·Forge Anima
 shape 추론·block AdaLN 무변이 주입, pass 종료 tensor 해제와 Notebook 자산
 구조를 포함합니다.
+
+디테일 묶음과 2026-10-02 검토 제안 기능은 다음 테스트가 봅니다. 모두 CPU 가짜 데이터로 돌리며, 실제 Forge
+샘플링·GPU·이미지 비교는 하지 않습니다.
+
+- `test_guidance_detail_suite.py`: S²·Adaptive SMC·TSR·Momentum·HiGS·HiFlow 수식을 원본 식과 대조하고 경계 조건을 봅니다.
+- `test_guidance_detail_script.py`: 스크립트 인수 해석부터 post-CFG 도달, 적용 횟수, HiFlow 기록·정렬까지 봅니다.
+- `test_pag_envelope.py`: PAG 강도 곡선.
+- `test_anima_cfg_optimal_scale.py`: Optimal Scale 식, 외부 콜백 보존, 건너뛰는 이유.
 
 원본 대조 테스트(`tests/test_anima_safe_pag_origin.py`, `test_skimmed_cfg.py`, `test_dcw_origin.py`,
 `test_dave_origin.py`, `test_cns_origin.py`, `test_detail_daemon_origin.py`)는 각 원본 노드의 해당 코드를 고정 커밋
@@ -576,6 +874,14 @@ Detail Daemon 슬라이더는 이 이전의 대상이 아닙니다. Amount는 �
 | CNS | [namemechan/comfyui-cns_sampler_patch](https://github.com/namemechan/comfyui-cns_sampler_patch) (GPL-3.0), [논문](https://arxiv.org/abs/2605.30332) | `color_noise_wavelet` 편입(`sam3ext/guidance/cns.py`, 고지는 THIRD_PARTY_NOTICES.md), Forge noise 원천·callback 훅 |
 | Anima Modulation Guidance | [Anzhc/Anima-Mod-Guidance-ComfyUI-Node](https://github.com/Anzhc/Anima-Mod-Guidance-ComfyUI-Node) (MIT 선언), [quickjkee/modulation-guidance](https://github.com/quickjkee/modulation-guidance) (MIT), [yresearch/cosmos-pooled adapter](https://huggingface.co/yresearch/cosmos-pooled) | 공개 수식·어댑터 형식 기반 Forge block 재작성, vendor 아님 |
 | Detail Daemon | [muerrilla/sd-webui-detail-daemon](https://github.com/muerrilla/sd-webui-detail-daemon) (MIT), [Jonseed/ComfyUI-Detail-Daemon](https://github.com/Jonseed/ComfyUI-Detail-Daemon) (MIT) | schedule·σ 조회 함수 편입(고지는 THIRD_PARTY_NOTICES.md), Forge 훅 |
+| S²-Guidance | [S²-Guidance 논문](https://arxiv.org/abs/2508.12880) (공식 코드 없음) | 논문 식 재구현, SLG weak 행 재사용 |
+| Adaptive SMC | [sorryhyun/anima_lora](https://github.com/sorryhyun/anima_lora) `smc_cfg.py` (MIT), [CFG-Ctrl 논문](https://arxiv.org/abs/2603.03281) | 식을 x0 공간으로 옮겨 재작성(고지는 THIRD_PARTY_NOTICES.md) |
+| TSR | ComfyUI `comfy_extras/nodes_eps.py` (GPL-3.0), [TSR 논문](https://arxiv.org/abs/2510.01184) | 노드 수식 이식(`sam3ext/guidance/tsr.py`, 고지는 THIRD_PARTY_NOTICES.md), 행별 σ |
+| Momentum Guidance | [MG 논문](https://arxiv.org/abs/2602.20360) (공식 코드 없음) | 논문 식 재구현 |
+| HiGS | [HiGS 논문](https://arxiv.org/abs/2509.22300) | 논문 식·알고리즘 재구현(논문 코드 미사용) |
+| HiFlow | [Bujiazi/HiFlow](https://github.com/Bujiazi/HiFlow) (Apache-2.0), [HiFlow 논문](https://arxiv.org/abs/2504.06232) | 공식 코드의 정렬 식 이식(`sam3ext/guidance/hiflow.py`, 고지는 THIRD_PARTY_NOTICES.md), Forge hires fix 연결 |
+| Anima Optimal Scale | [CFG-Zero* 논문](https://arxiv.org/abs/2503.18886) | optimized-scale 식만 독립 구현(zero-init 제외) |
+| PAG 강도 곡선 | — | 이 확장의 자체 실험(논문 기법 아님) |
 
 원본 저장소를 통째로 포함하지 않았으며, Forge 연결과 상태 관리는 이 확장에서 별도로 작성했습니다.
 각 기법과 참조 코드의 저작권·라이선스는 원저자/원 저장소에 따릅니다.

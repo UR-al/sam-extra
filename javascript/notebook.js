@@ -50,6 +50,8 @@
     var saveChain = Promise.resolve();
     var changeVersion = 0;
     var undoState = null;
+    var applyChain = Promise.resolve();
+    var pendingApplyOperations = 0;
     var gradioConfigSnapshot = null;
     var gradioConfigPromise = null;
     var configIndexSource = null;
@@ -1573,7 +1575,43 @@
         if (label) setStatus(label, "saved");
     }
 
-    async function applyPreset(preset) {
+    function syncApplyButtons() {
+        if (!panel) return;
+        var busy = pendingApplyOperations > 0;
+        panel.setAttribute("aria-busy", busy ? "true" : "false");
+        Array.prototype.forEach.call(
+            panel.querySelectorAll("[data-notebook-apply], [data-notebook-undo]"),
+            function (button) { button.disabled = busy; }
+        );
+    }
+
+    function queueApplyOperation(operation) {
+        pendingApplyOperations++;
+        syncApplyButtons();
+        var queued = applyChain.then(operation).catch(function (error) {
+            console.error("[SAM3 Notebook] queued apply failed:", error);
+            setStatus(String(error && error.message || error), "error");
+        }).finally(function () {
+            pendingApplyOperations--;
+            syncApplyButtons();
+        });
+        // Both Apply and Undo use this chain, including failure rollback.
+        applyChain = queued;
+        return queued;
+    }
+
+    function applyPreset(preset) {
+        // Editing a preset while it is queued must not change that request.
+        var snapshot = clone(preset);
+        return queueApplyOperation(function () { return runPresetApply(snapshot); });
+    }
+
+    function applyUndo() {
+        // Resolve undoState only after preceding Apply/Undo tasks finish.
+        return queueApplyOperation(runApplyUndo);
+    }
+
+    async function runPresetApply(preset) {
         if (!preset.entries.length) {
             setStatus("적용할 항목이 없습니다", "warning");
             return;
@@ -1606,7 +1644,7 @@
         }
     }
 
-    async function applyUndo() {
+    async function runApplyUndo() {
         if (!undoState) return;
         var state = undoState;
         setStatus("되돌리는 중…", "pending");
@@ -2007,6 +2045,8 @@
         apply.type = "button";
         apply.textContent = "적용";
         apply.className = "primary";
+        apply.setAttribute("data-notebook-apply", "");
+        apply.disabled = pendingApplyOperations > 0;
         apply.addEventListener("click", function () { applyPreset(preset); });
         header.appendChild(apply);
 
@@ -2109,12 +2149,14 @@
         presetList = details.querySelector("[data-notebook-presets]");
         statusElement = details.querySelector("[data-notebook-status]");
         searchInput = details.querySelector("[data-notebook-search]");
+        syncApplyButtons();
     }
 
     function syncUndoButton() {
         if (!panel) return;
         var button = panel.querySelector("[data-notebook-undo]");
         if (button) button.hidden = !undoState;
+        syncApplyButtons();
     }
 
     function isPlainObject(value) {

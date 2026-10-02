@@ -136,7 +136,7 @@ def apply_smc_error(
         return error, error.detach()
 
     working = _finite_or_zero(error.float())
-    if previous is None or previous.shape != working.shape:
+    if not torch.is_tensor(previous) or previous.shape != working.shape:
         previous_working = working.detach()
     else:
         previous_working = _finite_or_zero(
@@ -156,6 +156,76 @@ def apply_smc_error(
     delta = raw_delta.clamp(-delta_limit, delta_limit)
     corrected = _finite_or_zero(working + delta)
     return corrected.to(error.dtype), corrected.detach()
+
+
+SMC_MODE_UNIT = "Unit-L2"
+SMC_MODE_ADAPTIVE = "Adaptive sign"
+SMC_MODE_NAMES: tuple[str, ...] = (SMC_MODE_UNIT, SMC_MODE_ADAPTIVE)
+# sorryhyun/anima_lora docs/inference/smc_cfg.md + library/inference/args.py (MIT): alpha 0.2, lambda 5.
+SMC_ADAPTIVE_ALPHA = 0.2
+SMC_ADAPTIVE_LAMBDA = 5.0
+SMC_ADAPTIVE_FLOOR = 1e-12
+
+
+def normalize_smc_mode(value: Any) -> str:
+    """Public SMC mode name; unknown input keeps the original unit-L2 controller."""
+    text = str(value or "").strip().casefold()
+    if text.startswith("adaptive"):
+        return SMC_MODE_ADAPTIVE
+    return SMC_MODE_UNIT
+
+
+def apply_smc_adaptive(
+    error: torch.Tensor,
+    sigma: float | None,
+    previous,
+    alpha: float,
+    lambda_value: float,
+) -> tuple[torch.Tensor, Any]:
+    """Adaptive-gain sliding-mode CFG, ``(corrected_error, new_state)`` in denoised (x0) space.
+
+    sorryhyun's Anima form of CFG-Ctrl (arXiv 2603.03281) in velocity space
+    (sorryhyun/anima_lora ``library/inference/corrections/smc_cfg.py`` and
+    sorryhyun/ComfyUI-Spectrum-KSampler ``smc_cfg.py``, both MIT)::
+
+        e_t = v_c − v_u,  s_t = (e_t − e_prev) + λ·e_prev,  k_t = α·mean|e_t|
+        Δe  = −k_t·sign(s_t),   v̂ = v_u + w·(e_t + Δe),   e_prev ← e_t (uncorrected)
+
+    With ``x0 = x_t − σ·v`` the same controller in x0 space is exact when the stored error is
+    rescaled by ``σ_t/σ_prev`` (velocity errors at different sigmas carry a 1/σ factor)::
+
+        e = x0_c − x0_u,  e_prev' = e_prev·σ_t/σ_prev,  s = (e − e_prev') + λ·e_prev'
+        d = −α·mean|e|·sign(s),   corrected = e + d
+
+    (the sign flips twice and ``mean|e_v|·σ = mean|e_x0|``). The mean runs over the whole
+    tensor like the original (one gain for the batch); the state keeps the *uncorrected* error
+    like sorryhyun (the paper and the official code keep the corrected one). The first call, a
+    shape change or an unknown sigma start from ``e_prev = e``. ``alpha == 0`` is a no-op that still
+    records the state.
+    """
+    working = _finite_or_zero(error.float())
+    state = previous if isinstance(previous, dict) else None
+    sigma_now = None if sigma is None else float(sigma)
+    if (
+        state is None
+        or not torch.is_tensor(state.get("e"))
+        or tuple(state["e"].shape) != tuple(working.shape)
+        or sigma_now is None
+        or not state.get("sigma")
+        or sigma_now <= 0.0
+    ):
+        e_prev = working
+    else:
+        e_prev = _finite_or_zero(
+            state["e"].to(device=working.device, dtype=working.dtype)
+        ) * (sigma_now / float(state["sigma"]))
+    new_state = {"e": working.detach(), "sigma": sigma_now}
+    if float(alpha) == 0.0:
+        return error, new_state
+    surface = (working - e_prev) + float(lambda_value) * e_prev
+    gain = float(alpha) * working.abs().mean().clamp_min(SMC_ADAPTIVE_FLOOR)
+    corrected = _finite_or_zero(working - gain * torch.sign(surface))
+    return corrected.to(error.dtype), new_state
 
 
 def apply_cwm_error(
@@ -210,15 +280,28 @@ def compose_cfg(
     smc_lambda: float,
     smc_k: float,
     smc_previous,
-) -> tuple[torch.Tensor, torch.Tensor | None]:
-    """Compose standard/CWM/SMC/SMC+CWM in denoised space."""
+    *,
+    smc_mode: str = SMC_MODE_UNIT,
+    smc_sigma: float | None = None,
+    smc_alpha: float = SMC_ADAPTIVE_ALPHA,
+) -> tuple[torch.Tensor, Any]:
+    """Compose standard/CWM/SMC/SMC+CWM in denoised space.
+
+    ``smc_mode`` picks the SMC controller: the unit-L2 one (``smc_lambda``/``smc_k``, namemechan
+    contract) or the adaptive sign one (``smc_lambda``/``smc_alpha`` at the sampler's
+    ``smc_sigma`` — :func:`apply_smc_adaptive`)."""
     error = _finite_or_zero(cond.float() - uncond.float())
     uncond_working = _finite_or_zero(uncond.float())
     next_previous = smc_previous
     if mode in {"smc", "smc+cwm"}:
-        error, next_previous = apply_smc_error(
-            error, smc_previous, smc_lambda, smc_k
-        )
+        if smc_mode == SMC_MODE_ADAPTIVE:
+            error, next_previous = apply_smc_adaptive(
+                error, smc_sigma, smc_previous, smc_alpha, smc_lambda
+            )
+        else:
+            error, next_previous = apply_smc_error(
+                error, smc_previous, smc_lambda, smc_k
+            )
     if mode in {"cwm", "smc+cwm"}:
         guided_error = apply_cwm_error(
             error, sigma, effective_scale, alpha_low, alpha_high

@@ -297,7 +297,7 @@
         refs[tab] = {
             container: container, navBtns: navBtns, panes: panes,
             myBtn: myBtn, myPane: myPane, myIndex: myIndex,
-            loraIdx: loraIdx, selectTab: selectTab
+            loraIdx: loraIdx, selectTab: selectTab, frame: frame
         };
 
         // Apply config immediately if already known (replace mode / availability).
@@ -483,14 +483,34 @@
         try { ta.focus(); } catch (e) {}
     }
 
+    function isManagerMessage(ev) {
+        if (!ev || !ev.source) return false;
+        return Object.keys(refs).some(function (tab) {
+            var frame = refs[tab] && refs[tab].frame;
+            if (!frame || !frame.isConnected
+                    || frame.getAttribute("data-loaded") !== "1"
+                    || ev.source !== frame.contentWindow) return false;
+            var src = frame.getAttribute("src");
+            if (!src) return false;
+            try {
+                var frameUrl = new URL(src, document.baseURI);
+                return (frameUrl.protocol === "http:" || frameUrl.protocol === "https:")
+                    && ev.origin === frameUrl.origin;
+            } catch (error) {
+                return false;
+            }
+        });
+    }
+
     function attachLoraBridge() {
         if (window.__sam3LoraBridgeAttached) return;
         window.__sam3LoraBridgeAttached = true;
         window.addEventListener("message", function (ev) {
-            var d = ev && ev.data;
+            if (!isManagerMessage(ev)) return;
+            var d = ev.data;
             if (!d || typeof d !== "object") return;
             if (d.type !== "sam3-add-lora") return;
-            // port is dynamic / cross-origin, so validate by message shape.
+            // Dynamic ports are checked against each loaded iframe URL.
             if (typeof d.text !== "string" || d.text.indexOf("<lora:") !== 0) return;
             sam3InsertLora(d.text, !!d.replace);
         });

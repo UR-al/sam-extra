@@ -174,7 +174,8 @@ def handle_apply(current, pending, undo_state):
         return gr.update(), undo_state, gr.update(), None
     if (current or "") != pending["before"]:
         return gr.update(), undo_state, CHANGED_MESSAGE, None
-    return pending["after"], pending["before"], gr.update(), None
+    undo_record = {"before": pending["before"], "after": pending["after"]}
+    return pending["after"], undo_record, gr.update(), None
 
 
 def handle_undo(undo_state, prompt):
@@ -182,7 +183,15 @@ def handle_undo(undo_state, prompt):
 
     if undo_state is None:
         return gr.update(), None, "되돌릴 확장이 없습니다."
-    return undo_state, None, "확장 전 프롬프트로 되돌렸습니다."
+    # Older sessions stored only the original string. Without the applied
+    # text there is no safe way to distinguish later user edits.
+    if not isinstance(undo_state, dict) or not all(
+        isinstance(undo_state.get(key), str) for key in ("before", "after")
+    ):
+        return gr.update(), None, "이전 형식의 되돌리기 기록입니다 — 현재 편집을 보호하려고 복원하지 않았습니다."
+    if (prompt or "") != undo_state["after"]:
+        return gr.update(), undo_state, "확장 후 프롬프트를 수정해 되돌리지 않았습니다 — 현재 편집을 유지했습니다."
+    return undo_state["before"], None, "확장 전 프롬프트로 되돌렸습니다."
 
 
 def handle_download(*, runtime=None):

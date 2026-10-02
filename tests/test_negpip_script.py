@@ -379,6 +379,80 @@ class AnimaEmphasisGateTests(ScriptTestCase):
                 self.script.reset()
 
 
+class BuiltinSwitchTests(ScriptTestCase):
+    """Settings 스위치 sam3_builtin_negpip_enabled (기본 켬 = 예전 자동 적용). 스크립트 인수 0개는 그대로."""
+
+    def _off(self):
+        self.shared.opts.sam3_builtin_negpip_enabled = False
+
+    def test_default_on_keeps_the_automatic_activation(self):
+        self.assertFalse(hasattr(self.shared.opts, "sam3_builtin_negpip_enabled"))
+        p = self._p()
+        self._run(p)
+        self.assertEqual(self.module._test_calls, [("anima", False)])
+        self.assertIs(p.extra_generation_params.get("NegPiP"), True)
+        self.assertNotIn(self.module.INFOTEXT_BUILTIN_NEGPIP, p.extra_generation_params)
+
+    def test_off_skips_before_any_patch_and_records_it(self):
+        self._off()
+        p = self._p()
+        self._run(p)
+        self.assertEqual(self.module._test_calls, [])
+        self.assertFalse(self.script.active)
+        self.assertNotIn("NegPiP", p.extra_generation_params)
+        self.assertIs(p.extra_generation_params[self.module.INFOTEXT_BUILTIN_NEGPIP], False)
+        self.assertEqual(p.prompts, ["girl, (bad:-1)"], "음수 항은 순정 Forge 로 그대로 간다")
+
+    def test_off_unpatches_a_previous_builtin_patch(self):
+        p = self._p()
+        self._run(p)
+        self.assertEqual(negpip_pkg.PATCHED[1], True)
+        self._off()
+        self._run(self._p())
+        self.assertEqual(negpip_pkg.PATCHED, [False, False], "reset() 이 먼저 내장 패치를 푼다")
+
+    def test_off_removes_only_the_builtin_marker(self):
+        p = self._p()
+        self._run(p)                          # builtin wrote "NegPiP": True
+        self.assertTrue(p._sam3_builtin_negpip_recorded)
+        self._off()
+        self._run(p)
+        self.assertNotIn("NegPiP", p.extra_generation_params)
+        foreign = self._p()
+        foreign.extra_generation_params["NegPiP"] = "from another extension"
+        self._run(foreign)
+        self.assertEqual(foreign.extra_generation_params["NegPiP"], "from another extension")
+
+    def test_string_values_from_settings_and_infotext(self):
+        for value, expected in (("False", False), ("off", False), ("0", False), ("True", True),
+                                ("yes", True), ("garbage", True), (None, True), (0, False), (1, True)):
+            with self.subTest(value=value):
+                self.shared.opts.sam3_builtin_negpip_enabled = value
+                self.assertIs(self.module._builtin_negpip_enabled(), expected)
+
+    def test_settings_option_and_zero_argument_contract(self):
+        added = {}
+
+        class OptionInfo:
+            def __init__(self, default, label, component=None, *, section=None, infotext=None):
+                self.default, self.section, self.infotext = default, section, infotext
+
+            def info(self, _text):
+                return self
+
+        stub = types.SimpleNamespace(
+            OptionInfo=OptionInfo,
+            opts=types.SimpleNamespace(add_option=lambda key, info: added.__setitem__(key, info)),
+        )
+        with mock.patch.object(self.module, "shared", stub):
+            self.module._on_builtin_negpip_settings()
+        option = added[self.module.OPT_BUILTIN_NEGPIP]
+        self.assertIs(option.default, True)
+        self.assertEqual(option.section, ("sam3_negpip", "SAM Extra NegPiP"))
+        self.assertEqual(option.infotext, "SAM Extra NegPiP enabled")
+        self.assertIsNone(self.script.ui(False), "script 인수 0개 계약")
+
+
 class NewForgeEngineAttributeTests(ScriptTestCase):
     """Forge 2.29.2 는 Anima 텍스트 엔진을 text_processing_engine_qwen(Flux2·Krea2·Qwen-Image·Z-Image 공용)에 단다.
     옛 이름만 읽으면 Anima 생성에서 게이트가 AttributeError 로 죽는다 — anima_text_engine 이 두 이름을 다 찾는다."""

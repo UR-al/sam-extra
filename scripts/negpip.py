@@ -34,6 +34,11 @@
 # MODIFIED by sam-extra, 2026-10-02: the Anima emphasis gate looks the text engine up with
 # sam3ext.anima38.native_engine.anima_text_engine (Forge 2.29.2 renamed sd_model.text_processing_engine_anima to the
 # text_processing_engine_qwen name that Flux2/Krea2/Qwen-Image/Z-Image share).
+# MODIFIED by sam-extra, 2026-10-02: a Forge Settings switch for the builtin NegPiP only
+# (sam3_builtin_negpip_enabled, default True = the old automatic activation). Off returns from process_batch after
+# reset() (which unpatches) and records "SAM Extra NegPiP enabled: False"; the "NegPiP" infotext key is removed only
+# when this builtin wrote it. ui() still returns None (zero script arguments), and a separately installed
+# sd-forge-negpip is not governed by the switch.
 
 import re
 from typing import TYPE_CHECKING
@@ -70,6 +75,51 @@ from modules.prompt_parser import (
     get_learned_conditioning_prompt_schedules,
 )
 from modules.script_callbacks import CFGDenoiserParams, on_cfg_denoiser
+
+
+OPT_BUILTIN_NEGPIP = "sam3_builtin_negpip_enabled"
+INFOTEXT_BUILTIN_NEGPIP = "SAM Extra NegPiP enabled"
+
+
+def _builtin_negpip_enabled() -> bool:
+    """Keep the old automatic behaviour unless the builtin switch is explicitly off."""
+    value = getattr(shared.opts, OPT_BUILTIN_NEGPIP, True)
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"false", "0", "off", "no"}:
+            return False
+        if normalized in {"true", "1", "on", "yes"}:
+            return True
+        return True
+    return True if value is None else bool(value)
+
+
+def _on_builtin_negpip_settings() -> None:
+    shared.opts.add_option(
+        OPT_BUILTIN_NEGPIP,
+        shared.OptionInfo(
+            True,
+            "내장 NegPiP 사용 (음수 가중치가 있으면 자동 적용)",
+            section=("sam3_negpip", "SAM Extra NegPiP"),
+            infotext=INFOTEXT_BUILTIN_NEGPIP,
+        ).info(
+            "기본 켬은 현재와 같습니다. 끄면 내장 NegPiP만 건너뛰고 음수 가중치는 순정 Forge가 처리합니다. "
+            "따로 설치한 sd-forge-negpip에는 이 설정이 적용되지 않습니다. 변경 후 다음 생성부터 적용됩니다."
+        ),
+    )
+
+
+def _register_builtin_negpip_settings() -> None:
+    try:
+        from modules import script_callbacks
+    except ImportError:
+        return
+    register = getattr(script_callbacks, "on_ui_settings", None)
+    if register is not None:
+        register(_on_builtin_negpip_settings)
+
+
+_register_builtin_negpip_settings()
 
 
 def _verify_ext(p: " StableDiffusionProcessing"):
@@ -164,6 +214,18 @@ class NegPiP(scripts.Script):
     def process_batch(self, p: "StableDiffusionProcessing", *args, **kwargs):
         self.reset()
 
+        params = getattr(p, "extra_generation_params", None)
+        # Only remove a marker previously written by this builtin, not by another extension.
+        if getattr(p, "_sam3_builtin_negpip_recorded", False) and isinstance(params, dict):
+            params.pop("NegPiP", None)
+        p._sam3_builtin_negpip_recorded = False
+        if isinstance(params, dict):
+            params.pop(INFOTEXT_BUILTIN_NEGPIP, None)
+        if not _builtin_negpip_enabled():
+            if isinstance(params, dict):
+                params[INFOTEXT_BUILTIN_NEGPIP] = False
+            return
+
         if not any_negative(p):
             return
 
@@ -188,6 +250,7 @@ class NegPiP(scripts.Script):
                 patch_anima_negpip(NegPiP)
                 reset_prompt_cache(p)
                 p.extra_generation_params["NegPiP"] = True
+                p._sam3_builtin_negpip_recorded = True
                 self.active = True
             return
 
@@ -244,6 +307,7 @@ class NegPiP(scripts.Script):
         patch_sd_negpip(self, NegPiP)
         reset_prompt_cache(p)
         p.extra_generation_params["NegPiP"] = True
+        p._sam3_builtin_negpip_recorded = True
         self.active = True
 
         # sam-extra: 상류는 항목 0 의 첫 항 행 수만 찍었다(항목 0 에 항이 없으면 줄이 없음) — 어느 항목·줄이든 이은 행 수의 최대

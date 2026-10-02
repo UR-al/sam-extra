@@ -122,9 +122,16 @@ vendor(`lora_manager_vendor/`, `anima_vendor/`)와 사용자가 따로 받는 �
   이름순으로 Dynamic Thresholding 뒤였고, 상류 NegPiP `process_batch` 는 Dynamic Thresholding 이 바꾼 `p.sampler_name` 으로 cond/uncond
   절반을 골랐습니다. 편입본의 훅은 Forge 의 조각 표시를 읽고 샘플러 이름은 표시가 없는 호출자의 대체 경로에서만 쓰지만, 그 경로를 위해
   이 확장 폴더 자리에서도 그 순서를 지킵니다.
+- 내장 NegPiP 스위치(2026-10-02) — `scripts/negpip.py` 에 Forge 설정 `sam3_builtin_negpip_enabled`(Settings → SAM Extra
+  NegPiP)를 더했습니다.
+  - 기본 켬이며, 그때는 예전과 같이 음수 가중치가 있으면 자동으로 켜집니다.
+  - 끄면 `process_batch` 가 `reset()`(패치 해제) 뒤 바로 돌아가고 infotext 에 `SAM Extra NegPiP enabled: False` 를 남깁니다.
+  - `NegPiP` infotext 키는 내장본이 쓴 것만 지웁니다.
+  - `ui()` 는 그대로 `None`(스크립트 인수 0개)이고, 따로 설치한 sd-forge-negpip 는 이 스위치의 대상이 아닙니다.
+  - 2026-10-02 검토 제안(`docs/review_proposals_20261002/generation/`)을 편입한 것입니다.
 - `coexist.py` 는 이 확장이 새로 쓴 코드(GPL-3.0-only)로, 상류 코드가 아닙니다.
 - 나머지 — SD1/SDXL 훅의 `Counter`·`patch_sd_negpip`·`_main_forward`, Anima 의 조건 외 훅, 프롬프트 파싱, `NEG_PATTERN`, 스크립트
-  제목 `NegPiP`·UI 없음 — 는 상류 `0585496` 과 같습니다.
+  제목 `NegPiP`·스크립트 UI 없음 — 는 상류 `0585496` 과 같습니다.
   `NEG_PATTERN` 은 상류 `75b81b4` 에서 바뀐 것으로, 그 전 판(`b3673ce`)을 쓰던 설치와는 잡는 음수 항이 다릅니다
   (예: `(smile), (aqua hair:-1)` 에서 예전엔 전체, 이제 `(aqua hair:-1)` 만) — 상류의 수정이라 그대로 둡니다.
   `tests/test_negpip_vendor.py` 가 바꾸지 않은 함수 본문의 해시를 상류 `0585496` 과 대조합니다.
@@ -235,6 +242,33 @@ forward 마다 한 번만 찾는 캐시입니다. 기본 블록 `8-18` 은 같�
 MIT 고지 전문은 이 문서 끝에 있습니다. DC 감쇠 계산(`sam3ext/guidance/dave.py`)과 블록 래퍼는 이 확장이 다시 작성한
 것입니다.
 
+## ComfyUI TSR — Temporal Score Rescaling (GPL-3.0)
+
+`sam3ext/guidance/tsr.py` 의 식(`rescale_factors`·`apply_tsr`)은 ComfyUI(`comfyanonymous/ComfyUI`, commit
+`174208df6ba033e5b4784c94d83d065c0d4165a4`) `comfy_extras/nodes_eps.py` 의 `TemporalScoreRescaling` 노드(PR #10351)를
+옮긴 것입니다. 기본값 k 0.95·sigma 1.0 과 API 입력 범위 0.01–100 은 노드와 같습니다. 달라진 곳은 다음과 같습니다.
+
+- Forge 에 `model_sampling` 이 없어 flow/eps 판별과 half-log-SNR 을 `sam3ext/guidance/sigmas.py` 에서 직접 계산합니다.
+- 스칼라 σ 대신 행마다 r·α 를 구합니다.
+- σ ≤ 0 행과 flow σ ≥ 1 행은 노드의 '보정 없음' 경우처럼 그대로 둡니다.
+- UI 슬라이더 범위를 좁혔습니다.
+
+원본은 이 확장과 같은 GPL-3.0 입니다.
+
+## HiFlow — 흐름 정렬 (Apache-2.0)
+
+`sam3ext/guidance/hiflow.py` 는 [Bujiazi/HiFlow](https://github.com/Bujiazi/HiFlow)의 코드를 옮겨 다시 쓴 것입니다.
+
+- 정렬 식: `flux_pipeline_hiflow.py`, commit `31cc2b1c515195d8bfee002d3da58ac7c7773fef`
+- Butterworth 저역 통과 마스크: `utils.py`, 같은 commit
+- 기본값(α 1.0, β 0.5, cutoff 0.2): `run_hiflow.py`, commit `da351a8ef036384a42485744ba47bc9c1d882b94`
+
+원 파이프라인은 Euler 속도를 고칩니다. 이 확장은 같은 식을 모델 호출마다 x0 를 바꾸는 꼴로 다시 쓰고(x_t 가 상쇄돼 같은
+결과), Forge hires fix 와 1차 패스 기록(`sam3ext/guidance/trajectory.py`, 이 확장의 코드)에 연결했습니다. 바꾼 내용은
+Apache-2.0 4(b) 에 따라 파일 머리 주석에 적었습니다. 상류 `LICENSE` 는 Apache License 2.0 이며 NOTICE 파일은 없습니다
+(2026-10-02 저장소 목록 확인). 공식 실행의 모델 쪽 고해상도 기법(NTK RoPE, 비례 attention, swin padding)은 가져오지
+않았습니다. 이 확장의 GPL-3.0-only 라이선스는 이 코드의 상류 조건을 대체하지 않습니다.
+
 ## ComfyUI-NAFNet-Residual — 대조 테스트용 잔차 함수 사본 (Apache-2.0)
 
 `tests/test_vae_degrid.py` 의 `_apply_residual_mode` 는
@@ -260,6 +294,12 @@ Guidance 등)은 README 의 출처 / 크레딧 절과 [docs/GUIDANCE.md](docs/GU
 |---|---|---|---|---|
 | Anima VAE DeGrid 잔차 모드·타일 | `sam3ext/vae_degrid.py` | [DraconicDragon/ComfyUI-NAFNet-Residual](https://github.com/DraconicDragon/ComfyUI-NAFNet-Residual) `nafnet_node.py` 87-149줄, ComfyUI `comfy/utils.py` `tiled_scale` | Apache-2.0 · GPL-3.0 | 식·타일 위치·OOM 재시도를 같게 다시 작성(대조 테스트는 위 절). 16 배수가 아닌 타일의 반사 패딩은 저자의 NAFNet-c `infer.py`(`F.pad(..., mode="reflect")`)와 같은 방식을 다시 작성(사본 없음) |
 | Anima Safe PAG | `scripts/anima_safe_pag.py` | [iljung1106/comfyui-anima-safe-pag](https://github.com/iljung1106/comfyui-anima-safe-pag) (ComfyUI 노드), PAG 논문 [arXiv:2403.17377](https://arxiv.org/abs/2403.17377) | MIT | Anima 배치 확장·블록 선택을 이식하고 Forge 훅으로 다시 작성(적용 구간·파싱은 위 절처럼 편입) |
+| Adaptive SMC | `sam3ext/guidance/cwm_smc.py` `apply_smc_adaptive` | [sorryhyun/anima_lora](https://github.com/sorryhyun/anima_lora) `library/inference/corrections/smc_cfg.py` (같은 코드가 sorryhyun/ComfyUI-Spectrum-KSampler 에도 있음), CFG-Ctrl 논문 [arXiv:2603.03281](https://arxiv.org/abs/2603.03281) | MIT(Copyright (c) 2026 Seunghyun Ji) | 속도 공간 식과 기본값(α 0.2, λ 5)을 따르고 x0 공간에서 다시 작성(`σ_t/σ_prev` 보정, 원본 식 대조 테스트). 코드 사본 없음 |
+| S²-Guidance | `sam3ext/guidance/s2.py` | [arXiv:2508.12880](https://arxiv.org/abs/2508.12880) 식 4·알고리즘 1 | 공식 코드 없음 | 논문 식 재구현 |
+| Momentum Guidance | `sam3ext/guidance/history.py` | [arXiv:2602.20360](https://arxiv.org/abs/2602.20360) 식 12–13 | 공식 코드 없음 | 논문 식 재구현 |
+| HiGS | `sam3ext/guidance/history.py` | [arXiv:2509.22300](https://arxiv.org/abs/2509.22300) 식 6·8, 알고리즘 2–3 | 논문 코드는 arXiv 라이선스(사용 안 함) | 논문 식 재구현 |
+| Anima Optimal Scale | `scripts/anima_cfg_optimal_scale.py` | CFG-Zero* [arXiv:2503.18886](https://arxiv.org/abs/2503.18886) optimized-scale 식 | — | 식만 독립 구현(zero-init 제외). 2026-10-02 검토 제안(`docs/review_proposals_20261002/generation/`)을 편입 |
+| PAG 강도 곡선 | `scripts/anima_safe_pag.py` `_pag_envelope_factor` | — | — | 이 확장의 자체 실험(논문 기법 아님) |
 
 ## MIT License 전문
 
@@ -291,5 +331,5 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-Apache-2.0 전문(TIPO 모델 코드, Qwen3.5 토크나이저, Skimmed_CFG 코드, ComfyUI-NAFNet-Residual 대조 테스트 사본)은
+Apache-2.0 전문(TIPO 모델 코드, Qwen3.5 토크나이저, Skimmed_CFG 코드, HiFlow 코드, ComfyUI-NAFNet-Residual 대조 테스트 사본)은
 <https://www.apache.org/licenses/LICENSE-2.0> 에 있습니다.

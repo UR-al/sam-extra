@@ -1264,7 +1264,8 @@ class AnimaSafePagTests(unittest.TestCase):
         with gr.Blocks():
             inputs = self.pag.AnimaSafePAG().ui(False)
 
-        self.assertEqual(len(inputs), 62)
+        # 62 = the v0.21.3 prefix; 62-90 are the v0.30 detail suite (tests/test_guidance_detail_script.py).
+        self.assertEqual(len(inputs), 91)
         self.assertEqual(inputs[26].elem_id, "anima_guidance_smc_lambda")
         self.assertEqual(inputs[26].maximum, 30.0)
         self.assertEqual(inputs[27].elem_id, "anima_guidance_smc_k")
@@ -1367,6 +1368,36 @@ class AnimaSafePagTests(unittest.TestCase):
                 "[Anima RDC] Tau",
                 "[Anima RDC] Alpha LL",
                 "[Anima RDC] Alpha HH",
+                # v0.30 detail suite
+                "[Anima Pert] SLG Mode",
+                "[Anima S2] Scale",
+                "[Anima S2] Drop Ratio",
+                "[Anima S2] Eligible Blocks",
+                "[Anima S2] Start",
+                "[Anima S2] End",
+                "[Anima SMC] Controller",
+                "[Anima SMC] Adaptive Alpha",
+                "[Anima SMC] Adaptive Lambda",
+                "[Anima TSR] Enable",
+                "[Anima TSR] K",
+                "[Anima TSR] Sigma",
+                "[Anima MG] Enable",
+                "[Anima MG] Alpha",
+                "[Anima MG] Beta",
+                "[Anima MG] Normalize",
+                "[Anima MG] Window Min",
+                "[Anima MG] Window Max",
+                "[Anima HiGS] Enable",
+                "[Anima HiGS] Weight",
+                "[Anima HiGS] Eta",
+                "[Anima HiGS] History Alpha",
+                "[Anima HiGS] Cutoff",
+                "[Anima HiGS] T Min",
+                "[Anima HiGS] T Max",
+                "[Anima HiFlow] Enable",
+                "[Anima HiFlow] Alpha",
+                "[Anima HiFlow] Beta",
+                "[Anima HiFlow] Cutoff",
             ],
         )
 
@@ -2603,11 +2634,16 @@ class GuidanceSettingsInfotextTests(unittest.TestCase):
         )
         with mock.patch.object(p, "shared", shared_stub):
             p._on_ui_settings()
-        self.assertEqual(set(added), {p.OPT_PREFIX_DEDUP, p.OPT_SEG_SEPARABLE, p.OPT_DAVE_PRE_DD})
-        for key, infotext in ((p.OPT_PREFIX_DEDUP, p.INFOTEXT_PREFIX_DEDUP),
-                              (p.OPT_SEG_SEPARABLE, p.INFOTEXT_SEG_SEPARABLE),
-                              (p.OPT_DAVE_PRE_DD, p.INFOTEXT_DAVE_PRE_DD)):
-            self.assertIs(added[key].default, True)
+        self.assertEqual(
+            set(added),
+            {p.OPT_PREFIX_DEDUP, p.OPT_SEG_SEPARABLE, p.OPT_DAVE_PRE_DD, p.OPT_PAG_COSINE},
+        )
+        for key, infotext, default in ((p.OPT_PREFIX_DEDUP, p.INFOTEXT_PREFIX_DEDUP, True),
+                                       (p.OPT_SEG_SEPARABLE, p.INFOTEXT_SEG_SEPARABLE, True),
+                                       (p.OPT_DAVE_PRE_DD, p.INFOTEXT_DAVE_PRE_DD, True),
+                                       # the experimental PAG envelope is off by default
+                                       (p.OPT_PAG_COSINE, p.INFOTEXT_PAG_COSINE, False)):
+            self.assertIs(added[key].default, default)
             self.assertEqual(added[key].section, ("sam3_guidance", "SAM Extra Guidance"))
             self.assertEqual(added[key].infotext, infotext)
 

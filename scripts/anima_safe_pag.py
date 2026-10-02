@@ -81,19 +81,38 @@ except ImportError:  # standalone/unit-test loader
     shared = None  # type: ignore
 from sam3ext.guidance.cns import color_noise_wavelet
 from sam3ext.guidance.cwm_smc import (
+    SMC_ADAPTIVE_ALPHA,
+    SMC_ADAPTIVE_LAMBDA,
+    SMC_MODE_ADAPTIVE,
+    SMC_MODE_NAMES,
+    SMC_MODE_UNIT,
     SMC_PRESET_NAMES,
     apply_cwm_error,
+    apply_smc_adaptive,
     apply_smc_error,
     compose_cfg,
+    normalize_smc_mode,
     normalize_smc_preset,
     resolve_smc_preset,
 )
+from sam3ext.guidance import hiflow as hiflow_guidance
+from sam3ext.guidance import history as history_guidance
+from sam3ext.guidance import s2 as s2_guidance
+from sam3ext.guidance import tsr as tsr_guidance
+from sam3ext.guidance.sigmas import (
+    is_flow_model,
+    sampler_sigma,
+    sampling_schedule,
+    schedule_index,
+)
+from sam3ext.guidance.trajectory import Trajectory
 from sam3ext.guidance.dave import apply_dave
 from sam3ext.guidance.dave_gate import (
     DEFAULT_BLOCKS as DAVE_DEFAULT_BLOCKS,
     ForwardGateCache,
     attenuation_active as dave_attenuation_active,
     pre_dd_sigma,
+    sampled_schedule as _sampled_schedule,
     step_gate as dave_step_gate,
 )
 from sam3ext.guidance.dcw import apply_dcw
@@ -103,7 +122,7 @@ from sam3ext.guidance.modulation import (
     prepare_block_modulations,
 )
 from sam3ext.guidance.runtime import GuidanceRuntime
-from sam3ext.guidance.sigma_window import percent_range_to_sigmas, sigma_active
+from sam3ext.guidance.sigma_window import percent_range_to_sigmas, sigma_active, sigma_to_float
 from sam3ext.guidance.ui_config_migration import (
     CNS_GAMMA_SCALE_LABEL,
     PAG_SCALE_LABEL,
@@ -263,6 +282,10 @@ _STATE: dict = {
 
 # Forge 설정(섹션 'SAM Extra Guidance'). infotext 이름은 붙여넣기 때 같은 설정으로
 # 되돌아가도록 OptionInfo(infotext=...) 로도 등록한다(값은 "True"/"False").
+# PAG 강도 곡선: 이 확장의 자체 실험(논문 기법 아님) — PAG σ 창 양끝에서 0, 가운데서 최대(_pag_envelope_factor).
+OPT_PAG_COSINE = "sam3_guidance_pag_cosine_envelope"
+INFOTEXT_PAG_COSINE = "Anima PAG cosine envelope"
+INFOTEXT_PAG_ENVELOPE_EFFECTIVE = "Anima PAG envelope status"
 OPT_PREFIX_DEDUP = "sam3_guidance_pag_prefix_dedup"
 OPT_SEG_SEPARABLE = "sam3_guidance_seg_separable_blur"
 INFOTEXT_PREFIX_DEDUP = "Anima PAG prefix dedup"
@@ -289,10 +312,16 @@ _EXTRA_GENERATION_PARAM_KEYS = (
     "Anima DAVE",
     "Anima CNS Wavelet Noise",
     "Anima Modulation Guidance",
+    "Anima TSR",
+    "Anima Momentum Guidance",
+    "Anima HiGS",
+    "Anima HiFlow",
     INFOTEXT_PREFIX_DEDUP,
     INFOTEXT_SEG_SEPARABLE,
     INFOTEXT_CONTROLNET_GUARD,
     INFOTEXT_DAVE_PRE_DD,
+    INFOTEXT_PAG_COSINE,
+    INFOTEXT_PAG_ENVELOPE_EFFECTIVE,
 )
 
 
@@ -309,6 +338,20 @@ def _read_bool_option(name: str, default: bool = True) -> bool:
 
 def _on_ui_settings() -> None:
     section = ("sam3_guidance", "SAM Extra Guidance")
+    shared.opts.add_option(
+        OPT_PAG_COSINE,
+        shared.OptionInfo(
+            False,
+            "PAG 강도를 sigma 구간 양끝에서 부드럽게 줄이기 (자체 실험)",
+            gr.Checkbox,
+            section=section,
+            infotext=INFOTEXT_PAG_COSINE,
+        ).info(
+            "이 확장의 자체 실험 곡선이며 논문 기법이 아닙니다. 기본 끔은 기존 PAG와 같습니다. 켜면 실제 sigma 창 "
+            "안에서 0→최대 Scale→0의 cosine-squared 곡선을 씁니다. 구간 중앙에서만 지정한 Scale 전체가 적용되며 "
+            "평균 보정량이 줄어듭니다. SEG·SLG에는 적용하지 않습니다. 화질 효과는 미검증입니다."
+        ),
+    )
     shared.opts.add_option(
         OPT_PREFIX_DEDUP,
         shared.OptionInfo(
@@ -405,6 +448,81 @@ _ADG: dict = {
 
 
 # ---------------------------------------------------------------------------
+# S²-Guidance — the stochastic mode of SLG (sam3ext/guidance/s2.py). The SLG weak
+# row is reused; every model evaluation inside the S² window draws a fresh set of
+# skipped blocks from ``eligible`` and the term uses ``scale`` (ω).
+# ---------------------------------------------------------------------------
+
+_S2: dict = {
+    "on": False,
+    "scale": s2_guidance.DEFAULT_SCALE,
+    "ratio": s2_guidance.DEFAULT_RATIO,
+    "eligible": set(),
+    "start": s2_guidance.DEFAULT_START,
+    "end": s2_guidance.DEFAULT_END,
+    "seed": 0,
+    "pass_tag": "base",
+    "draws": 0,       # evaluations that drew a mask this pass (the RNG index)
+    "last": (),       # last drawn blocks (diagnostics)
+}
+
+
+# ---------------------------------------------------------------------------
+# Detail stages after the perturbation term (v0.30 detail suite), in this order:
+# HiFlow (hires pass) → Momentum Guidance → HiGS → TSR, then DCW/RDC. All default
+# off. ``flow`` is the model's parameterisation (sam3ext/guidance/sigmas.py).
+# ---------------------------------------------------------------------------
+
+_DETAIL: dict = {
+    "flow": None,          # True = rectified flow (Anima), False = eps/v, None = unknown
+    "warned": set(),       # stages that already logged a fallback this generation
+}
+
+_TSR: dict = {
+    "on": False,
+    "k": tsr_guidance.DEFAULT_K,
+    "sigma": tsr_guidance.DEFAULT_SIGMA,
+    "steps": 0,
+}
+
+_HIST: dict = {
+    "mg_on": False,
+    "mg_alpha": 0.5,
+    "mg_beta": 0.6,
+    "mg_normalize": False,
+    "mg_min": 0.30,        # noise-level window (σ on flow, σ/(1+σ) on eps/v)
+    "mg_max": 0.95,
+    "higs_on": False,
+    "higs_weight": 1.75,
+    "higs_eta": 0.0,
+    "higs_alpha": 0.75,
+    "higs_cutoff": 0.05,
+    "higs_t_min": 0.40,
+    "higs_t_max": 1.00,
+}
+
+_HIFLOW: dict = {
+    "enabled": False,
+    "alpha": hiflow_guidance.DEFAULT_ALPHA,
+    "beta": hiflow_guidance.DEFAULT_BETA,
+    "cutoff": hiflow_guidance.DEFAULT_CUTOFF,
+    # The base pass of a hires request records its x0 trajectory; the hires pass of the
+    # same request (``owner``) aligns with it. ``run_p`` is the request of the sampling
+    # run the coming model calls belong to (on_cfg_denoiser), so an ADetailer/inner run
+    # neither records into nor aligns with the trajectory.
+    "trajectory": Trajectory(),
+    "owner": None,         # weakref of the request that recorded the trajectory
+    "recording": False,
+    "applying": False,
+    "pass_p": None,        # weakref of the pass that records/applies
+    "run_p": None,
+    "offset": None,        # where the hires pass walks Forge's sampling_sigmas
+    "state": hiflow_guidance.HiFlowState(),
+    "recorded": 0,
+}
+
+
+# ---------------------------------------------------------------------------
 # Unified post-CFG, per-block, and sampler-noise feature configuration.
 # All defaults are neutral; merely installing/updating the extension cannot
 # alter a generation.
@@ -428,6 +546,11 @@ _CFG: dict = {
     "smc_resolved_preset": "Off",
     "smc_lambda": 6.0,
     "smc_k": 0.10,
+    # SMC controller: the original unit-L2 one (preset lambda/k above) or the adaptive sign one
+    # (sorryhyun's Anima form, sam3ext/guidance/cwm_smc.py apply_smc_adaptive) with its own α/λ.
+    "smc_mode": SMC_MODE_UNIT,
+    "smc_adaptive_alpha": SMC_ADAPTIVE_ALPHA,
+    "smc_adaptive_lambda": SMC_ADAPTIVE_LAMBDA,
     "steps": 0,
     "fit_error": None,
     # CFG scale the base override uses: ``args["cond_scale"]`` like the
@@ -1869,20 +1992,95 @@ def _pag_in_range(sigma) -> bool:
         return _percent_in_range()
 
 
+def _pag_envelope_factor(sigma) -> float:
+    """Our experimental strength curve in linear sigma space, not a published PAG variant.
+
+    ``sin²(π·u)`` with ``u = (σ_hi − σ)/(σ_hi − σ_lo)`` over PAG's own sigma window: 0 at both
+    ends, 1 in the middle. Off (Forge option OPT_PAG_COSINE) or without usable bounds it is the
+    constant 1.0 of the existing PAG."""
+    if not _STATE.get("pag_cosine_envelope", False):
+        return 1.0
+    try:
+        hi = float(_STATE["sigma_hi"])
+        lo = float(_STATE["sigma_lo"])
+        value = sigma_to_float(sigma)
+        if not all(math.isfinite(v) for v in (hi, lo, value)):
+            return 1.0
+        if hi < lo:
+            hi, lo = lo, hi
+        if hi <= lo:
+            return 1.0
+        u = (hi - value) / (hi - lo)
+        if u <= 0.0 or u >= 1.0:
+            return 0.0
+        return math.sin(math.pi * u) ** 2
+    except (TypeError, ValueError, IndexError, KeyError, AttributeError, RuntimeError, OverflowError):
+        # Missing model bounds retain the existing constant-strength behaviour.
+        return 1.0
+
+
 def _attn_rows_in_range(sigma) -> bool:
-    """Does this call get PAG/SEG weak rows? PAG: sigma window; SEG: step fraction."""
+    """Does this call get PAG/SEG weak rows? PAG: sigma window; SEG: step fraction.
+
+    With the experimental PAG envelope on, the window ends (factor 0) get no PAG weak rows."""
     if not (_STATE["attn_method"] and float(_STATE["attn_scale"]) > 0
             and _STATE["attn_targets"]):
         return False
     if _STATE["attn_method"] == "pag":
-        return _pag_in_range(sigma)
+        return _pag_in_range(sigma) and _pag_envelope_factor(sigma) > 0.0
     return _percent_in_range()
 
 
+def _s2_in_range() -> bool:
+    """S² window ``start <= pct <= end`` — the step fraction like SLG (same one-step lag)."""
+    pct = _pct_now()
+    return float(_S2["start"]) <= pct <= float(_S2["end"])
+
+
 def _slg_rows_in_range() -> bool:
-    """Does this call get SLG weak rows? Step fraction, as before the PAG window."""
-    return (bool(_STATE["slg_on"]) and float(_STATE["slg_scale"]) > 0
-            and bool(_STATE["slg_targets"]) and _percent_in_range())
+    """Does this call get SLG weak rows? Step fraction, as before the PAG window.
+
+    In S² mode the targets are redrawn per evaluation (``_s2_draw``) and the S² window applies."""
+    if not (bool(_STATE["slg_on"]) and float(_STATE["slg_scale"]) > 0):
+        return False
+    if _S2["on"]:
+        return bool(_S2["eligible"]) and _s2_in_range()
+    return bool(_STATE["slg_targets"]) and _percent_in_range()
+
+
+def _block_span_text(blocks) -> str:
+    """'1-27' for a contiguous run, else the comma list — short infotext for block sets."""
+    values = sorted(int(b) for b in blocks)
+    if not values:
+        return "none"
+    if values == list(range(values[0], values[-1] + 1)) and len(values) > 2:
+        return f"{values[0]}-{values[-1]}"
+    return ",".join(str(v) for v in values)
+
+
+def _s2_seed(p) -> int:
+    """The generation seed S² masks are drawn from: this batch's first seed, else ``p.seed``."""
+    for candidate in (
+        (getattr(p, "seeds", None) or [None])[0],
+        (getattr(p, "all_seeds", None) or [None])[0],
+        getattr(p, "seed", None),
+    ):
+        try:
+            if candidate is not None:
+                return int(candidate)
+        except (TypeError, ValueError):
+            continue
+    return 0
+
+
+def _s2_draw() -> None:
+    """Draw this evaluation's dropped blocks into ``slg_targets`` (S² mode only)."""
+    targets = s2_guidance.draw_blocks(
+        _S2["eligible"], float(_S2["ratio"]), _S2["seed"], _S2["pass_tag"], int(_S2["draws"]),
+    )
+    _S2["draws"] = int(_S2["draws"]) + 1
+    _S2["last"] = tuple(sorted(targets))
+    _STATE["slg_targets"] = targets
 
 
 def _pert_in_range(sigma) -> bool:
@@ -2116,6 +2314,10 @@ def _model_wrapper_inner(apply_model, w):
             _STATE["slg_raw"] = None
             _STATE["cond_raw"] = None
             _STATE["adg_skipped"] = False
+            # S²: one mask per model evaluation, shared by every wrapper call of it
+            # (low-VRAM splits, regional conditions).
+            if _STATE["on"] and _S2["on"] and _STATE["slg_on"]:
+                _s2_draw()
 
         chunk = batch // len(cou)
         cond_idx, uncond_idx = [], []
@@ -2745,11 +2947,20 @@ def _apply_cfg_base(args, incoming):
     uncond = args["uncond_denoised"].float()
     sigma = args.get("sigma")
 
+    adaptive_smc = _CFG.get("smc_mode") == SMC_MODE_ADAPTIVE
     if apg_on:
         # SMC -> APG -> CWM. APG consumes the (optionally SMC-smoothed) error
         # and already applies the CFG scale, so CWM runs on its output at 1.0.
         raw_error = cond - uncond
-        if smc_on:
+        if smc_on and adaptive_smc:
+            raw_error, _RUNTIME.smc_prev = apply_smc_adaptive(
+                raw_error,
+                sampler_sigma(args),
+                _RUNTIME.smc_prev,
+                float(_CFG["smc_adaptive_alpha"]),
+                float(_CFG["smc_adaptive_lambda"]),
+            )
+        elif smc_on:
             raw_error, _RUNTIME.smc_prev = apply_smc_error(
                 raw_error,
                 _RUNTIME.smc_prev,
@@ -2785,9 +2996,14 @@ def _apply_cfg_base(args, incoming):
         mode="smc+cwm" if smc_on and cwm_on else ("smc" if smc_on else "cwm"),
         alpha_low=float(_CFG["alpha_low"]),
         alpha_high=float(_CFG["alpha_high"]),
-        smc_lambda=float(_CFG["smc_lambda"]),
+        smc_lambda=float(
+            _CFG["smc_adaptive_lambda"] if adaptive_smc else _CFG["smc_lambda"]
+        ),
         smc_k=float(_CFG["smc_k"]),
         smc_previous=_RUNTIME.smc_prev,
+        smc_mode=SMC_MODE_ADAPTIVE if adaptive_smc else SMC_MODE_UNIT,
+        smc_sigma=sampler_sigma(args) if adaptive_smc else None,
+        smc_alpha=float(_CFG["smc_adaptive_alpha"]),
     )
     if smc_on:
         _RUNTIME.smc_prev = next_previous
@@ -2801,8 +3017,10 @@ def _apply_perturbation(args, base):
     (attention-perturbed for PAG/SEG, and/or layer-skipped for SLG). Forge's
     ``model.apply_model`` has already converted every prediction to denoised
     x0, so no eps/v/flow conversion is needed here. Each active term applies at
-    its full configured scale (the former auto-decay safety brake, which halved
-    each scale when >1 term was active, has been removed).
+    its full configured scale by default (the former auto-decay safety brake,
+    which halved each scale when >1 term was active, has been removed). The
+    optional experimental PAG-only envelope (_pag_envelope_factor) multiplies
+    the PAG scale in linear sigma space.
     Returns ``base`` unchanged on any problem."""
     cd = args["cond_denoised"].float()
     # Prefer the cond captured next to the weak predictions. Any post-CFG hook
@@ -2817,7 +3035,12 @@ def _apply_perturbation(args, base):
 
     terms = []
     if attn_raw is not None and attn_raw.shape == cd.shape:
-        terms.append((float(_STATE["attn_scale"]), attn_raw))
+        attn_scale = float(_STATE["attn_scale"])
+        envelope = _STATE["attn_method"] == "pag" and _STATE.get("pag_cosine_envelope", False)
+        if envelope:
+            attn_scale *= _pag_envelope_factor(args.get("sigma"))
+        if attn_scale > 0.0 or not envelope:
+            terms.append((attn_scale, attn_raw))
     if slg_raw is not None and slg_raw.shape == cd.shape:
         terms.append((float(_STATE["slg_scale"]), slg_raw))
     if not terms:
@@ -2863,6 +3086,218 @@ def _apply_perturbation(args, base):
     return result
 
 
+def _detail_warn_once(stage: str, message: str) -> None:
+    warned = _DETAIL["warned"]
+    if stage not in warned:
+        warned.add(stage)
+        _log(message)
+
+
+def _hiflow_run_callback(params) -> None:
+    """Remember the request of the sampling run the coming model calls belong to (HiFlow)."""
+    if not (_HIFLOW["recording"] or _HIFLOW["applying"]):
+        return
+    _HIFLOW["run_p"] = getattr(getattr(params, "denoiser", None), "p", None)
+
+
+script_callbacks.on_cfg_denoiser(_hiflow_run_callback)
+
+
+def _hiflow_clear() -> None:
+    """Drop the recorded trajectory and stop recording/aligning."""
+    _HIFLOW["trajectory"].clear()
+    _HIFLOW.update(
+        owner=None, recording=False, applying=False, pass_p=None, run_p=None,
+        offset=None, recorded=0,
+    )
+    _HIFLOW["state"] = hiflow_guidance.HiFlowState()
+
+
+def _hiflow_ref(p):
+    """A weak reference to the request, or a plain one for objects without weakref support.
+
+    The plain reference lives only until the request ends (postprocess clears it)."""
+    ref = _owner_ref(p)
+    return ref if ref is not None else (lambda obj=p: obj)
+
+
+def _hiflow_attach(p, enabled: bool) -> str:
+    """Start recording (base pass of a hires request) or aligning (its hires pass).
+
+    Returns what HiFlow does this pass: "record", "align", or a reason it does nothing."""
+    _HIFLOW.update(recording=False, applying=False, pass_p=None, run_p=None, offset=None)
+    _HIFLOW["state"] = hiflow_guidance.HiFlowState()
+    if not enabled:
+        _hiflow_clear()
+        return "off"
+    owner_ref = _HIFLOW["owner"]
+    owner = owner_ref() if callable(owner_ref) else None
+    if getattr(p, "is_hr_pass", False):
+        if owner is not p or not len(_HIFLOW["trajectory"]):
+            return "no base-pass trajectory"
+        _HIFLOW.update(applying=True, pass_p=_hiflow_ref(p), offset=_forge_sampling_offset(p))
+        return "align"
+    if not getattr(p, "enable_hr", False) or _is_img2img_request(p):
+        _hiflow_clear()
+        return "no hires fix"
+    _HIFLOW["trajectory"].clear()
+    _HIFLOW.update(owner=_hiflow_ref(p), recording=True, pass_p=_hiflow_ref(p), recorded=0)
+    return "record"
+
+
+def _hiflow_run_is_pass() -> bool:
+    """Do the current model calls belong to the pass HiFlow records/aligns (not an inner run)?"""
+    ref = _HIFLOW["pass_p"]
+    pass_p = ref() if callable(ref) else None
+    run_p = _HIFLOW["run_p"]
+    return run_p is None or run_p is pass_p
+
+
+def _detail_stages_on() -> bool:
+    return bool(
+        _TSR["on"] or _HIST["mg_on"] or _HIST["higs_on"]
+        or _HIFLOW["recording"] or _HIFLOW["applying"]
+    )
+
+
+def _hiflow_position(walked, sigma: float):
+    """``(fractional step k, N, on_schedule)`` of ``sigma`` on the hires pass's walked sigmas."""
+    if walked is None:
+        return None, None, None
+    try:
+        values = [float(v) for v in (walked.flatten().tolist() if hasattr(walked, "flatten") else walked)]
+    except (TypeError, ValueError, RuntimeError):
+        return None, None, None
+    if len(values) < 2:
+        return None, None, None
+    steps = len(values) - 1
+    index = schedule_index(values, sigma)
+    if index is not None:
+        return float(index), steps, True
+    for k in range(steps):
+        hi, lo = values[k], values[k + 1]
+        if hi >= sigma >= lo and hi != lo:
+            return k + (hi - sigma) / (hi - lo), steps, False
+    return None, steps, False
+
+
+def _hiflow_apply(args, result, sigma: float):
+    """HiFlow on a hires evaluation (sam3ext/guidance/hiflow.py); ``result`` when it cannot apply."""
+    lr = _HIFLOW["trajectory"].at(sigma, device=result.device)
+    if lr is None:
+        return result
+    if lr.ndim != result.ndim or tuple(lr.shape[:2]) != tuple(result.shape[:2]):
+        _detail_warn_once(
+            "hiflow_shape",
+            "HiFlow skipped: the base-pass trajectory "
+            f"{tuple(lr.shape)} does not match the hires latent {tuple(result.shape)} "
+            "(different batch or latent channels — e.g. a hires checkpoint of another family).",
+        )
+        return result
+    reference = hiflow_guidance.resize_latent(lr, tuple(result.shape[-2:]))
+    walked = _sampled_schedule(sampling_schedule(args), _HIFLOW["offset"])
+    position, steps, on_schedule = _hiflow_position(walked, sigma)
+    state = _HIFLOW["state"]
+    # A repeat of the last step sigma (Heun's corrector reused as the next predictor) and an
+    # off-schedule midpoint get the direction term only and leave the acceleration state alone.
+    step_start = on_schedule is not False and not (
+        state.prev_sigma is not None
+        and abs(float(state.prev_sigma) - sigma) <= 1e-4 * max(abs(sigma), 1e-12)
+    )
+    return hiflow_guidance.apply_hiflow(
+        result, sigma, reference, state,
+        alpha=float(_HIFLOW["alpha"]), beta=float(_HIFLOW["beta"]),
+        cutoff=float(_HIFLOW["cutoff"]),
+        weight=hiflow_guidance.step_weight(position, steps),
+        step_start=step_start,
+    )
+
+
+def _hiflow_record(args, result) -> None:
+    """Base pass: keep this evaluation's final x0 at the sampler's sigma (last one wins)."""
+    if not _hiflow_run_is_pass():
+        return
+    sigma = sampler_sigma(args)
+    if sigma is None or sigma <= 0.0 or not torch.is_tensor(result):
+        return
+    _HIFLOW["trajectory"].record(sigma, result)
+    _HIFLOW["recorded"] = len(_HIFLOW["trajectory"])
+
+
+def _apply_detail_stages(args, result, adg_skipped: bool):
+    """HiFlow (hires) → Momentum Guidance → HiGS → TSR on the guided x0 (all optional)."""
+    if not (_TSR["on"] or _HIST["mg_on"] or _HIST["higs_on"] or _HIFLOW["applying"]):
+        return result
+    x = args.get("input")
+    if not torch.is_tensor(x) or tuple(x.shape) != tuple(result.shape):
+        _detail_warn_once(
+            "input",
+            "detail stages (TSR/MG/HiGS/HiFlow) skipped: post-CFG input does not match the prediction.",
+        )
+        return result
+    sigma = sampler_sigma(args)
+    flow = _DETAIL["flow"]
+    if flow is None:
+        flow = is_flow_model(args.get("model"))
+
+    if _HIFLOW["applying"] and sigma is not None and sigma > 0.0 and _hiflow_run_is_pass():
+        try:
+            result = _hiflow_apply(args, result, sigma)
+        except Exception as e:
+            _detail_warn_once("hiflow", f"HiFlow fallback (earlier guidance kept): {type(e).__name__}: {e}")
+
+    if _HIST["mg_on"] or _HIST["higs_on"]:
+        history = _RUNTIME.history
+        if adg_skipped:
+            # A cond-only Adaptive Guidance step: no guided prediction to extend; start over
+            # once guidance comes back (like APG momentum).
+            history.reset()
+        else:
+            try:
+                schedule = sampling_schedule(args)
+                on_schedule = (
+                    None if schedule is None
+                    else schedule_index(schedule, sigma) is not None
+                )
+                role = history_guidance.step_role(history, sigma, on_schedule)
+                if _HIST["mg_on"]:
+                    level = history_guidance.noise_level(sigma, bool(flow)) if sigma else 0.0
+                    result = history_guidance.apply_mg(
+                        result, x, sigma, history,
+                        alpha=float(_HIST["mg_alpha"]), beta=float(_HIST["mg_beta"]),
+                        normalize=bool(_HIST["mg_normalize"]),
+                        active=float(_HIST["mg_min"]) <= level <= float(_HIST["mg_max"]),
+                        role=role,
+                    )
+                if _HIST["higs_on"]:
+                    result = history_guidance.apply_higs(
+                        result, sigma, history,
+                        weight=float(_HIST["higs_weight"]), eta=float(_HIST["higs_eta"]),
+                        alpha=float(_HIST["higs_alpha"]), cutoff=float(_HIST["higs_cutoff"]),
+                        t_min=float(_HIST["higs_t_min"]), t_max=float(_HIST["higs_t_max"]),
+                        flow=bool(flow), role=role,
+                    )
+            except Exception as e:
+                history.reset()
+                _detail_warn_once("history", f"MG/HiGS fallback (earlier guidance kept): {type(e).__name__}: {e}")
+
+    if _TSR["on"]:
+        if flow is None:
+            _detail_warn_once("tsr", "TSR skipped: the model's parameterisation (flow or eps/v) is unknown.")
+        else:
+            try:
+                rescaled = tsr_guidance.apply_tsr(
+                    result, x, args.get("sigma"),
+                    k=float(_TSR["k"]), tsr_sigma=float(_TSR["sigma"]), flow=bool(flow),
+                )
+                if rescaled is not result:
+                    _TSR["steps"] += 1
+                result = rescaled
+            except Exception as e:
+                _detail_warn_once("tsr", f"TSR fallback (earlier guidance kept): {type(e).__name__}: {e}")
+    return result
+
+
 def _post_cfg(args):
     """Single post-CFG orchestrator.
 
@@ -2899,7 +3334,8 @@ def _post_cfg(args):
     has_pert = not adg_skipped and _STATE["on"] and (
         _STATE["attn_raw"] is not None or _STATE["slg_raw"] is not None
     )
-    if not has_base_override and not has_pert and not _DCW["on"]:
+    detail_on = _detail_stages_on()
+    if not has_base_override and not has_pert and not _DCW["on"] and not detail_on:
         _RUNTIME.close_step()
         return denoised
 
@@ -2911,6 +3347,9 @@ def _post_cfg(args):
 
         if has_pert:
             result = _apply_perturbation(args, result)
+
+        if detail_on:
+            result = _apply_detail_stages(args, result, adg_skipped)
 
         if _DCW["on"]:
             try:
@@ -2946,6 +3385,12 @@ def _post_cfg(args):
                     "DCW/RDC fallback (earlier guidance kept): "
                     f"{type(e).__name__}: {e}"
                 )
+
+        if _HIFLOW["recording"]:
+            try:
+                _hiflow_record(args, result)
+            except Exception as e:
+                _detail_warn_once("hiflow_record", f"HiFlow recording failed: {type(e).__name__}: {e}")
 
         return result.to(denoised.dtype)
     except Exception as e:
@@ -3260,6 +3705,80 @@ def _make_pag_xyz_axis() -> None:
             "[Anima RDC] Alpha HH", float,
             partial(_pag_xyz_set, field="rdc_alpha_hh"),
         ),
+        # v0.30 detail suite — appended after the 52-axis prefix above.
+        xyz_grid.AxisOption(
+            "[Anima Pert] SLG Mode", str,
+            partial(_pag_xyz_set, field="slg_mode"),
+            choices=lambda: ["Fixed", "Stochastic (S²)"],
+        ),
+        xyz_grid.AxisOption(
+            "[Anima S2] Scale", float,
+            partial(_pag_xyz_set, field="s2_scale"),
+        ),
+        xyz_grid.AxisOption(
+            "[Anima S2] Drop Ratio", float,
+            partial(_pag_xyz_set, field="s2_ratio"),
+        ),
+        xyz_grid.AxisOption(
+            "[Anima S2] Eligible Blocks", str,
+            partial(_pag_xyz_set, field="s2_blocks"),
+        ),
+        xyz_grid.AxisOption(
+            "[Anima S2] Start", float,
+            partial(_pag_xyz_set, field="s2_start"),
+        ),
+        xyz_grid.AxisOption(
+            "[Anima S2] End", float,
+            partial(_pag_xyz_set, field="s2_end"),
+        ),
+        xyz_grid.AxisOption(
+            "[Anima SMC] Controller", str,
+            partial(_pag_xyz_set, field="smc_mode"),
+            choices=lambda: list(SMC_MODE_NAMES),
+        ),
+        xyz_grid.AxisOption(
+            "[Anima SMC] Adaptive Alpha", float,
+            partial(_pag_xyz_set, field="smc_adaptive_alpha"),
+        ),
+        xyz_grid.AxisOption(
+            "[Anima SMC] Adaptive Lambda", float,
+            partial(_pag_xyz_set, field="smc_adaptive_lambda"),
+        ),
+        xyz_grid.AxisOption(
+            "[Anima TSR] Enable", str,
+            partial(_pag_xyz_set, field="tsr_enabled"), choices=bool_choices,
+        ),
+        xyz_grid.AxisOption("[Anima TSR] K", float, partial(_pag_xyz_set, field="tsr_k")),
+        xyz_grid.AxisOption("[Anima TSR] Sigma", float, partial(_pag_xyz_set, field="tsr_sigma")),
+        xyz_grid.AxisOption(
+            "[Anima MG] Enable", str,
+            partial(_pag_xyz_set, field="mg_enabled"), choices=bool_choices,
+        ),
+        xyz_grid.AxisOption("[Anima MG] Alpha", float, partial(_pag_xyz_set, field="mg_alpha")),
+        xyz_grid.AxisOption("[Anima MG] Beta", float, partial(_pag_xyz_set, field="mg_beta")),
+        xyz_grid.AxisOption(
+            "[Anima MG] Normalize", str,
+            partial(_pag_xyz_set, field="mg_normalize"), choices=bool_choices,
+        ),
+        xyz_grid.AxisOption("[Anima MG] Window Min", float, partial(_pag_xyz_set, field="mg_min")),
+        xyz_grid.AxisOption("[Anima MG] Window Max", float, partial(_pag_xyz_set, field="mg_max")),
+        xyz_grid.AxisOption(
+            "[Anima HiGS] Enable", str,
+            partial(_pag_xyz_set, field="higs_enabled"), choices=bool_choices,
+        ),
+        xyz_grid.AxisOption("[Anima HiGS] Weight", float, partial(_pag_xyz_set, field="higs_weight")),
+        xyz_grid.AxisOption("[Anima HiGS] Eta", float, partial(_pag_xyz_set, field="higs_eta")),
+        xyz_grid.AxisOption("[Anima HiGS] History Alpha", float, partial(_pag_xyz_set, field="higs_alpha")),
+        xyz_grid.AxisOption("[Anima HiGS] Cutoff", float, partial(_pag_xyz_set, field="higs_cutoff")),
+        xyz_grid.AxisOption("[Anima HiGS] T Min", float, partial(_pag_xyz_set, field="higs_t_min")),
+        xyz_grid.AxisOption("[Anima HiGS] T Max", float, partial(_pag_xyz_set, field="higs_t_max")),
+        xyz_grid.AxisOption(
+            "[Anima HiFlow] Enable", str,
+            partial(_pag_xyz_set, field="hiflow_enabled"), choices=bool_choices,
+        ),
+        xyz_grid.AxisOption("[Anima HiFlow] Alpha", float, partial(_pag_xyz_set, field="hiflow_alpha")),
+        xyz_grid.AxisOption("[Anima HiFlow] Beta", float, partial(_pag_xyz_set, field="hiflow_beta")),
+        xyz_grid.AxisOption("[Anima HiFlow] Cutoff", float, partial(_pag_xyz_set, field="hiflow_cutoff")),
     ]
 
     # Register per label so a WebUI "reload scripts" after an extension update
@@ -3515,6 +4034,55 @@ class AnimaSafePAG(scripts.Script):
                 info="여러 블록을 건너뛸수록 불안정해질 수 있습니다. 이상하면 18 하나만 쓰세요.",
                 elem_id="anima_safe_pag_slg_blocks",
             )
+            slg_mode = gr.Radio(
+                label="SLG mode",
+                choices=["Fixed", "Stochastic (S²)"],
+                value="Fixed",
+                info=(
+                    "Fixed=위 블록을 늘 건너뜀(기존 SLG). S²=모델 호출마다 블록을 무작위로 새로 골라 "
+                    "건너뜀(S²-Guidance, ICLR 2026) — 아래 S² 값만 쓰고 위 SLG scale·블록은 쓰지 않습니다."
+                ),
+                elem_id="anima_safe_pag_slg_mode",
+            )
+            with gr.Accordion("S²-Guidance (SLG mode = Stochastic)", open=False):
+                gr.Markdown(
+                    "논문(arXiv 2508.12880) 본문 식 `CFG + ω·(cond − drop)` 그대로이며 공식 코드가 없어 논문으로 "
+                    "다시 구현했습니다. 기본값은 논문 권장: **ω 0.25**, 블록 0 제외, 전체 과정의 가운데 80% "
+                    "(0.10–0.90, 스텝 비율). 비율 0.05는 28·40·52블록 모델에서 1·2·3블록입니다(논문 표: 1–2블록이 "
+                    "가장 좋음). 블록은 시드·패스·호출 순번으로 정해져 같은 설정이면 같은 그림이 나옵니다. "
+                    "Anima 실측 A/B는 아직 없습니다."
+                )
+                s2_scale = gr.Slider(
+                    label="S² scale ω",
+                    minimum=0.0, maximum=5.0, step=0.01, value=s2_guidance.DEFAULT_SCALE,
+                    info="논문 권장 0.25(0.25~0.5가 최고점, 1 이상은 점수가 떨어짐). 형태가 흔들리면 낮추세요.",
+                    elem_id="anima_safe_pag_s2_scale",
+                )
+                s2_ratio = gr.Slider(
+                    label="S² drop ratio (호출마다 건너뛸 블록 비율 · 최소 1블록)",
+                    minimum=0.01, maximum=0.5, step=0.01, value=s2_guidance.DEFAULT_RATIO,
+                    info="많이 건너뛸수록 약한 예측이 크게 망가집니다. 논문 표는 1~2블록이 가장 좋았습니다.",
+                    elem_id="anima_safe_pag_s2_ratio",
+                )
+                s2_blocks = gr.Textbox(
+                    label="S² eligible blocks (빈칸=1~마지막 · 블록 0 제외)",
+                    value="",
+                    info="뽑을 수 있는 블록 범위입니다. 논문은 첫 블록(0)을 빼면 결과가 나빠진다고 보고했습니다.",
+                    elem_id="anima_safe_pag_s2_blocks",
+                )
+                with gr.Row():
+                    s2_start = gr.Slider(
+                        label="S² start (스텝 비율)",
+                        minimum=0.0, maximum=1.0, step=0.01, value=s2_guidance.DEFAULT_START,
+                        info="초반 구도가 흔들리면 늦추세요.",
+                        elem_id="anima_safe_pag_s2_start",
+                    )
+                    s2_end = gr.Slider(
+                        label="S² end (스텝 비율)",
+                        minimum=0.0, maximum=1.0, step=0.01, value=s2_guidance.DEFAULT_END,
+                        info="후반 디테일이 지저분하면 당기세요.",
+                        elem_id="anima_safe_pag_s2_end",
+                    )
 
             # Removed: the "auto-decay" safety brake that divided each PAG/SEG/
             # SLG scale by the active-term count. Perturbations now always apply
@@ -3785,6 +4353,30 @@ class AnimaSafePAG(scripts.Script):
                     info="보정이 튀거나 디테일이 깨지면 낮추세요. 0이면 Custom SMC가 중립입니다.",
                     elem_id="anima_guidance_smc_k",
                 )
+            smc_mode = gr.Radio(
+                label="SMC controller",
+                choices=list(SMC_MODE_NAMES),
+                value=SMC_MODE_UNIT,
+                info=(
+                    "Unit-L2=원본 ComfyUI-DCW 식(위 preset·Custom 값). 1MP Anima 잠재에서는 원소당 보정이 "
+                    "k/√N ≈ 4e-4라 거의 효과가 없습니다. Adaptive sign=sorryhyun의 Anima 판(원소별 sign, "
+                    "이득 α·mean|e|) — 아래 α·λ만 씁니다."
+                ),
+                elem_id="anima_guidance_smc_mode",
+            )
+            with gr.Row():
+                smc_adaptive_alpha = gr.Slider(
+                    label="Adaptive SMC α (이득 = α·mean|e|)",
+                    minimum=0.0, maximum=1.0, step=0.01, value=SMC_ADAPTIVE_ALPHA,
+                    info="원작 기본 0.2. 결과가 어두워지거나 거칠어지면 낮추세요(0=보정 없음).",
+                    elem_id="anima_guidance_smc_adaptive_alpha",
+                )
+                smc_adaptive_lambda = gr.Slider(
+                    label="Adaptive SMC λ",
+                    minimum=0.5, maximum=30.0, step=0.1, value=SMC_ADAPTIVE_LAMBDA,
+                    info="원작 기본 5. 원작자는 λ를 낮추면 어두워짐이 줄었다고 보고했습니다.",
+                    elem_id="anima_guidance_smc_adaptive_lambda",
+                )
 
             with gr.Accordion("Legacy CFG base mode (구버전 호환)", open=False):
                 gr.Markdown(
@@ -3882,6 +4474,171 @@ class AnimaSafePAG(scripts.Script):
                 minimum=0.1, maximum=25.0, step=0.1, value=2.0,
                 info="노이즈 분포가 과장되면 기본값 2.0으로 되돌린 뒤 Strength를 낮추세요.",
                 elem_id="anima_guidance_cns_gamma_scale",
+            )
+
+            gr.Markdown(
+                "---\n### 디테일 단계 — TSR · Momentum · HiGS · HiFlow\n"
+                "PAG/SEG/SLG 항 뒤, DCW 앞에서 **HiFlow → Momentum → HiGS → TSR** 순서로 돕니다. 추가 forward가 "
+                "없고 모두 기본 OFF입니다. 논문·원본 코드 그대로 옮겼지만 **Anima 실측 A/B는 아직 없습니다** — "
+                "XYZ로 고정 시드 비교부터 하세요. 비슷한 효과끼리(TSR·Detail Daemon·DCW lambda high, "
+                "Momentum·HiGS·APG momentum)는 한 번에 하나씩 비교하는 것을 권장합니다."
+            )
+            gr.Markdown(
+                "#### TSR — Temporal Score Rescaling\n"
+                "SNR에 따라 예측 점수를 다시 배율합니다(arXiv 2510.01184, ComfyUI 원본 노드 이식). k < 1이면 "
+                "노이즈가 거의 없을 때 예측 노이즈를 조금 더 남겨 잔디테일이 늘고, k > 1이면 매끈해집니다. "
+                "Forge 기본 Epsilon scaling은 eps 모델에서만 돌아 Anima·v-pred에는 없습니다."
+            )
+            tsr_enabled = gr.Checkbox(
+                label="Enable TSR",
+                value=False,
+                elem_id="anima_guidance_tsr_enable",
+                elem_classes=["sam3-on", "sam3-on--tsr"],
+            )
+            with gr.Row():
+                tsr_k = gr.Slider(
+                    label="TSR k (1=끔 · 낮을수록 디테일)",
+                    minimum=0.5, maximum=1.5, step=0.005, value=tsr_guidance.DEFAULT_K,
+                    info="원본 노드 기본 0.95, 논문 SD3 최적 0.93. 지저분해지면 1 쪽으로 올리세요.",
+                    elem_id="anima_guidance_tsr_k",
+                )
+                tsr_sigma = gr.Slider(
+                    label="TSR sigma (클수록 일찍 적용)",
+                    minimum=0.1, maximum=10.0, step=0.05, value=tsr_guidance.DEFAULT_SIGMA,
+                    info="원본 기본 1.0(Anima에서 σ≈0.5부터), 논문 SD3 최적 3.0(σ≈0.75부터).",
+                    elem_id="anima_guidance_tsr_sigma",
+                )
+
+            gr.Markdown(
+                "#### Momentum Guidance (MG)\n"
+                "앞 스텝 속도의 지수평균에서 멀어지는 쪽으로 현재 속도를 밀어 흐릿함을 줄입니다(arXiv 2602.20360, "
+                "flow 모델 Euler 기준 — `D + α·σ·(v − m)`). CFG가 낮을수록 효과가 크고, 2차·멀티스텝 샘플러는 "
+                "이미 외삽을 해서 겹칩니다. 창은 노이즈 수준(flow σ)입니다."
+            )
+            mg_enabled = gr.Checkbox(
+                label="Enable Momentum Guidance",
+                value=False,
+                elem_id="anima_guidance_mg_enable",
+                elem_classes=["sam3-on", "sam3-on--mg"],
+            )
+            with gr.Row():
+                mg_alpha = gr.Slider(
+                    label="MG α (밀어내는 세기)",
+                    minimum=0.0, maximum=3.0, step=0.05, value=0.5,
+                    info="논문 FLUX CFG 2.5~3.5 예시 0.5, 낮은 CFG에서는 1~1.5. 형태가 튀면 낮추세요.",
+                    elem_id="anima_guidance_mg_alpha",
+                )
+                mg_beta = gr.Slider(
+                    label="MG β (지수평균 기억)",
+                    minimum=0.0, maximum=0.95, step=0.05, value=0.6,
+                    info="논문 예시 0.6. 너무 크면 과보정합니다.",
+                    elem_id="anima_guidance_mg_beta",
+                )
+            mg_normalize = gr.Checkbox(
+                label="Normalize momentum (‖m‖을 ‖v‖에 맞춤 · 논문 §8.2)",
+                value=False,
+                elem_id="anima_guidance_mg_normalize",
+            )
+            with gr.Row():
+                mg_min = gr.Slider(
+                    label="MG window min (노이즈 수준)",
+                    minimum=0.0, maximum=1.0, step=0.01, value=0.30,
+                    info="논문 t∈[0.05,0.7] → σ 0.30~0.95. 후반 디테일이 지저분하면 올리세요.",
+                    elem_id="anima_guidance_mg_min",
+                )
+                mg_max = gr.Slider(
+                    label="MG window max (노이즈 수준)",
+                    minimum=0.0, maximum=1.0, step=0.01, value=0.95,
+                    info="초반 구도가 흔들리면 낮추세요.",
+                    elem_id="anima_guidance_mg_max",
+                )
+
+            gr.Markdown(
+                "#### HiGS — History-Guided Sampling\n"
+                "앞 스텝 예측의 지수평균과의 차이 중 **고주파(DCT 필터)**만 더해 디테일을 살립니다(arXiv 2509.22300, "
+                "ICLR 2026). 첫 스텝은 기록만 합니다. Anima는 CFG 4~5로 논문(2.5)보다 높아 과채도를 막는 η=0을 "
+                "기본으로 했습니다(논문 FID 설정). Momentum과 같은 기록을 써서 함께 켜면 겹칩니다."
+            )
+            higs_enabled = gr.Checkbox(
+                label="Enable HiGS",
+                value=False,
+                elem_id="anima_guidance_higs_enable",
+                elem_classes=["sam3-on", "sam3-on--higs"],
+            )
+            with gr.Row():
+                higs_weight = gr.Slider(
+                    label="HiGS weight w",
+                    minimum=0.0, maximum=3.0, step=0.05, value=1.75,
+                    info="논문 1.75(≤3). Res Multistep 같은 멀티스텝 샘플러에서는 1.75가 이미지를 무너뜨렸습니다"
+                         "(Anima 3.8B 실측) — 0.5 이하부터 시작하세요.",
+                    elem_id="anima_guidance_higs_weight",
+                )
+                higs_eta = gr.Slider(
+                    label="HiGS η (예측 방향 성분 비중)",
+                    minimum=0.0, maximum=1.0, step=0.05, value=0.0,
+                    info="0=예측과 수직 성분만(FID 설정), 1=그대로(선호도 설정). 과채도가 나면 0 쪽으로.",
+                    elem_id="anima_guidance_higs_eta",
+                )
+            with gr.Accordion("HiGS Advanced (세부값)", open=False):
+                with gr.Row():
+                    higs_alpha = gr.Slider(
+                        label="HiGS history α (지수평균 갱신)",
+                        minimum=0.05, maximum=0.95, step=0.05, value=0.75,
+                        info="논문 0.5 또는 0.75.",
+                        elem_id="anima_guidance_higs_alpha",
+                    )
+                    higs_cutoff = gr.Slider(
+                        label="HiGS high-pass cutoff R_c",
+                        minimum=0.0, maximum=0.5, step=0.005, value=0.05,
+                        info="논문 0.05 — 최저 주파수만 거의 빼 색 변화를 막습니다.",
+                        elem_id="anima_guidance_higs_cutoff",
+                    )
+                with gr.Row():
+                    higs_t_min = gr.Slider(
+                        label="HiGS t min (노이즈 수준 · 이하에서 끔)",
+                        minimum=0.0, maximum=1.0, step=0.01, value=0.40,
+                        info="논문 0.3~0.5. 후반 잡티가 늘면 올리세요.",
+                        elem_id="anima_guidance_higs_t_min",
+                    )
+                    higs_t_max = gr.Slider(
+                        label="HiGS t max (노이즈 수준)",
+                        minimum=0.0, maximum=1.0, step=0.01, value=1.00,
+                        info="논문 0.9~1.0.",
+                        elem_id="anima_guidance_higs_t_max",
+                    )
+
+            gr.Markdown(
+                "#### HiFlow — hires 패스 흐름 정렬\n"
+                "**Hires fix 전용.** 1차(저해상도) 패스의 x0 궤적을 기록했다가, hires 패스의 같은 노이즈 수준에서 "
+                "저주파(방향)와 스텝 간 변화(가속도)를 그 궤적에 맞춥니다(arXiv 2504.06232, NeurIPS 2025, 공식 코드 "
+                "이식). 1차 구도를 유지한 채 새 디테일을 만들도록 돕고, 가중치는 hires 스텝 동안 줄어듭니다. "
+                "공식 설정은 1차 30스텝 · hires 16스텝 · denoise 0.53 근처입니다. Hires fix를 켜지 않은 생성에서는 "
+                "아무것도 하지 않습니다."
+            )
+            hiflow_enabled = gr.Checkbox(
+                label="Enable HiFlow (hires fix)",
+                value=False,
+                elem_id="anima_guidance_hiflow_enable",
+                elem_classes=["sam3-on", "sam3-on--hiflow"],
+            )
+            with gr.Row():
+                hiflow_alpha = gr.Slider(
+                    label="HiFlow direction α",
+                    minimum=0.0, maximum=2.0, step=0.05, value=hiflow_guidance.DEFAULT_ALPHA,
+                    info="공식 1.0(2K 단계). 1차 구도에 너무 묶이면 낮추세요.",
+                    elem_id="anima_guidance_hiflow_alpha",
+                )
+                hiflow_beta = gr.Slider(
+                    label="HiFlow acceleration β",
+                    minimum=0.0, maximum=1.0, step=0.05, value=hiflow_guidance.DEFAULT_BETA,
+                    info="공식 0.5. 디테일 생성 쪽 정렬입니다. 얼룩지면 낮추세요.",
+                    elem_id="anima_guidance_hiflow_beta",
+                )
+            hiflow_cutoff = gr.Slider(
+                label="HiFlow low-pass cutoff D (Butterworth)",
+                minimum=0.05, maximum=1.0, step=0.01, value=hiflow_guidance.DEFAULT_CUTOFF,
+                info="공식 코드 0.2(논문 본문 0.4). 클수록 더 많은 대역을 1차 패스에 맞춥니다.",
+                elem_id="anima_guidance_hiflow_cutoff",
             )
 
             gr.Markdown(
@@ -4020,6 +4777,15 @@ class AnimaSafePAG(scripts.Script):
             # independent toggle plus all three upstream parameters.
             smc_master_enabled,
             rdc_enabled, rdc_tau, rdc_alpha_ll, rdc_alpha_hh,
+            # Appended in the v0.30 detail suite (62-70); all 62 older indexes stay put.
+            slg_mode, s2_scale, s2_ratio, s2_blocks, s2_start, s2_end,
+            smc_mode, smc_adaptive_alpha, smc_adaptive_lambda,
+            # 71-90: detail stages (TSR, Momentum Guidance, HiGS, HiFlow).
+            tsr_enabled, tsr_k, tsr_sigma,
+            mg_enabled, mg_alpha, mg_beta, mg_normalize, mg_min, mg_max,
+            higs_enabled, higs_weight, higs_eta, higs_alpha, higs_cutoff,
+            higs_t_min, higs_t_max,
+            hiflow_enabled, hiflow_alpha, hiflow_beta, hiflow_cutoff,
         ]
 
     def process_before_every_sampling(self, p, *args, **kwargs):
@@ -4037,11 +4803,17 @@ class AnimaSafePAG(scripts.Script):
             smc_on=False, apg_on=False, cwm_on=False,
             mode="preserve", experimental_stack=False, steps=0,
             smc_preset="Off", smc_resolved_preset="Off",
+            smc_mode=SMC_MODE_UNIT,
             fit_error=None, effective_scale=None, fit_scale=None,
             external_cfg_detected=False, warned=False, cfg1_warned=False,
             external_cfg_warned=False,
             base_skipped=False, fit_checked=False,
         )
+        _S2.update(on=False, eligible=set(), draws=0, last=())
+        _TSR.update(on=False, steps=0)
+        _HIST.update(mg_on=False, higs_on=False)
+        _DETAIL.update(flow=None, warned=set())
+        _HIFLOW.update(recording=False, applying=False, pass_p=None, run_p=None)
         _DCW.update(
             on=False,
             dcw_on=False,
@@ -4092,6 +4864,8 @@ class AnimaSafePAG(scripts.Script):
             cond_raw=None,
             adg_skipped=False, step_open=False,
             # 결과를 미세하게 바꾸는 Forge 설정 두 개 — 패스마다 읽어 infotext 와 맞춘다.
+            # PAG 강도 곡선(자체 실험, 기본 끔)도 패스마다 읽는다.
+            pag_cosine_envelope=_read_bool_option(OPT_PAG_COSINE, False),
             prefix_dedup=_read_bool_option(OPT_PREFIX_DEDUP, True),
             seg_separable=_read_bool_option(OPT_SEG_SEPARABLE, True),
             dedup_blocks=0, dedup_fallbacks=0, dedup_warned=False,
@@ -4206,6 +4980,17 @@ class AnimaSafePAG(scripts.Script):
             if "mod_enabled" in xyz
             else _as_bool(_arg(44, False), False)
         )
+
+        def _flag(key, raw):
+            value = _as_bool(raw, False)
+            return _as_bool(xyz[key], value) if key in xyz else value
+
+        # v0.30 detail stages (appended args 71, 74, 80, 87). The index stays a literal in
+        # _arg(N, …) like every other read here, so static contract scanners can see it.
+        tsr_enabled = _flag("tsr_enabled", _arg(71, False))
+        mg_enabled = _flag("mg_enabled", _arg(74, False))
+        higs_enabled = _flag("higs_enabled", _arg(80, False))
+        hiflow_enabled = _flag("hiflow_enabled", _arg(87, False))
         resolved_apg = apg_enabled or cfg_mode == "apg" or experimental_stack
         legacy_smc_requested = (
             legacy_smc_enabled
@@ -4250,6 +5035,8 @@ class AnimaSafePAG(scripts.Script):
             requested_modulation=mod_enabled,
         )
 
+        if not hiflow_enabled:
+            _hiflow_clear()
         if not any((
             pert_enabled,
             adg_enabled,
@@ -4261,6 +5048,10 @@ class AnimaSafePAG(scripts.Script):
             dave_enabled,
             cns_enabled,
             mod_enabled,
+            tsr_enabled,
+            mg_enabled,
+            higs_enabled,
+            hiflow_enabled,
         )):
             return
 
@@ -4374,6 +5165,59 @@ class AnimaSafePAG(scripts.Script):
                 "Auto-download official"
             )
             mod_adapter_path = str(_arg(55, "") or "")
+            # Appended after arg 61 (v0.30 detail suite) — every older index stays put.
+            slg_mode = str(
+                xyz["slg_mode"] if "slg_mode" in xyz else (_arg(62, "Fixed") or "Fixed")
+            ).strip().lower()
+            s2_mode = slg_mode.startswith("stoch") or slg_mode in {"s2", "s²"}
+            s2_scale = _xyz_num(
+                "s2_scale", float(_arg(63, s2_guidance.DEFAULT_SCALE))
+            )
+            s2_ratio = _xyz_num(
+                "s2_ratio", float(_arg(64, s2_guidance.DEFAULT_RATIO))
+            )
+            s2_block_spec = (
+                str(xyz["s2_blocks"])
+                if "s2_blocks" in xyz else str(_arg(65, "") or "")
+            )
+            s2_start = _xyz_num(
+                "s2_start", float(_arg(66, s2_guidance.DEFAULT_START))
+            )
+            s2_end = _xyz_num("s2_end", float(_arg(67, s2_guidance.DEFAULT_END)))
+            smc_mode = normalize_smc_mode(
+                xyz["smc_mode"] if "smc_mode" in xyz
+                else _arg(68, SMC_MODE_UNIT)
+            )
+            smc_adaptive_alpha = _xyz_num(
+                "smc_adaptive_alpha", float(_arg(69, SMC_ADAPTIVE_ALPHA))
+            )
+            smc_adaptive_lambda = _xyz_num(
+                "smc_adaptive_lambda", float(_arg(70, SMC_ADAPTIVE_LAMBDA))
+            )
+            tsr_k = _xyz_num("tsr_k", float(_arg(72, tsr_guidance.DEFAULT_K)))
+            tsr_sigma = _xyz_num(
+                "tsr_sigma", float(_arg(73, tsr_guidance.DEFAULT_SIGMA))
+            )
+            mg_alpha = _xyz_num("mg_alpha", float(_arg(75, 0.5)))
+            mg_beta = _xyz_num("mg_beta", float(_arg(76, 0.6)))
+            mg_normalize = _flag("mg_normalize", _arg(77, False))
+            mg_min = _xyz_num("mg_min", float(_arg(78, 0.30)))
+            mg_max = _xyz_num("mg_max", float(_arg(79, 0.95)))
+            higs_weight = _xyz_num("higs_weight", float(_arg(81, 1.75)))
+            higs_eta = _xyz_num("higs_eta", float(_arg(82, 0.0)))
+            higs_alpha = _xyz_num("higs_alpha", float(_arg(83, 0.75)))
+            higs_cutoff = _xyz_num("higs_cutoff", float(_arg(84, 0.05)))
+            higs_t_min = _xyz_num("higs_t_min", float(_arg(85, 0.40)))
+            higs_t_max = _xyz_num("higs_t_max", float(_arg(86, 1.00)))
+            hiflow_alpha = _xyz_num(
+                "hiflow_alpha", float(_arg(88, hiflow_guidance.DEFAULT_ALPHA))
+            )
+            hiflow_beta = _xyz_num(
+                "hiflow_beta", float(_arg(89, hiflow_guidance.DEFAULT_BETA))
+            )
+            hiflow_cutoff = _xyz_num(
+                "hiflow_cutoff", float(_arg(90, hiflow_guidance.DEFAULT_CUTOFF))
+            )
         except Exception as e:
             _STATE["on"] = False
             _APG["on"] = False
@@ -4442,6 +5286,39 @@ class AnimaSafePAG(scripts.Script):
         mod_end_layer = int(
             _finite_clamp(mod_end_layer, -1.0, 1024.0, -1.0)
         )
+        s2_scale = _finite_clamp(s2_scale, 0.0, 5.0, s2_guidance.DEFAULT_SCALE)
+        s2_ratio = _finite_clamp(s2_ratio, 0.0, 0.5, s2_guidance.DEFAULT_RATIO)
+        s2_start = _finite_clamp(s2_start, 0.0, 1.0, s2_guidance.DEFAULT_START)
+        s2_end = _finite_clamp(s2_end, 0.0, 1.0, s2_guidance.DEFAULT_END)
+        s2_start, s2_end = min(s2_start, s2_end), max(s2_start, s2_end)
+        smc_adaptive_alpha = _finite_clamp(
+            smc_adaptive_alpha, 0.0, 1.0, SMC_ADAPTIVE_ALPHA
+        )
+        smc_adaptive_lambda = _finite_clamp(
+            smc_adaptive_lambda, 0.5, 30.0, SMC_ADAPTIVE_LAMBDA
+        )
+        # TSR: the ComfyUI node's input range 0.01-100 for both (the UI slider is narrower).
+        tsr_k = _finite_clamp(tsr_k, 0.01, 100.0, tsr_guidance.DEFAULT_K)
+        tsr_sigma = _finite_clamp(tsr_sigma, 0.01, 100.0, tsr_guidance.DEFAULT_SIGMA)
+        mg_alpha = _finite_clamp(mg_alpha, 0.0, 3.0, 0.5)
+        mg_beta = _finite_clamp(mg_beta, 0.0, 0.99, 0.6)
+        mg_min = _finite_clamp(mg_min, 0.0, 1.0, 0.30)
+        mg_max = _finite_clamp(mg_max, 0.0, 1.0, 0.95)
+        mg_min, mg_max = min(mg_min, mg_max), max(mg_min, mg_max)
+        higs_weight = _finite_clamp(higs_weight, 0.0, 3.0, 1.75)
+        higs_eta = _finite_clamp(higs_eta, 0.0, 1.0, 0.0)
+        higs_alpha = _finite_clamp(higs_alpha, 0.01, 0.99, 0.75)
+        higs_cutoff = _finite_clamp(higs_cutoff, 0.0, 0.5, 0.05)
+        higs_t_min = _finite_clamp(higs_t_min, 0.0, 1.0, 0.40)
+        higs_t_max = _finite_clamp(higs_t_max, 0.0, 1.0, 1.00)
+        higs_t_min, higs_t_max = min(higs_t_min, higs_t_max), max(higs_t_min, higs_t_max)
+        hiflow_alpha = _finite_clamp(
+            hiflow_alpha, 0.0, 2.0, hiflow_guidance.DEFAULT_ALPHA
+        )
+        hiflow_beta = _finite_clamp(hiflow_beta, 0.0, 1.0, hiflow_guidance.DEFAULT_BETA)
+        hiflow_cutoff = _finite_clamp(
+            hiflow_cutoff, 0.05, 1.0, hiflow_guidance.DEFAULT_CUTOFF
+        )
 
         requested_start, requested_end = min(start, end), max(start, end)
         effective_end = requested_end
@@ -4465,6 +5342,9 @@ class AnimaSafePAG(scripts.Script):
             smc_resolved_preset=effective_smc_preset,
             smc_lambda=smc_lambda,
             smc_k=smc_k,
+            smc_mode=smc_mode,
+            smc_adaptive_alpha=smc_adaptive_alpha,
+            smc_adaptive_lambda=smc_adaptive_lambda,
         )
         _DCW.update(
             on=dcw_active,
@@ -4693,7 +5573,20 @@ class AnimaSafePAG(scripts.Script):
                         if pert_enabled:
                             if attn_method and scale > 0:
                                 attn_targets = _parse_blocks(block_spec, nblocks)
-                            if slg_on and slg_scale > 0:
+                            if slg_on and s2_mode:
+                                # S²: the eligible pool; each evaluation draws
+                                # its own subset of it (_s2_draw).
+                                s2_eligible = (
+                                    _parse_blocks(s2_block_spec, nblocks)
+                                    if s2_block_spec.strip()
+                                    else s2_guidance.default_eligible(nblocks)
+                                )
+                                if (
+                                    s2_scale > 0
+                                    and s2_guidance.count_for(s2_ratio, len(s2_eligible))
+                                ):
+                                    slg_targets = set(s2_eligible)
+                            elif slg_on and slg_scale > 0:
                                 slg_targets = _parse_blocks(
                                     slg_block_spec, nblocks
                                 )
@@ -4745,6 +5638,33 @@ class AnimaSafePAG(scripts.Script):
                 typed={},
             )
 
+        # ---- Detail stages (model-agnostic post-CFG; HiFlow needs a hires request) ----
+        _DETAIL["flow"] = is_flow_model(getattr(unet, "model", None))
+        _TSR.update(on=bool(tsr_enabled and tsr_k != 1.0), k=tsr_k, sigma=tsr_sigma, steps=0)
+        if tsr_enabled and _DETAIL["flow"] is None:
+            _log("TSR: the model's parameterisation is unknown here — it is decided per call.")
+        _HIST.update(
+            mg_on=bool(mg_enabled), mg_alpha=mg_alpha, mg_beta=mg_beta,
+            mg_normalize=bool(mg_normalize), mg_min=mg_min, mg_max=mg_max,
+            higs_on=bool(higs_enabled and higs_weight > 0.0), higs_weight=higs_weight,
+            higs_eta=higs_eta, higs_alpha=higs_alpha, higs_cutoff=higs_cutoff,
+            higs_t_min=higs_t_min, higs_t_max=higs_t_max,
+        )
+        if _HIST["mg_on"] and _HIST["higs_on"]:
+            _log(
+                "Momentum Guidance and HiGS are both on: they extrapolate along the same "
+                "history, so the push is counted twice (compare them one at a time)."
+            )
+        if _HIST["mg_on"] and resolved_apg and apg_momentum != 0.0:
+            _log("Momentum Guidance + APG momentum: two history extrapolations stack.")
+        _HIFLOW.update(
+            enabled=bool(hiflow_enabled), alpha=hiflow_alpha, beta=hiflow_beta,
+            cutoff=hiflow_cutoff,
+        )
+        hiflow_mode = _hiflow_attach(p, bool(hiflow_enabled))
+        if hiflow_enabled and hiflow_mode not in {"record", "align"}:
+            _log(f"HiFlow inactive this pass: {hiflow_mode}.")
+
         if pert_ok and _perturbation_oom_blocked(p):
             pert_ok = False
             _log(
@@ -4766,12 +5686,27 @@ class AnimaSafePAG(scripts.Script):
                 if sigma_hi is None:
                     _log("no predictor.percent_to_sigma — the PAG window "
                          "falls back to the step fraction.")
+            s2_active = bool(slg_on and s2_mode and slg_targets)
+            if s2_active:
+                _S2.update(
+                    on=True,
+                    scale=s2_scale,
+                    ratio=s2_ratio,
+                    eligible=set(slg_targets),
+                    start=s2_start,
+                    end=s2_end,
+                    seed=_s2_seed(p),
+                    pass_tag="hires" if getattr(p, "is_hr_pass", False) else "base",
+                    draws=0,
+                    last=(),
+                )
             _STATE.update(
                 on=True, attn_method=(attn_method if attn_targets else None),
                 attn_scale=scale, strength=strength, legacy_attn=legacy_attn,
                 seg_sigma=seg_sigma, head_spec=head_spec,
                 attn_targets=attn_targets,
-                slg_on=bool(slg_on and slg_targets), slg_scale=slg_scale,
+                slg_on=bool(slg_on and slg_targets),
+                slg_scale=(s2_scale if s2_active else slg_scale),
                 slg_targets=slg_targets, rescale=rescale,
                 rescale_mode=rescale_mode,
                 start=requested_start, end=effective_end,
@@ -4797,6 +5732,7 @@ class AnimaSafePAG(scripts.Script):
             _DAVE["on"],
             _CNS["on"],
             _MOD["on"],
+            _detail_stages_on(),
         )):
             return
 
@@ -4850,7 +5786,16 @@ class AnimaSafePAG(scripts.Script):
                     heads = head_spec.strip() or "all"
                     parts.append(f"{_STATE['attn_method'].upper()} mode={mode} scale={scale} "
                                  f"{detail} blocks={sorted(attn_targets)} heads={heads}")
-                if _STATE["slg_on"]:
+                if _STATE["slg_on"] and _S2["on"]:
+                    eligible = sorted(_S2["eligible"])
+                    parts.append(
+                        f"S2 scale={s2_scale} ratio={s2_ratio} "
+                        f"drop={s2_guidance.count_for(s2_ratio, len(eligible))}/{len(eligible)} "
+                        f"eligible={_block_span_text(eligible)} "
+                        f"window={_S2['start']:.2f}-{_S2['end']:.2f} "
+                        f"seed={_S2['seed']}:{_S2['pass_tag']}"
+                    )
+                elif _STATE["slg_on"]:
                     parts.append(f"SLG scale={slg_scale} skip={sorted(slg_targets)}")
                 p.extra_generation_params["Anima Perturbation Guidance"] = (
                     "; ".join(parts)
@@ -4863,6 +5808,18 @@ class AnimaSafePAG(scripts.Script):
                     + f"; range_mode={_STATE['range_mode']}"
                     + f"; rescale={rescale}({rescale_mode})"
                 )
+                if _STATE["attn_method"] == "pag" and _STATE.get("pag_cosine_envelope", False):
+                    p.extra_generation_params[INFOTEXT_PAG_COSINE] = "True"
+                    hi, lo = _STATE.get("sigma_hi"), _STATE.get("sigma_lo")
+                    usable = (
+                        hi is not None and lo is not None
+                        and math.isfinite(float(hi)) and math.isfinite(float(lo))
+                        and float(hi) != float(lo)
+                    )
+                    p.extra_generation_params[INFOTEXT_PAG_ENVELOPE_EFFECTIVE] = (
+                        "cosine-squared in linear sigma window"
+                        if usable else "constant fallback: no usable sigma window"
+                    )
                 # The wrapper writes INFOTEXT_CONTROLNET_GUARD here if it blocks.
                 _STATE["guard_params"] = p.extra_generation_params
                 # 결과를 미세하게 바꾸는 설정(재현성). 붙여넣기 때 같은 Forge 설정으로
@@ -4888,14 +5845,22 @@ class AnimaSafePAG(scripts.Script):
                     name for name, on in
                     (("SMC", smc_on), ("APG", apg_on), ("CWM", cwm_on)) if on
                 ]
+                if smc_on and smc_mode == SMC_MODE_ADAPTIVE:
+                    smc_text = (
+                        f", smc={SMC_MODE_ADAPTIVE}"
+                        f"(alpha={smc_adaptive_alpha:g},lambda={smc_adaptive_lambda:g})"
+                    )
+                elif smc_on:
+                    smc_text = (
+                        f", smc={smc_preset_label}"
+                        f"({smc_lambda:g},{smc_k:g})"
+                    )
+                else:
+                    smc_text = ""
                 p.extra_generation_params["Anima CFG Orchestrator"] = (
                     "→".join(active)
                     + (f", alpha=({cwm_alpha_low},{cwm_alpha_high})" if cwm_on else "")
-                    + (
-                        f", smc={smc_preset_label}"
-                        f"({smc_lambda:g},{smc_k:g})"
-                        if smc_on else ""
-                    )
+                    + smc_text
                 )
             if _DCW["on"]:
                 p.extra_generation_params["Anima DCW"] = (
@@ -4930,6 +5895,23 @@ class AnimaSafePAG(scripts.Script):
                 p.extra_generation_params["Anima Adaptive Guidance"] = (
                     f"skip_after={_ADG['start']:.2f}, keep_every={_ADG['interval']}"
                 )
+            if _TSR["on"]:
+                p.extra_generation_params["Anima TSR"] = f"k={tsr_k}, sigma={tsr_sigma}"
+            if _HIST["mg_on"]:
+                p.extra_generation_params["Anima Momentum Guidance"] = (
+                    f"alpha={mg_alpha}, beta={mg_beta}, "
+                    f"normalize={bool(mg_normalize)}, window={mg_min:.2f}-{mg_max:.2f}"
+                )
+            if _HIST["higs_on"]:
+                p.extra_generation_params["Anima HiGS"] = (
+                    f"w={higs_weight}, eta={higs_eta}, alpha={higs_alpha}, "
+                    f"cutoff={higs_cutoff}, t={higs_t_min:.2f}-{higs_t_max:.2f}"
+                )
+            if _HIFLOW["applying"]:
+                p.extra_generation_params["Anima HiFlow"] = (
+                    f"alpha={hiflow_alpha}, beta={hiflow_beta}, cutoff={hiflow_cutoff}, "
+                    f"reference={len(_HIFLOW['trajectory'])} sigmas"
+                )
             _log(
                 f"attached ✅ engine={engine} "
                 f"pert={'on' if _STATE['on'] else 'off'} "
@@ -4937,7 +5919,14 @@ class AnimaSafePAG(scripts.Script):
                 f"mode={'legacy' if legacy_attn else 'official'} "
                 f"strength={strength} heads={head_spec.strip() or 'all'} "
                 f"seg_sigma={seg_sigma} "
-                f"slg={_STATE['slg_on']}:{sorted(slg_targets)} scale={slg_scale} "
+                + (
+                    f"s2=on(scale={s2_scale} ratio={s2_ratio} "
+                    f"eligible={_block_span_text(_S2['eligible'])} "
+                    f"window={_S2['start']:.2f}-{_S2['end']:.2f}) "
+                    if _S2["on"] else
+                    f"slg={_STATE['slg_on']}:{sorted(slg_targets)} scale={slg_scale} "
+                )
+                +
                 f"range={_STATE['requested_start']:.2f}-{_STATE['requested_end']:.2f}"
                 f"→{_STATE['start']:.2f}-{_STATE['end']:.2f}"
                 f" pag_sigma={_sigma_window_text()}"
@@ -4952,9 +5941,13 @@ class AnimaSafePAG(scripts.Script):
                 f"(skip_after={_ADG['start']} keep_every={_ADG['interval']}) "
                 f"CFGBase={_CFG['mode']} stack={_CFG['experimental_stack']} "
                 f"cfg1_uncond={cfg1_uncond} "
-                f"SMC={smc_preset_label}"
-                f"({smc_lambda:g},{smc_k:g}) "
-                f"DCW={_DCW['dcw_on']} RDC={_DCW['rdc_on']} "
+                + (
+                    f"SMC={SMC_MODE_ADAPTIVE}(alpha={smc_adaptive_alpha:g},"
+                    f"lambda={smc_adaptive_lambda:g}) "
+                    if resolved_smc and smc_mode == SMC_MODE_ADAPTIVE else
+                    f"SMC={smc_preset_label}({smc_lambda:g},{smc_k:g}) "
+                )
+                + f"DCW={_DCW['dcw_on']} RDC={_DCW['rdc_on']} "
                 f"DAVE={_DAVE['on']} CNS={_CNS['on']} "
                 f"Mod={'on' if _MOD['on'] else 'off'}"
                 + (
@@ -4962,6 +5955,11 @@ class AnimaSafePAG(scripts.Script):
                     f"blocks={_MOD['start_layer']}-{_MOD['end_layer']})"
                     if _MOD["on"] else ""
                 )
+                + f" TSR={'on' if _TSR['on'] else 'off'}"
+                + f" MG={'on' if _HIST['mg_on'] else 'off'}"
+                + f" HiGS={'on' if _HIST['higs_on'] else 'off'}"
+                + f" HiFlow={hiflow_mode}"
+                + f" flow={_DETAIL['flow']}"
             )
         except Exception as e:
             _STATE["on"] = False
@@ -4978,6 +5976,10 @@ class AnimaSafePAG(scripts.Script):
                 block_modulations=None,
                 typed={},
             )
+            _S2["on"] = False
+            _TSR["on"] = False
+            _HIST.update(mg_on=False, higs_on=False)
+            _HIFLOW.update(recording=False, applying=False)
             _RUNTIME.reset_pass()
             _log(f"failed to attach hooks: {type(e).__name__}: {e}")
 
@@ -5008,6 +6010,9 @@ class AnimaSafePAG(scripts.Script):
             _STATE["requested_dave"],
             _STATE["requested_cns"],
             _STATE["requested_modulation"],
+            # The detail stages (TSR/MG/HiGS/HiFlow) report in the same summary, also when on alone.
+            _detail_stages_on(),
+            _HIFLOW["enabled"],
         ))
         if guidance_diagnostics_enabled() and verify_requested:
             elapsed = None
@@ -5054,6 +6059,25 @@ class AnimaSafePAG(scripts.Script):
                 f"elapsed={elapsed_text}"
             )
 
+            if _S2["on"]:
+                _log(
+                    "[VERIFY] S2: "
+                    f"draws={_S2['draws']} last_drop={list(_S2['last'])} "
+                    f"eligible={_block_span_text(_S2['eligible'])} "
+                    f"window={_S2['start']:.2f}-{_S2['end']:.2f}"
+                )
+            if _detail_stages_on() or _HIFLOW["enabled"]:
+                counters = _RUNTIME.history.counters
+                hiflow_counts = _HIFLOW["state"].counters
+                _log(
+                    "[VERIFY] detail: "
+                    f"TSR={'APPLIED(%d evals)' % _TSR['steps'] if _TSR['on'] else 'OFF'}, "
+                    f"MG={'APPLIED(%d evals)' % counters['mg'] if _HIST['mg_on'] else 'OFF'}, "
+                    f"HiGS={'APPLIED(%d evals)' % counters['higs'] if _HIST['higs_on'] else 'OFF'}, "
+                    f"HiFlow=recorded {len(_HIFLOW['trajectory'])} sigmas, "
+                    f"direction {hiflow_counts['direction']} / acceleration "
+                    f"{hiflow_counts['acceleration']} evals, flow={_DETAIL['flow']}"
+                )
             if (
                 not _STATE["requested_pert"]
                 or _STATE["requested_method"] not in {"pag", "seg"}
@@ -5161,6 +6185,12 @@ class AnimaSafePAG(scripts.Script):
         _STATE["on"] = False
         _APG["on"] = False
         _ADG["on"] = False
+        _S2.update(on=False, eligible=set(), draws=0, last=())
+        _TSR.update(on=False, steps=0)
+        _HIST.update(mg_on=False, higs_on=False)
+        _DETAIL.update(flow=None, warned=set())
+        _hiflow_clear()
+        _HIFLOW["enabled"] = False
         _CFG.update(
             smc_on=False,
             apg_on=False,
@@ -5169,6 +6199,7 @@ class AnimaSafePAG(scripts.Script):
             experimental_stack=False,
             smc_preset="Off",
             smc_resolved_preset="Off",
+            smc_mode=SMC_MODE_UNIT,
             steps=0,
             fit_error=None,
             effective_scale=None,

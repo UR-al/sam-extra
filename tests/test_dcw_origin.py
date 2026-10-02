@@ -354,7 +354,9 @@ class InputTypesOriginTests(DcwOriginTestCase):
         self.assertFalse(placeholder.visible)
         self.assertIs(placeholder.value, True)
         self.assertTrue(getattr(placeholder, "do_not_save_to_config", False))
-        self.assertEqual(len(inputs), 62)
+        # 62 = the prefix this slot belongs to; the v0.30 detail suite appends 62-90.
+        self.assertEqual(len(inputs), 91)
+        self.assertEqual(inputs[61].elem_id, "anima_guidance_rdc_alpha_hh")
 
     def test_smc_presets_and_constants_match_upstream(self):
         """origin: dcw_node.py:75-94 (presets, names), 243-290 (_ch_energy_weight, _SMC_CLAMP_MIN)."""

@@ -11,6 +11,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, MutableMapping
 
+from .history import HistoryState
+
 
 @dataclass
 class GuidanceRuntime:
@@ -25,6 +27,8 @@ class GuidanceRuntime:
     rdc_state: dict[str, Any] = field(default_factory=dict)
     cns_x_t: Any = None
     cns_noise_calls: int = 0
+    # MG/HiGS velocity and prediction EMAs (sam3ext/guidance/history.py), one run at a time.
+    history: HistoryState = field(default_factory=HistoryState)
 
     def reset_cfg_state(self) -> None:
         self.apg["avg"] = None
@@ -36,6 +40,7 @@ class GuidanceRuntime:
         self.rdc_state.clear()
         self.cns_x_t = None
         self.cns_noise_calls = 0
+        self.history.reset()
         self.state["active"] = 0
         self.state["step_open"] = False
         self.state["attn_raw"] = None
