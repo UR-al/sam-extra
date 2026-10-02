@@ -712,7 +712,8 @@ D'   = D + w(t)·iDCT(H·DCT(ΔD(η))),   H = sigmoid(50·(R − R_c))   (정규
 `Log Guidance verification summary`를 켜면 `[VERIFY] detail: TSR=APPLIED(n evals), MG=…, HiGS=…,
 HiFlow=recorded n sigmas, direction n / acceleration n evals, flow=True|False`가 남습니다. 여기서 n은 **실제로 결과를
 바꾼 호출 수**입니다. 붙기만 하고 한 번도 적용되지 않으면 0입니다. 첫 호출은 기록만 하므로 MG·HiGS는 호출 수보다
-적고, 창 밖 호출도 세지 않습니다.
+적고, 창 밖 호출도 세지 않습니다. TSR·MG·HiGS는 패스마다 0부터 세므로, Hires.fix를 켜면 hires 패스의 수가 남습니다.
+v0.30.0에서는 MG·HiGS 수가 한 Forge 실행 동안 생성마다 더해졌습니다. 이미지는 바뀌지 않았고, v0.30.1에서 고쳤습니다.
 
 ## 조합 원칙
 
