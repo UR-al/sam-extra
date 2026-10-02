@@ -1,5 +1,10 @@
+# Runtime deps of forge_sam3_extension. install.py reads this file and installs only the
+# missing ones into the Forge venv (installed packages are never up/downgraded; with
+# --sam3-no-auto-install it only prints the pip command). Keep this file ASCII-only:
+# pip decodes it with the locale code page on Windows.
+# torch/torchvision are deliberately absent: Forge installs the CUDA build, and
+# `pip install -r requirements.txt` must never swap it for the default PyPI wheel.
 sam3
-torch
 safetensors
 opencv-python
 timm
@@ -7,9 +12,11 @@ einops
 huggingface_hub
 iopath
 pydantic
-py-cpuinfo
-protobuf
 packaging
 numpy
 Pillow>=11.1.0
 gradio<6.0,>=4.0
+# Anima Tile-Repair vendor (kohya-ss sd-scripts, cloned by install.py) imports this when it
+# loads. Pure Python, so auto-installing it is safe. Same pin as the vendor's own
+# requirements.txt: 2.x reports EXIF-rotated sizes, 1.4.1 does not.
+imagesize==1.4.1

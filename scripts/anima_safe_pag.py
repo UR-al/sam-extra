@@ -59,6 +59,7 @@ generation — worst case it logs and renders normally.
 """
 from __future__ import annotations
 
+import gc
 import math
 import importlib
 import re
@@ -72,20 +73,48 @@ from pathlib import Path
 import gradio as gr
 
 from modules import script_callbacks, scripts
+
+from sam3ext import layout_lanes
 try:
     from modules import shared
 except ImportError:  # standalone/unit-test loader
     shared = None  # type: ignore
 from sam3ext.guidance.cns import color_noise_wavelet
 from sam3ext.guidance.cwm_smc import (
+    SMC_ADAPTIVE_ALPHA,
+    SMC_ADAPTIVE_LAMBDA,
+    SMC_MODE_ADAPTIVE,
+    SMC_MODE_NAMES,
+    SMC_MODE_UNIT,
     SMC_PRESET_NAMES,
     apply_cwm_error,
+    apply_smc_adaptive,
     apply_smc_error,
     compose_cfg,
+    normalize_smc_mode,
     normalize_smc_preset,
     resolve_smc_preset,
 )
+from sam3ext.guidance import hiflow as hiflow_guidance
+from sam3ext.guidance import history as history_guidance
+from sam3ext.guidance import s2 as s2_guidance
+from sam3ext.guidance import tsr as tsr_guidance
+from sam3ext.guidance.sigmas import (
+    is_flow_model,
+    sampler_sigma,
+    sampling_schedule,
+    schedule_index,
+)
+from sam3ext.guidance.trajectory import Trajectory
 from sam3ext.guidance.dave import apply_dave
+from sam3ext.guidance.dave_gate import (
+    DEFAULT_BLOCKS as DAVE_DEFAULT_BLOCKS,
+    ForwardGateCache,
+    attenuation_active as dave_attenuation_active,
+    pre_dd_sigma,
+    sampled_schedule as _sampled_schedule,
+    step_gate as dave_step_gate,
+)
 from sam3ext.guidance.dcw import apply_dcw
 from sam3ext.guidance.modulation import (
     clear_modulation_caches,
@@ -93,6 +122,12 @@ from sam3ext.guidance.modulation import (
     prepare_block_modulations,
 )
 from sam3ext.guidance.runtime import GuidanceRuntime
+from sam3ext.guidance.sigma_window import percent_range_to_sigmas, sigma_active, sigma_to_float
+from sam3ext.guidance.ui_config_migration import (
+    CNS_GAMMA_SCALE_LABEL,
+    PAG_SCALE_LABEL,
+    migrate_ui_config_file,
+)
 try:
     from guidance_diagnostics import guidance_diagnostics_enabled
 except ImportError:  # standalone/unit-test loader without extension root on sys.path
@@ -155,7 +190,19 @@ _STATE: dict = {
     "rescale": 0.20,      # std-matching rescale factor
     "rescale_mode": "full",  # full=CFG+guidance, partial=cond+guidance std source
     "start": 0.0,         # start percent of sampling
-    "end": 0.7,           # end percent of sampling
+    # End percent of sampling, cut at the Adaptive Guidance start when ADG runs
+    # with keep-every 0. Step-fraction gate of SEG/SLG, and of PAG without a
+    # predictor.
+    "end": 0.7,
+    # PAG's window: upstream converts the percents with the model's
+    # percent_to_sigma once and tests every model call's sigma against it, both
+    # ends inclusive (origin: iljung1106/comfyui-anima-safe-pag@905b0107
+    # :__init__.py:15-34, sam3ext/guidance/sigma_window.py). Set at attach time
+    # from predictor.percent_to_sigma and the *requested* percents — ADG's cut
+    # is its own skip branch in the wrapper, not a sigma bound. None → no
+    # predictor (or no PAG), step-percent fallback.
+    "sigma_hi": None,     # sigma at the start percent (upper bound)
+    "sigma_lo": None,     # sigma at the requested end percent (lower bound)
     "total": 20,          # total steps this pass
     "step": 0,            # current step counter
     # A sampling step may invoke the model wrapper more than once when Forge
@@ -192,6 +239,9 @@ _STATE: dict = {
     "split_cond_calls": 0,
     "split_uncond_calls": 0,
     "control_blocked_calls": 0,
+    # This pass's p.extra_generation_params, so the wrapper can record the
+    # ControlNet guard (INFOTEXT_CONTROLNET_GUARD) when it actually blocks.
+    "guard_params": None,
     "wrapper_fallbacks": 0,
     "requested_pert": False,
     "requested_apg": False,
@@ -201,6 +251,7 @@ _STATE: dict = {
     "requested_smc": False,
     "requested_cwm": False,
     "requested_dcw": False,
+    "requested_rdc": False,
     "requested_dave": False,
     "requested_cns": False,
     "requested_modulation": False,
@@ -208,7 +259,48 @@ _STATE: dict = {
     "engine": "?",
     "diag_started_at": None,
     "delta_logged": False,
+    # 확장 배치가 OOM 으로 실패하면 그 생성(같은 p 의 남은 패스·배치)의
+    # perturbation 을 끈다. p 는 약한 참조로만 들고 postprocess 에서 푼다.
+    "pass_owner": None,
+    "pert_oom_owner": None,
+    # 앞쪽 블록 중복 제거(Forge 설정 OPT_PREFIX_DEDUP, 생성마다 읽음). 첫 target
+    # 블록 이전에는 weak 행이 cond 행과 입력·연산이 같으므로 원래 배치 행만
+    # forward 하고 weak 자리에는 cond 행 출력을 복사한다.
+    "prefix_dedup": True,
+    # 공식 SEG blur 를 가로·세로 1D depthwise 두 번으로(Forge 설정 OPT_SEG_SEPARABLE).
+    "seg_separable": True,
+    # 확장 forward 한 번 동안만 유효한 표식(_clear_markers 가 지운다).
+    "dedup_until": None,  # 첫 target 블록 번호. None = 이번 forward 에서 중복 제거 안 함
+    "dedup_src": None,    # 붙인 weak 행의 원본 cond 행 인덱스(원래 배치 기준)
+    "dedup_next": 0,      # 다음에 와야 하는 블록 번호(연속·순서 확인)
+    # 생성 단위 진단/안전장치.
+    "dedup_blocks": 0,     # 중복 제거로 돈 블록 호출 수
+    "dedup_fallbacks": 0,  # 조건이 안 맞아 예전 경로(전체 배치)로 돈 횟수
+    "dedup_warned": False,
+    "dedup_disabled": False,  # 잘린 배치 forward 가 예외를 내면 이 생성은 끈다
 }
+
+# Forge 설정(섹션 'SAM Extra Guidance'). infotext 이름은 붙여넣기 때 같은 설정으로
+# 되돌아가도록 OptionInfo(infotext=...) 로도 등록한다(값은 "True"/"False").
+# PAG 강도 곡선: 이 확장의 자체 실험(논문 기법 아님) — PAG σ 창 양끝에서 0, 가운데서 최대(_pag_envelope_factor).
+OPT_PAG_COSINE = "sam3_guidance_pag_cosine_envelope"
+INFOTEXT_PAG_COSINE = "Anima PAG cosine envelope"
+INFOTEXT_PAG_ENVELOPE_EFFECTIVE = "Anima PAG envelope status"
+OPT_PREFIX_DEDUP = "sam3_guidance_pag_prefix_dedup"
+OPT_SEG_SEPARABLE = "sam3_guidance_seg_separable_blur"
+INFOTEXT_PREFIX_DEDUP = "Anima PAG prefix dedup"
+# DAVE + Detail Daemon: the gate looks up the sigma before Detail Daemon scaled it
+# (sam3ext/guidance/dave_gate.py note_pre_dd_sigma). Off = the originals' behaviour.
+OPT_DAVE_PRE_DD = "sam3_guidance_dave_pre_dd_sigma"
+INFOTEXT_DAVE_PRE_DD = "Anima DAVE pre-DD sigma"
+INFOTEXT_SEG_SEPARABLE = "Anima SEG separable blur"
+# ControlNet 가드(호스트 차이): 원본 노드는 ControlNet 과 함께 PAG 를 돌리지만 이 확장은
+# ControlNet 이 붙은 호출에서 PAG/SEG/SLG 를 쉰다. 실제로 막힌 패스에만 적는다(설명용,
+# 붙여넣기 때 되돌릴 설정은 없다).
+INFOTEXT_CONTROLNET_GUARD = "Anima Perturbation ControlNet guard"
+INFOTEXT_CONTROLNET_GUARD_VALUE = (
+    "PAG/SEG/SLG skipped while ControlNet is active (Forge guard; the ComfyUI node does not skip)"
+)
 
 _EXTRA_GENERATION_PARAM_KEYS = (
     "Anima Perturbation Guidance",
@@ -216,10 +308,108 @@ _EXTRA_GENERATION_PARAM_KEYS = (
     "Anima Adaptive Guidance",
     "Anima CFG Orchestrator",
     "Anima DCW",
+    "Anima RDC",
     "Anima DAVE",
     "Anima CNS Wavelet Noise",
     "Anima Modulation Guidance",
+    "Anima TSR",
+    "Anima Momentum Guidance",
+    "Anima HiGS",
+    "Anima HiFlow",
+    INFOTEXT_PREFIX_DEDUP,
+    INFOTEXT_SEG_SEPARABLE,
+    INFOTEXT_CONTROLNET_GUARD,
+    INFOTEXT_DAVE_PRE_DD,
+    INFOTEXT_PAG_COSINE,
+    INFOTEXT_PAG_ENVELOPE_EFFECTIVE,
 )
+
+
+def _read_bool_option(name: str, default: bool = True) -> bool:
+    """Forge 설정값. 설정이 없거나 Forge 밖(테스트)이면 ``default``."""
+    try:
+        opts = getattr(shared, "opts", None)
+        if opts is None:
+            return default
+        return bool(getattr(opts, name, default))
+    except Exception:
+        return default
+
+
+def _on_ui_settings() -> None:
+    section = ("sam3_guidance", "SAM Extra Guidance")
+    shared.opts.add_option(
+        OPT_PAG_COSINE,
+        shared.OptionInfo(
+            False,
+            "PAG 강도를 sigma 구간 양끝에서 부드럽게 줄이기 (자체 실험)",
+            gr.Checkbox,
+            section=section,
+            infotext=INFOTEXT_PAG_COSINE,
+        ).info(
+            "이 확장의 자체 실험 곡선이며 논문 기법이 아닙니다. 기본 끔은 기존 PAG와 같습니다. 켜면 실제 sigma 창 "
+            "안에서 0→최대 Scale→0의 cosine-squared 곡선을 씁니다. 구간 중앙에서만 지정한 Scale 전체가 적용되며 "
+            "평균 보정량이 줄어듭니다. SEG·SLG에는 적용하지 않습니다. 화질 효과는 미검증입니다."
+        ),
+    )
+    shared.opts.add_option(
+        OPT_PREFIX_DEDUP,
+        shared.OptionInfo(
+            True,
+            "PAG/SEG/SLG: 첫 target 블록 이전의 weak 행 중복 계산 건너뛰기",
+            gr.Checkbox,
+            section=section,
+            infotext=INFOTEXT_PREFIX_DEDUP,
+        ).info(
+            "켜면(기본) 첫 target 블록(기본 18) 이전 블록은 원래 cond/uncond 행만 돌리고 weak 행 자리에는 "
+            "cond 행 출력을 복사합니다 — 그 블록들에서 weak 행은 cond 행과 입력·연산이 같습니다. "
+            "기본 블록(18)에서 PAG 한 장에 약 9% 빨라지고 앞쪽 블록의 활성 VRAM 도 줄어듭니다(추정). 행 수가 안 맞거나 "
+            "모르는 블록 인자가 있으면 그 블록부터 예전 경로(전체 배치)로 돕니다. 행렬 곱의 배치 크기가 "
+            "달라져 결과가 아주 미세하게 달라질 수 있어 infotext 에 남깁니다. 끄면 예전 경로 그대로입니다."
+        ),
+    )
+    shared.opts.add_option(
+        OPT_SEG_SEPARABLE,
+        shared.OptionInfo(
+            True,
+            "SEG(공식): query Gaussian blur 를 가로·세로 1D 두 번으로 계산",
+            gr.Checkbox,
+            section=section,
+            infotext=INFOTEXT_SEG_SEPARABLE,
+        ).info(
+            "켜면(기본) 같은 Gaussian 커널을 2D 한 번 대신 가로·세로 1D depthwise conv 두 번으로 적용합니다 — "
+            "커널 크기 k 에서 픽셀당 곱셈이 k² 에서 2k 로 줄어듭니다. 수학적으로 같은 blur 지만 반올림 순서가 "
+            "달라 결과가 아주 미세하게 달라질 수 있어 infotext 에 남깁니다. 끄면 예전 2D conv 그대로입니다."
+        ),
+    )
+    shared.opts.add_option(
+        OPT_DAVE_PRE_DD,
+        shared.OptionInfo(
+            True,
+            "DAVE + Detail Daemon: DAVE 적용 스텝을 Detail Daemon 이 바꾸기 전 σ 로 판정(우회)",
+            gr.Checkbox,
+            section=section,
+            infotext=INFOTEXT_DAVE_PRE_DD,
+        ).info(
+            "Detail Daemon 은 모델에 넘기는 σ 를 줄이고, DAVE 는 그 σ 를 스케줄에서 찾아 앞쪽 몇 스텝에만 "
+            "적용합니다. 줄어든 σ 는 스케줄에 없어 원본 규칙대로면 '0번 스텝'으로 판정돼 DAVE 가 모든 스텝에 "
+            "걸리고 이미지가 무너집니다(원본 ComfyUI 노드 둘을 이어도 같음). 켜면(기본) Detail Daemon 이 바꾸기 "
+            "전 σ 로 판정해 둘을 함께 써도 DAVE 가 원래 구간(tau)에만 걸립니다. Detail Daemon 을 끈 생성은 "
+            "켜고 끔에 관계없이 같습니다. 끄면 원본 노드 조합과 같은 동작입니다."
+        ),
+    )
+
+
+def _register_settings_hook() -> None:
+    register = getattr(script_callbacks, "on_ui_settings", None)
+    if register is not None and shared is not None:
+        try:
+            register(_on_ui_settings)
+        except Exception:
+            pass
+
+
+_register_settings_hook()
 
 
 # ---------------------------------------------------------------------------
@@ -258,6 +448,81 @@ _ADG: dict = {
 
 
 # ---------------------------------------------------------------------------
+# S²-Guidance — the stochastic mode of SLG (sam3ext/guidance/s2.py). The SLG weak
+# row is reused; every model evaluation inside the S² window draws a fresh set of
+# skipped blocks from ``eligible`` and the term uses ``scale`` (ω).
+# ---------------------------------------------------------------------------
+
+_S2: dict = {
+    "on": False,
+    "scale": s2_guidance.DEFAULT_SCALE,
+    "ratio": s2_guidance.DEFAULT_RATIO,
+    "eligible": set(),
+    "start": s2_guidance.DEFAULT_START,
+    "end": s2_guidance.DEFAULT_END,
+    "seed": 0,
+    "pass_tag": "base",
+    "draws": 0,       # evaluations that drew a mask this pass (the RNG index)
+    "last": (),       # last drawn blocks (diagnostics)
+}
+
+
+# ---------------------------------------------------------------------------
+# Detail stages after the perturbation term (v0.30 detail suite), in this order:
+# HiFlow (hires pass) → Momentum Guidance → HiGS → TSR, then DCW/RDC. All default
+# off. ``flow`` is the model's parameterisation (sam3ext/guidance/sigmas.py).
+# ---------------------------------------------------------------------------
+
+_DETAIL: dict = {
+    "flow": None,          # True = rectified flow (Anima), False = eps/v, None = unknown
+    "warned": set(),       # stages that already logged a fallback this generation
+}
+
+_TSR: dict = {
+    "on": False,
+    "k": tsr_guidance.DEFAULT_K,
+    "sigma": tsr_guidance.DEFAULT_SIGMA,
+    "steps": 0,
+}
+
+_HIST: dict = {
+    "mg_on": False,
+    "mg_alpha": 0.5,
+    "mg_beta": 0.6,
+    "mg_normalize": False,
+    "mg_min": 0.30,        # noise-level window (σ on flow, σ/(1+σ) on eps/v)
+    "mg_max": 0.95,
+    "higs_on": False,
+    "higs_weight": 1.75,
+    "higs_eta": 0.0,
+    "higs_alpha": 0.75,
+    "higs_cutoff": 0.05,
+    "higs_t_min": 0.40,
+    "higs_t_max": 1.00,
+}
+
+_HIFLOW: dict = {
+    "enabled": False,
+    "alpha": hiflow_guidance.DEFAULT_ALPHA,
+    "beta": hiflow_guidance.DEFAULT_BETA,
+    "cutoff": hiflow_guidance.DEFAULT_CUTOFF,
+    # The base pass of a hires request records its x0 trajectory; the hires pass of the
+    # same request (``owner``) aligns with it. ``run_p`` is the request of the sampling
+    # run the coming model calls belong to (on_cfg_denoiser), so an ADetailer/inner run
+    # neither records into nor aligns with the trajectory.
+    "trajectory": Trajectory(),
+    "owner": None,         # weakref of the request that recorded the trajectory
+    "recording": False,
+    "applying": False,
+    "pass_p": None,        # weakref of the pass that records/applies
+    "run_p": None,
+    "offset": None,        # where the hires pass walks Forge's sampling_sigmas
+    "state": hiflow_guidance.HiFlowState(),
+    "recorded": 0,
+}
+
+
+# ---------------------------------------------------------------------------
 # Unified post-CFG, per-block, and sampler-noise feature configuration.
 # All defaults are neutral; merely installing/updating the extension cannot
 # alter a generation.
@@ -273,24 +538,56 @@ _CFG: dict = {
     # OR-ed into the toggles above by _cfg_base_flags().
     "mode": "preserve",  # preserve | apg | cwm | smc | smc+cwm
     "experimental_stack": False,
-    "alpha_low": 0.30,
-    "alpha_high": 0.15,
+    # Upstream DCW(+a) defaults: alpha_l/alpha_h 0.0 (neutral), smc_k 0.1
+    # (origin: namemechan/ComfyUI-DCW@66aaf9dd:dcw_node.py:675-704, 738-747).
+    "alpha_low": 0.0,
+    "alpha_high": 0.0,
     "smc_preset": "Off",
     "smc_resolved_preset": "Off",
     "smc_lambda": 6.0,
     "smc_k": 0.10,
+    # SMC controller: the original unit-L2 one (preset lambda/k above) or the adaptive sign one
+    # (sorryhyun's Anima form, sam3ext/guidance/cwm_smc.py apply_smc_adaptive) with its own α/λ.
+    "smc_mode": SMC_MODE_UNIT,
+    "smc_adaptive_alpha": SMC_ADAPTIVE_ALPHA,
+    "smc_adaptive_lambda": SMC_ADAPTIVE_LAMBDA,
     "steps": 0,
     "fit_error": None,
+    # CFG scale the base override uses: ``args["cond_scale"]`` like the
+    # upstream cfg hook (× Forge's edit_strength, see _cfg_scale_from_args).
     "effective_scale": None,
+    # Least-squares fit of the incoming CFG result — diagnostics only.
+    "fit_scale": None,
     "external_cfg_detected": False,
     "warned": False,
+    # Another extension registered ``sampler_cfg_function`` (RescaleCFG,
+    # Dynamic Thresholding…): SMC/CWM step aside like upstream, warned once.
+    "external_cfg_warned": False,
+    # CFG 1 guard: without disable_cfg1_optimization Forge skips the uncond
+    # pass at cond_scale≈1; APG is always skipped there. Log once per generation.
+    "cfg1_warned": False,
+    # 이번 post-CFG 호출에서 CFG 1 가드로 APG 를 건너뛰었는가(스텝마다
+    # _apply_cfg_base 가 다시 씀). 건너뛴 스텝은 APG 가 돌지 않았으므로 PAG
+    # rescale 자동 끄기(apg_autooff_rescale)도 적용하지 않는다.
+    "base_skipped": False,
+    # fit_error 는 경고 한 줄과 [VERIFY] 요약에만 쓰인다. 진단이 꺼져 있으면
+    # 패스마다 첫 평가에서만 재고(동기화 1회), 이후 스텝은 건너뛴다.
+    "fit_checked": False,
 }
 
 _DCW: dict = {
     "on": False,
-    "lambda_low": 0.10,
-    "lambda_high": 0.02,
+    "dcw_on": False,
+    "rdc_on": False,
+    # Upstream defaults (origin: namemechan/ComfyUI-DCW@66aaf9dd:dcw_node.py:636-667).
+    "lambda_low": 0.05,
+    "lambda_high": 0.01,
     "steps": 0,
+    "dcw_steps": 0,
+    "rdc_steps": 0,
+    "rdc_tau": 0.0,
+    "rdc_alpha_ll": 0.03,
+    "rdc_alpha_hh": 0.0,
 }
 
 _DAVE: dict = {
@@ -299,14 +596,51 @@ _DAVE: dict = {
     "tau": 0.10,
     "targets": set(),
     "steps": 0,
+    # Early-step gate (sam3ext/guidance/dave_gate.py): one sigma lookup per
+    # forward, shared by the pooled blocks. Replaced at every attach.
+    "gate": ForwardGateCache(),
+    # False for Forge's CompVis timestep samplers, which publish no
+    # ``sampling_sigmas`` (see _sampler_publishes_sigmas).
+    "schedule_ok": True,
+    # Where this pass's walked sigmas start in ``sampling_sigmas``
+    # (_forge_sampling_offset): 0 for txt2img, steps - t_enc - 1 for
+    # img2img/hires, None = unknown (whole list). Set at every attach,
+    # together with the request it belongs to (``offset_p``).
+    "offset": None,
+    "offset_p": None,
+    # Forge option OPT_DAVE_PRE_DD, read at every attach (default on).
+    "pre_dd": True,
+    # The sampling run the next block calls belong to (_dave_run_callback):
+    # its request and ``launch_sampling`` step count (see _dave_offset).
+    "run_p": None,
+    "run_steps": 0,
 }
 
 _CNS: dict = {
     "on": False,
+    # Upstream defaults (origin: namemechan/comfyui-cns_sampler_patch@42278b13
+    # :cns_sampler_patch.py:391-439 INPUT_TYPES).
     "strength": 1.0,
     "gamma_power": 0.5,
-    "gamma_scale": 3.0,
+    "gamma_scale": 2.0,
     "warned": False,
+    # Where the live x_t comes from this pass (_install_cns_x_capture):
+    # "callback" = the sampler's step callback like upstream, "post_cfg" =
+    # fallback when the sampler has no wrappable callback_state.
+    "capture": "post_cfg",
+    # True once the wrapped callback has recorded an x in this pass.
+    "callback_seen": False,
+    # Which sampler runs get colored noise (_install_cns_sampler_scope):
+    # "sampler" = only while the attached pass's p.sampler is sampling, like
+    # upstream, whose node returns a new SAMPLER that hands its CNS noise
+    # sampler to that one call or patches kds only until a finally
+    # (origin: namemechan/comfyui-cns_sampler_patch@42278b13:
+    # cns_sampler_patch.py:544-608); a nested run of a p without this script
+    # (ADetailer's filtered img2img) stays white. "pass" = fallback for a
+    # sampler whose launch_sampling cannot be wrapped: while CNS is on.
+    "scope": "pass",
+    # True while the wrapped launch_sampling of the attached sampler runs.
+    "live": False,
 }
 
 _MOD: dict = {
@@ -361,8 +695,13 @@ _PATCHED_CNS_TARGETS: list = []  # [(sampling_module, brownian_cls_or_None)]
 # ---------------------------------------------------------------------------
 
 
-def _gaussian_blur_2d(img, sigma: float):
-    """Official SEG separable Gaussian kernel, applied depthwise over H/W."""
+def _gaussian_blur_2d(img, sigma: float, separable: bool = True):
+    """Official SEG separable Gaussian kernel, applied depthwise over H/W.
+
+    ``separable=True`` 는 같은 1D 커널을 가로(1×k)·세로(k×1) depthwise conv 로
+    두 번 적용한다(픽셀당 곱셈 k² → 2k). 반사 패딩을 먼저 한 번에 하므로 2D
+    conv 와 수학적으로 같고, 반올림 순서만 달라 결과가 아주 미세하게 다를 수
+    있다. ``False`` 는 예전 2D 외적 커널 conv 그대로다(Forge 설정으로 고른다)."""
     if F is None or sigma <= 0:
         return img
     height, width = int(img.shape[-2]), int(img.shape[-1])
@@ -381,6 +720,17 @@ def _gaussian_blur_2d(img, sigma: float):
     x = torch.linspace(-half, half, steps=kernel_size, device=img.device, dtype=torch.float32)
     pdf = torch.exp(-0.5 * (x / float(sigma)).pow(2))
     kernel_1d = (pdf / pdf.sum()).to(dtype=img.dtype)
+    if separable:
+        channels = img.shape[-3]
+        img = F.pad(img, [kernel_size // 2] * 4, mode="reflect")
+        horizontal = kernel_1d.reshape(1, 1, 1, kernel_size).expand(
+            channels, 1, 1, kernel_size
+        )
+        vertical = kernel_1d.reshape(1, 1, kernel_size, 1).expand(
+            channels, 1, kernel_size, 1
+        )
+        img = F.conv2d(img, horizontal, groups=channels)
+        return F.conv2d(img, vertical, groups=channels)
     kernel_2d = torch.mm(kernel_1d[:, None], kernel_1d[None, :])
     kernel_2d = kernel_2d.expand(img.shape[-3], 1, kernel_size, kernel_size)
     img = F.pad(img, [kernel_size // 2] * 4, mode="reflect")
@@ -388,7 +738,13 @@ def _gaussian_blur_2d(img, sigma: float):
 
 
 def _parse_attention_heads(spec: str, n: int) -> set:
-    """Parse an optional attention-head list; an empty value selects all."""
+    """Parse an optional attention-head list; an empty value selects all.
+
+    Reversed ranges are swapped like upstream ('7-4' → 4..7; origin:
+    iljung1106/comfyui-anima-safe-pag@905b0107:__init__.py:44-51, 61-64).
+    Invalid parts are skipped instead of raising (host policy: never fail the
+    generation over a text field).
+    """
     if n <= 0:
         return set()
     spec = (spec or "").strip()
@@ -402,8 +758,9 @@ def _parse_attention_heads(spec: str, n: int) -> set:
             a, _, b = part.partition("-")
             try:
                 start, end = int(a), int(b)
-                if start <= end:
-                    out.update(range(start, end + 1))
+                if end < start:
+                    start, end = end, start
+                out.update(range(start, end + 1))
             except ValueError:
                 pass
         else:
@@ -414,6 +771,17 @@ def _parse_attention_heads(spec: str, n: int) -> set:
     return {i for i in out if 0 <= i < n}
 
 
+def _head_index(heads: list, device):
+    """head 축 인덱스를 장치 위 LongTensor 로(캐시) 돌려준다.
+
+    파이썬 리스트로 인덱싱하면 PyTorch 가 매번 CPU LongTensor 를 만들어 GPU 로
+    올린다(forward 중간의 동기 H2D, 인덱싱마다 1회). 같은 값의 장치 텐서로
+    인덱싱하면 같은 index/index_put 커널이 같은 출력 배치로 돌므로 결과는
+    비트 단위로 같다. slice 로 바꾸면 lerp 입력의 메모리 배치가 달라져 CPU 에서
+    마지막 비트가 달라지는 경우가 있어(FMA 벡터 경로) 쓰지 않는다."""
+    return _index_tensor(heads, device)
+
+
 def _official_seg_query(
     query,
     a0: int,
@@ -422,6 +790,7 @@ def _official_seg_query(
     spatial_shape=None,
     strength: float = 1.0,
     head_spec: str = "",
+    separable: bool = True,
 ):
     """Blur only appended weak-row queries over Anima's real spatial axes.
 
@@ -437,7 +806,7 @@ def _official_seg_query(
         if sigma > 9999.0:
             spatial = spatial.mean(dim=(-2, -1), keepdim=True).expand_as(spatial)
         else:
-            spatial = _gaussian_blur_2d(spatial, sigma)
+            spatial = _gaussian_blur_2d(spatial, sigma, separable)
         perturbed = spatial.reshape(b, t, n, d, h, w).permute(0, 1, 4, 5, 2, 3)
     elif weak.ndim == 4:  # B,S,N,D (current Forge Neo)
         if not spatial_shape or len(spatial_shape) != 3:
@@ -455,7 +824,7 @@ def _official_seg_query(
         if sigma > 9999.0:
             spatial = spatial.mean(dim=(-2, -1), keepdim=True).expand_as(spatial)
         else:
-            spatial = _gaussian_blur_2d(spatial, sigma)
+            spatial = _gaussian_blur_2d(spatial, sigma, separable)
         perturbed = (
             spatial.reshape(b, t, n, d, h, w)
             .permute(0, 1, 4, 5, 2, 3)
@@ -468,9 +837,10 @@ def _official_seg_query(
         return query
     strength = min(1.0, max(0.0, float(strength)))
     blended = weak.clone()
-    blended[..., heads, :] = torch.lerp(
-        weak[..., heads, :],
-        perturbed[..., heads, :],
+    head_idx = _head_index(heads, weak.device)
+    blended[..., head_idx, :] = torch.lerp(
+        weak[..., head_idx, :],
+        perturbed[..., head_idx, :],
         strength,
     )
     result = query.clone()
@@ -508,6 +878,7 @@ def _patched_anima_attention_op(query, key, value, *args, **kwargs):
                 _STATE.get("attn_spatial_shape"),
                 float(_STATE["strength"]),
                 str(_STATE.get("head_spec", "")),
+                bool(_STATE.get("seg_separable", True)),
             )
         out = original(query, key, value, *args, **kwargs)
         if a1 > out.shape[0]:
@@ -549,9 +920,10 @@ def _patched_anima_attention_op(query, key, value, *args, **kwargs):
         else:
             return out
         weak = result_heads[a0:a1]
-        weak[..., heads, :] = torch.lerp(
-            out_heads[a0:a1, :, heads, :],
-            target[..., heads, :],
+        head_idx = _head_index(heads, out_heads.device)
+        weak[..., head_idx, :] = torch.lerp(
+            out_heads[a0:a1, :, head_idx, :],
+            target[..., head_idx, :],
             strength,
         )
         result_heads[a0:a1] = weak
@@ -559,10 +931,16 @@ def _patched_anima_attention_op(query, key, value, *args, **kwargs):
         _STATE["attn_hook_hits_total"] += 1
         return result_heads.reshape_as(out)
     except Exception as e:  # never let the patch break sampling
+        # 여기서는 기록만 한다. except 안에서 원본 op 를 다시 돌리면 살아 있는
+        # 예외의 __traceback__ 이 실패한 호출의 중간 활성값을 붙잡은 채 두 번째
+        # attention 이 돌아 VRAM 이 이중으로 든다.
         _log(f"attention perturb skipped: {type(e).__name__}: {e}")
-        if out is not None:
-            return out
-        return original(original_query, key, value, *args, **kwargs)
+
+    # except 블록 밖: 예외·traceback 이 풀린 뒤 반환/재시도한다(결과는 같다).
+    if out is not None:
+        return out
+    query = None  # noqa: F841 - 교란된(SEG) query 를 재시도 전에 해제
+    return original(original_query, key, value, *args, **kwargs)
 
 
 _patched_anima_attention_op._anima_pag_owner = _PATCH_OWNER
@@ -655,6 +1033,301 @@ def _modulate_block_call(idx: int, args, kwargs):
         return args, kwargs
 
 
+# ---------------------------------------------------------------------------
+# 앞쪽 블록 중복 제거(효율 보고서 2026-09-23 [2]).
+#
+# 확장 forward 에서 weak 행은 cond 행의 사본(x·timestep·조건 모두 index_select)이고,
+# 첫 target 블록(PAG/SEG 의 attn_targets, SLG 의 slg_targets 중 가장 앞) 이전에는
+# perturbation 이 없으므로 행마다 독립인 블록에서 weak 행 출력은 cond 행 출력과 같다.
+# 그 구간에서는 원래 배치 행([:batch])만 원본 forward 로 돌리고 weak 자리에는 cond 행
+# 출력을 복사한다. Modulation Guidance(adaln 에 행마다 같은 delta)·DAVE(행별 평균)·
+# NegPiP(행별 마스크)·3.8B 커넥터(행별 run 마커로 DiT forward 에서 미리 확장한 조건)는
+# 모두 행 단위라 이 전제를 깨지 않는다.
+#
+# 행 수를 전제로 하는 소비자와 충돌하지 않도록 블록 인자는 아는 것만 자른다.
+# 모르는 kwargs, 행 수가 확장 배치도 1(브로드캐스트)도 아닌 텐서, transformer_options
+# 안의 모르는 확장-배치 텐서가 있으면 그 블록부터 이번 forward 는 예전 경로(전체 배치)다.
+# ---------------------------------------------------------------------------
+
+# Forge Anima ``Block.forward`` 의 인자 이름(backend/nn/anima.py). Comfy 계열도 같다.
+_DEDUP_BLOCK_KWARGS = frozenset({
+    "x_B_T_H_W_D",
+    "emb_B_T_D",
+    "crossattn_emb",
+    "rope_emb_L_1_1_D",
+    "adaln_lora_B_T_3D",
+    "extra_per_block_pos_emb",
+    "transformer_options",
+})
+_DEDUP_MAX_POSITIONAL = 7
+# transformer_options 안에서 확장 배치 행 수를 가진 텐서 중 잘라도 되는 것.
+# negpip_mask: NegPiP 의 DiT forward 훅(또는 3.8B 런타임)이 c_negpip_mask 를 그대로
+# 옮겨 둔 것. NegPiP cross-attn 은 x 행 수 // 마스크 행 수 로 반복하므로 x 와 같이
+# 잘라야 한다. sigmas·cond_mark 는 Forge 가 원래 배치 행 수로 만들어 자를 것이 없다.
+_DEDUP_OPTION_ROW_KEYS = frozenset({"negpip_mask"})
+_DEDUP_UNSUPPORTED = object()
+
+
+def _dedup_slice_tensor(value, batch: int, extended: int):
+    if value is None:
+        return value
+    if not torch.is_tensor(value):
+        return _DEDUP_UNSUPPORTED
+    if value.ndim == 0 or value.shape[0] == 1:
+        return value  # 스칼라·브로드캐스트(rope 등)
+    if value.shape[0] == extended:
+        return value[:batch]
+    return _DEDUP_UNSUPPORTED
+
+
+def _dedup_slice_options(options, batch: int, extended: int):
+    if options is None:
+        return options
+    if not isinstance(options, dict):
+        return _DEDUP_UNSUPPORTED
+    changed = None
+    for key, value in options.items():
+        if torch.is_tensor(value) and value.ndim > 0 and value.shape[0] == extended:
+            if key not in _DEDUP_OPTION_ROW_KEYS:
+                return _DEDUP_UNSUPPORTED
+            if changed is None:
+                changed = dict(options)  # 공유 딕셔너리는 건드리지 않는다
+            changed[key] = value[:batch]
+    return options if changed is None else changed
+
+
+def _dedup_block_call(args, kwargs):
+    """원래 배치 행으로 자른 (args, kwargs). 쓸 수 없으면 사유 문자열."""
+    batch = _STATE["any_b0"]
+    src = _STATE["dedup_src"]
+    if batch is None or not torch.is_tensor(src) or src.ndim != 1:
+        return "no layout"
+    extended = int(batch) + int(src.shape[0])
+    x = args[0] if args else kwargs.get("x_B_T_H_W_D")
+    if not torch.is_tensor(x) or x.ndim == 0 or x.shape[0] != extended:
+        return "x rows"
+    if len(args) > _DEDUP_MAX_POSITIONAL:
+        return f"{len(args)} positional args"
+    new_args = []
+    for position, value in enumerate(args):
+        if isinstance(value, dict):
+            sliced = _dedup_slice_options(value, batch, extended)
+        else:
+            sliced = _dedup_slice_tensor(value, batch, extended)
+        if sliced is _DEDUP_UNSUPPORTED:
+            return f"positional arg {position}"
+        new_args.append(sliced)
+    new_kwargs = {}
+    for key, value in kwargs.items():
+        if key not in _DEDUP_BLOCK_KWARGS:
+            return f"unknown kwarg {key!r}"
+        if key == "transformer_options":
+            sliced = _dedup_slice_options(value, batch, extended)
+        else:
+            sliced = _dedup_slice_tensor(value, batch, extended)
+        if sliced is _DEDUP_UNSUPPORTED:
+            return f"kwarg {key!r}"
+        new_kwargs[key] = sliced
+    return tuple(new_args), new_kwargs
+
+
+def _dedup_fallback(idx: int, reason: str) -> None:
+    """이번 forward 는 이 블록부터 예전 경로(전체 배치)."""
+    _STATE["dedup_until"] = None
+    _STATE["dedup_fallbacks"] += 1
+    if not _STATE["dedup_warned"]:
+        _STATE["dedup_warned"] = True
+        _log(
+            f"앞쪽 블록 중복 제거를 블록 {idx} 부터 건너뜁니다(예전 전체 배치 경로): "
+            f"{reason}"
+        )
+
+
+def _dedup_plan(idx: int, args, kwargs):
+    """이 블록 호출을 원래 배치 행만으로 돌릴 수 있으면 잘린 (args, kwargs)."""
+    until = _STATE.get("dedup_until")
+    if until is None or _STATE["any_b0"] is None:
+        return None
+    if idx >= until or idx != _STATE["dedup_next"]:
+        # 첫 target 도달, 또는 블록이 0 부터 연속으로 오지 않았다(감싸지 않은 블록·
+        # 재호출 등) — weak 행이 cond 행과 같다는 전제를 더는 보장할 수 없다.
+        _STATE["dedup_until"] = None
+        return None
+    plan = _dedup_block_call(args, kwargs)
+    if isinstance(plan, str):
+        _dedup_fallback(idx, plan)
+        return None
+    return plan
+
+
+def _run_dedup_block(idx: int, orig_forward, plan):
+    """원래 배치 행만 forward 하고 weak 자리에 cond 행 출력을 붙인다. 실패하면 None."""
+    sliced_args, sliced_kwargs = plan
+    batch = int(_STATE["any_b0"])
+    src = _STATE["dedup_src"]
+    failure = None
+    try:
+        out_b = orig_forward(*sliced_args, **sliced_kwargs)
+    except Exception as exc:
+        if _is_out_of_memory(exc):
+            raise  # 확장 배치 OOM 경로(_model_wrapper_inner)가 처리한다
+        # 여기서는 기록만 — 폴백 forward 는 예외·traceback 이 풀린 뒤에 돈다.
+        failure = f"{type(exc).__name__}: {exc}"
+    if failure is not None:
+        _STATE["dedup_disabled"] = True  # 이 생성의 남은 스텝은 예전 경로
+        _dedup_fallback(idx, failure)
+        return None
+    if not torch.is_tensor(out_b) or out_b.ndim == 0 or out_b.shape[0] != batch:
+        _dedup_fallback(idx, "block output rows")
+        return None
+    out = torch.cat([out_b, out_b.index_select(0, src.to(out_b.device))], dim=0)
+    _STATE["dedup_next"] = idx + 1
+    _STATE["dedup_blocks"] += 1
+    return out
+
+
+# Forge Anima ``Block.forward`` 의 transformer_options 위치(backend/nn/anima.py).
+# Forge 는 키워드로 넘기지만 Comfy 계열 포크는 위치 인자로 넘길 수 있다.
+_BLOCK_OPTIONS_POSITION = 6
+
+
+def _block_transformer_options(args, kwargs):
+    options = kwargs.get("transformer_options")
+    if options is None and len(args) > _BLOCK_OPTIONS_POSITION:
+        options = args[_BLOCK_OPTIONS_POSITION]
+    return options if isinstance(options, dict) else None
+
+
+def _is_img2img_request(p) -> bool:
+    """Is ``p`` a ``StableDiffusionProcessingImg2Img`` (or a subclass of it)?
+
+    Checked by class name so the helper needs no ``modules.processing`` import."""
+    return any(
+        cls.__name__ == "StableDiffusionProcessingImg2Img"
+        for cls in type(p).__mro__
+    )
+
+
+def _forge_sampling_offset(p):
+    """Index in Forge's ``sampling_sigmas`` of the first sigma this pass samples.
+
+    txt2img's first pass walks the whole list (``KDiffusionSampler.sample``),
+    so the offset is 0. img2img and the hires pass walk
+    ``sigmas[steps - t_enc - 1:]`` (modules/sd_samplers_kdiffusion.py:145-148).
+    Their ``steps, t_enc`` come from Forge's own ``setup_img2img_steps`` with
+    the argument ``processing.py`` passes it: the hires pass uses
+    ``hr_second_pass_steps or steps`` (:1552), img2img uses None (:1920).
+    Returns None when the offset cannot be worked out; the gate then uses the
+    whole list. It is not inferred from ``shared.state.sampling_steps``,
+    because some schedulers (Forge's ``ddim_scheduler``) return more than
+    ``steps + 1`` sigmas."""
+    if getattr(p, "is_hr_pass", False):
+        requested = getattr(p, "hr_second_pass_steps", 0) or getattr(p, "steps", None)
+    elif _is_img2img_request(p):
+        requested = None
+    else:
+        return 0
+    try:
+        from modules import sd_samplers_common
+
+        steps, t_enc = sd_samplers_common.setup_img2img_steps(p, requested)
+        return int(steps) - int(t_enc) - 1
+    except Exception:
+        return None
+
+
+def _sampler_publishes_sigmas(p) -> bool:
+    """Does this pass's sampler set ``transformer_options['sampling_sigmas']``?
+
+    Forge's k-diffusion samplers do, right before sampling
+    (modules/sd_samplers_kdiffusion.py:192, 246). The CompVis timestep
+    samplers (DDIM, PLMS — ``classic_ddim_eps_estimation``) never do,
+    so a list found there was left by an earlier run."""
+    denoiser = getattr(getattr(p, "sampler", None), "model_wrap_cfg", None)
+    return not bool(getattr(denoiser, "classic_ddim_eps_estimation", False))
+
+
+def _dave_run_callback(params) -> None:
+    """Remember which sampling run the coming block calls belong to.
+
+    Forge fires ``on_cfg_denoiser`` before every model call with the running
+    denoiser (modules/sd_samplers_cfg_denoiser.py:133-134): its ``p`` is the
+    request the sampler was given and its ``steps`` the ``launch_sampling``
+    count (sd_samplers_common.py). DAVE stays attached until ``postprocess``,
+    so runs made from ``postprocess_image`` without this script's
+    ``process_before_every_sampling`` (ADetailer's inner img2img,
+    img2img-hires-fix's ``sample_img2img(copy(p), ...)``) reach the blocks too."""
+    if not _DAVE.get("on"):
+        return
+    denoiser = getattr(params, "denoiser", None)
+    _DAVE["run_p"] = getattr(denoiser, "p", None)
+    try:
+        _DAVE["run_steps"] = int(getattr(denoiser, "steps", 0) or 0)
+    except (TypeError, ValueError):
+        _DAVE["run_steps"] = 0
+
+
+script_callbacks.on_cfg_denoiser(_dave_run_callback)
+
+
+def _dave_offset(schedule):
+    """Index in ``schedule`` of the first sigma the running sampling walks.
+
+    The attach-time offset (``_forge_sampling_offset``) belongs to the request
+    it was worked out for, the pass's own sampling. Any other run counts its own
+    ``launch_sampling`` steps + 1 sigmas back from the end — the list it walks
+    whenever the scheduler returns ``steps + 1`` sigmas; the original node, fed
+    that run's sigmas by a detailer, gates on them the same way. With no run
+    seen yet the attach-time offset stands."""
+    offset = _DAVE.get("offset")
+    pass_p = _DAVE.get("offset_p")
+    run_p = _DAVE.get("run_p")
+    if run_p is None or run_p is pass_p:
+        return offset
+    run_steps = int(_DAVE.get("run_steps") or 0)
+    try:
+        total = len(schedule)
+    except TypeError:
+        return None
+    if 0 < run_steps < total - 1:
+        return total - (run_steps + 1)
+    return 0
+
+
+def _dave_gate_open(args, kwargs) -> bool:
+    """DAVE's early-step gate for this block call — the original node's gate.
+
+    Upstream decides once per forward in its APPLY_MODEL wrapper (origin:
+    sorryhyun/ComfyUI-Anima-DAVE@83143e8d:nodes.py:91-106, 199-208): the
+    forward's sigma (Forge: ``transformer_options['sigmas']``) is looked up in
+    the schedule the sampler walks — Forge's ``sampling_sigmas`` from the
+    running sampling's offset on (``_dave_offset``) — and DAVE runs while
+    its index is below ``k = max(1, min(n, round(tau·n)))``; an off-schedule sigma (a
+    second-order midpoint) is step 0, so on. ``ForwardGateCache`` shares the
+    lookup across the pooled blocks of one forward. Forge's timestep samplers
+    publish no sigma list: there the index is Forge's step position — the one
+    host difference, one step late like the step-fraction gates."""
+    tau = float(_DAVE["tau"])
+    if tau <= 0.0:
+        return True
+    if not _DAVE.get("schedule_ok", True):
+        step, total = _sampling_position()
+        return dave_step_gate(step, total, tau)
+    options = _block_transformer_options(args, kwargs) or {}
+    schedule = options.get("sampling_sigmas")
+    sigma = options.get("sigmas")
+    if _DAVE.get("pre_dd", True):
+        noted = pre_dd_sigma(sigma)   # Detail Daemon's note, only for the forward it scaled
+        if noted is not None:
+            sigma = noted
+    return _DAVE["gate"].active(
+        tau,
+        schedule,
+        sigma,
+        _dave_offset(schedule),
+    )
+
+
 def _make_block_wrapper(idx: int, orig_forward):
     """Compose CLIP modulation, original block, DAVE, then SLG restoration."""
 
@@ -670,8 +1343,14 @@ def _make_block_wrapper(idx: int, orig_forward):
         )
         if captures_spatial:
             _STATE["attn_spatial_shape"] = tuple(int(v) for v in x_in.shape[1:4])
+        dedup = _dedup_plan(idx, call_args, call_kwargs)
         try:
-            out = orig_forward(*call_args, **call_kwargs)
+            out = None
+            if dedup is not None:
+                out = _run_dedup_block(idx, orig_forward, dedup)
+                dedup = None  # 잘린 인자를 폴백 forward 동안 붙잡지 않는다
+            if out is None:
+                out = orig_forward(*call_args, **call_kwargs)
         finally:
             if captures_spatial:
                 _STATE["attn_spatial_shape"] = previous_spatial
@@ -679,10 +1358,7 @@ def _make_block_wrapper(idx: int, orig_forward):
             dave_active = (
                 _DAVE["on"]
                 and idx in _DAVE["targets"]
-                and (
-                    float(_DAVE["tau"]) <= 0.0
-                    or _pct_now() < float(_DAVE["tau"])
-                )
+                and _dave_gate_open(args, kwargs)
             )
             if dave_active and torch.is_tensor(out):
                 out = apply_dave(out, float(_DAVE["strength"]))
@@ -805,20 +1481,131 @@ def _ensure_patched(diffusion_model) -> int:
 
 
 # ---------------------------------------------------------------------------
-# CNS-inspired sampler-noise patch (global install, generation-gated fast path)
+# CNS sampler-noise patch (global install, generation-gated fast path)
 # ---------------------------------------------------------------------------
+#
+# Upstream (namemechan/comfyui-cns_sampler_patch@42278b13:cns_sampler_patch.py)
+# colors every noise_sampler call against ``state["x_current"]``: the sampler's
+# initial x (:315 ``x_initial.detach().clone()``), then the ``info["x"]`` of each
+# step callback (:473-478, :567-572) — the step's start state, recorded after
+# its first model evaluation and before its noise. Forge's k-diffusion samplers
+# pass ``callback=self.callback_state`` (modules/sd_samplers_kdiffusion.py:196,
+# :250), so the same x is captured by wrapping ``p.sampler.callback_state``.
+# The initial x is seeded when the sampler builds its default noise sampler
+# (``default_noise_sampler(x)`` at the top of every ancestral ``sample_*``).
+# Capturing the post-CFG ``input`` is only a fallback for a sampler whose
+# callback cannot be wrapped: that input is the *last* model evaluation's
+# (the midpoint of dpmpp_2s_ancestral / dpmpp_sde, the mask-blended latent in
+# inpainting), not the step's x. Coloring and recording are limited to the
+# attached sampler's run (_install_cns_sampler_scope), like upstream's
+# per-SAMPLER wrap, although the patch itself is a global install.
+
+
+def _record_cns_x(x, *, clone: bool = False) -> None:
+    _RUNTIME.cns_x_t = x.detach().clone() if clone else x.detach()
+
+
+def _install_cns_x_capture(p) -> str:
+    """Wrap ``p.sampler.callback_state`` so each step's ``d["x"]`` feeds CNS.
+
+    Returns ``"callback"`` when installed (or already installed on this sampler
+    object), else ``"post_cfg"``. The wrapper is an instance attribute of the
+    per-pass sampler object Forge creates for every ``sample()`` / hires pass,
+    so nothing outlives the pass. It records only while CNS is on, then calls
+    the original callback, in upstream's ``cns_callback`` order (:473-478).
+    """
+    sampler = getattr(p, "sampler", None)
+    original = getattr(sampler, "callback_state", None)
+    if sampler is None or not callable(original):
+        return "post_cfg"
+    if getattr(original, "_anima_cns_capture", False):
+        return "callback"
+
+    def _cns_callback_state(d, *args, **kwargs):
+        x = d.get("x") if isinstance(d, dict) else None
+        if _CNS["on"] and torch is not None and torch.is_tensor(x):
+            _record_cns_x(x)
+            _CNS["callback_seen"] = True
+        return original(d, *args, **kwargs)
+
+    _cns_callback_state._anima_cns_capture = True
+    try:
+        sampler.callback_state = _cns_callback_state
+    except Exception:
+        return "post_cfg"
+    return "callback"
+
+
+def _install_cns_sampler_scope(p) -> str:
+    """Scope CNS to the sampler run of the pass it attached to.
+
+    The noise patches are k-diffusion module globals, so without a scope a
+    nested run of another p whose script list lacks this script (ADetailer's
+    inner img2img in ``postprocess_image``, before ``postprocess`` clears
+    CNS) would also be colored, against a frozen x_t. Upstream colors only the
+    SAMPLER it wraps (:544-608). Forge runs every k-diffusion ``sample_*`` of
+    a pass inside ``self.launch_sampling(steps, func)``
+    (modules/sd_samplers_kdiffusion.py:194, :248), so wrapping that instance
+    method marks the attached run live. Returns ``"sampler"`` when installed
+    (or already installed on this sampler object), else ``"pass"``.
+    """
+    sampler = getattr(p, "sampler", None)
+    original = getattr(sampler, "launch_sampling", None)
+    if sampler is None or not callable(original):
+        return "pass"
+    if getattr(original, "_anima_cns_scope", False):
+        return "sampler"
+
+    def _cns_launch_sampling(*args, **kwargs):
+        previous = _CNS["live"]
+        _CNS["live"] = True
+        try:
+            return original(*args, **kwargs)
+        finally:
+            _CNS["live"] = previous
+
+    _cns_launch_sampling._anima_cns_scope = True
+    try:
+        sampler.launch_sampling = _cns_launch_sampling
+    except Exception:
+        return "pass"
+    return "sampler"
+
+
+def _cns_active() -> bool:
+    """CNS is on and, when scoped, the attached sampler is the one sampling."""
+    return bool(_CNS["on"]) and (_CNS["scope"] != "sampler" or bool(_CNS["live"]))
+
+
+def _capture_cns_post_cfg_input(live_input) -> None:
+    """Post-CFG ``input`` as the CNS x_t — fallback only.
+
+    With the callback capture installed it only fills a still-empty slot
+    (a Brownian sampler has no default-noise-sampler seed) until the first
+    step callback; the fallback mode keeps the per-evaluation update.
+    """
+    if not _cns_active() or not torch.is_tensor(live_input):
+        return
+    if _CNS["capture"] == "callback" and (
+        _CNS["callback_seen"] or _RUNTIME.cns_x_t is not None
+    ):
+        return
+    _record_cns_x(live_input)
 
 
 def _maybe_color_cns_noise(noise):
-    if not _CNS["on"] or torch is None:
+    if not _cns_active() or torch is None:
         return noise
     x_t = _RUNTIME.cns_x_t
     if not torch.is_tensor(x_t):
         return noise
     try:
+        # Device only: color_noise_wavelet casts x_t to float32 itself like
+        # upstream (:220 ``x_t.float()``); rounding it to a half-precision
+        # noise dtype first would change the band energies.
         result = color_noise_wavelet(
             noise,
-            x_t.to(device=noise.device, dtype=noise.dtype),
+            x_t.to(device=noise.device),
             strength=float(_CNS["strength"]),
             gamma_power=float(_CNS["gamma_power"]),
             gamma_scale=float(_CNS["gamma_scale"]),
@@ -837,8 +1624,12 @@ def _patched_default_noise_sampler(x):
     if not callable(factory):
         return lambda _sigma, _sigma_next: torch.randn_like(x)
     original_sampler = factory(x)
-    if not _CNS["on"]:
+    if not _cns_active():
         return original_sampler
+    # The sampler's initial x, like upstream's make_cns_noise_sampler seed
+    # (:315); the step callbacks replace it.
+    if torch.is_tensor(x):
+        _record_cns_x(x, clone=True)
 
     def _sample(sigma, sigma_next):
         return _maybe_color_cns_noise(original_sampler(sigma, sigma_next))
@@ -1080,6 +1871,67 @@ def _select_c(c: dict, idx_tensor, batch: int) -> dict:
     return out
 
 
+# cond/uncond 행 인덱스 텐서 캐시. ``torch.tensor(list, device=cuda)`` 는 스텝마다
+# pageable 동기 H2D 였다. 값은 (행 목록, device)만으로 정해지므로 그 둘을 키로
+# 두면 결과가 같다. 배치 배치(layout)는 몇 가지뿐이라 작게 두고 postprocess 에서 비운다.
+_INDEX_TENSOR_CACHE: dict = {}
+_INDEX_TENSOR_CACHE_MAX = 16
+
+
+def _index_tensor(indices, device):
+    key = (tuple(int(i) for i in indices), str(device))
+    cached = _INDEX_TENSOR_CACHE.get(key)
+    if cached is None:
+        if len(_INDEX_TENSOR_CACHE) >= _INDEX_TENSOR_CACHE_MAX:
+            _INDEX_TENSOR_CACHE.clear()
+        cached = torch.tensor(key[0], device=device, dtype=torch.long)
+        _INDEX_TENSOR_CACHE[key] = cached
+    return cached
+
+
+def _is_out_of_memory(exc: BaseException) -> bool:
+    oom_type = getattr(torch, "OutOfMemoryError", None) if torch is not None else None
+    if oom_type is not None and isinstance(exc, oom_type):
+        return True
+    return isinstance(exc, RuntimeError) and "out of memory" in str(exc).lower()
+
+
+def _owner_ref(p):
+    """생성(p)을 붙잡지 않는 약한 참조. 지원하지 않는 객체면 None(이번 패스만)."""
+    if p is None:
+        return None
+    try:
+        return weakref.ref(p)
+    except TypeError:
+        return None
+
+
+def _perturbation_oom_blocked(p) -> bool:
+    """이 p 의 앞선 패스/배치에서 확장 배치가 OOM 으로 실패했는가."""
+    ref = _STATE.get("pert_oom_owner")
+    return ref is not None and p is not None and ref() is p
+
+
+def _disable_perturbation_after_oom() -> None:
+    """확장 배치 OOM 뒤: 이번 생성의 PAG/SEG/SLG 를 끄고 VRAM 을 돌려받는다.
+
+    호출 시점에는 예외 객체와 traceback 이 이미 풀려 있어야 한다(except 블록 밖).
+    그래야 실패한 forward 의 중간 활성값이 해제되어 폴백 forward 가 쓸 수 있다.
+    """
+    _STATE["on"] = False
+    _STATE["pert_oom_owner"] = _STATE.get("pass_owner")
+    try:
+        gc.collect()  # traceback 순환 참조에 남은 프레임까지 정리
+    except Exception:
+        pass
+    try:
+        from backend import memory_management
+
+        memory_management.soft_empty_cache()
+    except Exception:
+        pass
+
+
 def _sampling_position() -> tuple[int, int]:
     """Return Forge's authoritative 0-based sampler position.
 
@@ -1106,8 +1958,174 @@ def _pct_now() -> float:
 
 
 def _percent_in_range() -> bool:
+    """Step-fraction window ``start <= pct <= end`` (``end`` cut by ADG).
+
+    The gate SEG and SLG have always used — they are not part of the safe-pag
+    original (parity plan §0.3 item 9, out of scope), so PAG's sigma window
+    does not move them — and PAG's fallback without a predictor.
+    """
     pct = _pct_now()
     return _STATE["start"] <= pct <= _STATE["end"]
+
+
+def _pag_in_range(sigma) -> bool:
+    """PAG window test for the current model call.
+
+    Upstream gates by sigma (origin: iljung1106/comfyui-anima-safe-pag@905b0107
+    :__init__.py:15-22, 280): the bounds come from the model's own
+    ``percent_to_sigma`` and the value is the sigma of this call, so a
+    second-order sampler's extra evaluations and img2img's shortened schedule
+    are placed exactly as upstream places them. ``sigma`` is the ``timestep``
+    Forge passes to the model wrapper and the pre-CFG hook — KModel.apply_model
+    treats it as the sampler sigma. Without bounds (no predictor) the old
+    step-fraction gate is the fallback. ADG keeps using ``_pct_now`` (DAVE
+    has its own schedule gate, _dave_gate_open); a step Adaptive Guidance
+    skips never reaches this gate (the wrapper's ADG branch runs first), so
+    the bounds carry no ADG cut.
+    """
+    sigma_hi, sigma_lo = _STATE.get("sigma_hi"), _STATE.get("sigma_lo")
+    if sigma_hi is None or sigma_lo is None or sigma is None:
+        return _percent_in_range()
+    try:
+        return sigma_active(sigma, sigma_hi, sigma_lo)
+    except Exception:
+        return _percent_in_range()
+
+
+def _pag_envelope_factor(sigma) -> float:
+    """Our experimental strength curve in linear sigma space, not a published PAG variant.
+
+    ``sin²(π·u)`` with ``u = (σ_hi − σ)/(σ_hi − σ_lo)`` over PAG's own sigma window: 0 at both
+    ends, 1 in the middle. Off (Forge option OPT_PAG_COSINE) or without usable bounds it is the
+    constant 1.0 of the existing PAG."""
+    if not _STATE.get("pag_cosine_envelope", False):
+        return 1.0
+    try:
+        hi = float(_STATE["sigma_hi"])
+        lo = float(_STATE["sigma_lo"])
+        value = sigma_to_float(sigma)
+        if not all(math.isfinite(v) for v in (hi, lo, value)):
+            return 1.0
+        if hi < lo:
+            hi, lo = lo, hi
+        if hi <= lo:
+            return 1.0
+        u = (hi - value) / (hi - lo)
+        if u <= 0.0 or u >= 1.0:
+            return 0.0
+        return math.sin(math.pi * u) ** 2
+    except (TypeError, ValueError, IndexError, KeyError, AttributeError, RuntimeError, OverflowError):
+        # Missing model bounds retain the existing constant-strength behaviour.
+        return 1.0
+
+
+def _attn_rows_in_range(sigma) -> bool:
+    """Does this call get PAG/SEG weak rows? PAG: sigma window; SEG: step fraction.
+
+    With the experimental PAG envelope on, the window ends (factor 0) get no PAG weak rows."""
+    if not (_STATE["attn_method"] and float(_STATE["attn_scale"]) > 0
+            and _STATE["attn_targets"]):
+        return False
+    if _STATE["attn_method"] == "pag":
+        return _pag_in_range(sigma) and _pag_envelope_factor(sigma) > 0.0
+    return _percent_in_range()
+
+
+def _s2_in_range() -> bool:
+    """S² window ``start <= pct <= end`` — the step fraction like SLG (same one-step lag)."""
+    pct = _pct_now()
+    return float(_S2["start"]) <= pct <= float(_S2["end"])
+
+
+def _slg_rows_in_range() -> bool:
+    """Does this call get SLG weak rows? Step fraction, as before the PAG window.
+
+    In S² mode the targets are redrawn per evaluation (``_s2_draw``) and the S² window applies."""
+    if not (bool(_STATE["slg_on"]) and float(_STATE["slg_scale"]) > 0):
+        return False
+    if _S2["on"]:
+        return bool(_S2["eligible"]) and _s2_in_range()
+    return bool(_STATE["slg_targets"]) and _percent_in_range()
+
+
+def _block_span_text(blocks) -> str:
+    """'1-27' for a contiguous run, else the comma list — short infotext for block sets."""
+    values = sorted(int(b) for b in blocks)
+    if not values:
+        return "none"
+    if values == list(range(values[0], values[-1] + 1)) and len(values) > 2:
+        return f"{values[0]}-{values[-1]}"
+    return ",".join(str(v) for v in values)
+
+
+def _s2_seed(p) -> int:
+    """The generation seed S² masks are drawn from: this batch's first seed, else ``p.seed``."""
+    for candidate in (
+        (getattr(p, "seeds", None) or [None])[0],
+        (getattr(p, "all_seeds", None) or [None])[0],
+        getattr(p, "seed", None),
+    ):
+        try:
+            if candidate is not None:
+                return int(candidate)
+        except (TypeError, ValueError):
+            continue
+    return 0
+
+
+def _s2_draw() -> None:
+    """Draw this evaluation's dropped blocks into ``slg_targets`` (S² mode only)."""
+    targets = s2_guidance.draw_blocks(
+        _S2["eligible"], float(_S2["ratio"]), _S2["seed"], _S2["pass_tag"], int(_S2["draws"]),
+    )
+    _S2["draws"] = int(_S2["draws"]) + 1
+    _S2["last"] = tuple(sorted(targets))
+    _STATE["slg_targets"] = targets
+
+
+def _pert_in_range(sigma) -> bool:
+    """Does any enabled perturbation add weak rows to this model call?"""
+    return _attn_rows_in_range(sigma) or _slg_rows_in_range()
+
+
+def _sigma_window_text() -> str:
+    """Infotext/log form of PAG's gate: 'hi-lo' sigmas, or the fallback."""
+    sigma_hi, sigma_lo = _STATE.get("sigma_hi"), _STATE.get("sigma_lo")
+    if sigma_hi is None or sigma_lo is None:
+        return "step-fraction"
+    return f"{float(sigma_hi):.4f}-{float(sigma_lo):.4f}"
+
+
+def _note_control_guard() -> None:
+    """Write the ControlNet-guard infotext for the pass that was blocked."""
+    params = _STATE.get("guard_params")
+    if isinstance(params, dict):
+        params[INFOTEXT_CONTROLNET_GUARD] = INFOTEXT_CONTROLNET_GUARD_VALUE
+
+
+def _pag_sigma_window(unet, start: float, end: float):
+    """PAG's ``(sigma_hi, sigma_lo)`` for a percent window, or ``(None, None)``.
+
+    Upstream converts once, when the node patches the model (origin
+    :__init__.py:25-34, 229-233). Forge applies the shift (``set_shift``) before
+    ``process_before_every_sampling``, and clones share the predictor, so the
+    attach-time conversion sees the schedule this pass samples with — the same
+    ``real_model.predictor.percent_to_sigma`` Forge's own ControlNet uses
+    (backend/sampling/sampling_function.py:385).
+    """
+    predictor = getattr(getattr(unet, "model", None), "predictor", None)
+    percent_to_sigma = getattr(predictor, "percent_to_sigma", None)
+    if not callable(percent_to_sigma):
+        return None, None
+    try:
+        sigma_hi, sigma_lo, _start, _end = percent_range_to_sigmas(
+            percent_to_sigma, start, end,
+        )
+        return float(sigma_hi), float(sigma_lo)
+    except Exception as exc:
+        _log(f"percent_to_sigma failed ({type(exc).__name__}: {exc}) — "
+             "PAG window falls back to the step fraction.")
+        return None, None
 
 
 def _adg_should_skip() -> bool:
@@ -1124,8 +2142,20 @@ def _adg_should_skip() -> bool:
 
 
 def reset_cfg_state() -> None:
-    """Clear all stateful CFG transforms at a pass boundary or ADG skip."""
+    """Clear all stateful CFG transforms (APG momentum and SMC e_prev)."""
     _RUNTIME.reset_cfg_state()
+
+
+def _reset_apg_momentum() -> None:
+    """Clear only APG's momentum buffer (an ADG cond-only step).
+
+    SMC keeps ``e_prev``: the upstream DCW(+a) node carries it across every
+    step of a run and resets it only per KSampler run (fresh model_options) or
+    on a shape change (origin: namemechan/ComfyUI-DCW@66aaf9dd:dcw_node.py:
+    87-89, 486-507). ADG is not part of upstream; its cond-only steps give SMC
+    no CFG error, so they neither update nor discard it."""
+    _APG["avg"] = None
+    _APG["last_sigma"] = None
 
 
 # ---------------------------------------------------------------------------
@@ -1133,14 +2163,122 @@ def reset_cfg_state() -> None:
 # ---------------------------------------------------------------------------
 
 
+_AGGREGATION_KEY = "_sam_extra_condition_aggregation"
+
+
+class _ConditionAggregation:
+    """Opaque conditioning metadata consumed before calling the model.
+
+    Implements Forge's Condition concatenation protocol so each queued
+    condition retains its original area/mult even when VRAM changes grouping.
+    It never reaches diffusion_model.forward or changes its real conditioning.
+    """
+    def __init__(self, aggregate, prepared, positive):
+        self.aggregate = aggregate
+        self.prepared = prepared
+        self.positive = positive
+
+    def process_cond(self, **_kwargs):
+        return self
+
+    def can_concat(self, _other):
+        return True
+
+    def concat(self, others):
+        return [self, *others]
+
+
+def _prepare_condition_aggregation(model, cond, uncond, x, timestep, model_options):
+    """Keep the exact Forge weights/regions for compositional weak predictions."""
+    _STATE.pop("condition_aggregation", None)
+    if not _STATE["on"] or not _pert_in_range(timestep) or not cond:
+        return model, cond, uncond, x, timestep, model_options
+    if len(cond) == 1 and not any(key in cond[0] for key in ("area", "mask")):
+        return model, cond, uncond, x, timestep, model_options
+    from backend.sampling.sampling_function import get_area_and_mult
+
+    aggregate = {
+        "cond": torch.zeros_like(x), "attn": torch.zeros_like(x),
+        "slg": torch.zeros_like(x), "count": torch.ones_like(x) * 1e-37,
+        "attn_seen": False, "slg_seen": False,
+    }
+
+    def attach(items, positive):
+        if items is None:
+            return None
+        output = []
+        for item in items:
+            # Delegate mask strength, crop feathering and timestep filtering
+            # to Forge itself; do not approximate them with a prompt average.
+            prepared = get_area_and_mult(
+                {**item, "model_conds": {}}, x, timestep,
+            ) if positive else None
+            metadata = None if prepared is None else (prepared.area, prepared.mult)
+            changed = dict(item)
+            changed["model_conds"] = {
+                **item["model_conds"],
+                _AGGREGATION_KEY: _ConditionAggregation(aggregate, metadata, positive),
+            }
+            output.append(changed)
+        return output
+
+    _STATE["condition_aggregation"] = aggregate
+    return model, attach(cond, True), attach(uncond, False), x, timestep, model_options
+
+
+def _accumulate_condition_predictions(metadata, output, attn, slg):
+    chunks = len(metadata)
+    batch = output.shape[0] // chunks
+    cond_offset = 0
+    for index, entry in enumerate(metadata):
+        if not entry.positive:
+            continue
+        current = output[index * batch:(index + 1) * batch]
+        weak_slice = slice(cond_offset, cond_offset + batch)
+        cond_offset += batch
+        if entry.prepared is None:
+            continue
+        area, mult = entry.prepared
+        target = (..., slice(area[2], area[2] + area[0]), slice(area[3], area[3] + area[1]))
+        aggregate = entry.aggregate
+        aggregate["cond"][target] += current * mult
+        aggregate["count"][target] += mult
+        # A condition where ControlNet/another guard blocks perturbation
+        # contributes an identity weak result, so only its own delta is zero.
+        for key, weak in (("attn", attn), ("slg", slg)):
+            prediction = current if weak is None else weak[weak_slice]
+            aggregate[key][target] += prediction * mult
+            aggregate[key + "_seen"] |= weak is not None
+
+
 def _clear_markers():
     _STATE["any_b0"] = None
     _STATE["attn_b0"] = _STATE["attn_b1"] = None
     _STATE["slg_b0"] = _STATE["slg_b1"] = None
     _STATE["attn_spatial_shape"] = None
+    _STATE["dedup_until"] = None
+    _STATE["dedup_src"] = None
+    _STATE["dedup_next"] = 0
 
 
 def _model_wrapper(apply_model, w):
+    metadata = (w.get("c") or {}).get(_AGGREGATION_KEY)
+    if metadata is None:
+        return _model_wrapper_inner(apply_model, w)
+    changed = dict(w)
+    changed["c"] = dict(w.get("c") or {})
+    changed["c"].pop(_AGGREGATION_KEY, None)
+    # A microbatch may have no active weak rows. Never reuse the preceding
+    # microbatch's cache when folding its output into the full image.
+    _STATE["attn_raw"] = _STATE["slg_raw"] = None
+    output = _model_wrapper_inner(apply_model, changed)
+    _accumulate_condition_predictions(
+        metadata, output, _STATE["attn_raw"], _STATE["slg_raw"],
+    )
+    return output
+
+
+def _model_wrapper_inner(apply_model, w):
     """model_function_wrapper: run an enlarged cond ``apply_model`` that also
     produces the weak predictions (attention-perturbed for PAG/SEG and/or
     layer-skipped for SLG) by appending copies of the cond rows. This supports
@@ -1155,6 +2293,7 @@ def _model_wrapper(apply_model, w):
     if not (_STATE["on"] or _ADG["on"]) or torch is None:
         return apply_model(x, ts, **c)
 
+    extended_forward = False  # OOM 이 weak 행을 붙인 확장 forward 에서 났는가
     try:
         _STATE["wrapper_calls"] += 1
         if cou is None or len(cou) == 0:
@@ -1175,6 +2314,10 @@ def _model_wrapper(apply_model, w):
             _STATE["slg_raw"] = None
             _STATE["cond_raw"] = None
             _STATE["adg_skipped"] = False
+            # S²: one mask per model evaluation, shared by every wrapper call of it
+            # (low-VRAM splits, regional conditions).
+            if _STATE["on"] and _S2["on"] and _STATE["slg_on"]:
+                _s2_draw()
 
         chunk = batch // len(cou)
         cond_idx, uncond_idx = [], []
@@ -1189,10 +2332,8 @@ def _model_wrapper(apply_model, w):
         elif uncond_idx:
             _STATE["split_uncond_calls"] += 1
 
-        idx = torch.tensor(cond_idx, device=x.device, dtype=torch.long) \
-            if cond_idx else None
-        uidx = torch.tensor(uncond_idx, device=x.device, dtype=torch.long) \
-            if uncond_idx else None
+        idx = _index_tensor(cond_idx, x.device) if cond_idx else None
+        uidx = _index_tensor(uncond_idx, x.device) if uncond_idx else None
 
         # A split uncond-only call cannot carry a perturbation copy. Forge's
         # post-CFG args already supply the aggregated denoised predictions, so
@@ -1216,7 +2357,8 @@ def _model_wrapper(apply_model, w):
             _STATE["adg_skipped"] = True
             # APG momentum from a preceding guided step must not leak through
             # a cond-only interval or into the next periodically-kept step.
-            reset_cfg_state()
+            # SMC's e_prev is kept (see _reset_apg_momentum).
+            _reset_apg_momentum()
             out_full = torch.empty(
                 (batch,) + tuple(out_c.shape[1:]),
                 device=out_c.device, dtype=out_c.dtype,
@@ -1225,16 +2367,17 @@ def _model_wrapper(apply_model, w):
             out_full.index_copy_(0, uidx, out_c)  # uncond := cond
             return out_full
 
-        if (_STATE["on"] and _percent_in_range()
-                and c.get("control") is not None):
+        # Each weak row keeps its own window: PAG the sigma window, SEG/SLG the
+        # step fraction (see _attn_rows_in_range/_slg_rows_in_range).
+        attn_on = bool(_STATE["on"]) and _attn_rows_in_range(ts)
+        slg_on = bool(_STATE["on"]) and _slg_rows_in_range()
+        if (attn_on or slg_on) and c.get("control") is not None:
+            # Host guard (upstream does not have it): Forge's ControlNet control
+            # tensors are sized for the real batch, not the appended weak rows,
+            # so PAG/SEG/SLG stay off for this call. Recorded in the infotext.
             _STATE["control_blocked_calls"] += 1
-        if not _STATE["on"] or not _percent_in_range() or c.get("control") is not None:
+            _note_control_guard()
             return apply_model(x, ts, **c)
-
-        attn_on = bool(_STATE["attn_method"]) and float(_STATE["attn_scale"]) > 0 \
-            and bool(_STATE["attn_targets"])
-        slg_on = bool(_STATE["slg_on"]) and float(_STATE["slg_scale"]) > 0 \
-            and bool(_STATE["slg_targets"])
         if not attn_on and not slg_on:
             return apply_model(x, ts, **c)
 
@@ -1257,12 +2400,31 @@ def _model_wrapper(apply_model, w):
         _STATE["attn_b0"], _STATE["attn_b1"] = a0, a1
         _STATE["slg_b0"], _STATE["slg_b1"] = s0, s1
         _STATE["any_b0"] = batch
+        # 앞쪽 블록 중복 제거: 첫 target 블록 이전은 원래 배치 행만 돌린다.
+        first_target = min(
+            (_STATE["attn_targets"] if a0 is not None else set())
+            | (_STATE["slg_targets"] if s0 is not None else set()),
+            default=0,
+        )
+        _STATE["dedup_src"] = app_idx
+        _STATE["dedup_next"] = 0
+        _STATE["dedup_until"] = (
+            int(first_target)
+            if (
+                _STATE.get("prefix_dedup")
+                and not _STATE.get("dedup_disabled")
+                and int(first_target) > 0
+            )
+            else None
+        )
         if a0 is not None:
             _STATE["attn_hook_hits"] = 0
+        extended_forward = True
         try:
             out_ext = apply_model(x_ext, ts_ext, **c_ext)
         finally:
             _clear_markers()
+        extended_forward = False
 
         out = out_ext[:batch]
         # The cond rows the weak predictions were derived from. post_cfg must
@@ -1279,7 +2441,11 @@ def _model_wrapper(apply_model, w):
             _STATE["slg_raw"] = out_ext[s0:s1].detach().float()
         _STATE["weak_steps"] += 1
 
-        if a0 is not None:
+        # rel_delta 는 진단값이다(첫 스텝 로그 + 진단 켰을 때 [VERIFY] 요약).
+        # float() 가 forward 전체를 기다리는 동기화라 그 둘일 때만 잰다.
+        if a0 is not None and (
+            not _STATE["attn_diag_logged"] or guidance_diagnostics_enabled()
+        ):
             weak = _STATE["attn_raw"]
             cond = cond_rows
             rel_delta = None
@@ -1308,13 +2474,33 @@ def _model_wrapper(apply_model, w):
                 _STATE["attn_diag_logged"] = True
         return out
     except Exception as e:
-        _STATE["wrapper_fallbacks"] += 1
-        _clear_markers()
-        _STATE["attn_raw"] = None
-        _STATE["slg_raw"] = None
-        _STATE["cond_raw"] = None
-        _log(f"wrapper fallback → normal apply_model: {type(e).__name__}: {e}")
-        return apply_model(x, ts, **c)
+        # 여기서는 기록만 한다. except 안에서 폴백 forward 를 돌리면 살아 있는
+        # 예외의 __traceback__ 이 실패한 forward 프레임(중간 활성값)을 붙잡은
+        # 채로 두 번째 forward 가 돌아 VRAM 이 이중으로 든다.
+        failure = (
+            type(e).__name__,
+            str(e),
+            extended_forward and _is_out_of_memory(e),
+        )
+
+    # except 블록 밖: 예외·traceback 이 풀린 뒤 폴백한다.
+    name, message, oom = failure
+    _STATE["wrapper_fallbacks"] += 1
+    _clear_markers()
+    _STATE["attn_raw"] = None
+    _STATE["slg_raw"] = None
+    _STATE["cond_raw"] = None
+    x_ext = ts_ext = c_ext = out_ext = out = None  # noqa: F841 - 확장 배치 해제
+    if oom and _STATE["on"]:
+        _disable_perturbation_after_oom()
+        _log(
+            f"wrapper fallback → normal apply_model: {name}: {message} "
+            "— 확장 배치(PAG/SEG/SLG weak 행)가 VRAM 부족으로 실패해 "
+            "캐시를 비우고 이 생성의 perturbation 을 끕니다."
+        )
+    else:
+        _log(f"wrapper fallback → normal apply_model: {name}: {message}")
+    return apply_model(x, ts, **c)
 
 
 # Owner tag so a co-loaded script (e.g. anima_ref_poc) can recognise our unet
@@ -1407,12 +2593,16 @@ def _apply_apg(args, effective_scale, guidance_override=None):
         return None
 
 
-def _recover_effective_cfg(args, incoming):
+def _recover_effective_cfg(args, incoming, with_fit_error=True):
     """Fit the incoming CFG result to ``uncond + w_eff*(cond-uncond)``.
 
-    Forge does not expose per-conditioning ``edit_strength`` in post-CFG args.
-    Least-squares recovery retains it for linear CFG and quantifies how poorly
-    a nonlinear/custom CFG result fits before any explicit base override.
+    Diagnostics only: the base override takes its scale from
+    ``args["cond_scale"]`` like the upstream cfg hook (_cfg_scale_from_args).
+    The fit quantifies how poorly a nonlinear/custom CFG result fits before an
+    explicit base override, and supplies the scale only for callers that pass
+    no ``cond_scale`` (Forge always does). ``with_fit_error=False`` skips the
+    fit error (two norms and a second GPU->CPU sync) and returns
+    ``fit_error=None``; ``effective`` is unchanged.
     """
     cond = args["cond_denoised"].float()
     uncond = args["uncond_denoised"].float()
@@ -1420,6 +2610,8 @@ def _recover_effective_cfg(args, incoming):
     residual = incoming.float() - uncond
     denom = (guidance * guidance).sum().clamp_min(1e-12)
     effective = float(((residual * guidance).sum() / denom).item())
+    if not with_fit_error:
+        return effective, None
     fitted = uncond + effective * guidance
     fit_error = float(
         (
@@ -1428,6 +2620,122 @@ def _recover_effective_cfg(args, incoming):
         ).item()
     )
     return effective, fit_error
+
+
+def _cfg_scale_from_args(args) -> float | None:
+    """The CFG scale SMC/APG/CWM combine with, or None without ``cond_scale``.
+
+    Upstream's cfg hook reads ``args["cond_scale"]`` (origin: namemechan/
+    ComfyUI-DCW@66aaf9dd:dcw_node.py:848-866). Forge's own linear CFG also
+    multiplies by ``edit_strength`` — the summed ``strength`` of the cond
+    entries, e.g. ``a AND b`` — whenever no ``sampler_cfg_function`` is set
+    (backend/sampling/sampling_function.py:293, 307-310); the same factor is
+    applied here so a neutral base reproduces Forge's CFG. Post-CFG args carry
+    that cond list as ``args["cond"]``.
+    """
+    try:
+        scale = float(args.get("cond_scale"))
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(scale):
+        return None
+    model_options = args.get("model_options") or {}
+    if isinstance(model_options, dict) and "sampler_cfg_function" in model_options:
+        return scale
+    cond = args.get("cond")
+    if isinstance(cond, (list, tuple)) and cond:
+        try:
+            edit_strength = sum(
+                (item["strength"] if "strength" in item else 1)
+                for item in cond
+            )
+            edit_strength = float(edit_strength)
+        except (TypeError, ValueError, KeyError):
+            edit_strength = 1.0
+        if math.isfinite(edit_strength) and not math.isclose(edit_strength, 1.0):
+            scale *= edit_strength
+    return scale
+
+
+def _uncond_ran_at_cfg1(args, skip_reason: str) -> bool:
+    """At cond_scale≈1, did Forge still evaluate a real uncond batch?
+
+    Only with ``disable_cfg1_optimization`` (Forge sampling_function.py:295;
+    ComfyUI samplers.py:610 is the same test). This script sets that flag
+    whenever SMC or CWM would install upstream's cfg hook on a pass whose own
+    CFG is ≈1, so those bases run at CFG 1 like upstream (origin:
+    namemechan/ComfyUI-DCW@66aaf9dd:dcw_node.py:877-878).
+
+    The flag cannot conjure an uncond Forge never encoded: at CFG == 1 Forge
+    drops the negative prompt (modules/processing.py:481-483, hires
+    :1606-1608), so the post-CFG ``uncond`` is None and ``uncond_denoised``
+    is all zeros. Forge always passes the ``uncond`` key
+    (backend/sampling/sampling_function.py:316-317), hence the explicit
+    None test."""
+    if "uncond" in args and args["uncond"] is None:
+        return False
+    model_options = args.get("model_options") or {}
+    return bool(
+        isinstance(model_options, dict)
+        and model_options.get("disable_cfg1_optimization", False)
+        and skip_reason.startswith("cond_scale")
+    )
+
+
+def _cfg_hook_needed(unet=None) -> bool:
+    """Would upstream DCW(+a) install its cfg hook (and ``disable_cfg1_optimization``)?
+
+    Upstream: ``cwm_alpha_active = cwm_enabled and (alpha_l or alpha_h)``,
+    ``cfg_hook_needed = cwm_alpha_active or smc_on``, and the hook plus the
+    flag are skipped when another node already registered
+    ``sampler_cfg_function`` (origin: namemechan/ComfyUI-DCW@66aaf9dd:
+    dcw_node.py:817-821, 834-841, 877-878). APG is not upstream and never
+    needs the flag: it is skipped at CFG≈1."""
+    smc_on, _apg_on, cwm_on = _cfg_base_flags()
+    cwm_alpha_active = cwm_on and (
+        float(_CFG["alpha_low"]) != 0.0 or float(_CFG["alpha_high"]) != 0.0
+    )
+    if not (smc_on or cwm_alpha_active):
+        return False
+    options = getattr(unet, "model_options", None) if unet is not None else None
+    if isinstance(options, dict) and "sampler_cfg_function" in options:
+        return False
+    return True
+
+
+def _pass_cfg_near_one(p) -> bool:
+    """Is the configured CFG of the pass being attached ≈1?
+
+    Forge's per-step ``cond_scale`` starts at ``p.cfg_scale``
+    (modules/sd_samplers_kdiffusion.py:188, 242), becomes ``p.hr_cfg`` on the
+    hires pass and ``p.refiner_cfg or cond_scale`` after a refiner switch
+    (modules/sd_samplers_cfg_denoiser.py:136-139); the refiner reuses this
+    pass's unet and cannot run with hires (sd_samplers_common.py:277-279).
+    Any other cond_scale=1 step comes from Forge's skip-negative settings
+    (:141-148), which ``disable_cfg1_optimization`` would undo. Without a
+    readable CFG (non-Forge callers) this keeps upstream's unconditional
+    flag."""
+    if bool(getattr(p, "is_hr_pass", False)):
+        scales = [getattr(p, "hr_cfg", None)]
+    else:
+        scales = [getattr(p, "cfg_scale", None)]
+        if (
+            getattr(p, "refiner_checkpoint_info", None) is not None
+            and getattr(p, "refiner_switch_at", None)
+            and getattr(p, "refiner_cfg", None)
+        ):
+            scales.append(p.refiner_cfg)
+    known = []
+    for scale in scales:
+        try:
+            number = float(scale)
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(number):
+            known.append(number)
+    if not known:
+        return True
+    return any(math.isclose(number, 1.0) for number in known)
 
 
 def _cfg_base_flags() -> tuple[bool, bool, bool]:
@@ -1444,28 +2752,194 @@ def _cfg_base_flags() -> tuple[bool, bool, bool]:
     return smc_on, apg_on, cwm_on
 
 
+def _cfg_base_skip_reason(args) -> str | None:
+    """Why the CFG base override must not run on this post-CFG call.
+
+    At ``cond_scale`` ≈ 1 Forge never evaluates the uncond batch
+    (``sampling_function_inner``: ``uncond_ = None``) and hands the hook an
+    all-zero ``uncond_denoised``. SMC/APG/CWM all rewrite ``cond - uncond``,
+    which then equals ``cond`` itself: APG with eta=0 projects most of the
+    prediction away (near-black output) and CWM/SMC reweight the image
+    instead of a guidance error. Skimmed CFG guards the same case. Either
+    signal alone is enough — ``cond_scale`` covers
+    ``disable_cfg1_optimization``, the zero check covers callers that omit
+    the key. Returns None when the override may proceed.
+
+    Forge always passes ``cond_scale`` (``sampling_function_inner``) and only
+    drops the uncond batch when it is ≈1, so with a usable ``cond_scale`` the
+    zero scan — a full-tensor ``torch.any`` read back to the host, i.e. a
+    GPU->CPU sync every step — is redundant and runs only as a fallback."""
+    cond_scale = args.get("cond_scale")
+    if cond_scale is not None:
+        try:
+            scale = float(cond_scale)
+        except (TypeError, ValueError):
+            scale = None
+        if scale is not None:
+            if math.isclose(scale, 1.0):
+                return f"cond_scale={scale:g}"
+            return None
+    uncond = args.get("uncond_denoised")
+    if (
+        torch.is_tensor(uncond)
+        and uncond.numel() > 0
+        and not bool(torch.any(uncond != 0))
+    ):
+        return "uncond_denoised is all zero (no uncond pass; cond_scale≈1)"
+    return None
+
+
+def _cfg1_skip_message(
+    args,
+    skip_reason: str,
+    skipped: tuple = ("SMC", "APG", "CWM"),
+    kept: tuple = (),
+) -> str:
+    """CFG 1 가드 경고 한 줄(생성당 1회).
+
+    ``disable_cfg1_optimization`` 이 켜져 있으면 Forge 는 CFG 1 에서도 uncond
+    패스를 돌린다. 그때 SMC/CWM 은 원본 cfg 훅처럼 그대로 돌고(``kept``), APG 만
+    배율 1 이라 건너뛴다(CFG 결과가 cond 예측 그 자체라 되투영할 가이던스가 없다).
+    플래그가 없으면 uncond 가 없어 켜진 기반 전부를 건너뛴다."""
+    forced_uncond = _uncond_ran_at_cfg1(args, skip_reason)
+    names = "/".join(skipped)
+    if forced_uncond:
+        why = (
+            "disable_cfg1_optimization is set, so Forge still ran the uncond "
+            "pass, but at CFG 1 the incoming result is the cond prediction "
+            "itself and there is no CFG guidance to reproject"
+        )
+    else:
+        why = (
+            "Forge runs no uncond at CFG 1, so there is no CFG error to "
+            "smooth, reproject or reweight"
+        )
+    if kept:
+        message = (
+            f"CFG base override ({names}) skipped: {skip_reason}. {why}; "
+            f"{'/'.join(kept)} still run on the real uncond like the original "
+            "DCW(+a) cfg hook (set CFG > 1 to use "
+            f"{'it' if len(skipped) == 1 else 'them'})."
+        )
+    else:
+        message = (
+            f"CFG base override ({names}) skipped: {skip_reason}. {why}; "
+            "the incoming result is kept unchanged (set CFG > 1 to use "
+            f"{'it' if len(skipped) == 1 else 'these bases'})."
+        )
+    if (
+        "APG" in skipped
+        and _APG["on"]
+        and _STATE.get("apg_autooff_rescale", True)
+        and _STATE.get("on")
+        and float(_STATE.get("rescale", 0.0) or 0.0) > 0
+    ):
+        message += (
+            " APG did not run, so the PAG rescale auto-off is not applied "
+            "either (rescale stays active)."
+        )
+    return message
+
+
 def _apply_cfg_base(args, incoming):
     """Return the selected CFG base before PAG/SEG/SLG and DCW.
 
     SMC, APG and CWM are independent; whichever are on run in the fixed order
     SMC (smooth the CFG error across steps) -> APG (reproject it) -> CWM
     (reweight it per Haar band). With none on, the incoming CFG result from
-    Forge/MaHiRo/other extensions is preserved untouched."""
+    Forge/MaHiRo/other extensions is preserved untouched.
+
+    Matches upstream DCW(+a) (origin: namemechan/ComfyUI-DCW@66aaf9dd:
+    dcw_node.py:813-878):
+
+    - CWM counts only with a non-zero alpha (``cwm_alpha_active``).
+    - When another extension registered ``sampler_cfg_function`` (RescaleCFG,
+      Dynamic Thresholding…), SMC/CWM step aside with one warning and its
+      result is kept; PAG/SEG/SLG and DCW/RDC still run.
+    - SMC/CWM also run at CFG≈1: on a pass configured at CFG≈1 attach sets
+      ``disable_cfg1_optimization`` (_cfg_hook_needed, _pass_cfg_near_one)
+      so Forge evaluates the uncond. APG (not upstream) is skipped at
+      CFG≈1, and every base is skipped when no uncond ran — including
+      CFG == 1, where Forge encodes no negative prompt at all.
+    - The scale is ``args["cond_scale"]`` (× Forge edit_strength); the
+      least-squares fit of the incoming result is a diagnostic.
+    """
+    _CFG["base_skipped"] = False
     smc_on, apg_on, cwm_on = _cfg_base_flags()
+    cwm_on = cwm_on and (
+        float(_CFG["alpha_low"]) != 0.0 or float(_CFG["alpha_high"]) != 0.0
+    )
     if not (smc_on or apg_on or cwm_on):
         return incoming.float()
 
-    effective_scale, fit_error = _recover_effective_cfg(args, incoming)
-    _CFG["effective_scale"] = effective_scale
-    _CFG["fit_error"] = fit_error
     model_options = args.get("model_options") or {}
-    external_cfg = "sampler_cfg_function" in model_options
+    external_cfg = (
+        isinstance(model_options, dict)
+        and "sampler_cfg_function" in model_options
+    )
     _CFG["external_cfg_detected"] = bool(external_cfg)
-    if not _CFG["warned"] and (external_cfg or fit_error > 0.05):
+    if external_cfg and (smc_on or cwm_on):
+        if not _CFG["external_cfg_warned"]:
+            _CFG["external_cfg_warned"] = True
+            stepped_aside = "/".join(
+                name for name, on in (("SMC", smc_on), ("CWM", cwm_on)) if on
+            )
+            _log(
+                "another extension registered sampler_cfg_function; "
+                f"{stepped_aside} skipped to avoid the conflict, like the "
+                "original DCW(+a) node. Its CFG result is kept and PAG/SEG/SLG "
+                "and DCW/RDC still apply"
+                + ("; APG still replaces it." if apg_on else ".")
+            )
+        smc_on = cwm_on = False
+        if not apg_on:
+            return incoming.float()
+
+    skip_reason = _cfg_base_skip_reason(args)
+    if skip_reason is not None:
+        uncond_ran = _uncond_ran_at_cfg1(args, skip_reason)
+        requested = (("SMC", smc_on), ("APG", apg_on), ("CWM", cwm_on))
+        kept = tuple(
+            name for name, on in requested
+            if on and uncond_ran and name != "APG"
+        )
+        skipped = tuple(
+            name for name, on in requested if on and name not in kept
+        )
+        # base_skipped: APG did not run this step (see _apply_perturbation).
+        _CFG["base_skipped"] = bool(apg_on)
+        if skipped and not _CFG["cfg1_warned"]:
+            _CFG["cfg1_warned"] = True
+            _log(_cfg1_skip_message(args, skip_reason, skipped, kept))
+        if not kept:
+            return incoming.float()
+        apg_on = False
+
+    # The scale comes from cond_scale. fit_error / fit_scale are diagnostics
+    # (a warning line + the [VERIFY] summary): with diagnostics off they are
+    # measured once per pass (one GPU->CPU sync) to keep the nonlinear-CFG
+    # warning, and every step only for a caller without cond_scale.
+    scale = _cfg_scale_from_args(args)
+    measure_fit = guidance_diagnostics_enabled() or not _CFG["fit_checked"]
+    fit_error = None
+    if measure_fit or scale is None:
+        fit_scale, fit_error = _recover_effective_cfg(
+            args, incoming, with_fit_error=measure_fit
+        )
+        if measure_fit:
+            _CFG["fit_checked"] = True
+            _CFG["fit_error"] = fit_error
+            _CFG["fit_scale"] = fit_scale
+        if scale is None:
+            scale = fit_scale
+    _CFG["effective_scale"] = scale
+    nonlinear = fit_error is not None and fit_error > 0.05
+    if not _CFG["warned"] and (external_cfg or nonlinear):
         _CFG["warned"] = True
+        fit_text = "?" if fit_error is None else f"{fit_error:.3e}"
         _log(
             "CFG base override requested while incoming CFG is custom/nonlinear "
-            f"(sampler_cfg_function={external_cfg}, fit_error={fit_error:.3e}); "
+            f"(sampler_cfg_function={external_cfg}, fit_error={fit_text}); "
             "the selected base intentionally replaces it."
         )
 
@@ -1473,11 +2947,20 @@ def _apply_cfg_base(args, incoming):
     uncond = args["uncond_denoised"].float()
     sigma = args.get("sigma")
 
+    adaptive_smc = _CFG.get("smc_mode") == SMC_MODE_ADAPTIVE
     if apg_on:
         # SMC -> APG -> CWM. APG consumes the (optionally SMC-smoothed) error
         # and already applies the CFG scale, so CWM runs on its output at 1.0.
         raw_error = cond - uncond
-        if smc_on:
+        if smc_on and adaptive_smc:
+            raw_error, _RUNTIME.smc_prev = apply_smc_adaptive(
+                raw_error,
+                sampler_sigma(args),
+                _RUNTIME.smc_prev,
+                float(_CFG["smc_adaptive_alpha"]),
+                float(_CFG["smc_adaptive_lambda"]),
+            )
+        elif smc_on:
             raw_error, _RUNTIME.smc_prev = apply_smc_error(
                 raw_error,
                 _RUNTIME.smc_prev,
@@ -1485,12 +2968,12 @@ def _apply_cfg_base(args, incoming):
                 float(_CFG["smc_k"]),
             )
         apg_result = _apply_apg(
-            args, effective_scale, raw_error if smc_on else None
+            args, scale, raw_error if smc_on else None
         )
         if apg_result is None:
             if not (smc_on or cwm_on):
                 return incoming.float()  # APG alone failed: keep incoming CFG
-            apg_result = uncond + effective_scale * raw_error
+            apg_result = uncond + scale * raw_error
         else:
             _STATE["apg_steps"] += 1
         _CFG["steps"] += 1
@@ -1509,13 +2992,18 @@ def _apply_cfg_base(args, incoming):
         cond=cond,
         uncond=uncond,
         sigma=sigma,
-        effective_scale=effective_scale,
+        effective_scale=scale,
         mode="smc+cwm" if smc_on and cwm_on else ("smc" if smc_on else "cwm"),
         alpha_low=float(_CFG["alpha_low"]),
         alpha_high=float(_CFG["alpha_high"]),
-        smc_lambda=float(_CFG["smc_lambda"]),
+        smc_lambda=float(
+            _CFG["smc_adaptive_lambda"] if adaptive_smc else _CFG["smc_lambda"]
+        ),
         smc_k=float(_CFG["smc_k"]),
         smc_previous=_RUNTIME.smc_prev,
+        smc_mode=SMC_MODE_ADAPTIVE if adaptive_smc else SMC_MODE_UNIT,
+        smc_sigma=sampler_sigma(args) if adaptive_smc else None,
+        smc_alpha=float(_CFG["smc_adaptive_alpha"]),
     )
     if smc_on:
         _RUNTIME.smc_prev = next_previous
@@ -1529,8 +3017,10 @@ def _apply_perturbation(args, base):
     (attention-perturbed for PAG/SEG, and/or layer-skipped for SLG). Forge's
     ``model.apply_model`` has already converted every prediction to denoised
     x0, so no eps/v/flow conversion is needed here. Each active term applies at
-    its full configured scale (the former auto-decay safety brake, which halved
-    each scale when >1 term was active, has been removed).
+    its full configured scale by default (the former auto-decay safety brake,
+    which halved each scale when >1 term was active, has been removed). The
+    optional experimental PAG-only envelope (_pag_envelope_factor) multiplies
+    the PAG scale in linear sigma space.
     Returns ``base`` unchanged on any problem."""
     cd = args["cond_denoised"].float()
     # Prefer the cond captured next to the weak predictions. Any post-CFG hook
@@ -1545,7 +3035,12 @@ def _apply_perturbation(args, base):
 
     terms = []
     if attn_raw is not None and attn_raw.shape == cd.shape:
-        terms.append((float(_STATE["attn_scale"]), attn_raw))
+        attn_scale = float(_STATE["attn_scale"])
+        envelope = _STATE["attn_method"] == "pag" and _STATE.get("pag_cosine_envelope", False)
+        if envelope:
+            attn_scale *= _pag_envelope_factor(args.get("sigma"))
+        if attn_scale > 0.0 or not envelope:
+            terms.append((attn_scale, attn_raw))
     if slg_raw is not None and slg_raw.shape == cd.shape:
         terms.append((float(_STATE["slg_scale"]), slg_raw))
     if not terms:
@@ -1568,7 +3063,12 @@ def _apply_perturbation(args, base):
     # prediction plus guidance. In both modes only the new guidance term is
     # scaled. Scaling the entire CFG base every denoise step drains image energy.
     r = float(_STATE["rescale"])
-    apg_governs = _APG["on"] and _STATE.get("apg_autooff_rescale", True)
+    # CFG 1 가드로 APG 를 건너뛴 스텝에서는 자동 끄기도 적용하지 않는다.
+    apg_governs = (
+        _APG["on"]
+        and _STATE.get("apg_autooff_rescale", True)
+        and not _CFG.get("base_skipped", False)
+    )
     if r > 0 and not apg_governs:
         guided = (
             cd + guidance
@@ -1586,38 +3086,270 @@ def _apply_perturbation(args, base):
     return result
 
 
+def _detail_warn_once(stage: str, message: str) -> None:
+    warned = _DETAIL["warned"]
+    if stage not in warned:
+        warned.add(stage)
+        _log(message)
+
+
+def _hiflow_run_callback(params) -> None:
+    """Remember the request of the sampling run the coming model calls belong to (HiFlow)."""
+    if not (_HIFLOW["recording"] or _HIFLOW["applying"]):
+        return
+    _HIFLOW["run_p"] = getattr(getattr(params, "denoiser", None), "p", None)
+
+
+script_callbacks.on_cfg_denoiser(_hiflow_run_callback)
+
+
+def _hiflow_clear() -> None:
+    """Drop the recorded trajectory and stop recording/aligning."""
+    _HIFLOW["trajectory"].clear()
+    _HIFLOW.update(
+        owner=None, recording=False, applying=False, pass_p=None, run_p=None,
+        offset=None, recorded=0,
+    )
+    _HIFLOW["state"] = hiflow_guidance.HiFlowState()
+
+
+def _hiflow_ref(p):
+    """A weak reference to the request, or a plain one for objects without weakref support.
+
+    The plain reference lives only until the request ends (postprocess clears it)."""
+    ref = _owner_ref(p)
+    return ref if ref is not None else (lambda obj=p: obj)
+
+
+def _hiflow_attach(p, enabled: bool) -> str:
+    """Start recording (base pass of a hires request) or aligning (its hires pass).
+
+    Returns what HiFlow does this pass: "record", "align", or a reason it does nothing."""
+    _HIFLOW.update(recording=False, applying=False, pass_p=None, run_p=None, offset=None)
+    _HIFLOW["state"] = hiflow_guidance.HiFlowState()
+    if not enabled:
+        _hiflow_clear()
+        return "off"
+    owner_ref = _HIFLOW["owner"]
+    owner = owner_ref() if callable(owner_ref) else None
+    if getattr(p, "is_hr_pass", False):
+        if owner is not p or not len(_HIFLOW["trajectory"]):
+            return "no base-pass trajectory"
+        _HIFLOW.update(applying=True, pass_p=_hiflow_ref(p), offset=_forge_sampling_offset(p))
+        return "align"
+    if not getattr(p, "enable_hr", False) or _is_img2img_request(p):
+        _hiflow_clear()
+        return "no hires fix"
+    _HIFLOW["trajectory"].clear()
+    _HIFLOW.update(owner=_hiflow_ref(p), recording=True, pass_p=_hiflow_ref(p), recorded=0)
+    return "record"
+
+
+def _hiflow_run_is_pass() -> bool:
+    """Do the current model calls belong to the pass HiFlow records/aligns (not an inner run)?"""
+    ref = _HIFLOW["pass_p"]
+    pass_p = ref() if callable(ref) else None
+    run_p = _HIFLOW["run_p"]
+    return run_p is None or run_p is pass_p
+
+
+def _detail_stages_on() -> bool:
+    return bool(
+        _TSR["on"] or _HIST["mg_on"] or _HIST["higs_on"]
+        or _HIFLOW["recording"] or _HIFLOW["applying"]
+    )
+
+
+def _hiflow_position(walked, sigma: float):
+    """``(fractional step k, N, on_schedule)`` of ``sigma`` on the hires pass's walked sigmas."""
+    if walked is None:
+        return None, None, None
+    try:
+        values = [float(v) for v in (walked.flatten().tolist() if hasattr(walked, "flatten") else walked)]
+    except (TypeError, ValueError, RuntimeError):
+        return None, None, None
+    if len(values) < 2:
+        return None, None, None
+    steps = len(values) - 1
+    index = schedule_index(values, sigma)
+    if index is not None:
+        return float(index), steps, True
+    for k in range(steps):
+        hi, lo = values[k], values[k + 1]
+        if hi >= sigma >= lo and hi != lo:
+            return k + (hi - sigma) / (hi - lo), steps, False
+    return None, steps, False
+
+
+def _hiflow_apply(args, result, sigma: float):
+    """HiFlow on a hires evaluation (sam3ext/guidance/hiflow.py); ``result`` when it cannot apply."""
+    lr = _HIFLOW["trajectory"].at(sigma, device=result.device)
+    if lr is None:
+        return result
+    if lr.ndim != result.ndim or tuple(lr.shape[:2]) != tuple(result.shape[:2]):
+        _detail_warn_once(
+            "hiflow_shape",
+            "HiFlow skipped: the base-pass trajectory "
+            f"{tuple(lr.shape)} does not match the hires latent {tuple(result.shape)} "
+            "(different batch or latent channels — e.g. a hires checkpoint of another family).",
+        )
+        return result
+    reference = hiflow_guidance.resize_latent(lr, tuple(result.shape[-2:]))
+    walked = _sampled_schedule(sampling_schedule(args), _HIFLOW["offset"])
+    position, steps, on_schedule = _hiflow_position(walked, sigma)
+    state = _HIFLOW["state"]
+    # A repeat of the last step sigma (Heun's corrector reused as the next predictor) and an
+    # off-schedule midpoint get the direction term only and leave the acceleration state alone.
+    step_start = on_schedule is not False and not (
+        state.prev_sigma is not None
+        and abs(float(state.prev_sigma) - sigma) <= 1e-4 * max(abs(sigma), 1e-12)
+    )
+    return hiflow_guidance.apply_hiflow(
+        result, sigma, reference, state,
+        alpha=float(_HIFLOW["alpha"]), beta=float(_HIFLOW["beta"]),
+        cutoff=float(_HIFLOW["cutoff"]),
+        weight=hiflow_guidance.step_weight(position, steps),
+        step_start=step_start,
+    )
+
+
+def _hiflow_record(args, result) -> None:
+    """Base pass: keep this evaluation's final x0 at the sampler's sigma (last one wins)."""
+    if not _hiflow_run_is_pass():
+        return
+    sigma = sampler_sigma(args)
+    if sigma is None or sigma <= 0.0 or not torch.is_tensor(result):
+        return
+    _HIFLOW["trajectory"].record(sigma, result)
+    _HIFLOW["recorded"] = len(_HIFLOW["trajectory"])
+
+
+def _apply_detail_stages(args, result, adg_skipped: bool):
+    """HiFlow (hires) → Momentum Guidance → HiGS → TSR on the guided x0 (all optional)."""
+    if not (_TSR["on"] or _HIST["mg_on"] or _HIST["higs_on"] or _HIFLOW["applying"]):
+        return result
+    x = args.get("input")
+    if not torch.is_tensor(x) or tuple(x.shape) != tuple(result.shape):
+        _detail_warn_once(
+            "input",
+            "detail stages (TSR/MG/HiGS/HiFlow) skipped: post-CFG input does not match the prediction.",
+        )
+        return result
+    sigma = sampler_sigma(args)
+    flow = _DETAIL["flow"]
+    if flow is None:
+        flow = is_flow_model(args.get("model"))
+
+    if _HIFLOW["applying"] and sigma is not None and sigma > 0.0 and _hiflow_run_is_pass():
+        try:
+            result = _hiflow_apply(args, result, sigma)
+        except Exception as e:
+            _detail_warn_once("hiflow", f"HiFlow fallback (earlier guidance kept): {type(e).__name__}: {e}")
+
+    if _HIST["mg_on"] or _HIST["higs_on"]:
+        history = _RUNTIME.history
+        if adg_skipped:
+            # A cond-only Adaptive Guidance step: no guided prediction to extend; start over
+            # once guidance comes back (like APG momentum).
+            history.reset()
+        else:
+            try:
+                schedule = sampling_schedule(args)
+                on_schedule = (
+                    None if schedule is None
+                    else schedule_index(schedule, sigma) is not None
+                )
+                role = history_guidance.step_role(history, sigma, on_schedule)
+                if _HIST["mg_on"]:
+                    level = history_guidance.noise_level(sigma, bool(flow)) if sigma else 0.0
+                    result = history_guidance.apply_mg(
+                        result, x, sigma, history,
+                        alpha=float(_HIST["mg_alpha"]), beta=float(_HIST["mg_beta"]),
+                        normalize=bool(_HIST["mg_normalize"]),
+                        active=float(_HIST["mg_min"]) <= level <= float(_HIST["mg_max"]),
+                        role=role,
+                    )
+                if _HIST["higs_on"]:
+                    result = history_guidance.apply_higs(
+                        result, sigma, history,
+                        weight=float(_HIST["higs_weight"]), eta=float(_HIST["higs_eta"]),
+                        alpha=float(_HIST["higs_alpha"]), cutoff=float(_HIST["higs_cutoff"]),
+                        t_min=float(_HIST["higs_t_min"]), t_max=float(_HIST["higs_t_max"]),
+                        flow=bool(flow), role=role,
+                    )
+            except Exception as e:
+                history.reset()
+                _detail_warn_once("history", f"MG/HiGS fallback (earlier guidance kept): {type(e).__name__}: {e}")
+
+    if _TSR["on"]:
+        if flow is None:
+            _detail_warn_once("tsr", "TSR skipped: the model's parameterisation (flow or eps/v) is unknown.")
+        else:
+            try:
+                rescaled = tsr_guidance.apply_tsr(
+                    result, x, args.get("sigma"),
+                    k=float(_TSR["k"]), tsr_sigma=float(_TSR["sigma"]), flow=bool(flow),
+                )
+                if rescaled is not result:
+                    _TSR["steps"] += 1
+                result = rescaled
+            except Exception as e:
+                _detail_warn_once("tsr", f"TSR fallback (earlier guidance kept): {type(e).__name__}: {e}")
+    return result
+
+
 def _post_cfg(args):
     """Single post-CFG orchestrator.
 
-    Order is fixed and visible: capture live x_t for CNS; handle ADG state;
+    Order is fixed and visible: CNS x_t fallback capture (the step callback
+    is the primary source, see _install_cns_x_capture); handle ADG state;
     select one CFG base (or the explicit experimental stack); add perturbation
     deltas; run DCW last inside sam-extra.
+
+    DCW/RDC runs on every model evaluation like upstream's post-CFG hook
+    (origin: namemechan/ComfyUI-DCW@66aaf9dd:dcw_node.py:883-930), including
+    the cond-only steps Adaptive Guidance skips: there the incoming result is
+    the cond prediction, no CFG base or perturbation applies, APG momentum is
+    cleared and SMC keeps its e_prev.
     """
     denoised = args["denoised"]
+    aggregate = _STATE.pop("condition_aggregation", None)
+    if aggregate is not None:
+        count = aggregate["count"]
+        _STATE["cond_raw"] = aggregate["cond"] / count
+        for key in ("attn", "slg"):
+            _STATE[key + "_raw"] = (
+                aggregate[key] / count if aggregate[key + "_seen"] else None
+            )
     if torch is None:
         return denoised
     live_input = args.get("input")
-    if torch.is_tensor(live_input):
-        _RUNTIME.cns_x_t = live_input.detach()
+    _capture_cns_post_cfg_input(live_input)
 
-    if _STATE["adg_skipped"]:
-        reset_cfg_state()
-        _RUNTIME.close_step()
-        return denoised
+    adg_skipped = bool(_STATE["adg_skipped"])
+    if adg_skipped:
+        _reset_apg_momentum()
 
-    has_base_override = any(_cfg_base_flags())
-    has_pert = _STATE["on"] and (
+    has_base_override = not adg_skipped and any(_cfg_base_flags())
+    has_pert = not adg_skipped and _STATE["on"] and (
         _STATE["attn_raw"] is not None or _STATE["slg_raw"] is not None
     )
-    if not has_base_override and not has_pert and not _DCW["on"]:
+    detail_on = _detail_stages_on()
+    if not has_base_override and not has_pert and not _DCW["on"] and not detail_on:
         _RUNTIME.close_step()
         return denoised
 
     try:
-        result = _apply_cfg_base(args, denoised)
+        result = (
+            denoised.float() if adg_skipped
+            else _apply_cfg_base(args, denoised)
+        )
 
         if has_pert:
             result = _apply_perturbation(args, result)
+
+        if detail_on:
+            result = _apply_detail_stages(args, result, adg_skipped)
 
         if _DCW["on"]:
             try:
@@ -1625,14 +3357,40 @@ def _post_cfg(args):
                     result,
                     live_input,
                     args.get("sigma"),
-                    float(_DCW["lambda_low"]),
-                    float(_DCW["lambda_high"]),
+                    (
+                        float(_DCW["lambda_low"])
+                        if _DCW["dcw_on"] else 0.0
+                    ),
+                    (
+                        float(_DCW["lambda_high"])
+                        if _DCW["dcw_on"] else 0.0
+                    ),
+                    rdc_tau=(
+                        float(_DCW["rdc_tau"])
+                        if _DCW["rdc_on"] else 0.0
+                    ),
+                    rdc_alpha_ll=float(_DCW["rdc_alpha_ll"]),
+                    rdc_alpha_hh=float(_DCW["rdc_alpha_hh"]),
+                    rdc_state=_RUNTIME.rdc_state,
                 )
                 _DCW["steps"] += 1
+                if _DCW["dcw_on"]:
+                    _DCW["dcw_steps"] += 1
+                if _DCW["rdc_on"]:
+                    _DCW["rdc_steps"] += 1
             except Exception as e:
-                # DCW is the final optional transform. A bad/missing live
+                # DCW/RDC is the final optional transform. A bad/missing live
                 # latent must not discard an already-valid CFG/PAG result.
-                _log(f"DCW fallback (earlier guidance kept): {type(e).__name__}: {e}")
+                _log(
+                    "DCW/RDC fallback (earlier guidance kept): "
+                    f"{type(e).__name__}: {e}"
+                )
+
+        if _HIFLOW["recording"]:
+            try:
+                _hiflow_record(args, result)
+            except Exception as e:
+                _detail_warn_once("hiflow_record", f"HiFlow recording failed: {type(e).__name__}: {e}")
 
         return result.to(denoised.dtype)
     except Exception as e:
@@ -1655,6 +3413,9 @@ def _parse_blocks(spec: str, n: int) -> set:
     block in the later half (14-27), which multiplied a soft perturbation into
     a destructive one. Keep the safe single-block default and clamp it for
     smaller compatible models.
+
+    Reversed ranges are swapped like upstream ('20-18' → {18, 19, 20};
+    origin: iljung1106/comfyui-anima-safe-pag@905b0107:__init__.py:44-51).
     """
     spec = (spec or "").strip()
     if not spec:
@@ -1666,7 +3427,10 @@ def _parse_blocks(spec: str, n: int) -> set:
         if "-" in part:
             a, _, b = part.partition("-")
             try:
-                out.update(range(int(a), int(b) + 1))
+                start, end = int(a), int(b)
+                if end < start:
+                    start, end = end, start
+                out.update(range(start, end + 1))
             except ValueError:
                 pass
         else:
@@ -1921,6 +3685,100 @@ def _make_pag_xyz_axis() -> None:
             partial(_pag_xyz_set, field="smc_preset"),
             choices=lambda: list(SMC_PRESET_NAMES),
         ),
+        # RDC was introduced upstream after the existing 47-axis compatibility
+        # prefix. Append only: xyz_grid persists the integer axis index.
+        # "Enable" is the legacy switch: False turns RDC off, True leaves the
+        # upstream gate (Enable DCW and tau > 0) in charge.
+        xyz_grid.AxisOption(
+            "[Anima RDC] Enable", str,
+            partial(_pag_xyz_set, field="rdc_enabled"), choices=bool_choices,
+        ),
+        xyz_grid.AxisOption(
+            "[Anima RDC] Tau", float,
+            partial(_pag_xyz_set, field="rdc_tau"),
+        ),
+        xyz_grid.AxisOption(
+            "[Anima RDC] Alpha LL", float,
+            partial(_pag_xyz_set, field="rdc_alpha_ll"),
+        ),
+        xyz_grid.AxisOption(
+            "[Anima RDC] Alpha HH", float,
+            partial(_pag_xyz_set, field="rdc_alpha_hh"),
+        ),
+        # v0.30 detail suite — appended after the 52-axis prefix above.
+        xyz_grid.AxisOption(
+            "[Anima Pert] SLG Mode", str,
+            partial(_pag_xyz_set, field="slg_mode"),
+            choices=lambda: ["Fixed", "Stochastic (S²)"],
+        ),
+        xyz_grid.AxisOption(
+            "[Anima S2] Scale", float,
+            partial(_pag_xyz_set, field="s2_scale"),
+        ),
+        xyz_grid.AxisOption(
+            "[Anima S2] Drop Ratio", float,
+            partial(_pag_xyz_set, field="s2_ratio"),
+        ),
+        xyz_grid.AxisOption(
+            "[Anima S2] Eligible Blocks", str,
+            partial(_pag_xyz_set, field="s2_blocks"),
+        ),
+        xyz_grid.AxisOption(
+            "[Anima S2] Start", float,
+            partial(_pag_xyz_set, field="s2_start"),
+        ),
+        xyz_grid.AxisOption(
+            "[Anima S2] End", float,
+            partial(_pag_xyz_set, field="s2_end"),
+        ),
+        xyz_grid.AxisOption(
+            "[Anima SMC] Controller", str,
+            partial(_pag_xyz_set, field="smc_mode"),
+            choices=lambda: list(SMC_MODE_NAMES),
+        ),
+        xyz_grid.AxisOption(
+            "[Anima SMC] Adaptive Alpha", float,
+            partial(_pag_xyz_set, field="smc_adaptive_alpha"),
+        ),
+        xyz_grid.AxisOption(
+            "[Anima SMC] Adaptive Lambda", float,
+            partial(_pag_xyz_set, field="smc_adaptive_lambda"),
+        ),
+        xyz_grid.AxisOption(
+            "[Anima TSR] Enable", str,
+            partial(_pag_xyz_set, field="tsr_enabled"), choices=bool_choices,
+        ),
+        xyz_grid.AxisOption("[Anima TSR] K", float, partial(_pag_xyz_set, field="tsr_k")),
+        xyz_grid.AxisOption("[Anima TSR] Sigma", float, partial(_pag_xyz_set, field="tsr_sigma")),
+        xyz_grid.AxisOption(
+            "[Anima MG] Enable", str,
+            partial(_pag_xyz_set, field="mg_enabled"), choices=bool_choices,
+        ),
+        xyz_grid.AxisOption("[Anima MG] Alpha", float, partial(_pag_xyz_set, field="mg_alpha")),
+        xyz_grid.AxisOption("[Anima MG] Beta", float, partial(_pag_xyz_set, field="mg_beta")),
+        xyz_grid.AxisOption(
+            "[Anima MG] Normalize", str,
+            partial(_pag_xyz_set, field="mg_normalize"), choices=bool_choices,
+        ),
+        xyz_grid.AxisOption("[Anima MG] Window Min", float, partial(_pag_xyz_set, field="mg_min")),
+        xyz_grid.AxisOption("[Anima MG] Window Max", float, partial(_pag_xyz_set, field="mg_max")),
+        xyz_grid.AxisOption(
+            "[Anima HiGS] Enable", str,
+            partial(_pag_xyz_set, field="higs_enabled"), choices=bool_choices,
+        ),
+        xyz_grid.AxisOption("[Anima HiGS] Weight", float, partial(_pag_xyz_set, field="higs_weight")),
+        xyz_grid.AxisOption("[Anima HiGS] Eta", float, partial(_pag_xyz_set, field="higs_eta")),
+        xyz_grid.AxisOption("[Anima HiGS] History Alpha", float, partial(_pag_xyz_set, field="higs_alpha")),
+        xyz_grid.AxisOption("[Anima HiGS] Cutoff", float, partial(_pag_xyz_set, field="higs_cutoff")),
+        xyz_grid.AxisOption("[Anima HiGS] T Min", float, partial(_pag_xyz_set, field="higs_t_min")),
+        xyz_grid.AxisOption("[Anima HiGS] T Max", float, partial(_pag_xyz_set, field="higs_t_max")),
+        xyz_grid.AxisOption(
+            "[Anima HiFlow] Enable", str,
+            partial(_pag_xyz_set, field="hiflow_enabled"), choices=bool_choices,
+        ),
+        xyz_grid.AxisOption("[Anima HiFlow] Alpha", float, partial(_pag_xyz_set, field="hiflow_alpha")),
+        xyz_grid.AxisOption("[Anima HiFlow] Beta", float, partial(_pag_xyz_set, field="hiflow_beta")),
+        xyz_grid.AxisOption("[Anima HiFlow] Cutoff", float, partial(_pag_xyz_set, field="hiflow_cutoff")),
     ]
 
     # Register per label so a WebUI "reload scripts" after an extension update
@@ -1931,7 +3789,37 @@ def _make_pag_xyz_axis() -> None:
     )
 
 
+def _migrate_saved_ui_config() -> None:
+    """Carry an existing ui-config.json over the PAG/DCW(+a)/CNS, Skimmed CFG and
+    Tile-Repair parity changes (one-time).
+
+    The PAG scale/DCW/RDC/CWM labels are the ui-config keys and did not change, so
+    Forge's UiLoadsave would reapply the old PAG scale maximum 15, the old RDC tau 0.15
+    (while the removed RDC switch's saved False no longer applies), the old slider
+    bounds and the old 2x defaults.
+    The CNS strength/gamma power bounds would come back the same way, and the
+    renamed CNS gamma scale would drop a value the user saved under its old label.
+    on_before_ui runs before ui.create_ui() builds UiLoadsave (webui.py,
+    modules/ui.py:866), so fixing the file here is what the UI then loads. See
+    sam3ext/guidance/ui_config_migration.py for the rules."""
+    cmd_opts = getattr(shared, "cmd_opts", None) if shared is not None else None
+    path = getattr(cmd_opts, "ui_config_file", None)
+    if not path:
+        return
+    changes = migrate_ui_config_file(path, script_file=Path(__file__).name)
+    if changes:
+        _log(
+            "ui-config.json migrated to the upstream PAG/DCW(+a)/CNS/Skimmed CFG/Tile-Repair "
+            "defaults/ranges:\n  "
+            + "\n  ".join(changes)
+        )
+
+
 def _pag_on_before_ui() -> None:
+    try:
+        _migrate_saved_ui_config()
+    except Exception:
+        _log("ui-config migration failed (left as is):\n" + traceback.format_exc())
     try:
         _make_pag_xyz_axis()
     except Exception:
@@ -1970,7 +3858,14 @@ def _clear_extra_generation_params(p) -> None:
     params = getattr(p, "extra_generation_params", None)
     if not isinstance(params, dict):
         return
+    # Forge runs this hook again for the hires pass on the same ``p``
+    # (modules/processing.py:1453 is_hr_pass, :1546). The ControlNet guard is
+    # a record of a pass that was blocked: a base pass blocked by a "Low res
+    # only" control must keep it through an unblocked hires pass.
+    hires = bool(getattr(p, "is_hr_pass", False))
     for key in _EXTRA_GENERATION_PARAM_KEYS:
+        if hires and key == INFOTEXT_CONTROLNET_GUARD:
+            continue
         params.pop(key, None)
 
 
@@ -1980,6 +3875,12 @@ def _clear_extra_generation_params(p) -> None:
 
 
 class AnimaSafePAG(scripts.Script):
+    @property
+    def section(self):
+        # Forge 는 사용자 섹션을 설정값 칼럼(#txt2img_settings) 안에 만든다 → 1열 "ANIMA 튜닝" 자리.
+        # 설정(sam3_layout_sections)을 끄거나 img2img 면 None 이라 예전과 똑같이 스크립트 컨테이너로 간다.
+        return layout_lanes.anima_section(bool(getattr(self, "is_img2img", False)))
+
     # sorting_priority still governs the accordion position. Current Forge Neo
     # accidentally defines process_before_every_sampling twice; the later raw
     # alwayson_scripts loop wins and ignores this priority for execution.
@@ -2010,13 +3911,17 @@ class AnimaSafePAG(scripts.Script):
                 label="Enable Perturbation Guidance",
                 value=False,
                 elem_id="anima_safe_pag_enable",
+                elem_classes=["sam3-on", "sam3-on--pag"],
             )
             gr.Markdown(
                 "#### PAG / SEG — Attention perturbation\n"
                 "기본은 **공식 경로**입니다: PAG는 value-only, SEG는 실제 H·W query에 "
                 "Gaussian blur를 적용합니다. Strength=1이면 원 기법의 전체 perturbation, "
                 "기본 0.75는 Anima Safe PAG의 부드러운 권장값입니다. `None`은 SLG만 "
-                "사용할 때 선택하세요."
+                "사용할 때 선택하세요.\n\n"
+                "⚠️ **ControlNet이 켜진 생성에서는 PAG/SEG/SLG를 적용하지 않습니다** "
+                "(Forge 전용 안전장치 — 원본 ComfyUI 노드는 끄지 않음). 이때 결과 "
+                "infotext에 `Anima Perturbation ControlNet guard`가 남습니다."
             )
             attn_method = gr.Radio(
                 label="Attention perturbation method",
@@ -2026,8 +3931,11 @@ class AnimaSafePAG(scripts.Script):
                 elem_id="anima_safe_pag_method",
             )
             scale = gr.Slider(
-                label="Attn Scale — PAG / SEG guidance scale (cond−weak 배율)",
-                minimum=0.0, maximum=15.0, step=0.1, value=4.0,
+                # Same label as the pre-parity 0~15 slider: the saved maximum 15 is
+                # dropped once by _migrate_saved_ui_config.
+                label=PAG_SCALE_LABEL,
+                # 원본 노드 scale 범위 0~100 (iljung1106/comfyui-anima-safe-pag@905b0107:__init__.py:201)
+                minimum=0.0, maximum=100.0, step=0.1, value=4.0,
                 info="이미지가 찢어지거나 배경·구도가 과하게 변하면 이 값을 먼저 낮추세요.",
                 elem_id="anima_safe_pag_scale",
             )
@@ -2071,7 +3979,10 @@ class AnimaSafePAG(scripts.Script):
             gr.Markdown(
                 "#### 공통 적용 범위·보정 — PAG / SEG / SLG\n"
                 "아래 Start·End·Rescale은 **활성화한 모든 perturbation에 공통 적용**됩니다. "
-                "SLG를 끈 상태에서도 PAG/SEG에 그대로 적용됩니다."
+                "SLG를 끈 상태에서도 PAG/SEG에 그대로 적용됩니다. **PAG**는 원본 노드처럼 "
+                "퍼센트를 모델 스케줄의 σ로 바꿔(`percent_to_sigma`) 현재 σ가 그 사이일 때 "
+                "켭니다 — 스텝 수·스케줄러·img2img denoise가 달라도 같은 σ 구간입니다. "
+                "**SEG/SLG**는 원본 PAG 노드에 없는 기능이라 예전처럼 스텝 비율로 잽니다."
             )
             with gr.Row():
                 start_percent = gr.Slider(
@@ -2109,6 +4020,7 @@ class AnimaSafePAG(scripts.Script):
                 label="Enable SLG (skip layers)",
                 value=False,
                 elem_id="anima_safe_pag_slg_enable",
+                elem_classes=["sam3-on", "sam3-on--slg"],
             )
             slg_scale = gr.Slider(
                 label="SLG guidance scale",
@@ -2122,6 +4034,55 @@ class AnimaSafePAG(scripts.Script):
                 info="여러 블록을 건너뛸수록 불안정해질 수 있습니다. 이상하면 18 하나만 쓰세요.",
                 elem_id="anima_safe_pag_slg_blocks",
             )
+            slg_mode = gr.Radio(
+                label="SLG mode",
+                choices=["Fixed", "Stochastic (S²)"],
+                value="Fixed",
+                info=(
+                    "Fixed=위 블록을 늘 건너뜀(기존 SLG). S²=모델 호출마다 블록을 무작위로 새로 골라 "
+                    "건너뜀(S²-Guidance, ICLR 2026) — 아래 S² 값만 쓰고 위 SLG scale·블록은 쓰지 않습니다."
+                ),
+                elem_id="anima_safe_pag_slg_mode",
+            )
+            with gr.Accordion("S²-Guidance (SLG mode = Stochastic)", open=False):
+                gr.Markdown(
+                    "논문(arXiv 2508.12880) 본문 식 `CFG + ω·(cond − drop)` 그대로이며 공식 코드가 없어 논문으로 "
+                    "다시 구현했습니다. 기본값은 논문 권장: **ω 0.25**, 블록 0 제외, 전체 과정의 가운데 80% "
+                    "(0.10–0.90, 스텝 비율). 비율 0.05는 28·40·52블록 모델에서 1·2·3블록입니다(논문 표: 1–2블록이 "
+                    "가장 좋음). 블록은 시드·패스·호출 순번으로 정해져 같은 설정이면 같은 그림이 나옵니다. "
+                    "Anima 실측 A/B는 아직 없습니다."
+                )
+                s2_scale = gr.Slider(
+                    label="S² scale ω",
+                    minimum=0.0, maximum=5.0, step=0.01, value=s2_guidance.DEFAULT_SCALE,
+                    info="논문 권장 0.25(0.25~0.5가 최고점, 1 이상은 점수가 떨어짐). 형태가 흔들리면 낮추세요.",
+                    elem_id="anima_safe_pag_s2_scale",
+                )
+                s2_ratio = gr.Slider(
+                    label="S² drop ratio (호출마다 건너뛸 블록 비율 · 최소 1블록)",
+                    minimum=0.01, maximum=0.5, step=0.01, value=s2_guidance.DEFAULT_RATIO,
+                    info="많이 건너뛸수록 약한 예측이 크게 망가집니다. 논문 표는 1~2블록이 가장 좋았습니다.",
+                    elem_id="anima_safe_pag_s2_ratio",
+                )
+                s2_blocks = gr.Textbox(
+                    label="S² eligible blocks (빈칸=1~마지막 · 블록 0 제외)",
+                    value="",
+                    info="뽑을 수 있는 블록 범위입니다. 논문은 첫 블록(0)을 빼면 결과가 나빠진다고 보고했습니다.",
+                    elem_id="anima_safe_pag_s2_blocks",
+                )
+                with gr.Row():
+                    s2_start = gr.Slider(
+                        label="S² start (스텝 비율)",
+                        minimum=0.0, maximum=1.0, step=0.01, value=s2_guidance.DEFAULT_START,
+                        info="초반 구도가 흔들리면 늦추세요.",
+                        elem_id="anima_safe_pag_s2_start",
+                    )
+                    s2_end = gr.Slider(
+                        label="S² end (스텝 비율)",
+                        minimum=0.0, maximum=1.0, step=0.01, value=s2_guidance.DEFAULT_END,
+                        info="후반 디테일이 지저분하면 당기세요.",
+                        elem_id="anima_safe_pag_s2_end",
+                    )
 
             # Removed: the "auto-decay" safety brake that divided each PAG/SEG/
             # SLG scale by the active-term count. Perturbations now always apply
@@ -2142,6 +4103,7 @@ class AnimaSafePAG(scripts.Script):
                 label="Enable APG (실험 · CFG > 1)",
                 value=False,
                 elem_id="anima_safe_pag_apg_enable",
+                elem_classes=["sam3-on", "sam3-on--apg"],
             )
             apg_autooff = gr.Checkbox(
                 label="APG 켜지면 PAG rescale 자동 끄기 (이중 크기보정 방지)",
@@ -2185,6 +4147,7 @@ class AnimaSafePAG(scripts.Script):
                 label="Enable Adaptive Guidance (combined-batch에서만 후반 uncond 생략)",
                 value=False,
                 elem_id="anima_safe_pag_adg_enable",
+                elem_classes=["sam3-on", "sam3-on--adg"],
             )
             adg_start = gr.Slider(
                 label="Skip after (이 지점 이후 uncond 생략)",
@@ -2211,11 +4174,20 @@ class AnimaSafePAG(scripts.Script):
 
             gr.Markdown("---\n### Guidance Orchestrator (CFG / Wavelet / Control)")
             gr.Markdown(
-                "**SMC · APG · CWM은 서로 독립 토글**입니다. 원하는 만큼 함께 켤 수 "
+                "**DCW · CWM · SMC · APG는 서로 독립 토글**입니다. 원하는 만큼 함께 켤 수 "
                 "있고, 여러 개가 켜지면 항상 **SMC → APG → CWM** 순서로 적용됩니다. "
-                "APG 토글은 위 APG 섹션에 있습니다. 셋 다 끄면 Forge·MaHiRo·다른 CFG "
-                "확장의 결과를 그대로 보존합니다. 아래 패널은 찾기 쉽도록 "
-                "**DCW → CWM → SMC** 순서로 배치했습니다."
+                "RDC는 원본 ComfyUI-DCW처럼 따로 켜는 스위치 없이 **DCW가 켜져 있고 "
+                "tau > 0**일 때 DCW 보정 안에서 돕니다. "
+                "APG 토글은 위 APG 섹션에 있습니다. CFG 세 기능(SMC·APG·CWM)을 "
+                "모두 끄면 Forge·MaHiRo·다른 CFG "
+                "확장의 결과를 그대로 보존합니다. RescaleCFG처럼 다른 확장이 CFG 함수를 "
+                "이미 걸어 두면 원본처럼 SMC·CWM만 비키고(경고 1회) DCW·PAG는 그대로 "
+                "적용됩니다. 원본 노드는 SMC·CWM을 CFG 1에서도 돌리지만, Forge는 "
+                "**CFG = 1이면 negative prompt를 인코딩하지 않아**(uncond 없음) 그때는 "
+                "SMC·CWM도 건너뜁니다(경고 1회). CFG가 1이 아닌 패스에서 Forge의 "
+                "'Ignore Negative Prompt during Early Steps'·NGMS가 negative를 건너뛰는 "
+                "스텝은 그대로 negative 없이 둡니다. 아래 패널은 찾기 쉽도록 "
+                "**DCW → RDC → CWM → SMC** 순서로 배치했습니다."
             )
 
             gr.Markdown("#### DCW — post-CFG wavelet correction")
@@ -2223,38 +4195,107 @@ class AnimaSafePAG(scripts.Script):
                 label="Enable DCW",
                 value=False,
                 elem_id="anima_guidance_dcw_enable",
+                elem_classes=["sam3-on", "sam3-on--dcw"],
             )
+            # Ranges/defaults = upstream DCW(+a) (origin: namemechan/
+            # ComfyUI-DCW@66aaf9dd:dcw_node.py:636-667): lambda_l 0.05 ±0.5
+            # step .005, lambda_h 0.01 ±0.3 step .001. The labels are the
+            # ui-config keys; _migrate_saved_ui_config drops the old saved
+            # bounds and old defaults once so these reach an existing install.
             with gr.Row():
                 dcw_lambda_low = gr.Slider(
                     label="DCW lambda low",
-                    minimum=-0.5, maximum=0.5, step=0.005, value=0.10,
-                    info="구도·밝기·큰 색면이 어색해지면 0 쪽으로 줄이세요.",
+                    minimum=-0.5, maximum=0.5, step=0.005, value=0.05,
+                    info=(
+                        "원본 기본 0.05. 구도·밝기·큰 색면이 어색해지면 "
+                        "0 쪽으로 줄이세요."
+                    ),
                     elem_id="anima_guidance_dcw_lambda_low",
                 )
                 dcw_lambda_high = gr.Slider(
                     label="DCW lambda high",
-                    minimum=-0.5, maximum=0.5, step=0.005, value=0.02,
-                    info="윤곽 링·미세 노이즈가 생기면 0 쪽으로 줄이세요.",
+                    minimum=-0.3, maximum=0.3, step=0.001, value=0.01,
+                    info=(
+                        "원본 기본 0.01. 윤곽 링·미세 노이즈가 생기면 "
+                        "0 쪽으로 줄이세요."
+                    ),
                     elem_id="anima_guidance_dcw_lambda_high",
+                )
+
+            gr.Markdown(
+                "#### RDC — band-wise reverse drift compensation\n"
+                "원본처럼 켜기 스위치가 없습니다: **Enable DCW + tau > 0**이면 켜지고 "
+                "tau 0(기본)이면 꺼집니다. DCW lambda를 0으로 두면 RDC만 쓸 수 있습니다."
+            )
+            # Script-arg 58 keeps its slot (the old separate RDC toggle) so
+            # args 59-61 and every API/app caller stay aligned. Upstream has
+            # no toggle — rdc_tau alone switches RDC and it runs inside the
+            # DCW hook (origin: namemechan/ComfyUI-DCW@66aaf9dd:dcw_node.py:
+            # 757-815, 817-819). The hidden checkbox always sends True from
+            # this UI, so here RDC is exactly ``dcw_enabled and tau > 0``; an
+            # API caller (UR_IV app) may still send False to veto RDC. Not
+            # saved to ui-config, so an old saved False cannot stick; the
+            # old tau 0.15 saved beside that False is reset to 0 once by
+            # _migrate_saved_ui_config (else Enable DCW would turn RDC on).
+            rdc_enabled = gr.Checkbox(
+                label="Enable RDC",
+                value=True,
+                visible=False,
+                elem_id="anima_guidance_rdc_enable",
+            )
+            rdc_enabled.do_not_save_to_config = True
+            rdc_tau = gr.Slider(
+                label="RDC tau (EMA 기억 구간)",
+                minimum=0.0, maximum=0.5, step=0.01, value=0.0,
+                info=(
+                    "0 = RDC 끔(원본 기본). 0.05~0.10은 빠른 반응, 0.2~0.3은 느리고 "
+                    "부드러운 보정입니다. 구도가 초반 상태에 고착되면 낮추세요."
+                ),
+                elem_id="anima_guidance_rdc_tau",
+            )
+            with gr.Row():
+                rdc_alpha_ll = gr.Slider(
+                    label="RDC alpha LL (구조 drift)",
+                    minimum=0.0, maximum=0.3, step=0.005, value=0.03,
+                    info=(
+                        "권장 시작값 0.02~0.05. 포즈·구도 변화가 지나치게 "
+                        "고정되면 0 쪽으로 낮추세요."
+                    ),
+                    elem_id="anima_guidance_rdc_alpha_ll",
+                )
+                rdc_alpha_hh = gr.Slider(
+                    label="RDC alpha HH (텍스처 drift)",
+                    minimum=0.0, maximum=0.1, step=0.001, value=0.0,
+                    info=(
+                        "기본 0 권장. 텍스처가 흐려지면 0으로 되돌리세요. "
+                        "필요한 경우에도 0.01 이하부터 시작하세요."
+                    ),
+                    elem_id="anima_guidance_rdc_alpha_hh",
                 )
 
             gr.Markdown("#### CWM — CFG wavelet mixing (주파수 대역별 CFG 재가중)")
             cwm_enabled = gr.Checkbox(
                 label="Enable CWM",
                 value=False,
-                info="alpha low·high가 모두 0이면 켜도 표준 CFG와 같습니다.",
+                info=(
+                    "alpha low·high가 모두 0(원본 기본)이면 켜도 표준 CFG와 "
+                    "같습니다 — 원본 권장 시작값 low 0.1~0.3, high 0.1~0.2."
+                ),
                 elem_id="anima_guidance_cwm_enable",
+                elem_classes=["sam3-on", "sam3-on--cwm"],
             )
+            # Upstream alpha_l/alpha_h: default 0.0, range -1..2, step .01
+            # (origin: namemechan/ComfyUI-DCW@66aaf9dd:dcw_node.py:675-704).
             with gr.Row():
                 cwm_alpha_low = gr.Slider(
                     label="CWM alpha low (초반 저주파 CFG)",
-                    minimum=-1.0, maximum=1.0, step=0.01, value=0.30,
+                    minimum=-1.0, maximum=2.0, step=0.01, value=0.0,
                     info="전체 구도·큰 색면이 과하게 변하면 0 쪽으로 줄이세요.",
                     elem_id="anima_guidance_cwm_alpha_low",
                 )
                 cwm_alpha_high = gr.Slider(
                     label="CWM alpha high (후반 고주파 CFG)",
-                    minimum=-1.0, maximum=1.0, step=0.01, value=0.15,
+                    minimum=-1.0, maximum=2.0, step=0.01, value=0.0,
                     info="인물 복제·윤곽 링·세부 노이즈가 생기면 0 쪽으로 줄이세요.",
                     elem_id="anima_guidance_cwm_alpha_high",
                 )
@@ -2275,10 +4316,20 @@ class AnimaSafePAG(scripts.Script):
             )
 
             gr.Markdown("#### SMC — sliding-mode control (스텝 간 CFG error 안정화)")
+            smc_master_enabled = gr.Checkbox(
+                label="Enable SMC",
+                value=False,
+                info=(
+                    "프리셋 값은 유지한 채 SMC만 즉시 ON/OFF합니다. "
+                    "CWM과 함께 켜면 SMC → CWM 순서로 실행됩니다."
+                ),
+                elem_id="anima_guidance_smc_master_enable",
+                elem_classes=["sam3-on", "sam3-on--smc"],
+            )
             smc_preset = gr.Dropdown(
                 label="SMC preset",
-                choices=list(SMC_PRESET_NAMES),
-                value="Off",
+                choices=list(SMC_PRESET_NAMES[1:]),
+                value="Auto",
                 info=(
                     "Auto는 현재 모델을 감지해 원본 ComfyUI-DCW 값을 적용합니다. "
                     "Anima는 Cosmos / Wan (lambda 6.0, k 0.20)으로 판별됩니다."
@@ -2302,6 +4353,30 @@ class AnimaSafePAG(scripts.Script):
                     info="보정이 튀거나 디테일이 깨지면 낮추세요. 0이면 Custom SMC가 중립입니다.",
                     elem_id="anima_guidance_smc_k",
                 )
+            smc_mode = gr.Radio(
+                label="SMC controller",
+                choices=list(SMC_MODE_NAMES),
+                value=SMC_MODE_UNIT,
+                info=(
+                    "Unit-L2=원본 ComfyUI-DCW 식(위 preset·Custom 값). 1MP Anima 잠재에서는 원소당 보정이 "
+                    "k/√N ≈ 4e-4라 거의 효과가 없습니다. Adaptive sign=sorryhyun의 Anima 판(원소별 sign, "
+                    "이득 α·mean|e|) — 아래 α·λ만 씁니다."
+                ),
+                elem_id="anima_guidance_smc_mode",
+            )
+            with gr.Row():
+                smc_adaptive_alpha = gr.Slider(
+                    label="Adaptive SMC α (이득 = α·mean|e|)",
+                    minimum=0.0, maximum=1.0, step=0.01, value=SMC_ADAPTIVE_ALPHA,
+                    info="원작 기본 0.2. 결과가 어두워지거나 거칠어지면 낮추세요(0=보정 없음).",
+                    elem_id="anima_guidance_smc_adaptive_alpha",
+                )
+                smc_adaptive_lambda = gr.Slider(
+                    label="Adaptive SMC λ",
+                    minimum=0.5, maximum=30.0, step=0.1, value=SMC_ADAPTIVE_LAMBDA,
+                    info="원작 기본 5. 원작자는 λ를 낮추면 어두워짐이 줄었다고 보고했습니다.",
+                    elem_id="anima_guidance_smc_adaptive_lambda",
+                )
 
             with gr.Accordion("Legacy CFG base mode (구버전 호환)", open=False):
                 gr.Markdown(
@@ -2321,12 +4396,14 @@ class AnimaSafePAG(scripts.Script):
                     value="Preserve incoming",
                     info="호환 문제나 이미지 붕괴가 생기면 Preserve incoming으로 되돌리세요.",
                     elem_id="anima_guidance_cfg_mode",
+                    elem_classes=["sam3-on-radio"],
                 )
                 experimental_stack = gr.Checkbox(
                     label="Experimental stack: SMC → APG → CWM (legacy 단축)",
                     value=False,
                     info="세 토글을 모두 켜는 것과 같습니다. 새 토글을 쓰면 필요 없습니다.",
                     elem_id="anima_guidance_experimental_stack",
+                    elem_classes=["sam3-on", "sam3-on--apg", "sam3-on--smc", "sam3-on--cwm"],
                 )
                 smc_enabled = gr.Checkbox(
                     label="Enable SMC (legacy)",
@@ -2336,6 +4413,7 @@ class AnimaSafePAG(scripts.Script):
                         "Off여도 Custom lambda/k로 SMC가 활성화됩니다."
                     ),
                     elem_id="anima_guidance_smc_enable",
+                    elem_classes=["sam3-on", "sam3-on--smc"],
                 )
 
             gr.Markdown("#### DAVE — Anima diversity · block DC attenuation")
@@ -2343,6 +4421,7 @@ class AnimaSafePAG(scripts.Script):
                 label="Enable DAVE",
                 value=False,
                 elem_id="anima_guidance_dave_enable",
+                elem_classes=["sam3-on", "sam3-on--dave"],
             )
             dave_strength = gr.Slider(
                 label="DAVE strength",
@@ -2372,24 +4451,194 @@ class AnimaSafePAG(scripts.Script):
                 label="Enable CNS-inspired Wavelet Noise",
                 value=False,
                 elem_id="anima_guidance_cns_enable",
+                elem_classes=["sam3-on", "sam3-on--cns"],
             )
+            # Ranges/defaults = upstream INPUT_TYPES (origin: namemechan/
+            # comfyui-cns_sampler_patch@42278b13:cns_sampler_patch.py:395-437);
+            # the 3.0 hint is upstream README's "Flux / Anima +
+            # euler_ancestral_cfg_pp" row.
             cns_strength = gr.Slider(
                 label="CNS strength",
-                minimum=0.0, maximum=1.0, step=0.01, value=1.0,
+                minimum=0.0, maximum=1.0, step=0.05, value=1.0,
                 info="색 노이즈·거친 입자·구조 변형이 과하면 먼저 낮추세요.",
                 elem_id="anima_guidance_cns_strength",
             )
             cns_gamma_power = gr.Slider(
                 label="CNS gamma power",
-                minimum=0.05, maximum=2.0, step=0.05, value=0.5,
+                minimum=0.1, maximum=2.0, step=0.05, value=0.5,
                 info="주파수별 색 노이즈가 어색하면 기본값 0.5로 되돌린 뒤 Strength를 낮추세요.",
                 elem_id="anima_guidance_cns_gamma_power",
             )
             cns_gamma_scale = gr.Slider(
-                label="CNS gamma scale (Anima 시작값 3.0)",
-                minimum=0.25, maximum=25.0, step=0.25, value=3.0,
-                info="노이즈 분포가 과장되면 기본값 3.0으로 되돌린 뒤 Strength를 낮추세요.",
+                label=CNS_GAMMA_SCALE_LABEL,
+                minimum=0.1, maximum=25.0, step=0.1, value=2.0,
+                info="노이즈 분포가 과장되면 기본값 2.0으로 되돌린 뒤 Strength를 낮추세요.",
                 elem_id="anima_guidance_cns_gamma_scale",
+            )
+
+            gr.Markdown(
+                "---\n### 디테일 단계 — TSR · Momentum · HiGS · HiFlow\n"
+                "PAG/SEG/SLG 항 뒤, DCW 앞에서 **HiFlow → Momentum → HiGS → TSR** 순서로 돕니다. 추가 forward가 "
+                "없고 모두 기본 OFF입니다. 논문·원본 코드 그대로 옮겼지만 **Anima 실측 A/B는 아직 없습니다** — "
+                "XYZ로 고정 시드 비교부터 하세요. 비슷한 효과끼리(TSR·Detail Daemon·DCW lambda high, "
+                "Momentum·HiGS·APG momentum)는 한 번에 하나씩 비교하는 것을 권장합니다."
+            )
+            gr.Markdown(
+                "#### TSR — Temporal Score Rescaling\n"
+                "SNR에 따라 예측 점수를 다시 배율합니다(arXiv 2510.01184, ComfyUI 원본 노드 이식). k < 1이면 "
+                "노이즈가 거의 없을 때 예측 노이즈를 조금 더 남겨 잔디테일이 늘고, k > 1이면 매끈해집니다. "
+                "Forge 기본 Epsilon scaling은 eps 모델에서만 돌아 Anima·v-pred에는 없습니다."
+            )
+            tsr_enabled = gr.Checkbox(
+                label="Enable TSR",
+                value=False,
+                elem_id="anima_guidance_tsr_enable",
+                elem_classes=["sam3-on", "sam3-on--tsr"],
+            )
+            with gr.Row():
+                tsr_k = gr.Slider(
+                    label="TSR k (1=끔 · 낮을수록 디테일)",
+                    minimum=0.5, maximum=1.5, step=0.005, value=tsr_guidance.DEFAULT_K,
+                    info="원본 노드 기본 0.95, 논문 SD3 최적 0.93. 지저분해지면 1 쪽으로 올리세요.",
+                    elem_id="anima_guidance_tsr_k",
+                )
+                tsr_sigma = gr.Slider(
+                    label="TSR sigma (클수록 일찍 적용)",
+                    minimum=0.1, maximum=10.0, step=0.05, value=tsr_guidance.DEFAULT_SIGMA,
+                    info="원본 기본 1.0(Anima에서 σ≈0.5부터), 논문 SD3 최적 3.0(σ≈0.75부터).",
+                    elem_id="anima_guidance_tsr_sigma",
+                )
+
+            gr.Markdown(
+                "#### Momentum Guidance (MG)\n"
+                "앞 스텝 속도의 지수평균에서 멀어지는 쪽으로 현재 속도를 밀어 흐릿함을 줄입니다(arXiv 2602.20360, "
+                "flow 모델 Euler 기준 — `D + α·σ·(v − m)`). CFG가 낮을수록 효과가 크고, 2차·멀티스텝 샘플러는 "
+                "이미 외삽을 해서 겹칩니다. 창은 노이즈 수준(flow σ)입니다."
+            )
+            mg_enabled = gr.Checkbox(
+                label="Enable Momentum Guidance",
+                value=False,
+                elem_id="anima_guidance_mg_enable",
+                elem_classes=["sam3-on", "sam3-on--mg"],
+            )
+            with gr.Row():
+                mg_alpha = gr.Slider(
+                    label="MG α (밀어내는 세기)",
+                    minimum=0.0, maximum=3.0, step=0.05, value=0.5,
+                    info="논문 FLUX CFG 2.5~3.5 예시 0.5, 낮은 CFG에서는 1~1.5. 형태가 튀면 낮추세요.",
+                    elem_id="anima_guidance_mg_alpha",
+                )
+                mg_beta = gr.Slider(
+                    label="MG β (지수평균 기억)",
+                    minimum=0.0, maximum=0.95, step=0.05, value=0.6,
+                    info="논문 예시 0.6. 너무 크면 과보정합니다.",
+                    elem_id="anima_guidance_mg_beta",
+                )
+            mg_normalize = gr.Checkbox(
+                label="Normalize momentum (‖m‖을 ‖v‖에 맞춤 · 논문 §8.2)",
+                value=False,
+                elem_id="anima_guidance_mg_normalize",
+            )
+            with gr.Row():
+                mg_min = gr.Slider(
+                    label="MG window min (노이즈 수준)",
+                    minimum=0.0, maximum=1.0, step=0.01, value=0.30,
+                    info="논문 t∈[0.05,0.7] → σ 0.30~0.95. 후반 디테일이 지저분하면 올리세요.",
+                    elem_id="anima_guidance_mg_min",
+                )
+                mg_max = gr.Slider(
+                    label="MG window max (노이즈 수준)",
+                    minimum=0.0, maximum=1.0, step=0.01, value=0.95,
+                    info="초반 구도가 흔들리면 낮추세요.",
+                    elem_id="anima_guidance_mg_max",
+                )
+
+            gr.Markdown(
+                "#### HiGS — History-Guided Sampling\n"
+                "앞 스텝 예측의 지수평균과의 차이 중 **고주파(DCT 필터)**만 더해 디테일을 살립니다(arXiv 2509.22300, "
+                "ICLR 2026). 첫 스텝은 기록만 합니다. Anima는 CFG 4~5로 논문(2.5)보다 높아 과채도를 막는 η=0을 "
+                "기본으로 했습니다(논문 FID 설정). Momentum과 같은 기록을 써서 함께 켜면 겹칩니다."
+            )
+            higs_enabled = gr.Checkbox(
+                label="Enable HiGS",
+                value=False,
+                elem_id="anima_guidance_higs_enable",
+                elem_classes=["sam3-on", "sam3-on--higs"],
+            )
+            with gr.Row():
+                higs_weight = gr.Slider(
+                    label="HiGS weight w",
+                    minimum=0.0, maximum=3.0, step=0.05, value=1.75,
+                    info="논문 1.75(≤3). Res Multistep 같은 멀티스텝 샘플러에서는 1.75가 이미지를 무너뜨렸습니다"
+                         "(Anima 3.8B 실측) — 0.5 이하부터 시작하세요.",
+                    elem_id="anima_guidance_higs_weight",
+                )
+                higs_eta = gr.Slider(
+                    label="HiGS η (예측 방향 성분 비중)",
+                    minimum=0.0, maximum=1.0, step=0.05, value=0.0,
+                    info="0=예측과 수직 성분만(FID 설정), 1=그대로(선호도 설정). 과채도가 나면 0 쪽으로.",
+                    elem_id="anima_guidance_higs_eta",
+                )
+            with gr.Accordion("HiGS Advanced (세부값)", open=False):
+                with gr.Row():
+                    higs_alpha = gr.Slider(
+                        label="HiGS history α (지수평균 갱신)",
+                        minimum=0.05, maximum=0.95, step=0.05, value=0.75,
+                        info="논문 0.5 또는 0.75.",
+                        elem_id="anima_guidance_higs_alpha",
+                    )
+                    higs_cutoff = gr.Slider(
+                        label="HiGS high-pass cutoff R_c",
+                        minimum=0.0, maximum=0.5, step=0.005, value=0.05,
+                        info="논문 0.05 — 최저 주파수만 거의 빼 색 변화를 막습니다.",
+                        elem_id="anima_guidance_higs_cutoff",
+                    )
+                with gr.Row():
+                    higs_t_min = gr.Slider(
+                        label="HiGS t min (노이즈 수준 · 이하에서 끔)",
+                        minimum=0.0, maximum=1.0, step=0.01, value=0.40,
+                        info="논문 0.3~0.5. 후반 잡티가 늘면 올리세요.",
+                        elem_id="anima_guidance_higs_t_min",
+                    )
+                    higs_t_max = gr.Slider(
+                        label="HiGS t max (노이즈 수준)",
+                        minimum=0.0, maximum=1.0, step=0.01, value=1.00,
+                        info="논문 0.9~1.0.",
+                        elem_id="anima_guidance_higs_t_max",
+                    )
+
+            gr.Markdown(
+                "#### HiFlow — hires 패스 흐름 정렬\n"
+                "**Hires fix 전용.** 1차(저해상도) 패스의 x0 궤적을 기록했다가, hires 패스의 같은 노이즈 수준에서 "
+                "저주파(방향)와 스텝 간 변화(가속도)를 그 궤적에 맞춥니다(arXiv 2504.06232, NeurIPS 2025, 공식 코드 "
+                "이식). 1차 구도를 유지한 채 새 디테일을 만들도록 돕고, 가중치는 hires 스텝 동안 줄어듭니다. "
+                "공식 설정은 1차 30스텝 · hires 16스텝 · denoise 0.53 근처입니다. Hires fix를 켜지 않은 생성에서는 "
+                "아무것도 하지 않습니다."
+            )
+            hiflow_enabled = gr.Checkbox(
+                label="Enable HiFlow (hires fix)",
+                value=False,
+                elem_id="anima_guidance_hiflow_enable",
+                elem_classes=["sam3-on", "sam3-on--hiflow"],
+            )
+            with gr.Row():
+                hiflow_alpha = gr.Slider(
+                    label="HiFlow direction α",
+                    minimum=0.0, maximum=2.0, step=0.05, value=hiflow_guidance.DEFAULT_ALPHA,
+                    info="공식 1.0(2K 단계). 1차 구도에 너무 묶이면 낮추세요.",
+                    elem_id="anima_guidance_hiflow_alpha",
+                )
+                hiflow_beta = gr.Slider(
+                    label="HiFlow acceleration β",
+                    minimum=0.0, maximum=1.0, step=0.05, value=hiflow_guidance.DEFAULT_BETA,
+                    info="공식 0.5. 디테일 생성 쪽 정렬입니다. 얼룩지면 낮추세요.",
+                    elem_id="anima_guidance_hiflow_beta",
+                )
+            hiflow_cutoff = gr.Slider(
+                label="HiFlow low-pass cutoff D (Butterworth)",
+                minimum=0.05, maximum=1.0, step=0.01, value=hiflow_guidance.DEFAULT_CUTOFF,
+                info="공식 코드 0.2(논문 본문 0.4). 클수록 더 많은 대역을 1차 패스에 맞춥니다.",
+                elem_id="anima_guidance_hiflow_cutoff",
             )
 
             gr.Markdown(
@@ -2405,6 +4654,7 @@ class AnimaSafePAG(scripts.Script):
                 label="Enable Anima Modulation Guidance (CLIP-L)",
                 value=False,
                 elem_id="anima_mod_guidance_enable",
+                elem_classes=["sam3-on", "sam3-on--mod"],
             )
             mod_clip_model = gr.Dropdown(
                 label="CLIP-L model (models/text_encoder)",
@@ -2522,6 +4772,20 @@ class AnimaSafePAG(scripts.Script):
             mod_adapter_mode, mod_adapter_path,
             # Appended after v0.20 to preserve all 56 older argument indexes.
             smc_preset,
+            # Appended after v0.21.2. Keep the complete historical prefix:
+            # current SMC gets an explicit master toggle and RDC gets its own
+            # independent toggle plus all three upstream parameters.
+            smc_master_enabled,
+            rdc_enabled, rdc_tau, rdc_alpha_ll, rdc_alpha_hh,
+            # Appended in the v0.30 detail suite (62-70); all 62 older indexes stay put.
+            slg_mode, s2_scale, s2_ratio, s2_blocks, s2_start, s2_end,
+            smc_mode, smc_adaptive_alpha, smc_adaptive_lambda,
+            # 71-90: detail stages (TSR, Momentum Guidance, HiGS, HiFlow).
+            tsr_enabled, tsr_k, tsr_sigma,
+            mg_enabled, mg_alpha, mg_beta, mg_normalize, mg_min, mg_max,
+            higs_enabled, higs_weight, higs_eta, higs_alpha, higs_cutoff,
+            higs_t_min, higs_t_max,
+            hiflow_enabled, hiflow_alpha, hiflow_beta, hiflow_cutoff,
         ]
 
     def process_before_every_sampling(self, p, *args, **kwargs):
@@ -2531,6 +4795,7 @@ class AnimaSafePAG(scripts.Script):
         # XYZ-plot overrides (set per grid cell by the AxisOption apply fns).
         xyz = getattr(p, "_anima_safe_pag_xyz", {}) or {}
         _clear_extra_generation_params(p)
+        _STATE.pop("condition_aggregation", None)
         _RUNTIME.reset_pass()
         _APG.update(on=False, avg=None, last_sigma=None)
         _ADG["on"] = False
@@ -2538,12 +4803,33 @@ class AnimaSafePAG(scripts.Script):
             smc_on=False, apg_on=False, cwm_on=False,
             mode="preserve", experimental_stack=False, steps=0,
             smc_preset="Off", smc_resolved_preset="Off",
-            fit_error=None, effective_scale=None,
-            external_cfg_detected=False, warned=False,
+            smc_mode=SMC_MODE_UNIT,
+            fit_error=None, effective_scale=None, fit_scale=None,
+            external_cfg_detected=False, warned=False, cfg1_warned=False,
+            external_cfg_warned=False,
+            base_skipped=False, fit_checked=False,
         )
-        _DCW.update(on=False, steps=0)
-        _DAVE.update(on=False, targets=set(), steps=0)
-        _CNS.update(on=False, warned=False)
+        _S2.update(on=False, eligible=set(), draws=0, last=())
+        _TSR.update(on=False, steps=0)
+        _HIST.update(mg_on=False, higs_on=False)
+        _DETAIL.update(flow=None, warned=set())
+        _HIFLOW.update(recording=False, applying=False, pass_p=None, run_p=None)
+        _DCW.update(
+            on=False,
+            dcw_on=False,
+            rdc_on=False,
+            steps=0,
+            dcw_steps=0,
+            rdc_steps=0,
+        )
+        _DAVE.update(
+            on=False, targets=set(), steps=0, offset=None, offset_p=None,
+            run_p=None, run_steps=0,
+        )
+        _CNS.update(
+            on=False, warned=False, capture="post_cfg", callback_seen=False,
+            scope="pass",
+        )
         _MOD.update(
             on=False,
             targets=set(),
@@ -2560,11 +4846,13 @@ class AnimaSafePAG(scripts.Script):
             slg_on=False, slg_targets=set(), active=0,
             wrapper_calls=0, weak_steps=0, applied_steps=0, apg_steps=0,
             adg_skipped_steps=0, combined_calls=0, split_cond_calls=0,
-            split_uncond_calls=0, control_blocked_calls=0,
+            split_uncond_calls=0, control_blocked_calls=0, guard_params=None,
+            sigma_hi=None, sigma_lo=None,
             wrapper_fallbacks=0, requested_pert=False, requested_apg=False,
             requested_adg=False, requested_cfg_mode="preserve",
             requested_cfg_stack=False, requested_smc=False,
             requested_cwm=False, requested_dcw=False,
+            requested_rdc=False,
             requested_dave=False, requested_cns=False,
             requested_modulation=False,
             requested_method=None, engine="?",
@@ -2575,8 +4863,20 @@ class AnimaSafePAG(scripts.Script):
             attn_spatial_shape=None, attn_raw=None, slg_raw=None,
             cond_raw=None,
             adg_skipped=False, step_open=False,
+            # 결과를 미세하게 바꾸는 Forge 설정 두 개 — 패스마다 읽어 infotext 와 맞춘다.
+            # PAG 강도 곡선(자체 실험, 기본 끔)도 패스마다 읽는다.
+            pag_cosine_envelope=_read_bool_option(OPT_PAG_COSINE, False),
+            prefix_dedup=_read_bool_option(OPT_PREFIX_DEDUP, True),
+            seg_separable=_read_bool_option(OPT_SEG_SEPARABLE, True),
+            dedup_blocks=0, dedup_fallbacks=0, dedup_warned=False,
+            dedup_disabled=False,
         )
         _clear_markers()
+        # 같은 p(hires 패스, n_iter 다음 배치)면 앞선 OOM 차단을 유지하고,
+        # 다른 생성이면 지난 기록을 버린다.
+        if not _perturbation_oom_blocked(p):
+            _STATE["pert_oom_owner"] = None
+        _STATE["pass_owner"] = _owner_ref(p)
 
         def _xyz_num(key, cur):
             if key in xyz:
@@ -2636,7 +4936,7 @@ class AnimaSafePAG(scripts.Script):
         )
         if cfg_mode == "preserve" and apg_enabled:
             cfg_mode = "apg"  # backwards-compatible quick checkbox
-        smc_enabled = (
+        legacy_smc_enabled = (
             _as_bool(xyz["smc_enabled"], _as_bool(_arg(42, False), False))
             if "smc_enabled" in xyz
             else _as_bool(_arg(42, False), False)
@@ -2656,6 +4956,15 @@ class AnimaSafePAG(scripts.Script):
             if "dcw_enabled" in xyz
             else _as_bool(_arg(28, False), False)
         )
+        # Arg 58 is the old separate RDC toggle, kept as a slot. Upstream has
+        # none: RDC = dcw_enabled and rdc_tau > 0 (resolved below). This UI's
+        # hidden checkbox always sends True; False (an API caller such as the
+        # UR_IV app, or the legacy XYZ axis) only vetoes RDC.
+        rdc_switch = (
+            _as_bool(xyz["rdc_enabled"], _as_bool(_arg(58, True), True))
+            if "rdc_enabled" in xyz
+            else _as_bool(_arg(58, True), True)
+        )
         dave_enabled = (
             _as_bool(xyz["dave_enabled"], _as_bool(_arg(31, False), False))
             if "dave_enabled" in xyz
@@ -2671,16 +4980,41 @@ class AnimaSafePAG(scripts.Script):
             if "mod_enabled" in xyz
             else _as_bool(_arg(44, False), False)
         )
+
+        def _flag(key, raw):
+            value = _as_bool(raw, False)
+            return _as_bool(xyz[key], value) if key in xyz else value
+
+        # v0.30 detail stages (appended args 71, 74, 80, 87). The index stays a literal in
+        # _arg(N, …) like every other read here, so static contract scanners can see it.
+        tsr_enabled = _flag("tsr_enabled", _arg(71, False))
+        mg_enabled = _flag("mg_enabled", _arg(74, False))
+        higs_enabled = _flag("higs_enabled", _arg(80, False))
+        hiflow_enabled = _flag("hiflow_enabled", _arg(87, False))
         resolved_apg = apg_enabled or cfg_mode == "apg" or experimental_stack
         legacy_smc_requested = (
-            smc_enabled or experimental_stack or cfg_mode in {"smc", "smc+cwm"}
+            legacy_smc_enabled
+            or experimental_stack
+            or cfg_mode in {"smc", "smc+cwm"}
+        )
+        smc_master_is_explicit = "smc_enabled" in xyz or len(args) > 57
+        smc_master_enabled = (
+            _as_bool(xyz["smc_enabled"], False)
+            if "smc_enabled" in xyz
+            else _as_bool(_arg(57, False), False)
+        )
+        # Before the appended master checkbox existed, choosing a non-Off
+        # preset itself enabled SMC. Preserve that contract for short API/
+        # infotext argument lists; new UI calls use the explicit checkbox.
+        resolved_smc = legacy_smc_requested or (
+            smc_master_enabled
+            if smc_master_is_explicit
+            else smc_preset != "Off"
         )
         effective_smc_preset = (
-            smc_preset
-            if smc_preset != "Off"
-            else ("Custom" if legacy_smc_requested else "Off")
+            (smc_preset if smc_preset != "Off" else "Custom")
+            if resolved_smc else "Off"
         )
-        resolved_smc = effective_smc_preset != "Off"
         resolved_cwm = (
             cwm_enabled or experimental_stack or cfg_mode in {"cwm", "smc+cwm"}
         )
@@ -2694,11 +5028,15 @@ class AnimaSafePAG(scripts.Script):
             requested_smc=resolved_smc,
             requested_cwm=resolved_cwm,
             requested_dcw=dcw_enabled,
+            # Set once rdc_tau is read (RDC needs DCW and tau > 0).
+            requested_rdc=False,
             requested_dave=dave_enabled,
             requested_cns=cns_enabled,
             requested_modulation=mod_enabled,
         )
 
+        if not hiflow_enabled:
+            _hiflow_clear()
         if not any((
             pert_enabled,
             adg_enabled,
@@ -2710,6 +5048,10 @@ class AnimaSafePAG(scripts.Script):
             dave_enabled,
             cns_enabled,
             mod_enabled,
+            tsr_enabled,
+            mg_enabled,
+            higs_enabled,
+            hiflow_enabled,
         )):
             return
 
@@ -2757,18 +5099,26 @@ class AnimaSafePAG(scripts.Script):
             legacy_attn = _as_bool(xyz["legacy_attn"], _as_bool(_arg(20, False), False)) \
                 if "legacy_attn" in xyz else _as_bool(_arg(20, False), False)
             seg_sigma = _xyz_num("seg_sigma", float(_arg(21, 100.0)))
-            cwm_alpha_low = _xyz_num("cwm_alpha_low", float(_arg(24, 0.30)))
-            cwm_alpha_high = _xyz_num("cwm_alpha_high", float(_arg(25, 0.15)))
+            # Omitted-argument fallbacks are the upstream DCW(+a) defaults
+            # (origin: namemechan/ComfyUI-DCW@66aaf9dd:dcw_node.py:636-667
+            # lambda_l/lambda_h, 675-704 alpha_l/alpha_h, 729-750 smc_lambda/
+            # smc_k, 757-777 rdc_tau). Values a caller sends are used as-is.
+            cwm_alpha_low = _xyz_num("cwm_alpha_low", float(_arg(24, 0.0)))
+            cwm_alpha_high = _xyz_num("cwm_alpha_high", float(_arg(25, 0.0)))
             smc_lambda = _xyz_num("smc_lambda", float(_arg(26, 6.0)))
-            # Index 27 predates the appended preset selector. Keep its omitted
-            # API/infotext fallback at the historical 0.20; the new Custom UI
-            # still supplies its explicit upstream default of 0.10.
-            smc_k = _xyz_num("smc_k", float(_arg(27, 0.20)))
+            smc_k = _xyz_num("smc_k", float(_arg(27, 0.10)))
             dcw_lambda_low = _xyz_num(
-                "dcw_lambda_low", float(_arg(29, 0.10))
+                "dcw_lambda_low", float(_arg(29, 0.05))
             )
             dcw_lambda_high = _xyz_num(
-                "dcw_lambda_high", float(_arg(30, 0.02))
+                "dcw_lambda_high", float(_arg(30, 0.01))
+            )
+            rdc_tau = _xyz_num("rdc_tau", float(_arg(59, 0.0)))
+            rdc_alpha_ll = _xyz_num(
+                "rdc_alpha_ll", float(_arg(60, 0.03))
+            )
+            rdc_alpha_hh = _xyz_num(
+                "rdc_alpha_hh", float(_arg(61, 0.0))
             )
             dave_strength = _xyz_num(
                 "dave_strength", float(_arg(32, 0.30))
@@ -2785,7 +5135,7 @@ class AnimaSafePAG(scripts.Script):
                 "cns_gamma_power", float(_arg(37, 0.5))
             )
             cns_gamma_scale = _xyz_num(
-                "cns_gamma_scale", float(_arg(38, 3.0))
+                "cns_gamma_scale", float(_arg(38, 2.0))
             )
             mod_clip_model = str(_arg(45, "") or "").strip()
             mod_weight = _xyz_num(
@@ -2815,6 +5165,59 @@ class AnimaSafePAG(scripts.Script):
                 "Auto-download official"
             )
             mod_adapter_path = str(_arg(55, "") or "")
+            # Appended after arg 61 (v0.30 detail suite) — every older index stays put.
+            slg_mode = str(
+                xyz["slg_mode"] if "slg_mode" in xyz else (_arg(62, "Fixed") or "Fixed")
+            ).strip().lower()
+            s2_mode = slg_mode.startswith("stoch") or slg_mode in {"s2", "s²"}
+            s2_scale = _xyz_num(
+                "s2_scale", float(_arg(63, s2_guidance.DEFAULT_SCALE))
+            )
+            s2_ratio = _xyz_num(
+                "s2_ratio", float(_arg(64, s2_guidance.DEFAULT_RATIO))
+            )
+            s2_block_spec = (
+                str(xyz["s2_blocks"])
+                if "s2_blocks" in xyz else str(_arg(65, "") or "")
+            )
+            s2_start = _xyz_num(
+                "s2_start", float(_arg(66, s2_guidance.DEFAULT_START))
+            )
+            s2_end = _xyz_num("s2_end", float(_arg(67, s2_guidance.DEFAULT_END)))
+            smc_mode = normalize_smc_mode(
+                xyz["smc_mode"] if "smc_mode" in xyz
+                else _arg(68, SMC_MODE_UNIT)
+            )
+            smc_adaptive_alpha = _xyz_num(
+                "smc_adaptive_alpha", float(_arg(69, SMC_ADAPTIVE_ALPHA))
+            )
+            smc_adaptive_lambda = _xyz_num(
+                "smc_adaptive_lambda", float(_arg(70, SMC_ADAPTIVE_LAMBDA))
+            )
+            tsr_k = _xyz_num("tsr_k", float(_arg(72, tsr_guidance.DEFAULT_K)))
+            tsr_sigma = _xyz_num(
+                "tsr_sigma", float(_arg(73, tsr_guidance.DEFAULT_SIGMA))
+            )
+            mg_alpha = _xyz_num("mg_alpha", float(_arg(75, 0.5)))
+            mg_beta = _xyz_num("mg_beta", float(_arg(76, 0.6)))
+            mg_normalize = _flag("mg_normalize", _arg(77, False))
+            mg_min = _xyz_num("mg_min", float(_arg(78, 0.30)))
+            mg_max = _xyz_num("mg_max", float(_arg(79, 0.95)))
+            higs_weight = _xyz_num("higs_weight", float(_arg(81, 1.75)))
+            higs_eta = _xyz_num("higs_eta", float(_arg(82, 0.0)))
+            higs_alpha = _xyz_num("higs_alpha", float(_arg(83, 0.75)))
+            higs_cutoff = _xyz_num("higs_cutoff", float(_arg(84, 0.05)))
+            higs_t_min = _xyz_num("higs_t_min", float(_arg(85, 0.40)))
+            higs_t_max = _xyz_num("higs_t_max", float(_arg(86, 1.00)))
+            hiflow_alpha = _xyz_num(
+                "hiflow_alpha", float(_arg(88, hiflow_guidance.DEFAULT_ALPHA))
+            )
+            hiflow_beta = _xyz_num(
+                "hiflow_beta", float(_arg(89, hiflow_guidance.DEFAULT_BETA))
+            )
+            hiflow_cutoff = _xyz_num(
+                "hiflow_cutoff", float(_arg(90, hiflow_guidance.DEFAULT_CUTOFF))
+            )
         except Exception as e:
             _STATE["on"] = False
             _APG["on"] = False
@@ -2825,7 +5228,9 @@ class AnimaSafePAG(scripts.Script):
         # Gradio sliders constrain interactive values, but XYZ axes accept
         # arbitrary strings (including NaN/Inf). Keep the same safe domains
         # when values arrive through XYZ or an API client.
-        scale = _finite_clamp(scale, 0.0, 15.0, 4.0)
+        # Upstream scale range 0..100 (origin: iljung1106/comfyui-anima-safe-pag
+        # @905b0107:__init__.py:201) — XYZ/API values above the old cap of 15 pass.
+        scale = _finite_clamp(scale, 0.0, 100.0, 4.0)
         legacy_strength = _finite_clamp(
             legacy_strength, 0.0, 1.0, 0.75
         )
@@ -2846,25 +5251,73 @@ class AnimaSafePAG(scripts.Script):
         adg_start = _finite_clamp(adg_start, 0.0, 1.0, 0.5)
         adg_interval = int(_finite_clamp(adg_interval, 0.0, 10.0, 0.0))
         seg_sigma = _finite_clamp(seg_sigma, 0.0, 10000.0, 100.0)
-        cwm_alpha_low = _finite_clamp(cwm_alpha_low, -1.0, 1.0, 0.30)
-        cwm_alpha_high = _finite_clamp(cwm_alpha_high, -1.0, 1.0, 0.15)
-        # Keep 0 valid for legacy/API neutral values even though the upstream
-        # Custom UI starts lambda at 0.5.
-        smc_lambda = _finite_clamp(smc_lambda, 0.0, 30.0, 6.0)
-        smc_k = _finite_clamp(smc_k, 0.0, 5.0, 0.20)
-        dcw_lambda_low = _finite_clamp(dcw_lambda_low, -0.5, 0.5, 0.10)
-        dcw_lambda_high = _finite_clamp(dcw_lambda_high, -0.5, 0.5, 0.02)
+        # DCW(+a) domains = the upstream INPUT_TYPES min/max, non-finite values
+        # fall back to the upstream default (origin: namemechan/
+        # ComfyUI-DCW@66aaf9dd:dcw_node.py:636-801).
+        cwm_alpha_low = _finite_clamp(cwm_alpha_low, -1.0, 2.0, 0.0)
+        cwm_alpha_high = _finite_clamp(cwm_alpha_high, -1.0, 2.0, 0.0)
+        smc_lambda = _finite_clamp(smc_lambda, 0.5, 30.0, 6.0)
+        smc_k = _finite_clamp(smc_k, 0.0, 5.0, 0.10)
+        dcw_lambda_low = _finite_clamp(dcw_lambda_low, -0.5, 0.5, 0.05)
+        dcw_lambda_high = _finite_clamp(dcw_lambda_high, -0.3, 0.3, 0.01)
+        rdc_tau = _finite_clamp(rdc_tau, 0.0, 0.5, 0.0)
+        rdc_alpha_ll = _finite_clamp(rdc_alpha_ll, 0.0, 0.3, 0.03)
+        rdc_alpha_hh = _finite_clamp(rdc_alpha_hh, 0.0, 0.1, 0.0)
+        # Upstream gating (origin: namemechan/ComfyUI-DCW@66aaf9dd:
+        # dcw_node.py:817-819): RDC is on when rdc_tau > 0 and only inside
+        # the DCW hook, which needs dcw_enabled and a non-zero lambda or RDC.
+        rdc_on = bool(dcw_enabled and rdc_tau > 0.0 and rdc_switch)
+        dcw_active = bool(
+            dcw_enabled
+            and (dcw_lambda_low != 0.0 or dcw_lambda_high != 0.0 or rdc_on)
+        )
+        _STATE["requested_rdc"] = rdc_on
         dave_strength = _finite_clamp(dave_strength, 0.0, 1.0, 0.30)
         dave_tau = _finite_clamp(dave_tau, 0.0, 1.0, 0.10)
+        # Upstream INPUT_TYPES bounds/defaults (origin: namemechan/
+        # comfyui-cns_sampler_patch@42278b13:cns_sampler_patch.py:395-437).
         cns_strength = _finite_clamp(cns_strength, 0.0, 1.0, 1.0)
-        cns_gamma_power = _finite_clamp(cns_gamma_power, 0.05, 2.0, 0.5)
-        cns_gamma_scale = _finite_clamp(cns_gamma_scale, 0.25, 25.0, 3.0)
+        cns_gamma_power = _finite_clamp(cns_gamma_power, 0.1, 2.0, 0.5)
+        cns_gamma_scale = _finite_clamp(cns_gamma_scale, 0.1, 25.0, 2.0)
         mod_weight = _finite_clamp(mod_weight, -20.0, 20.0, 3.0)
         mod_start_layer = int(
             _finite_clamp(mod_start_layer, 0.0, 1024.0, 0.0)
         )
         mod_end_layer = int(
             _finite_clamp(mod_end_layer, -1.0, 1024.0, -1.0)
+        )
+        s2_scale = _finite_clamp(s2_scale, 0.0, 5.0, s2_guidance.DEFAULT_SCALE)
+        s2_ratio = _finite_clamp(s2_ratio, 0.0, 0.5, s2_guidance.DEFAULT_RATIO)
+        s2_start = _finite_clamp(s2_start, 0.0, 1.0, s2_guidance.DEFAULT_START)
+        s2_end = _finite_clamp(s2_end, 0.0, 1.0, s2_guidance.DEFAULT_END)
+        s2_start, s2_end = min(s2_start, s2_end), max(s2_start, s2_end)
+        smc_adaptive_alpha = _finite_clamp(
+            smc_adaptive_alpha, 0.0, 1.0, SMC_ADAPTIVE_ALPHA
+        )
+        smc_adaptive_lambda = _finite_clamp(
+            smc_adaptive_lambda, 0.5, 30.0, SMC_ADAPTIVE_LAMBDA
+        )
+        # TSR: the ComfyUI node's input range 0.01-100 for both (the UI slider is narrower).
+        tsr_k = _finite_clamp(tsr_k, 0.01, 100.0, tsr_guidance.DEFAULT_K)
+        tsr_sigma = _finite_clamp(tsr_sigma, 0.01, 100.0, tsr_guidance.DEFAULT_SIGMA)
+        mg_alpha = _finite_clamp(mg_alpha, 0.0, 3.0, 0.5)
+        mg_beta = _finite_clamp(mg_beta, 0.0, 0.99, 0.6)
+        mg_min = _finite_clamp(mg_min, 0.0, 1.0, 0.30)
+        mg_max = _finite_clamp(mg_max, 0.0, 1.0, 0.95)
+        mg_min, mg_max = min(mg_min, mg_max), max(mg_min, mg_max)
+        higs_weight = _finite_clamp(higs_weight, 0.0, 3.0, 1.75)
+        higs_eta = _finite_clamp(higs_eta, 0.0, 1.0, 0.0)
+        higs_alpha = _finite_clamp(higs_alpha, 0.01, 0.99, 0.75)
+        higs_cutoff = _finite_clamp(higs_cutoff, 0.0, 0.5, 0.05)
+        higs_t_min = _finite_clamp(higs_t_min, 0.0, 1.0, 0.40)
+        higs_t_max = _finite_clamp(higs_t_max, 0.0, 1.0, 1.00)
+        higs_t_min, higs_t_max = min(higs_t_min, higs_t_max), max(higs_t_min, higs_t_max)
+        hiflow_alpha = _finite_clamp(
+            hiflow_alpha, 0.0, 2.0, hiflow_guidance.DEFAULT_ALPHA
+        )
+        hiflow_beta = _finite_clamp(hiflow_beta, 0.0, 1.0, hiflow_guidance.DEFAULT_BETA)
+        hiflow_cutoff = _finite_clamp(
+            hiflow_cutoff, 0.05, 1.0, hiflow_guidance.DEFAULT_CUTOFF
         )
 
         requested_start, requested_end = min(start, end), max(start, end)
@@ -2889,11 +5342,19 @@ class AnimaSafePAG(scripts.Script):
             smc_resolved_preset=effective_smc_preset,
             smc_lambda=smc_lambda,
             smc_k=smc_k,
+            smc_mode=smc_mode,
+            smc_adaptive_alpha=smc_adaptive_alpha,
+            smc_adaptive_lambda=smc_adaptive_lambda,
         )
         _DCW.update(
-            on=dcw_enabled,
+            on=dcw_active,
+            dcw_on=dcw_enabled,
+            rdc_on=rdc_on,
             lambda_low=dcw_lambda_low,
             lambda_high=dcw_lambda_high,
+            rdc_tau=rdc_tau,
+            rdc_alpha_ll=rdc_alpha_ll,
+            rdc_alpha_hh=rdc_alpha_hh,
         )
         _CNS.update(
             on=cns_enabled,
@@ -2927,12 +5388,16 @@ class AnimaSafePAG(scripts.Script):
             custom_k=smc_k,
         )
         smc_preset_label = (
-            "Legacy Custom"
-            if smc_preset == "Off" and legacy_smc_requested
+            "Off"
+            if not resolved_smc
             else (
-                f"Auto→{smc_resolved_preset}"
-                if smc_preset == "Auto"
-                else smc_resolved_preset
+                "Legacy Custom"
+                if smc_preset == "Off" and legacy_smc_requested
+                else (
+                    f"Auto→{smc_resolved_preset}"
+                    if smc_preset == "Auto"
+                    else smc_resolved_preset
+                )
             )
         )
         _CFG.update(
@@ -2941,7 +5406,7 @@ class AnimaSafePAG(scripts.Script):
             smc_lambda=smc_lambda,
             smc_k=smc_k,
         )
-        if smc_preset == "Auto":
+        if resolved_smc and smc_preset == "Auto":
             _log(
                 f"SMC Auto detected {smc_resolved_preset}: "
                 f"lambda={smc_lambda:g}, k={smc_k:g}"
@@ -3108,7 +5573,20 @@ class AnimaSafePAG(scripts.Script):
                         if pert_enabled:
                             if attn_method and scale > 0:
                                 attn_targets = _parse_blocks(block_spec, nblocks)
-                            if slg_on and slg_scale > 0:
+                            if slg_on and s2_mode:
+                                # S²: the eligible pool; each evaluation draws
+                                # its own subset of it (_s2_draw).
+                                s2_eligible = (
+                                    _parse_blocks(s2_block_spec, nblocks)
+                                    if s2_block_spec.strip()
+                                    else s2_guidance.default_eligible(nblocks)
+                                )
+                                if (
+                                    s2_scale > 0
+                                    and s2_guidance.count_for(s2_ratio, len(s2_eligible))
+                                ):
+                                    slg_targets = set(s2_eligible)
+                            elif slg_on and slg_scale > 0:
                                 slg_targets = _parse_blocks(
                                     slg_block_spec, nblocks
                                 )
@@ -3120,19 +5598,37 @@ class AnimaSafePAG(scripts.Script):
                                 _log(
                                     "no valid target blocks — perturbation skipped."
                                 )
-                        if dave_enabled and dave_strength > 0:
+                        # Upstream pools a block only when its attenuation
+                        # clip(strength·w, 0, 1) > 1e-3, and an empty pool is
+                        # a passthrough (origin: sorryhyun/ComfyUI-Anima-DAVE
+                        # @83143e8d:nodes.py:165-172). The block field stands
+                        # in for the mask; empty = the shipped mask's 8-18.
+                        if dave_enabled and dave_attenuation_active(dave_strength):
                             dave_targets = _parse_blocks(
-                                dave_block_spec, nblocks
+                                dave_block_spec.strip() or DAVE_DEFAULT_BLOCKS,
+                                nblocks,
                             )
                             dave_ok = bool(dave_targets)
                             if not dave_ok:
                                 _log("no valid DAVE blocks — DAVE skipped.")
+                        elif dave_enabled:
+                            _log(
+                                "DAVE strength <= 0.001 — no-op, like the "
+                                "original node."
+                            )
 
         _DAVE.update(
             on=dave_ok,
             strength=dave_strength,
             tau=dave_tau,
             targets=dave_targets,
+            gate=ForwardGateCache(),
+            schedule_ok=_sampler_publishes_sigmas(p),
+            offset=_forge_sampling_offset(p),
+            offset_p=p,
+            pre_dd=_read_bool_option(OPT_DAVE_PRE_DD, True),
+            run_p=None,
+            run_steps=0,
         )
         if not mod_ok:
             _MOD.update(
@@ -3142,16 +5638,79 @@ class AnimaSafePAG(scripts.Script):
                 typed={},
             )
 
+        # ---- Detail stages (model-agnostic post-CFG; HiFlow needs a hires request) ----
+        _DETAIL["flow"] = is_flow_model(getattr(unet, "model", None))
+        _TSR.update(on=bool(tsr_enabled and tsr_k != 1.0), k=tsr_k, sigma=tsr_sigma, steps=0)
+        if tsr_enabled and _DETAIL["flow"] is None:
+            _log("TSR: the model's parameterisation is unknown here — it is decided per call.")
+        _HIST.update(
+            mg_on=bool(mg_enabled), mg_alpha=mg_alpha, mg_beta=mg_beta,
+            mg_normalize=bool(mg_normalize), mg_min=mg_min, mg_max=mg_max,
+            higs_on=bool(higs_enabled and higs_weight > 0.0), higs_weight=higs_weight,
+            higs_eta=higs_eta, higs_alpha=higs_alpha, higs_cutoff=higs_cutoff,
+            higs_t_min=higs_t_min, higs_t_max=higs_t_max,
+        )
+        if _HIST["mg_on"] and _HIST["higs_on"]:
+            _log(
+                "Momentum Guidance and HiGS are both on: they extrapolate along the same "
+                "history, so the push is counted twice (compare them one at a time)."
+            )
+        if _HIST["mg_on"] and resolved_apg and apg_momentum != 0.0:
+            _log("Momentum Guidance + APG momentum: two history extrapolations stack.")
+        _HIFLOW.update(
+            enabled=bool(hiflow_enabled), alpha=hiflow_alpha, beta=hiflow_beta,
+            cutoff=hiflow_cutoff,
+        )
+        hiflow_mode = _hiflow_attach(p, bool(hiflow_enabled))
+        if hiflow_enabled and hiflow_mode not in {"record", "align"}:
+            _log(f"HiFlow inactive this pass: {hiflow_mode}.")
+
+        if pert_ok and _perturbation_oom_blocked(p):
+            pert_ok = False
+            _log(
+                "PAG/SEG/SLG 확장 배치가 이 생성의 앞선 패스에서 VRAM 부족(OOM)"
+                "으로 실패해 perturbation 을 끈 상태를 유지합니다."
+            )
+
         if pert_ok:
+            # PAG's window: sigmas of the requested percent range on this
+            # pass's own schedule, like the node's patch() does. Not the ADG
+            # cut: that is a step fraction (not a sigma percent) and ADG's own
+            # skip branch already drops PAG on the steps it skips. SEG/SLG keep
+            # the step-fraction gate (start..effective_end).
+            sigma_hi = sigma_lo = None
+            if attn_method == "pag" and attn_targets:
+                sigma_hi, sigma_lo = _pag_sigma_window(
+                    unet, requested_start, requested_end,
+                )
+                if sigma_hi is None:
+                    _log("no predictor.percent_to_sigma — the PAG window "
+                         "falls back to the step fraction.")
+            s2_active = bool(slg_on and s2_mode and slg_targets)
+            if s2_active:
+                _S2.update(
+                    on=True,
+                    scale=s2_scale,
+                    ratio=s2_ratio,
+                    eligible=set(slg_targets),
+                    start=s2_start,
+                    end=s2_end,
+                    seed=_s2_seed(p),
+                    pass_tag="hires" if getattr(p, "is_hr_pass", False) else "base",
+                    draws=0,
+                    last=(),
+                )
             _STATE.update(
                 on=True, attn_method=(attn_method if attn_targets else None),
                 attn_scale=scale, strength=strength, legacy_attn=legacy_attn,
                 seg_sigma=seg_sigma, head_spec=head_spec,
                 attn_targets=attn_targets,
-                slg_on=bool(slg_on and slg_targets), slg_scale=slg_scale,
+                slg_on=bool(slg_on and slg_targets),
+                slg_scale=(s2_scale if s2_active else slg_scale),
                 slg_targets=slg_targets, rescale=rescale,
                 rescale_mode=rescale_mode,
                 start=requested_start, end=effective_end,
+                sigma_hi=sigma_hi, sigma_lo=sigma_lo,
                 requested_start=requested_start, requested_end=requested_end,
                 range_mode=range_mode,
                 active=0, attn_raw=None, slg_raw=None, cond_raw=None,
@@ -3173,6 +5732,7 @@ class AnimaSafePAG(scripts.Script):
             _DAVE["on"],
             _CNS["on"],
             _MOD["on"],
+            _detail_stages_on(),
         )):
             return
 
@@ -3185,13 +5745,32 @@ class AnimaSafePAG(scripts.Script):
         try:
             if _CNS["on"] and not _ensure_cns_noise_patched():
                 _CNS["on"] = False
+            if _CNS["on"]:
+                _CNS["capture"] = _install_cns_x_capture(p)
+                _CNS["scope"] = _install_cns_sampler_scope(p)
             unet = unet.clone()
             # The wrapper is needed for perturbation AND for Adaptive Guidance
             # (both manipulate the cond/uncond batch before apply_model).
             if _STATE["on"] or _ADG["on"]:
                 _warn_foreign_unet_wrapper(unet)
                 unet.set_model_unet_function_wrapper(_model_wrapper)
-            unet.set_model_sampler_post_cfg_function(_post_cfg)
+            if _STATE["on"]:
+                unet.set_model_sampler_pre_cfg_function(_prepare_condition_aggregation)
+            # Upstream installs its SMC/CWM cfg hook with
+            # disable_cfg1_optimization=True, so those bases also work at
+            # CFG 1 on a real uncond (origin: namemechan/ComfyUI-DCW@66aaf9dd:
+            # dcw_node.py:877-878). DCW-only / APG-only registrations keep
+            # Forge's CFG 1 shortcut. Only for a pass whose own CFG is ≈1:
+            # in a CFG≠1 pass the cond_scale=1 steps are Forge's "Ignore
+            # Negative Prompt during Early Steps" / NGMS skips, which must
+            # stay negative-free (ComfyUI has no such setting).
+            cfg1_uncond = _cfg_hook_needed(unet) and _pass_cfg_near_one(p)
+            if cfg1_uncond:
+                unet.set_model_sampler_post_cfg_function(
+                    _post_cfg, disable_cfg1_optimization=True
+                )
+            else:
+                unet.set_model_sampler_post_cfg_function(_post_cfg)
             p.sd_model.forge_objects.unet = unet
 
             if not hasattr(p, "extra_generation_params"):
@@ -3207,16 +5786,55 @@ class AnimaSafePAG(scripts.Script):
                     heads = head_spec.strip() or "all"
                     parts.append(f"{_STATE['attn_method'].upper()} mode={mode} scale={scale} "
                                  f"{detail} blocks={sorted(attn_targets)} heads={heads}")
-                if _STATE["slg_on"]:
+                if _STATE["slg_on"] and _S2["on"]:
+                    eligible = sorted(_S2["eligible"])
+                    parts.append(
+                        f"S2 scale={s2_scale} ratio={s2_ratio} "
+                        f"drop={s2_guidance.count_for(s2_ratio, len(eligible))}/{len(eligible)} "
+                        f"eligible={_block_span_text(eligible)} "
+                        f"window={_S2['start']:.2f}-{_S2['end']:.2f} "
+                        f"seed={_S2['seed']}:{_S2['pass_tag']}"
+                    )
+                elif _STATE["slg_on"]:
                     parts.append(f"SLG scale={slg_scale} skip={sorted(slg_targets)}")
                 p.extra_generation_params["Anima Perturbation Guidance"] = (
                     "; ".join(parts)
                     + f"; requested_range={_STATE['requested_start']:.2f}-"
                       f"{_STATE['requested_end']:.2f}"
                     + f"; effective_range={_STATE['start']:.2f}-{_STATE['end']:.2f}"
+                    # PAG only: SEG/SLG are gated by effective_range.
+                    + (f"; pag_sigma_window={_sigma_window_text()}"
+                       if _STATE["attn_method"] == "pag" else "")
                     + f"; range_mode={_STATE['range_mode']}"
                     + f"; rescale={rescale}({rescale_mode})"
                 )
+                if _STATE["attn_method"] == "pag" and _STATE.get("pag_cosine_envelope", False):
+                    p.extra_generation_params[INFOTEXT_PAG_COSINE] = "True"
+                    hi, lo = _STATE.get("sigma_hi"), _STATE.get("sigma_lo")
+                    usable = (
+                        hi is not None and lo is not None
+                        and math.isfinite(float(hi)) and math.isfinite(float(lo))
+                        and float(hi) != float(lo)
+                    )
+                    p.extra_generation_params[INFOTEXT_PAG_ENVELOPE_EFFECTIVE] = (
+                        "cosine-squared in linear sigma window"
+                        if usable else "constant fallback: no usable sigma window"
+                    )
+                # The wrapper writes INFOTEXT_CONTROLNET_GUARD here if it blocks.
+                _STATE["guard_params"] = p.extra_generation_params
+                # 결과를 미세하게 바꾸는 설정(재현성). 붙여넣기 때 같은 Forge 설정으로
+                # 돌아가도록 OptionInfo(infotext=...) 이름·"True"/"False" 로 적는다.
+                p.extra_generation_params[INFOTEXT_PREFIX_DEDUP] = str(
+                    bool(_STATE["prefix_dedup"])
+                )
+                if (
+                    _STATE["attn_method"] == "seg"
+                    and not legacy_attn
+                    and 0.0 < float(seg_sigma) <= 9999.0
+                ):
+                    p.extra_generation_params[INFOTEXT_SEG_SEPARABLE] = str(
+                        bool(_STATE["seg_separable"])
+                    )
             if _APG["on"]:
                 p.extra_generation_params["Anima APG"] = (
                     f"eta={apg_eta}, norm={apg_norm}, momentum={apg_momentum}"
@@ -3227,25 +5845,40 @@ class AnimaSafePAG(scripts.Script):
                     name for name, on in
                     (("SMC", smc_on), ("APG", apg_on), ("CWM", cwm_on)) if on
                 ]
+                if smc_on and smc_mode == SMC_MODE_ADAPTIVE:
+                    smc_text = (
+                        f", smc={SMC_MODE_ADAPTIVE}"
+                        f"(alpha={smc_adaptive_alpha:g},lambda={smc_adaptive_lambda:g})"
+                    )
+                elif smc_on:
+                    smc_text = (
+                        f", smc={smc_preset_label}"
+                        f"({smc_lambda:g},{smc_k:g})"
+                    )
+                else:
+                    smc_text = ""
                 p.extra_generation_params["Anima CFG Orchestrator"] = (
                     "→".join(active)
                     + (f", alpha=({cwm_alpha_low},{cwm_alpha_high})" if cwm_on else "")
-                    + (
-                        f", smc={smc_preset_label}"
-                        f"({smc_lambda:g},{smc_k:g})"
-                        if smc_on else ""
-                    )
+                    + smc_text
                 )
             if _DCW["on"]:
                 p.extra_generation_params["Anima DCW"] = (
                     f"lambda_low={dcw_lambda_low}, "
                     f"lambda_high={dcw_lambda_high}"
                 )
+            if _DCW["rdc_on"]:
+                p.extra_generation_params["Anima RDC"] = (
+                    f"tau={rdc_tau}, alpha_ll={rdc_alpha_ll}, "
+                    f"alpha_hh={rdc_alpha_hh}"
+                )
             if _DAVE["on"]:
                 p.extra_generation_params["Anima DAVE"] = (
                     f"strength={dave_strength}, tau={dave_tau}, "
                     f"blocks={sorted(dave_targets)}"
                 )
+                # 붙여넣기 때 같은 Forge 설정으로 돌아가도록 "True"/"False" (Detail Daemon 과 함께일 때만 차이)
+                p.extra_generation_params[INFOTEXT_DAVE_PRE_DD] = str(bool(_DAVE.get("pre_dd", True)))
             if _CNS["on"]:
                 p.extra_generation_params["Anima CNS Wavelet Noise"] = (
                     f"strength={cns_strength}, gamma_power={cns_gamma_power}, "
@@ -3262,6 +5895,23 @@ class AnimaSafePAG(scripts.Script):
                 p.extra_generation_params["Anima Adaptive Guidance"] = (
                     f"skip_after={_ADG['start']:.2f}, keep_every={_ADG['interval']}"
                 )
+            if _TSR["on"]:
+                p.extra_generation_params["Anima TSR"] = f"k={tsr_k}, sigma={tsr_sigma}"
+            if _HIST["mg_on"]:
+                p.extra_generation_params["Anima Momentum Guidance"] = (
+                    f"alpha={mg_alpha}, beta={mg_beta}, "
+                    f"normalize={bool(mg_normalize)}, window={mg_min:.2f}-{mg_max:.2f}"
+                )
+            if _HIST["higs_on"]:
+                p.extra_generation_params["Anima HiGS"] = (
+                    f"w={higs_weight}, eta={higs_eta}, alpha={higs_alpha}, "
+                    f"cutoff={higs_cutoff}, t={higs_t_min:.2f}-{higs_t_max:.2f}"
+                )
+            if _HIFLOW["applying"]:
+                p.extra_generation_params["Anima HiFlow"] = (
+                    f"alpha={hiflow_alpha}, beta={hiflow_beta}, cutoff={hiflow_cutoff}, "
+                    f"reference={len(_HIFLOW['trajectory'])} sigmas"
+                )
             _log(
                 f"attached ✅ engine={engine} "
                 f"pert={'on' if _STATE['on'] else 'off'} "
@@ -3269,26 +5919,47 @@ class AnimaSafePAG(scripts.Script):
                 f"mode={'legacy' if legacy_attn else 'official'} "
                 f"strength={strength} heads={head_spec.strip() or 'all'} "
                 f"seg_sigma={seg_sigma} "
-                f"slg={_STATE['slg_on']}:{sorted(slg_targets)} scale={slg_scale} "
+                + (
+                    f"s2=on(scale={s2_scale} ratio={s2_ratio} "
+                    f"eligible={_block_span_text(_S2['eligible'])} "
+                    f"window={_S2['start']:.2f}-{_S2['end']:.2f}) "
+                    if _S2["on"] else
+                    f"slg={_STATE['slg_on']}:{sorted(slg_targets)} scale={slg_scale} "
+                )
+                +
                 f"range={_STATE['requested_start']:.2f}-{_STATE['requested_end']:.2f}"
                 f"→{_STATE['start']:.2f}-{_STATE['end']:.2f}"
+                f" pag_sigma={_sigma_window_text()}"
                 f"({_STATE['range_mode']}) "
                 f"rescale={'auto-off' if (_APG['on'] and apg_autooff) else rescale}"
-                f"({rescale_mode})) "
+                f"({rescale_mode}) "
+                f"prefix_dedup={bool(_STATE['prefix_dedup'])} "
+                f"seg_separable={bool(_STATE['seg_separable'])}) "
                 f"APG={'on' if _APG['on'] else 'off'} "
                 f"(eta={apg_eta} norm={apg_norm} mom={apg_momentum}) "
                 f"AdaptiveG={'on' if _ADG['on'] else 'off'} "
                 f"(skip_after={_ADG['start']} keep_every={_ADG['interval']}) "
                 f"CFGBase={_CFG['mode']} stack={_CFG['experimental_stack']} "
-                f"SMC={smc_preset_label}"
-                f"({smc_lambda:g},{smc_k:g}) "
-                f"DCW={_DCW['on']} DAVE={_DAVE['on']} CNS={_CNS['on']} "
+                f"cfg1_uncond={cfg1_uncond} "
+                + (
+                    f"SMC={SMC_MODE_ADAPTIVE}(alpha={smc_adaptive_alpha:g},"
+                    f"lambda={smc_adaptive_lambda:g}) "
+                    if resolved_smc and smc_mode == SMC_MODE_ADAPTIVE else
+                    f"SMC={smc_preset_label}({smc_lambda:g},{smc_k:g}) "
+                )
+                + f"DCW={_DCW['dcw_on']} RDC={_DCW['rdc_on']} "
+                f"DAVE={_DAVE['on']} CNS={_CNS['on']} "
                 f"Mod={'on' if _MOD['on'] else 'off'}"
                 + (
                     f"(w={_MOD['weight']:g}, "
                     f"blocks={_MOD['start_layer']}-{_MOD['end_layer']})"
                     if _MOD["on"] else ""
                 )
+                + f" TSR={'on' if _TSR['on'] else 'off'}"
+                + f" MG={'on' if _HIST['mg_on'] else 'off'}"
+                + f" HiGS={'on' if _HIST['higs_on'] else 'off'}"
+                + f" HiFlow={hiflow_mode}"
+                + f" flow={_DETAIL['flow']}"
             )
         except Exception as e:
             _STATE["on"] = False
@@ -3296,7 +5967,7 @@ class AnimaSafePAG(scripts.Script):
             _ADG["on"] = False
             _CFG["mode"] = "preserve"
             _CFG["experimental_stack"] = False
-            _DCW["on"] = False
+            _DCW.update(on=False, dcw_on=False, rdc_on=False)
             _DAVE["on"] = False
             _CNS["on"] = False
             _MOD.update(
@@ -3305,6 +5976,10 @@ class AnimaSafePAG(scripts.Script):
                 block_modulations=None,
                 typed={},
             )
+            _S2["on"] = False
+            _TSR["on"] = False
+            _HIST.update(mg_on=False, higs_on=False)
+            _HIFLOW.update(recording=False, applying=False)
             _RUNTIME.reset_pass()
             _log(f"failed to attach hooks: {type(e).__name__}: {e}")
 
@@ -3317,6 +5992,11 @@ class AnimaSafePAG(scripts.Script):
                 f"wrapper_calls={_STATE['wrapper_calls']} "
                 f"weak_steps={_STATE['weak_steps']} "
                 f"applied_steps={_STATE['applied_steps']}"
+                + (
+                    f" prefix_dedup_blocks={_STATE['dedup_blocks']}"
+                    f" prefix_dedup_fallbacks={_STATE['dedup_fallbacks']}"
+                    if _STATE["weak_steps"] else ""
+                )
             )
         verify_requested = any((
             _STATE["requested_pert"],
@@ -3330,6 +6010,9 @@ class AnimaSafePAG(scripts.Script):
             _STATE["requested_dave"],
             _STATE["requested_cns"],
             _STATE["requested_modulation"],
+            # The detail stages (TSR/MG/HiGS/HiFlow) report in the same summary, also when on alone.
+            _detail_stages_on(),
+            _HIFLOW["enabled"],
         ))
         if guidance_diagnostics_enabled() and verify_requested:
             elapsed = None
@@ -3376,6 +6059,25 @@ class AnimaSafePAG(scripts.Script):
                 f"elapsed={elapsed_text}"
             )
 
+            if _S2["on"]:
+                _log(
+                    "[VERIFY] S2: "
+                    f"draws={_S2['draws']} last_drop={list(_S2['last'])} "
+                    f"eligible={_block_span_text(_S2['eligible'])} "
+                    f"window={_S2['start']:.2f}-{_S2['end']:.2f}"
+                )
+            if _detail_stages_on() or _HIFLOW["enabled"]:
+                counters = _RUNTIME.history.counters
+                hiflow_counts = _HIFLOW["state"].counters
+                _log(
+                    "[VERIFY] detail: "
+                    f"TSR={'APPLIED(%d evals)' % _TSR['steps'] if _TSR['on'] else 'OFF'}, "
+                    f"MG={'APPLIED(%d evals)' % counters['mg'] if _HIST['mg_on'] else 'OFF'}, "
+                    f"HiGS={'APPLIED(%d evals)' % counters['higs'] if _HIST['higs_on'] else 'OFF'}, "
+                    f"HiFlow=recorded {len(_HIFLOW['trajectory'])} sigmas, "
+                    f"direction {hiflow_counts['direction']} / acceleration "
+                    f"{hiflow_counts['acceleration']} evals, flow={_DETAIL['flow']}"
+                )
             if (
                 not _STATE["requested_pert"]
                 or _STATE["requested_method"] not in {"pag", "seg"}
@@ -3424,12 +6126,25 @@ class AnimaSafePAG(scripts.Script):
                 if _CFG["effective_scale"] is None
                 else f"{float(_CFG['effective_scale']):.4g}"
             )
+            fit_scale_text = (
+                "?"
+                if _CFG["fit_scale"] is None
+                else f"{float(_CFG['fit_scale']):.4g}"
+            )
             dcw_verdict = (
                 "OFF"
                 if not _STATE["requested_dcw"]
                 else (
-                    f"APPLIED({_DCW['steps']} evals)"
-                    if _DCW["steps"] > 0 else "NO-OP"
+                    f"APPLIED({_DCW['dcw_steps']} evals)"
+                    if _DCW["dcw_steps"] > 0 else "NO-OP"
+                )
+            )
+            rdc_verdict = (
+                "OFF"
+                if not _STATE["requested_rdc"]
+                else (
+                    f"APPLIED({_DCW['rdc_steps']} evals)"
+                    if _DCW["rdc_steps"] > 0 else "NO-OP"
                 )
             )
             dave_verdict = (
@@ -3444,7 +6159,8 @@ class AnimaSafePAG(scripts.Script):
                 "OFF"
                 if not _STATE["requested_cns"]
                 else (
-                    f"APPLIED({_RUNTIME.cns_noise_calls} noise calls)"
+                    f"APPLIED({_RUNTIME.cns_noise_calls} noise calls, "
+                    f"x_t={_CNS['capture']})"
                     if _RUNTIME.cns_noise_calls > 0
                     else "INERT(no ancestral/SDE noise call)"
                 )
@@ -3461,13 +6177,20 @@ class AnimaSafePAG(scripts.Script):
                 "[VERIFY] suite: "
                 f"attention={attention_verdict}, "
                 f"CFG={requested_mode}:{cfg_verdict} "
-                f"(w_eff={scale_text}, fit={fit_text}), "
-                f"DCW={dcw_verdict}, DAVE={dave_verdict}, CNS={cns_verdict}, "
+                f"(w_eff={scale_text}, w_fit={fit_scale_text}, fit={fit_text}), "
+                f"DCW={dcw_verdict}, RDC={rdc_verdict}, "
+                f"DAVE={dave_verdict}, CNS={cns_verdict}, "
                 f"Modulation={modulation_verdict}"
             )
         _STATE["on"] = False
         _APG["on"] = False
         _ADG["on"] = False
+        _S2.update(on=False, eligible=set(), draws=0, last=())
+        _TSR.update(on=False, steps=0)
+        _HIST.update(mg_on=False, higs_on=False)
+        _DETAIL.update(flow=None, warned=set())
+        _hiflow_clear()
+        _HIFLOW["enabled"] = False
         _CFG.update(
             smc_on=False,
             apg_on=False,
@@ -3476,15 +6199,34 @@ class AnimaSafePAG(scripts.Script):
             experimental_stack=False,
             smc_preset="Off",
             smc_resolved_preset="Off",
+            smc_mode=SMC_MODE_UNIT,
             steps=0,
             fit_error=None,
             effective_scale=None,
+            fit_scale=None,
             external_cfg_detected=False,
             warned=False,
+            cfg1_warned=False,
+            external_cfg_warned=False,
+            base_skipped=False,
+            fit_checked=False,
         )
-        _DCW.update(on=False, steps=0)
-        _DAVE.update(on=False, targets=set(), steps=0)
-        _CNS.update(on=False, warned=False)
+        _DCW.update(
+            on=False,
+            dcw_on=False,
+            rdc_on=False,
+            steps=0,
+            dcw_steps=0,
+            rdc_steps=0,
+        )
+        _DAVE.update(
+            on=False, targets=set(), steps=0, offset=None, offset_p=None,
+            run_p=None, run_steps=0,
+        )
+        _CNS.update(
+            on=False, warned=False, capture="post_cfg", callback_seen=False,
+            scope="pass",
+        )
         _MOD.update(
             on=False,
             targets=set(),
@@ -3498,6 +6240,7 @@ class AnimaSafePAG(scripts.Script):
         _STATE["attn_raw"] = None
         _STATE["slg_raw"] = None
         _STATE["cond_raw"] = None
+        _STATE.pop("condition_aggregation", None)
         _STATE["adg_skipped"] = False
         _STATE["attn_spatial_shape"] = None
         _STATE["attn_hook_hits"] = 0
@@ -3515,6 +6258,8 @@ class AnimaSafePAG(scripts.Script):
         _STATE["split_cond_calls"] = 0
         _STATE["split_uncond_calls"] = 0
         _STATE["control_blocked_calls"] = 0
+        _STATE["guard_params"] = None
+        _STATE["sigma_hi"] = _STATE["sigma_lo"] = None
         _STATE["wrapper_fallbacks"] = 0
         _STATE["requested_pert"] = False
         _STATE["requested_apg"] = False
@@ -3531,5 +6276,12 @@ class AnimaSafePAG(scripts.Script):
         _STATE["engine"] = "?"
         _STATE["diag_started_at"] = None
         _STATE["delta_logged"] = False
+        _STATE["pass_owner"] = None
+        _STATE["pert_oom_owner"] = None
+        _STATE["dedup_blocks"] = 0
+        _STATE["dedup_fallbacks"] = 0
+        _STATE["dedup_warned"] = False
+        _STATE["dedup_disabled"] = False
+        _INDEX_TENSOR_CACHE.clear()
         _RUNTIME.reset_pass()
         _clear_markers()

@@ -922,9 +922,14 @@ def _read_log_tail(n: int = 20) -> str:
 # ---------------------------------------------------------------------------
 # HTTP config/spawn endpoints
 # ---------------------------------------------------------------------------
-# Same-origin JSON routes let the embedded manager query config and lazily
-# spawn its server without coupling that lifecycle to a hidden Gradio button.
-# They wrap the exact same get_or_spawn() lifecycle.
+# JSON routes that query the config and lazily spawn the manager's server over
+# plain HTTP. The page's own JS uses the hidden Gradio bridge
+# (scripts/lora_manager.py) instead; these remain for external tools and wrap
+# the exact same get_or_spawn() lifecycle. They are guarded like the Notebook,
+# memo and Tile & Repair routes: Gradio's login and Forge's --api-auth under
+# --api/--nowebui (notebook_store.extension_auth_dependencies) plus the
+# X-SAM3-Notebook: 1 header, checked before the handler does anything, so a
+# refused /sam3-lora/spawn never starts the server.
 
 LORA_CONFIG_PATH = "/sam3-lora/config"
 LORA_SPAWN_PATH = "/sam3-lora/spawn"
@@ -968,32 +973,69 @@ def lora_spawn_data() -> dict[str, Any]:
         return {"url": "", "port": port, "status": "error", "message": str(e)}
 
 
-def register_lora_routes(app: Any) -> bool:
+def register_lora_routes(
+    app: Any,
+    *,
+    auth_dependencies: list[Any] | None = None,
+) -> bool:
     """Register the config/spawn JSON routes once. Returns True if newly added
-    (idempotent — Forge re-fires app-start after Reload UI)."""
+    (idempotent — Forge re-fires app-start after Reload UI).
+
+    ``auth_dependencies`` replaces the host's login guards
+    (``extension_auth_dependencies(app)``); it exists for tests, as in
+    ``register_memo_routes``.
+    """
     existing = {getattr(r, "path", None) for r in getattr(app, "routes", ())}
     if LORA_CONFIG_PATH in existing and LORA_SPAWN_PATH in existing:
         return False
 
+    # Imported here, not at module level: this module stays framework-agnostic.
+    from fastapi import Request
     from fastapi.responses import JSONResponse
 
+    from starlette.concurrency import run_in_threadpool
+
+    from .notebook_store import (
+        extension_auth_dependencies,
+        require_same_origin_header,
+    )
+
+    dependencies = (
+        list(auth_dependencies)
+        if auth_dependencies is not None
+        else extension_auth_dependencies(app)
+    )
     _no_store = {"Cache-Control": "no-store, max-age=0", "Pragma": "no-cache"}
 
-    async def _config_route() -> JSONResponse:
+    async def _config_route(request: Request) -> JSONResponse:
+        require_same_origin_header(request)
         return JSONResponse(lora_config_data(), headers=_no_store)
 
-    async def _spawn_route() -> JSONResponse:
-        return JSONResponse(lora_spawn_data(), headers=_no_store)
+    async def _spawn_route(request: Request) -> JSONResponse:
+        # Before anything else: a refused request must never start the server.
+        require_same_origin_header(request)
+        # get_or_spawn waits up to a few seconds for the child to answer; off
+        # the event loop like the Notebook and Tile & Repair routes.
+        return JSONResponse(await run_in_threadpool(lora_spawn_data), headers=_no_store)
+
+    # ``from __future__ import annotations`` leaves these annotations strings
+    # that FastAPI resolves in the module globals, where the lazy imports above
+    # are not; without the real classes ``request`` would be read as a required
+    # query parameter (422).
+    for handler in (_config_route, _spawn_route):
+        handler.__annotations__ = {"request": Request, "return": JSONResponse}
 
     if LORA_CONFIG_PATH not in existing:
         app.add_api_route(
             LORA_CONFIG_PATH, _config_route, methods=["GET"],
             include_in_schema=False, name="sam3-lora-config",
+            dependencies=dependencies,
         )
     if LORA_SPAWN_PATH not in existing:
         app.add_api_route(
             LORA_SPAWN_PATH, _spawn_route, methods=["GET"],
             include_in_schema=False, name="sam3-lora-spawn",
+            dependencies=dependencies,
         )
     return True
 

@@ -90,6 +90,7 @@ class AnimaRefPoC(scripts.Script):
                 label="Enable PoC (log apply_model input shape)",
                 value=False,
                 elem_id="anima_ref_poc_enable",
+                elem_classes=["sam3-on"],
             )
             do_concat = gr.Checkbox(
                 label="Also try reference temporal-concat (init_latent을 T축 concat→apply_model→slice)",

@@ -50,8 +50,13 @@
     var saveChain = Promise.resolve();
     var changeVersion = 0;
     var undoState = null;
+    var applyChain = Promise.resolve();
+    var pendingApplyOperations = 0;
     var gradioConfigSnapshot = null;
     var gradioConfigPromise = null;
+    var configIndexSource = null;
+    var configIndexLength = -1;
+    var configIndexByElemId = null;
     var delegatedEventRoots = typeof WeakSet === "function" ? new WeakSet() : [];
     var boundPanels = typeof WeakSet === "function" ? new WeakSet() : [];
     var fastDropdownVisibilityObserver = null;
@@ -321,13 +326,26 @@
         await gradioConfigPromise;
     }
 
+    // Forge's page config holds thousands of components and this lookup runs
+    // for every dropdown on every UI update, so resolve elem_ids through an
+    // index that is rebuilt only when the config array is replaced or grows.
+    // The first component wins for a duplicated elem_id, as a linear scan did.
     function metaForElemId(elemId) {
         var components = configComponents();
-        for (var i = 0; i < components.length; i++) {
-            var props = components[i] && components[i].props;
-            if (props && props.elem_id === elemId) return components[i];
+        if (components !== configIndexSource
+                || components.length !== configIndexLength) {
+            configIndexByElemId = Object.create(null);
+            for (var i = 0; i < components.length; i++) {
+                var props = components[i] && components[i].props;
+                var id = props && props.elem_id;
+                if (id && !(id in configIndexByElemId)) {
+                    configIndexByElemId[id] = components[i];
+                }
+            }
+            configIndexSource = components;
+            configIndexLength = components.length;
         }
-        return null;
+        return configIndexByElemId[elemId] || null;
     }
 
     function choiceLabels(rawChoices) {
@@ -644,6 +662,9 @@
         var allChoices = normalizeFastChoices(choices);
         var selectedValues = [];
         var optionButtons = [];
+        var renderedChoiceLimit = fastDropdownVisibleChoiceLimit();
+        var lastRenderedQuery = "";
+        var lastOrderedChoices = [];
 
         function selectedTokenValues() {
             if (!isMulti) return [];
@@ -702,7 +723,12 @@
         }
 
         function renderOptions(query) {
+            var preserveLimit = arguments.length > 1 && arguments[1] === true;
             var normalizedQuery = String(query || "").trim().toLocaleLowerCase();
+            if (!preserveLimit || normalizedQuery !== lastRenderedQuery) {
+                renderedChoiceLimit = fastDropdownVisibleChoiceLimit();
+            }
+            lastRenderedQuery = normalizedQuery;
             var matches = allChoices.filter(function (choice) {
                 return !normalizedQuery
                     || choice.toLocaleLowerCase().indexOf(normalizedQuery) !== -1;
@@ -716,8 +742,8 @@
             matches.forEach(function (choice) {
                 if (ordered.indexOf(choice) === -1) ordered.push(choice);
             });
-            var renderLimit = fastDropdownVisibleChoiceLimit();
-            var rendered = ordered.slice(0, renderLimit);
+            lastOrderedChoices = ordered;
+            var rendered = ordered.slice(0, renderedChoiceLimit);
             list.textContent = "";
             optionButtons = [];
             rendered.forEach(function (choice, index) {
@@ -760,12 +786,16 @@
                 empty.hidden = false;
             } else if (matches.length > rendered.length) {
                 empty.textContent = matches.length + "개 중 "
-                    + rendered.length + "개 표시 · 검색어를 더 입력하세요";
+                    + rendered.length + "개 표시 · 아래로 스크롤하면 더 표시";
                 empty.hidden = false;
             } else {
                 empty.hidden = true;
             }
             list.setAttribute("data-rendered-count", String(rendered.length));
+            list.setAttribute(
+                "data-has-more",
+                String(rendered.length < lastOrderedChoices.length)
+            );
             if (popoverIsOpen()) positionPopover();
         }
 
@@ -799,9 +829,23 @@
                 Math.floor(availableWidth / baseWidth)
             );
             var columns = Math.min(idealColumns, maxColumns);
+            var hasMore = list.getAttribute("data-has-more") === "true";
+            if (hasMore) {
+                // Keep at least one row below the viewport so a real scrollbar
+                // exists even on a large monitor. Reaching its end appends the
+                // next configured page instead of hiding unknown choices.
+                var maxColumnsWithOverflow = Math.max(
+                    1,
+                    Math.floor((itemCount - 1) / maxRows)
+                );
+                columns = Math.min(columns, maxColumnsWithOverflow);
+            }
             var rows = Math.max(1, Math.ceil(itemCount / columns));
             var visibleRows = Math.min(rows, maxRows);
-            var needsScroll = rows > maxRows;
+            if (hasMore && rows <= maxRows) {
+                visibleRows = Math.max(4, rows - 1);
+            }
+            var needsScroll = hasMore || rows > maxRows;
             var width = Math.min(baseWidth * columns, availableWidth);
             var panelHeight = Math.min(
                 availableHeight,
@@ -908,6 +952,19 @@
             allChoices = normalizeFastChoices(nextChoices);
             renderOptions(search.value);
         }
+
+        list.addEventListener("scroll", function () {
+            if (list.getAttribute("data-has-more") !== "true") return;
+            if (list.scrollTop + list.clientHeight < list.scrollHeight - 48) return;
+            var previousScrollTop = list.scrollTop;
+            renderedChoiceLimit += fastDropdownVisibleChoiceLimit();
+            renderedChoiceLimit = Math.min(
+                renderedChoiceLimit,
+                lastOrderedChoices.length
+            );
+            renderOptions(search.value, true);
+            list.scrollTop = previousScrollTop;
+        });
 
         wrapper.__sam3FastDropdownSync = syncValue;
         wrapper.__sam3FastDropdownSetChoices = setChoices;
@@ -1518,7 +1575,43 @@
         if (label) setStatus(label, "saved");
     }
 
-    async function applyPreset(preset) {
+    function syncApplyButtons() {
+        if (!panel) return;
+        var busy = pendingApplyOperations > 0;
+        panel.setAttribute("aria-busy", busy ? "true" : "false");
+        Array.prototype.forEach.call(
+            panel.querySelectorAll("[data-notebook-apply], [data-notebook-undo]"),
+            function (button) { button.disabled = busy; }
+        );
+    }
+
+    function queueApplyOperation(operation) {
+        pendingApplyOperations++;
+        syncApplyButtons();
+        var queued = applyChain.then(operation).catch(function (error) {
+            console.error("[SAM3 Notebook] queued apply failed:", error);
+            setStatus(String(error && error.message || error), "error");
+        }).finally(function () {
+            pendingApplyOperations--;
+            syncApplyButtons();
+        });
+        // Both Apply and Undo use this chain, including failure rollback.
+        applyChain = queued;
+        return queued;
+    }
+
+    function applyPreset(preset) {
+        // Editing a preset while it is queued must not change that request.
+        var snapshot = clone(preset);
+        return queueApplyOperation(function () { return runPresetApply(snapshot); });
+    }
+
+    function applyUndo() {
+        // Resolve undoState only after preceding Apply/Undo tasks finish.
+        return queueApplyOperation(runApplyUndo);
+    }
+
+    async function runPresetApply(preset) {
         if (!preset.entries.length) {
             setStatus("적용할 항목이 없습니다", "warning");
             return;
@@ -1551,7 +1644,7 @@
         }
     }
 
-    async function applyUndo() {
+    async function runApplyUndo() {
         if (!undoState) return;
         var state = undoState;
         setStatus("되돌리는 중…", "pending");
@@ -1585,105 +1678,6 @@
         return node && node.parentElement === container ? node : null;
     }
 
-    function scriptLayoutNodes(container, scriptList) {
-        var content = directChildContaining(container, scriptList);
-        if (!content || content === scriptList) content = container.firstElementChild || container;
-        var selectorGroup = directChildContaining(content, scriptList);
-        if (!selectorGroup) return [];
-        var result = [];
-        var node = selectorGroup;
-        while (node) {
-            // Forge appends every mutually exclusive Script panel after the
-            // Script selector. Always-on extension accordions are before it.
-            result.push(node);
-            node = node.nextElementSibling;
-        }
-        return result;
-    }
-
-    function setPixelStyle(element, property, value) {
-        var next = Math.round(value * 100) / 100 + "px";
-        if (element.style[property] !== next) element.style[property] = next;
-    }
-
-    // Keep Forge/Gradio's selectable-script nodes under their original
-    // #txt2img_settings parent. Reparenting those live Svelte components makes
-    // every dropdown interaction trigger expensive reconciliation. Absolute
-    // positioning gives the same center-column presentation without changing
-    // component ownership.
-    function positionScriptPanels(layout, settings, scriptColumn, nodes, scriptList) {
-        if (!layout || !settings || !scriptColumn || !nodes.length) return;
-        var body = scriptColumn.querySelector(":scope > div");
-        if (!body) return;
-        settings.classList.add("sam3-notebook-floating-script-owner");
-        nodes.forEach(function (node) {
-            node.classList.add("sam3-notebook-script-float");
-        });
-
-        var framePending = false;
-        function sync() {
-            framePending = false;
-            if (!layout.isConnected || !settings.isConnected) return;
-            var settingsRect = settings.getBoundingClientRect();
-            var bodyRect = body.getBoundingClientRect();
-            if (settingsRect.width < 1 || bodyRect.width < 1) return;
-            var gap = parseFloat(
-                getComputedStyle(layout).getPropertyValue("--layout-gap")
-            );
-            if (!Number.isFinite(gap)) gap = 8;
-            var top = bodyRect.top - settingsRect.top;
-            var left = bodyRect.left - settingsRect.left;
-            var cursor = top;
-            var visibleHeight = 0;
-
-            nodes.forEach(function (node) {
-                setPixelStyle(node, "left", left);
-                setPixelStyle(node, "top", cursor);
-                setPixelStyle(node, "width", bodyRect.width);
-                if (getComputedStyle(node).display === "none") return;
-                // Gradio temporarily counts its open dropdown menu in the
-                // selector group's height. The actual #script_list control
-                // keeps its stable height, so use that for the first row and
-                // avoid throwing the chosen Script panel far down the page.
-                var height = node === nodes[0] && scriptList
-                    ? scriptList.getBoundingClientRect().height
-                    : node.getBoundingClientRect().height;
-                if (height <= 0) return;
-                cursor += height + gap;
-                visibleHeight += height + gap;
-            });
-            body.style.minHeight = Math.max(
-                0,
-                visibleHeight ? visibleHeight - gap : 0
-            ) + "px";
-        }
-
-        function schedule() {
-            if (framePending) return;
-            framePending = true;
-            window.requestAnimationFrame(sync);
-        }
-
-        if (typeof ResizeObserver === "function") {
-            var resizeObserver = new ResizeObserver(schedule);
-            [layout, settings, scriptColumn, body].concat(nodes).forEach(
-                function (node) { resizeObserver.observe(node); }
-            );
-        }
-        var scriptInput = scriptList && scriptList.querySelector("input");
-        if (scriptInput) {
-            scriptInput.addEventListener("change", function () {
-                schedule();
-                window.setTimeout(schedule, 120);
-                window.setTimeout(schedule, 500);
-            });
-        }
-        window.addEventListener("resize", schedule, { passive: true });
-        schedule();
-        window.setTimeout(schedule, 250);
-        window.setTimeout(schedule, 1000);
-    }
-
     // The three-column layout extracts the Generation tab's settings/gallery
     // from #txt2img_extra_tabs. Move the remaining Forge-owned tab strip only
     // after that extraction so Textual Inversion / Checkpoints / Lora stay
@@ -1696,6 +1690,17 @@
         extraTabs.classList.remove("sam3-notebook-original-root");
         extraTabs.classList.add("sam3-notebook-extra-tabs");
         host.appendChild(extraTabs);
+    }
+
+    // 켜진 기능 칩 줄이 들어갈 자리. 프롬프트 영역과 3열 사이.
+    function ensureOnBar(layout) {
+        var bar = layout.querySelector("#sam3_onbar");
+        if (bar) return bar;
+        bar = document.createElement("div");
+        bar.id = "sam3_onbar";
+        var columns = layout.querySelector(".sam3-notebook-columns");
+        layout.insertBefore(bar, columns);
+        return bar;
     }
 
     function promptLayoutNodes() {
@@ -1727,6 +1732,7 @@
                 if (!existingGallery) return false;
                 existingGallery.appendChild(notebookPanel);
             }
+            ensureOnBar(existingLayout);
             restoreForgeExtraNetworkTabs(existingLayout);
             document.documentElement.classList.add(
                 "sam3-notebook-layout-active"
@@ -1748,11 +1754,11 @@
         // out of settings/results.
         var boundary = app().querySelector("#txt2img_extra_tabs") || settings.parentElement;
         var gallerySection = smallestSection(gallery, boundary, settings);
-        var scriptNodes = scriptLayoutNodes(scriptContainer, scripts);
         var layout = document.createElement("main");
         layout.id = "sam3_notebook_layout";
         layout.innerHTML = [
             '<section class="sam3-notebook-prompt"></section>',
+            '<div id="sam3_onbar"></div>',
             '<section class="sam3-notebook-columns">',
             ' <div class="sam3-notebook-column" data-column="parameters"><h2>Parameters</h2><div></div></div>',
             ' <div class="sam3-notebook-column" data-column="scripts"><h2>Scripts</h2><div></div></div>',
@@ -1767,7 +1773,10 @@
         promptNodes.forEach(function (node) { promptTarget.appendChild(node); });
         var parameterTarget = layout.querySelector('[data-column="parameters"] > div');
         parameterTarget.appendChild(settings);
-        var scriptsColumn = layout.querySelector('[data-column="scripts"]');
+        // 스크립트 칸은 컨테이너를 통째로 옮긴다. #script_list 와 선택형 패널은 그 안에 그대로 있어야 한다 —
+        // 따로 떼어 내면 Gradio 가 드롭다운을 만질 때마다 비싼 재조정을 한다(예전 방식이 그랬다).
+        var scriptsBody = layout.querySelector('[data-column="scripts"] > div');
+        scriptsBody.appendChild(scriptContainer);
         var galleryTarget = layout.querySelector('[data-column="gallery"] > div');
         galleryTarget.appendChild(gallerySection);
         galleryTarget.appendChild(notebookPanel);
@@ -1780,13 +1789,8 @@
         });
         layoutHost.appendChild(layout);
         document.documentElement.classList.add("sam3-notebook-layout-active");
-        positionScriptPanels(
-            layout,
-            settings,
-            scriptsColumn,
-            scriptNodes,
-            scripts
-        );
+        // 섹션·핀·칩을 붙이는 notebook_lanes.js 가 이 신호를 기다린다.
+        window.dispatchEvent(new CustomEvent("sam3:notebook-mounted"));
         return true;
     }
 
@@ -2041,6 +2045,8 @@
         apply.type = "button";
         apply.textContent = "적용";
         apply.className = "primary";
+        apply.setAttribute("data-notebook-apply", "");
+        apply.disabled = pendingApplyOperations > 0;
         apply.addEventListener("click", function () { applyPreset(preset); });
         header.appendChild(apply);
 
@@ -2143,12 +2149,14 @@
         presetList = details.querySelector("[data-notebook-presets]");
         statusElement = details.querySelector("[data-notebook-status]");
         searchInput = details.querySelector("[data-notebook-search]");
+        syncApplyButtons();
     }
 
     function syncUndoButton() {
         if (!panel) return;
         var button = panel.querySelector("[data-notebook-undo]");
         if (button) button.hidden = !undoState;
+        syncApplyButtons();
     }
 
     function isPlainObject(value) {
@@ -2540,7 +2548,7 @@
             '<div class="sam3-notebook-presets" data-notebook-presets></div>'
         ].join("");
         var uiState = readUiState();
-        details.open = uiState.open !== false;
+        details.open = uiState.open === true;
         selectedPresetId = uiState.selectedPresetId || null;
         bindPanelReferences(details);
         searchInput.value = uiState.search || "";
@@ -2612,6 +2620,15 @@
         }
         installFastDropdowns();
         await loadNotebook();
+    }
+
+    // Opt-in test seam only. Production pages never create this object, while
+    // jsdom can exercise the real dropdown DOM/event implementation without
+    // booting the complete Forge txt2img layout.
+    if (window.__sam3NotebookTestHooks
+            && typeof window.__sam3NotebookTestHooks === "object") {
+        window.__sam3NotebookTestHooks.installFastDropdown = installFastDropdown;
+        window.__sam3NotebookTestHooks.mountLayout = mountLayout;
     }
 
     if (typeof onUiLoaded === "function") {

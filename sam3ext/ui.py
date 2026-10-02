@@ -157,7 +157,10 @@ def sam3_ui(is_img2img: bool, buttons: WebuiButtons):
     with gr.Accordion(SAM3_NAME, open=False, elem_id=eid("accordion")):
         with gr.Row():
             with gr.Column(scale=3):
-                w.sam3_enable = gr.Checkbox(label="Enable SAM3", value=False, elem_id=eid("enable"))
+                w.sam3_enable = gr.Checkbox(
+                    label="Enable SAM3", value=False, elem_id=eid("enable"),
+                    elem_classes=["sam3-on"],
+                )
             with gr.Column(scale=5):
                 gr.Markdown("SAM3 local mask refinement")
             with gr.Column(scale=1, min_width=180):
@@ -433,9 +436,13 @@ def sam3_ui(is_img2img: bool, buttons: WebuiButtons):
             cn_module_default = _default_cn_module(cn_modules)
 
             gr.Markdown(
-                "**Tip**: LLLite inpaint models (`anima-lllite-inpainting-*`) take a 4-channel "
-                "RGB+mask cond and need the mask to survive preprocessing. The extension "
-                "auto-overrides the Preprocessor to `None` when it detects such a model."
+                "**Tip**: Anima ControlNet-LLLite models take the control image as given, like the "
+                "original kohya nodes. Tile & Repair models (e.g. `animaTileRepair_*`) always run with "
+                "Preprocessor `None` — `inpaint_only` would blank the area to repair. Other Anima LLLite "
+                "models (lineart, canny, depth…) keep your preprocessor, which turns the inpaint image into "
+                "their control map; only `inpaint_*` becomes `None`: 3-channel models ignore the mask, and "
+                "LLLite inpaint models (`anima-lllite-inpainting-*`, 4-channel RGB+mask) need the mask to "
+                "survive preprocessing. The extension reads the model file header and overrides it automatically."
             )
 
             with gr.Row():

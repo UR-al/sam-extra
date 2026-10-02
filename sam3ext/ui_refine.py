@@ -13,15 +13,25 @@ from dataclasses import dataclass
 from typing import Any
 
 import gradio as gr
+
+from .panel_container import ACCORDION, panel_container
 import numpy as np
 from PIL import Image
 
 from .coerce import as_float, as_int
+from .forge_exclusive import run_exclusive, stop_if_job
 from .ui import (
     _controlnet_model_choices,
     _controlnet_module_choices,
     _default_cn_module,
 )
+
+# Job name the Refine click runs under (shared.state.begin) and the prefixes
+# the per-pass names in inpaint_core.run_sam3_refine start with. The Stop
+# button only interrupts when one of these holds shared.state.job — see
+# forge_exclusive.stop_if_job.
+REFINE_JOB = "sam3_refine"
+_REFINE_JOB_PREFIXES = (REFINE_JOB, "SAM3 Refine")
 
 try:
     from modules_forge.forge_canvas.canvas import ForgeCanvas
@@ -55,7 +65,7 @@ class RefinePanel:
     later wiring (we wire the click handler in scripts/!sam3.py because the
     runtime callable depends on Forge's shared state)."""
 
-    accordion: gr.Accordion
+    container: gr.Blocks   # 아코디언(단독) 또는 칼럼(선택 이미지 탭 안)
     selected_index_state: gr.Number  # hidden frontend slot — JS shim fills it
     detect_prompt: gr.Textbox
     exclude_prompt: gr.Textbox
@@ -243,6 +253,8 @@ def build_refine_panel(
     samplers: list[str],
     schedulers: list[str],
     checkpoint_choices: list[str],
+    *,
+    container: str = ACCORDION,
 ) -> RefinePanel:
     """Render the Refine accordion. Must be called inside an open
     ``gr.Blocks`` context that is a sibling of ``txt2img_gallery``."""
@@ -251,7 +263,7 @@ def build_refine_panel(
     cn_modules = _controlnet_module_choices()
     cn_module_default = _default_cn_module(cn_modules)
 
-    with gr.Accordion("SAM3 Refine (post-generation)", open=False, elem_id="sam3_refine_panel") as acc:
+    with panel_container(container, "SAM3 Refine (post-generation)", "sam3_refine_panel") as acc:
         # Hidden Number (not gr.State) so the `_js` shim on the Refine button
         # can address this slot reliably: Gradio's _js handler only receives
         # frontend components in its args array — gr.State is server-side and
@@ -584,7 +596,7 @@ def build_refine_panel(
         status = gr.HTML(value="", elem_id="sam3_refine_status")
 
     return RefinePanel(
-        accordion=acc,
+        container=acc,
         selected_index_state=selected_index_state,
         detect_prompt=detect_prompt,
         exclude_prompt=exclude_prompt,
@@ -992,6 +1004,50 @@ def _refine_error_return(gallery_value, message: str):
     return gallery_value, message, gr.update(), gr.update()
 
 
+def stop_refine():
+    """⏹ handler for the Refine panel. Interrupts only while Refine itself
+    holds the job — if txt2img holds the queue lock and our click is still
+    waiting, blindly setting the flags would stop txt2img instead."""
+    stop_if_job(_REFINE_JOB_PREFIXES)
+
+
+def _refine_empty_message(results) -> str:
+    """Use outcome facts; legacy plain-list callers receive a neutral fallback."""
+    reason = getattr(results, "reason", "")
+    if reason == "empty_mask":
+        text = "SAM3 Refine: 검출된 마스크가 없습니다. Target·Exclude·임계값을 확인하세요."
+    elif reason == "interrupted":
+        text = "SAM3 Refine: 사용자가 작업을 중단했습니다."
+    elif reason == "runner_unavailable":
+        text = "SAM3 Refine: img2img 스크립트가 준비되지 않았습니다. 콘솔을 확인하세요."
+    elif reason == "passes_failed":
+        failed = getattr(results, "failed_passes", 0)
+        attempted = getattr(results, "attempted_passes", 0)
+        text = f"SAM3 Refine: 결과가 없습니다. 시도 {attempted}개 중 {failed}개 패스가 오류로 실패했습니다. 콘솔을 확인하세요."
+    elif reason == "no_images":
+        text = "SAM3 Refine: 마스크는 검출했지만 인페인트가 이미지를 반환하지 않았습니다. 콘솔을 확인하세요."
+    else:
+        text = "SAM3 Refine: 결과가 없습니다. 콘솔을 확인하세요."
+    return f"<span style='color:#c80'>{text}</span>"
+
+
+def _refine_success_message(results) -> str:
+    count = len(results)
+    failed = getattr(results, "failed_passes", 0)
+    empty = getattr(results, "empty_passes", 0)
+    interrupted = getattr(results, "interrupted", False)
+    details = []
+    if failed:
+        details.append(f"오류 {failed}개")
+    if empty:
+        details.append(f"이미지 미반환 {empty}개")
+    if interrupted:
+        details.append("작업 중단")
+    suffix = f" ({', '.join(details)}; 콘솔 확인)" if details else ""
+    color = "#c80" if details else "#383"
+    return f"<span style='color:{color}'>SAM3 Refine: 결과 {count}개를 추가했습니다{suffix}.</span>"
+
+
 def handle_refine_click(
     gallery_value, selected_index, *all_values, progress=gr.Progress(track_tqdm=True)
 ):
@@ -1176,8 +1232,8 @@ def handle_refine_click(
     if sd_model_override and sd_model_override != "Use current":
         override_settings["sd_model_checkpoint"] = sd_model_override
 
-    try:
-        new_pairs = run_sam3_refine(
+    def _refine():
+        return run_sam3_refine(
             image,
             args,
             sd_model=sd_model,
@@ -1185,6 +1241,13 @@ def handle_refine_click(
             outpath_grids=outpath_grids,
             override_settings=override_settings,
         )
+
+    # Like Forge's own Generate (wrap_gradio_gpu_call): one job at a time
+    # behind queue_lock, a fresh shared.state so a previous ⏹ Stop does not
+    # end this run at its first interrupted check, and the sampling itself on
+    # Forge's main thread. See forge_exclusive.run_exclusive.
+    try:
+        new_pairs = run_exclusive(REFINE_JOB, _refine, on_main_thread=True)
     except Exception:
         error = traceback.format_exc()
         print(f"[-] SAM3 Refine: handler failed:\n{error}", file=sys.stderr)
@@ -1196,7 +1259,7 @@ def handle_refine_click(
     if not new_pairs:
         return _refine_error_return(
             gallery_value,
-            "<span style='color:#c80'>SAM3 Refine: no result (empty mask or interrupted).</span>",
+            _refine_empty_message(new_pairs),
         )
 
     new_images = [img for img, _ in new_pairs]
@@ -1235,7 +1298,7 @@ def handle_refine_click(
 
     return (
         updated,
-        f"<span style='color:#383'>SAM3 Refine: added {len(new_images)} image(s). Click the new thumbnail to recheck infotext.</span>",
+        _refine_success_message(new_pairs),
         latest_html,
         new_info_json,
     )

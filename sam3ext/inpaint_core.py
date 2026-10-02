@@ -32,8 +32,18 @@ def _reclaim_vram() -> None:
     base 생성 + ADetailer 검출 + SAM3 검출 사이클을 거치며 PyTorch
     예약 캐시가 단편화돼, 인페인트용 KModel reload 시 가용 VRAM이
     수 GB 부족해지는 현상(16GB GPU에서 6.9GB까지 떨어짐) 완화.
-    torch.cuda.empty_cache() + Forge devices.torch_gc() 둘 다 시도.
+
+    Forge 의 devices.torch_gc() 는 곧 backend.memory_management.soft_empty_cache()
+    (synchronize → empty_cache → ipc_collect)라 한 번이면 된다. 예전엔 torch 직접 호출 +
+    torch_gc + soft_empty_cache 로 같은 회수를 세 번 했다(기존 L78, 2·3번째는 no-op).
+    torch_gc 가 없거나 실패하면 torch 로 직접 비운다.
     """
+    try:
+        if _devices is not None and hasattr(_devices, "torch_gc"):
+            _devices.torch_gc()
+            return
+    except Exception:
+        pass
     try:
         import torch
         if torch.cuda.is_available():
@@ -41,20 +51,22 @@ def _reclaim_vram() -> None:
             torch.cuda.ipc_collect()
     except Exception:
         pass
-    try:
-        if _devices is not None and hasattr(_devices, "torch_gc"):
-            _devices.torch_gc()
-    except Exception:
-        pass
-    try:  # Forge backend memory_management (있으면 더 강력)
-        from backend import memory_management as _mm
-        if hasattr(_mm, "soft_empty_cache"):
-            _mm.soft_empty_cache()
-    except Exception:
-        pass
 
 
 SCRIPT_EXCLUDE_FILENAMES = frozenset({"!sam3", "sam3_mask"})
+
+
+def is_oom(exc: BaseException) -> bool:
+    """CUDA OOM 판정 — Forge 의 backend.memory_management.is_oom 이 이미 import 돼 있으면 그것을, 없으면(테스트)
+    메시지로. 여기서 새로 import 하지 않는다(CUDA 를 건드리지 않게)."""
+    memory_management = sys.modules.get("backend.memory_management")
+    checker = getattr(memory_management, "is_oom", None)
+    if callable(checker):
+        try:
+            return bool(checker(exc))
+        except Exception:
+            pass
+    return "out of memory" in str(exc).lower()
 
 
 # Maps the user-facing inpainting_fill label (matches webui's img2img
@@ -185,6 +197,20 @@ def get_seed(p, args: dict[str, Any]) -> int:
     return getattr(p, "seed", -1) if p is not None else -1
 
 
+def _pin_seed(p2, seed, subseed, subseed_strength, seed_resize_from_h, seed_resize_from_w) -> None:
+    """``p2.script_args`` 를 대입하면 Forge 내장 Seed 스크립트(modules/processing_scripts/seed.py)의 setup 이
+    즉시 돌아 ``p2.seed``·subseed·seed resize 를 그 스크립트 칸 값으로 덮어쓴다. 칸에는 txt2img UI 의 시드 입력이
+    들어 있어(API 호출이면 기본값 -1) 인페인트 패스의 시드가 바깥 생성의 시드와 달라지고, -1 이면 매번 무작위라
+    같은 설정·시드로 다시 생성해도 SAM3 가 고친 부분이 매번 달랐다. 샘플러 칸(override_sampler_script_slot)과
+    같은 이유로, 대입 뒤에 의도한 값을 다시 적는다(🎯 빠른 버튼은 apply_quick_pass_settings 에서 이미 이렇게 한다).
+    """
+    p2.seed = seed
+    p2.subseed = subseed
+    p2.subseed_strength = subseed_strength
+    p2.seed_resize_from_h = seed_resize_from_h
+    p2.seed_resize_from_w = seed_resize_from_w
+
+
 def get_noise_multiplier(p, args: dict[str, Any]) -> float:
     if args.get("sam3_use_noise_multiplier"):
         return float(args.get("sam3_noise_multiplier", 1.0))
@@ -262,7 +288,23 @@ def build_i2i(p, image: Image.Image, args: dict[str, Any]) -> StableDiffusionPro
     p2._sam3_base_sampler = sampler_name
     p2._sam3_base_scheduler = version_args.get("scheduler", getattr(p, "scheduler", None))
     p2.scripts, p2.script_args = script_filter(p)
+    _pin_seed(
+        p2,
+        seed,
+        getattr(p, "subseed", -1),
+        getattr(p, "subseed_strength", 0),
+        getattr(p, "seed_resize_from_h", 0),
+        getattr(p, "seed_resize_from_w", 0),
+    )
     p2._sam3_inner = True
+    p2._sam3_outer = p   # Anima 3.8B 스크립트가 바깥 생성의 설치를 물려받는 표시
+    # 내부 인페인트 패스는 SAM3 만 돈다 — ADetailer(!adetailer.py 는 _ad_disabled 가 없으면 정상 실행)가
+    # 마스크마다 또 돌고 바깥 생성에서도 한 번 더 도는 것을 막는다. 예전엔 🎯 빠른 버튼 경로만 껐다.
+    p2._ad_disabled = True
+    if getattr(p, "_sam3_quick", False):
+        from .quick_button import apply_quick_pass_settings
+
+        apply_quick_pass_settings(p, p2, seed)   # 🎯 빠른 버튼 — 시드·Override 설정·ADetailer
     p2.all_hr_prompts = [""]
     p2.all_hr_negative_prompts = [""]
     return p2
@@ -340,20 +382,27 @@ def inject_controlnet_unit(p2: StableDiffusionProcessingImg2Img, cn_args: dict[s
     module_name = str(cn_args.get("sam3_cn_module", "inpaint_only"))
     model_name = str(cn_args.get("sam3_cn_model", "None"))
 
-    # LLLite anima inpaint variants take a 4-channel (RGB + mask) cond and
-    # need the mask tensor to survive preprocessing. ``inpaint_*`` preprocessors
-    # discard the mask (return None) and rewrite cond, which breaks the
-    # ``assert isinstance(mask, torch.Tensor)`` in the LLLite forward. Force a
-    # pass-through preprocessor in that case.
-    lower_model = model_name.lower()
-    if "lllite" in lower_model and "inpaint" in lower_model and module_name.startswith("inpaint"):
-        print(
-            f"[-] SAM3: LLLite inpaint model '{model_name}' is incompatible with "
-            f"preprocessor '{module_name}' (preprocessor strips the mask); "
-            f"overriding to 'None' so the mask reaches the LLLite forward.",
-            file=sys.stderr,
-        )
-        module_name = "None"
+    # Anima ControlNet-LLLite takes the control image as given, like the originals
+    # (kohya sd-scripts / ComfyUI-Anima-LLLite). Tile & Repair takes the image to
+    # repair → preprocessor "None" (inpaint_only would blank the region to -1).
+    # Other Anima LLLite (lineart/canny/depth…) keep the chosen preprocessor, which
+    # is what turns the inpaint image into their control map; only ``inpaint_*``
+    # becomes "None": 3-channel weights ignore the mask in the originals, and
+    # 4-channel inpaint weights need the mask tensor, which ``inpaint_*`` discard
+    # (``assert isinstance(mask, torch.Tensor)`` in the LLLite forward).
+    # Channels and Tile & Repair come from the safetensors header (torch-free),
+    # else the file name.
+    from .sam3_cn_lllite import anima_lllite, forced_cn_module
+
+    try:
+        model_path = _cn_state.controlnet_filename_dict.get(model_name)
+    except Exception:
+        model_path = None
+    module_name, override_reason = forced_cn_module(
+        module_name, anima_lllite(model_name, model_path), model_name
+    )
+    if override_reason:
+        print(f"[-] SAM3: {override_reason}", file=sys.stderr)
 
     sam3_unit = ControlNetUnit(
         enabled=True,
@@ -479,6 +528,60 @@ def build_standalone_i2i(
     p2._sam3_base_scheduler = version_args.get("scheduler", None)
     p2.scripts = scripts_runner
     p2.script_args = script_args
+    _pin_seed(p2, seed, -1, 0, 0, 0)
+    p2._sam3_inner = True
+    p2.all_hr_prompts = [""]
+    p2.all_hr_negative_prompts = [""]
+    return p2
+
+
+def build_standalone_t2i(
+    request,
+    *,
+    seed: int,
+    sd_model,
+    outpath_samples: str,
+    outpath_grids: str,
+):
+    """IPA 캐릭터 레퍼런스용 txt2img 잡.
+
+    캔버스가 없으므로 init 이미지도 마스크도 없다. 크기·샘플러·steps 는 요청에서 곧장 온다
+    (부모 ``p`` 가 없다). 스크립트 러너는 붙이지 않는다 — 다른 확장이 참조를 하나 더 끼워
+    넣거나 낡은 t2i 상태를 물고 있을 수 있다.
+    """
+    from modules.processing import StableDiffusionProcessingTxt2Img
+
+    p2 = StableDiffusionProcessingTxt2Img(
+        sd_model=sd_model,
+        outpath_samples=outpath_samples,
+        outpath_grids=outpath_grids,
+        prompt="",
+        negative_prompt="",
+        styles=[],
+        seed=int(seed),
+        subseed=-1,
+        subseed_strength=0,
+        seed_resize_from_h=0,
+        seed_resize_from_w=0,
+        sampler_name=str(request.sampler),
+        scheduler=str(request.scheduler),
+        batch_size=1,
+        n_iter=1,
+        steps=int(request.steps),
+        cfg_scale=float(request.cfg_scale),
+        width=int(request.canvas.output_width),
+        height=int(request.canvas.output_height),
+        restore_faces=False,
+        tiling=False,
+        extra_generation_params={},
+        # 결과는 우리가 저장한다(i2i 경로와 같은 규칙).
+        do_not_save_samples=True,
+        do_not_save_grid=True,
+    )
+    p2.cached_c = [None, None, None]
+    p2.cached_uc = [None, None, None]
+    p2.scripts = None
+    p2.script_args = None
     p2._sam3_inner = True
     p2.all_hr_prompts = [""]
     p2.all_hr_negative_prompts = [""]
@@ -717,6 +820,30 @@ def build_standalone_scripts_runner():
     return runner, script_args
 
 
+class RefineResults(list):
+    """Image/infotext pairs with outcome facts; remains a list for callers."""
+
+    def __init__(self, *, reason: str = "", detected_masks: int = 0):
+        super().__init__()
+        self.reason = reason
+        self.detected_masks = detected_masks
+        self.attempted_passes = 0
+        self.failed_passes = 0
+        self.empty_passes = 0
+        self.interrupted = False
+
+    def finish(self):
+        if self.interrupted:
+            self.reason = "interrupted"
+        elif self:
+            self.reason = "partial" if self.failed_passes or self.empty_passes else "ok"
+        elif self.failed_passes:
+            self.reason = "passes_failed"
+        elif self.detected_masks:
+            self.reason = "no_images"
+        return self
+
+
 def run_sam3_refine(
     image: Image.Image,
     args: dict[str, Any],
@@ -737,10 +864,9 @@ def run_sam3_refine(
     ``generation_info`` JSON so clicking the new image in the gallery shows
     the real transformed prompt, not the original t2i prompt.
 
-    Returns ``[]`` when SAM3 finds nothing or every pass is interrupted.
+    Returns a list-compatible ``RefineResults`` carrying empty-mask,
+    interruption, and failed-pass facts for the UI.
     """
-    from .core import run_sam3_on_pil, unload_sam3
-
     # Standalone refine always overrides the t2i sampler/steps/scheduler/seed
     # — there's no parent process to inherit from. Set the use_* flags so
     # override_sampler_script_slot patches all three ScriptSampler slots.
@@ -757,9 +883,109 @@ def run_sam3_refine(
     scripts_runner, script_args_template = build_standalone_scripts_runner()
     if scripts_runner is None:
         print("[-] SAM3 Refine: t2i scripts runner not initialized; aborting.", file=sys.stderr)
-        return []
+        return RefineResults(reason="runner_unavailable")
 
     allow_huggingface = not getattr(shared.cmd_opts, "sam3_no_huggingface", False)
+
+    # Whatever happens below (detection error, OOM, a pass raising), leave
+    # shared.state the way the caller's job set it up — a stale
+    # "SAM3 Refine: ..." textinfo/job would otherwise stay on the progress
+    # bar until the next Generate.
+    prev_job = shared.state.job
+    prev_job_count = shared.state.job_count
+    try:
+        return _run_sam3_refine_passes(
+            image,
+            args,
+            user_mask=user_mask,
+            scripts_runner=scripts_runner,
+            script_args_template=script_args_template,
+            allow_huggingface=allow_huggingface,
+            sd_model=sd_model,
+            outpath_samples=outpath_samples,
+            outpath_grids=outpath_grids,
+            override_settings=override_settings,
+        )
+    except Exception as exc:
+        # 검출·인페인트 도중 실패 — 성공 경로의 unload(검출 직후)를 못 지났으면 3.5GB 번들이 VRAM 에 남는다.
+        if args.get("sam3_unload_after") or is_oom(exc):
+            try:
+                from .core import describe_unload, unload_sam3
+
+                kept = unload_sam3()
+                print(f"[-] SAM3 Refine: {describe_unload(bool(kept), after_failure=True)}", file=sys.stderr)
+            except Exception:
+                traceback.print_exc(file=sys.stderr)
+        raise
+    finally:
+        shared.state.textinfo = ""
+        shared.state.job = prev_job
+        shared.state.job_count = prev_job_count
+
+
+def _refine_generation_params(args: dict[str, Any], result, mask: Image.Image, user_mask, index: int) -> dict[str, Any]:
+    """Describe detection and the exact pre-blur/pre-invert mask sent to Forge.
+
+    A mask digest is provenance, not a stored mask or a replayable asset.
+    """
+    import hashlib
+    from .__version__ import __version__
+
+    def mask_identity(value: Image.Image) -> tuple[str, str]:
+        value = value.convert("L")
+        dimensions = f"{value.width}x{value.height}"
+        payload = dimensions.encode("ascii") + b"\0" + value.tobytes()
+        return dimensions, hashlib.sha256(payload).hexdigest()
+
+    dimensions, mask_digest = mask_identity(mask)
+    params = {
+        "SAM3 Refine": True,
+        "SAM3 Version": __version__,
+        "SAM3 Refine Target": str(args.get("sam3_prompt") or ""),
+        "SAM3 Refine Exclude": str(args.get("sam3_exclude_prompt") or ""),
+        "SAM3 Refine Threshold": float(args.get("sam3_threshold", 0.4)),
+        "SAM3 Refine Checkpoint Requested": str(args.get("sam3_checkpoint") or "sam3.pt"),
+        "SAM3 Refine Checkpoint Used": result.checkpoint,
+        "SAM3 Refine Device": result.device,
+        "SAM3 Refine Mask Processing": str(args.get("sam3_mask_mode") or "Combined"),
+        "SAM3 Refine Pass": index,
+        "SAM3 Refine Mask Dilation": int(args.get("sam3_mask_dilation", 0)),
+        "SAM3 Refine Mask Hull": bool(args.get("sam3_mask_hull", False)),
+        "SAM3 Refine Mask Outline": int(args.get("sam3_mask_outline_px", 0)),
+        "SAM3 Refine Mask Blur": int(args.get("sam3_mask_blur", 4)),
+        "SAM3 Refine Mask Invert": bool(args.get("sam3_mask_invert", False)),
+        "SAM3 Refine Resize Mode": str(args.get("sam3_resize_mode") or "Just Resize"),
+        "SAM3 Refine Only Masked": bool(args.get("sam3_inpaint_only_masked", False)),
+        "SAM3 Refine Padding": int(args.get("sam3_inpaint_only_masked_padding", 32)),
+        "SAM3 Refine Masked Content": _resolve_inpainting_fill(args.get("sam3_inpainting_fill")),
+        "SAM3 Refine Mask Dimensions": dimensions,
+        "SAM3 Refine Mask SHA256": mask_digest,
+        "SAM3 Refine Mask Stage": "pre-blur/pre-invert",
+        "SAM3 Refine Manual Mask": user_mask is not None,
+    }
+    if user_mask is not None:
+        manual_image = Image.fromarray(user_mask.astype("uint8") * 255, mode="L")
+        manual_dimensions, manual_digest = mask_identity(manual_image)
+        params["SAM3 Refine Manual Mask Dimensions"] = manual_dimensions
+        params["SAM3 Refine Manual Mask SHA256"] = manual_digest
+    return params
+
+
+def _run_sam3_refine_passes(
+    image: Image.Image,
+    args: dict[str, Any],
+    *,
+    user_mask,
+    scripts_runner,
+    script_args_template,
+    allow_huggingface: bool,
+    sd_model,
+    outpath_samples: str,
+    outpath_grids: str,
+    override_settings: dict[str, Any] | None,
+) -> list[tuple[Image.Image, str]]:
+    """Body of ``run_sam3_refine``; the wrapper restores ``shared.state``."""
+    from .core import run_sam3_on_pil, unload_sam3
 
     shared.state.textinfo = "SAM3 Refine: running detection..."
     sam3_result = run_sam3_on_pil(
@@ -777,14 +1003,16 @@ def run_sam3_refine(
     )
 
     if args.get("sam3_unload_after"):
-        unload_sam3()
-        print("[-] SAM3 Refine: model unloaded from VRAM (re-loads on next detection).", file=sys.stderr)
+        from .core import describe_unload
+
+        kept = unload_sam3()
+        print(f"[-] SAM3 Refine: {describe_unload(bool(kept))}", file=sys.stderr)
 
     masks_source = sam3_result.masks if args.get("sam3_mask_mode") == "Individual" else None
     masks = [sam3_result.mask] if not masks_source else masks_source
     if not masks or not any(np_any(m) for m in masks):
         print("[-] SAM3 Refine: detection returned an empty mask; nothing to do.", file=sys.stderr)
-        return []
+        return RefineResults(reason="empty_mask")
 
     # Diagnostic: per-mask coverage so the user can see if SAM3 caught a tiny
     # sliver vs the whole garment, plus the key inpaint knobs in effect.
@@ -819,7 +1047,7 @@ def run_sam3_refine(
     prompt = copy_prompt(args.get("sam3_inpaint_prompt"), "")
     negative_prompt = copy_prompt(args.get("sam3_negative_prompt"), "")
 
-    results: list[tuple[Image.Image, str]] = []
+    results = RefineResults(detected_masks=len(masks))
     # Initialize Forge's progress state so the gallery's spinner/progress
     # bar advances during the refine pass. job_count being -1 (no active
     # job) means the standard UI won't render a percentage; setting it
@@ -833,6 +1061,7 @@ def run_sam3_refine(
     with pause_total_tqdm():
         for index, mask in enumerate(masks, start=1):
             if shared.state.interrupted or shared.state.skipped:
+                results.interrupted = True
                 break
             shared.state.textinfo = f"SAM3 Refine: pass {index}/{len(masks)} — preparing"
             shared.state.job = f"SAM3 Refine pass {index}/{len(masks)}"
@@ -850,6 +1079,9 @@ def run_sam3_refine(
             p2.image_mask = mask
             p2.prompt = prompt
             p2.negative_prompt = negative_prompt
+            p2.extra_generation_params.update(
+                _refine_generation_params(args, sam3_result, mask, user_mask, index)
+            )
             inject_controlnet_unit(p2, args)
             override_sampler_script_slot(p2, args)
             shared.state.textinfo = f"SAM3 Refine: pass {index}/{len(masks)} — sampling"
@@ -867,9 +1099,11 @@ def run_sam3_refine(
             import time as _time
 
             t0 = _time.perf_counter()
+            results.attempted_passes += 1
             try:
                 processed = process_images(p2)
             except Exception:
+                results.failed_passes += 1
                 error = traceback.format_exc()
                 print(
                     f"[-] SAM3 Refine: pass {index} failed inside process_images "
@@ -886,9 +1120,12 @@ def run_sam3_refine(
                     file=sys.stderr,
                 )
 
+            if shared.state.interrupted or shared.state.skipped:
+                results.interrupted = True
             if processed is None:
                 continue
             if not processed.images:
+                results.empty_passes += 1
                 print(f"[-] SAM3 Refine: pass {index} returned no images.", file=sys.stderr)
                 continue
             # Use the per-image infotext when available (Forge populates this
@@ -923,8 +1160,7 @@ def run_sam3_refine(
             print(f"[-] SAM3 Refine: pass {index} completed.", file=sys.stderr)
             shared.state.textinfo = f"SAM3 Refine: pass {index}/{len(masks)} — done"
 
-    shared.state.textinfo = ""
-    return results
+    return results.finish()
 
 
 def np_any(mask) -> bool:

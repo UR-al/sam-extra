@@ -78,8 +78,9 @@ def _spawn_handler() -> str:
 
 
 def _on_app_started(demo, app) -> None:
-    # Register lightweight same-origin config/spawn routes for the embedded
-    # manager. They share the same lifecycle as the hidden Gradio bridge.
+    # Register the guarded config/spawn HTTP routes for external tools (the
+    # page itself uses the hidden Gradio bridge below). They wrap the same
+    # lifecycle; see register_lora_routes.
     try:
         register_lora_routes(app)
     except Exception:

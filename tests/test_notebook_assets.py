@@ -141,38 +141,53 @@ class NotebookAssetTests(unittest.TestCase):
             2,
         )
 
-    def test_scripts_are_positioned_without_reparenting_gradio_components(self):
-        self.assertIn("function scriptLayoutNodes(", self.script)
-        self.assertIn("function positionScriptPanels(", self.script)
-        self.assertNotIn("function isBuiltInScriptPanel(", self.script)
-        self.assertIn(
-            "result.push(node);",
-            self.script,
-        )
-        self.assertIn(
-            "positionScriptPanels(",
-            self.script,
-        )
-        self.assertIn(
-            "node === nodes[0] && scriptList",
-            self.script,
-        )
-        self.assertNotIn(
-            "parameterTarget.appendChild(scriptContainer)",
-            self.script,
-        )
-        self.assertNotIn(
-            "scriptsTarget.appendChild(scriptContainer)",
-            self.script,
-        )
-        self.assertIn(
-            ".sam3-notebook-script-float",
-            self.css,
-        )
-        self.assertIn(
-            "position: absolute !important",
-            self.css,
-        )
+    def test_script_container_moves_whole_and_floats_are_gone(self):
+        """가운데 열은 절대 위치가 아니라 컨테이너 통째 이동으로 만든다(v0.22).
+
+        예전에는 선택기와 패널을 절대 위치로 띄웠다. 그 엔진(ResizeObserver + 타이머 4개)을 지우고,
+        Gradio 가 만든 컨테이너를 그대로 옮긴다 — #script_list 는 여전히 그 안에 있다.
+        """
+        self.assertNotIn("function scriptLayoutNodes(", self.script)
+        self.assertNotIn("function positionScriptPanels(", self.script)
+        self.assertNotIn("sam3-notebook-script-float", self.script)
+        self.assertNotIn("sam3-notebook-script-float", self.css)
+        self.assertNotIn("sam3-notebook-floating-script-owner", self.css)
+        self.assertIn("scriptsBody.appendChild(scriptContainer);", self.script)
+        self.assertNotIn("parameterTarget.appendChild(scriptContainer)", self.script)
+        self.assertIn('<div id="sam3_onbar"></div>', self.script)
+        self.assertIn('layout.querySelector("#sam3_onbar")', self.script)
+        self.assertIn('window.dispatchEvent(new CustomEvent("sam3:notebook-mounted"))', self.script)
+        self.assertIn("details.open = uiState.open === true;", self.script)
+        self.assertIn("window.__sam3NotebookTestHooks.mountLayout = mountLayout;", self.script)
+
+    def test_hidden_chips_really_disappear(self):
+        """`[hidden]` 은 UA 의 display:none 일 뿐이라, 우리가 display 를 지정하면 숨김이 무효가 된다.
+
+        이걸 놓쳐서 꺼진 기능의 칩까지 전부 보였다(v0.22 개발 중). 숨김 규칙을 명시적으로 둔다.
+        """
+        start = self.css.index("/* sam3-lanes:begin */")
+        end = self.css.index("/* sam3-lanes:end */")
+        block = self.css[start:end]
+        self.assertIn(".sam3-chip[hidden]", block)
+        self.assertIn(".sam3-onbar [hidden]", block)
+
+    def test_dock_css_marks_experiments_and_makes_no_stacking_context(self):
+        """탭 버튼은 Gradio 가 다시 만들므로 '실험' 표시는 JS 속성이 아니라 CSS 로 붙인다."""
+        import re
+
+        start = self.css.index("#sam3_dock_refine-button::after")
+        block = re.sub(r"/\*.*?\*/", "", self.css[start:start + 1600], flags=re.DOTALL)
+        self.assertIn('content: "실험"', block)
+        self.assertIn("#sam3_dock_tile-button::after", block)
+        for prop in self.FORBIDDEN_IN_LAYOUT:
+            self.assertNotIn(prop, block, f"도크 규칙에 {prop} 가 있다")
+
+    def test_columns_keep_the_grid_that_mobile_js_depends_on(self):
+        """3열 그리드의 position:relative 가 빠지면 Forge 가 모바일 모드로 바뀐다(mobile.js:7)."""
+        start = self.css.index(".sam3-notebook-columns {")
+        block = self.css[start:self.css.index("}", start)]
+        self.assertIn("grid-template-columns", block)
+        self.assertIn("position: relative", block)
 
     def test_static_generation_dropdowns_use_themed_fast_popovers(self):
         self.assertIn("function installFastDropdown(", self.script)
@@ -288,6 +303,11 @@ class NotebookAssetTests(unittest.TestCase):
         self.assertIn("function refreshFastDropdownVisibleLimits()", self.script)
         self.assertIn("gridTemplateColumns", self.script)
         self.assertIn("data-scroll", self.script)
+        self.assertIn("var renderedChoiceLimit", self.script)
+        self.assertIn('list.addEventListener("scroll"', self.script)
+        self.assertIn("renderedChoiceLimit += fastDropdownVisibleChoiceLimit()", self.script)
+        self.assertIn("아래로 스크롤하면 더 표시", self.script)
+        self.assertNotIn("검색어를 더 입력하세요", self.script)
 
     def test_original_forge_extra_network_tabs_are_restored_after_extraction(self):
         gallery_move = self.script.index(
@@ -406,11 +426,23 @@ class NotebookAssetTests(unittest.TestCase):
         )
         self.assertNotIn("fastDropdownLabel(wrapper), choices", body)
 
-    def test_script_floats_do_not_create_a_stacking_context(self):
-        """An integer z-index would trap Gradio popups below sibling floats."""
-        rule = self.css.index(".sam3-notebook-script-float {")
-        end = self.css.index("}", rule)
-        self.assertNotIn("z-index", self.css[rule:end])
+    FORBIDDEN_IN_LAYOUT = (
+        "z-index", "transform", "filter:", "opacity:", "contain:", "will-change",
+        "isolation", "backdrop-filter",
+    )
+
+    def test_lanes_css_never_creates_a_stacking_context(self):
+        """쌓임 맥락이 생기면 Gradio 드롭다운이 그 안에 갇힌다(v0.21.0 회귀).
+
+        주석은 걷어 내고 실제 선언만 본다 — 주석에서는 그 속성 이름을 설명할 수 있어야 한다.
+        """
+        import re
+
+        start = self.css.index("/* sam3-lanes:begin */")
+        end = self.css.index("/* sam3-lanes:end */")
+        block = re.sub(r"/\*.*?\*/", "", self.css[start:end], flags=re.DOTALL)
+        for prop in self.FORBIDDEN_IN_LAYOUT:
+            self.assertNotIn(prop, block, f"lanes 블록에 {prop} 가 있다")
 
 
 if __name__ == "__main__":

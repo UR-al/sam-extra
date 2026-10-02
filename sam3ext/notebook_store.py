@@ -12,15 +12,18 @@ import logging
 import os
 import re
 import shutil
+import sys
 import threading
 import uuid
 from copy import deepcopy
 from datetime import UTC, datetime
 from pathlib import Path
+from secrets import compare_digest
 from typing import Any
 
 from fastapi import Depends, HTTPException, Request
 from fastapi.responses import JSONResponse
+from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from starlette.concurrency import run_in_threadpool
 
 
@@ -313,22 +316,106 @@ def _gradio_auth_dependencies(app: Any) -> list[Any]:
     return []
 
 
+def _forge_api_auth_setting() -> str | None:
+    """Forge's ``--api-auth`` value (``user:password[,user:password...]``) or None.
+
+    Read from the ``modules.shared`` Forge has already loaded, never imported:
+    importing Forge's command-line module parses ``sys.argv``. Outside Forge
+    (tests, other hosts) there is no setting. Forge only builds its API (and
+    so only applies ``--api-auth``) under ``--api`` or ``--nowebui``
+    (``webui.py`` ``webui_worker``/``api_only_worker``); without either the
+    setting guards nothing there, and nothing here either.
+    """
+
+    shared = sys.modules.get("modules.shared")
+    cmd_opts = getattr(shared, "cmd_opts", None)
+    if not (getattr(cmd_opts, "api", False) or getattr(cmd_opts, "nowebui", False)):
+        return None
+    value = getattr(cmd_opts, "api_auth", None)
+    return value if isinstance(value, str) and value else None
+
+
+def _forge_api_auth_dependencies(api_auth: str | None) -> list[Any]:
+    """Forge's own API guard (``modules/api/api.py`` ``Api.auth``) for ``api_auth``.
+
+    Same credentials parsing, HTTP Basic scheme and 401 + ``WWW-Authenticate:
+    Basic`` answer as the ``/sdapi/v1/*`` routes get under ``--api-auth``.
+    Forge keeps its ``Api`` instance nowhere an extension can reach, so the
+    guard is rebuilt from the same setting.
+    """
+
+    if not api_auth:
+        return []
+    credentials: dict[str, str] = {}
+    for pair in api_auth.split(","):
+        user, _, password = pair.partition(":")
+        credentials[user] = password
+
+    def forge_api_auth(
+        basic: HTTPBasicCredentials = Depends(HTTPBasic()),
+    ) -> bool:
+        expected = credentials.get(basic.username)
+        if expected is not None and compare_digest(
+            basic.password.encode("utf-8"), expected.encode("utf-8")
+        ):
+            return True
+        raise HTTPException(
+            status_code=401,
+            detail="Incorrect username or password",
+            headers={"WWW-Authenticate": "Basic"},
+        )
+
+    return [Depends(forge_api_auth)]
+
+
+def extension_auth_dependencies(app: Any) -> list[Any]:
+    """The login guards of every sam-extra route: Gradio's and Forge's API auth.
+
+    Every route sam-extra adds to Forge's app takes them — the Notebook, memo
+    (sam3ext/notebook_memos.py), Tile & Repair (sam3ext/tile_repair_api.py)
+    and LoRA Manager config/spawn (sam3ext/lora_manager_core.py) routes —
+    together with ``require_same_origin_header``.
+
+    Gradio's ``/login_check`` (``--gradio-auth``) and Forge's ``--api-auth``
+    guard both apply when the host has them. ``--nowebui`` has no Gradio
+    login, so there ``--api-auth`` alone guards the routes, as it guards
+    ``/sdapi``. The browser pages fetch with ``credentials: "same-origin"``:
+    they send the Gradio cookie and, under ``--api-auth``, the Basic
+    credentials the browser's own prompt collected.
+    """
+
+    return _gradio_auth_dependencies(app) + _forge_api_auth_dependencies(
+        _forge_api_auth_setting()
+    )
+
+
+def require_same_origin_header(request: Request) -> None:
+    """Shared by the Notebook, memo, Tile & Repair and LoRA Manager routes.
+
+    Called first in each handler, after the ``extension_auth_dependencies``
+    guards and before the handler does anything else.
+    """
+
+    if request.headers.get("X-SAM3-Notebook") != "1":
+        raise HTTPException(
+            status_code=403,
+            detail="Missing same-origin Notebook request header",
+        )
+
+
 def register_notebook_routes(app: Any, store: NotebookStore | None = None) -> bool:
-    """Register same-origin GET/PUT Notebook routes exactly once."""
+    """Register same-origin GET/PUT Notebook routes exactly once.
+
+    The memo pad routes (``/sam3-notebook/memos``) are registered here too, so
+    ``scripts/!sam3.py`` keeps a single call.
+    """
 
     for route in getattr(app, "routes", ()):
         if getattr(route, "path", None) == NOTEBOOK_API_PATH:
             return False
 
     notebook_store = store or NotebookStore()
-    auth_dependencies = _gradio_auth_dependencies(app)
-
-    def require_same_origin_header(request: Request) -> None:
-        if request.headers.get("X-SAM3-Notebook") != "1":
-            raise HTTPException(
-                status_code=403,
-                detail="Missing same-origin Notebook request header",
-            )
+    auth_dependencies = extension_auth_dependencies(app)
 
     async def get_notebook(request: Request) -> JSONResponse:
         require_same_origin_header(request)
@@ -401,4 +488,8 @@ def register_notebook_routes(app: Any, store: NotebookStore | None = None) -> bo
         name="sam3-notebook-put",
         dependencies=auth_dependencies,
     )
+    # Imported here: notebook_memos imports this module's helpers.
+    from .notebook_memos import register_memo_routes_for_notebook
+
+    register_memo_routes_for_notebook(app, notebook_store, auth_dependencies)
     return True

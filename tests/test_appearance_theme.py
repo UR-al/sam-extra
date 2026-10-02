@@ -21,6 +21,13 @@ class AppearanceThemeTests(unittest.TestCase):
         cls.tokens = (ROOT / "tokens.css").read_text(encoding="utf-8")
         cls.design = (ROOT / "design.md").read_text(encoding="utf-8")
 
+    def test_layout_sections_option_is_registered(self):
+        """txt2img 섹션 정리를 끄는 스위치. 값(기본 True)은 tests/test_layout_lanes.py 가 함께 본다."""
+        self.assertIn("OPT_LAYOUT_SECTIONS", self.python)
+        self.assertIn("shared.opts.add_option(\n        OPT_LAYOUT_SECTIONS,", self.python)
+        self.assertIn("txt2img 섹션 정리", self.python)
+        self.assertIn("sam3_lanes=off", self.python)
+
     def test_settings_registers_all_requested_theme_choices(self):
         self.assertIn('OPT_APPEARANCE_THEME = "sam3_appearance_theme"', self.python)
         self.assertIn("script_callbacks.on_ui_settings(on_ui_settings)", self.python)
@@ -121,6 +128,16 @@ class AppearanceThemeTests(unittest.TestCase):
             'if (slug === DEFAULT_SLUG) localStorage.removeItem(STORAGE_KEY)',
             self.javascript,
         )
+
+    def test_theme_background_skips_the_lightbox_toolbar(self):
+        """Forge's lightbox toolbar is `<div class="modalControls gradio-container">`
+        and is meant to stay transparent until hovered. The page-background rule
+        for `.gradio-container` uses !important, so without an exclusion it
+        painted the toolbar solid and the bar never faded out."""
+        start = self.css.index("[data-sam3-theme] :where(.gradio-container")
+        selector = self.css[start:self.css.index("{", start)]
+        self.assertIn(":not(.modalControls)", selector)
+        self.assertNotIn("[data-sam3-theme] :where(.gradio-container) {", self.css)
 
     def test_custom_palettes_also_set_gradios_dark_class(self):
         """Every palette is dark, but a lot of Forge/Gradio CSS is gated on the

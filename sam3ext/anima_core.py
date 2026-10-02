@@ -31,8 +31,11 @@ via the LLLite cond_image, exactly like ComfyUI's AnimaLLLiteApply node.
 from __future__ import annotations
 
 import gc
+import json
 import os
 import random
+import re
+import struct
 import sys
 import tempfile
 import traceback
@@ -45,6 +48,8 @@ from typing import Any
 import numpy as np
 import torch
 from PIL import Image
+
+from .forge_exclusive import is_interrupted
 
 EXTENSION_ROOT = Path(__file__).resolve().parent.parent
 ANIMA_VENDOR = EXTENSION_ROOT / "anima_vendor"
@@ -80,13 +85,15 @@ class AnimaTileRepairArgs:
     cfg: float = 3.5
     flow_shift: float = 5.0
     seed: int = -1
-    # Output size
+    # Output size — the panel sets only ``short_side``; ``run_tile_repair``
+    # derives width/height from the source aspect ratio (tile_repair_size)
+    # and writes them here for the vendor args and the infotext.
+    short_side: int = 1024
     width: int = 1024
     height: int = 1024
-    # LLLite conditioning schedule
-    lllite_strength: float = 1.0
-    lllite_start: float = 0.0
-    lllite_end: float = 1.0
+    # LLLite conditioning — the vendor only takes a multiplier
+    # (control_net_lllite_anima.set_multiplier). Strength / Start % / End %
+    # used to sit here too but were never passed anywhere (audit M14).
     lllite_multiplier: float = 1.0
     # Housekeeping
     unload_forge_before: bool = True
@@ -275,9 +282,71 @@ def list_vae_choices() -> list[str]:
     return out
 
 
+# ---------------------------------------------------------------------------
+# LLLite file inspection (safetensors header only — no torch, no tensor read)
+# ---------------------------------------------------------------------------
+
+# safetensors layout: an 8-byte little-endian u64 N, then N bytes of UTF-8 JSON
+# ({tensor name: {dtype, shape, data_offsets}, "__metadata__": {str: str}}).
+# The format caps the header at 100 MB; anything larger is not a real file.
+_SAFETENSORS_HEADER_LIMIT = 100 * 1024 * 1024
+# Key prefix of the shared conditioning encoder in a saved Anima LLLite file
+# (sd-scripts networks/control_net_lllite_anima.py ``_SAVED_COND_PREFIX``).
+# SDXL LLLite (lllite_unet_*) and ordinary ControlNets never carry it.
+_LLLITE_COND_PREFIX = "lllite_conditioning1."
+# The Tile-Repair panel runs sd-scripts without a mask: only RGB (3-channel)
+# LLLite weights work. 4-channel ones are inpaint models that need
+# --mask_image (sd-scripts anima_minimal_inference_control_net_lllite.py:400-406).
+TILE_REPAIR_COND_IN_CHANNELS = 3
+
+
+def read_safetensors_header(path) -> dict | None:
+    """The JSON header of a ``.safetensors`` file, or ``None`` when the file
+    is unreadable or not a safetensors file."""
+    try:
+        with open(path, "rb") as fh:
+            raw = fh.read(8)
+            if len(raw) != 8:
+                return None
+            (size,) = struct.unpack("<Q", raw)
+            if size <= 0 or size > _SAFETENSORS_HEADER_LIMIT:
+                return None
+            blob = fh.read(size)
+        if len(blob) != size:
+            return None
+        header = json.loads(blob.decode("utf-8"))
+    except (OSError, ValueError, UnicodeDecodeError):
+        return None
+    return header if isinstance(header, dict) else None
+
+
+def lllite_cond_in_channels(path) -> int | None:
+    """``cond_in_channels`` of an Anima ControlNet-LLLite file, read the way
+    sd-scripts does — ``int(meta.get("lllite.cond_in_channels", 3))`` — or
+    ``None`` when the file is not an Anima LLLite (or cannot be read)."""
+    header = read_safetensors_header(path)
+    if header is None:
+        return None
+    if not any(
+        isinstance(key, str) and key.startswith(_LLLITE_COND_PREFIX)
+        for key in header
+        if key != "__metadata__"
+    ):
+        return None
+    meta = header.get("__metadata__")
+    if not isinstance(meta, dict):
+        meta = {}
+    try:
+        return int(meta.get("lllite.cond_in_channels", 3))
+    except (TypeError, ValueError):
+        return None
+
+
 def list_lllite_choices() -> list[str]:
-    """LLLite checkpoints. Forge's ControlNet folder is the user's convention
-    (``models/ControlNet/animaTileRepair_v10.safetensors`` etc.)."""
+    """Anima ControlNet-LLLite files the Tile-Repair panel can run: the RGB
+    (3-channel) ones in Forge's ControlNet folder. Read from each file's
+    safetensors header, so 4-channel inpaint LLLites (which fail without a
+    mask) and non-LLLite ControlNets never show up whatever their name."""
     out = ["None"]
     root = _models_path()
     if root is None:
@@ -287,29 +356,110 @@ def list_lllite_choices() -> list[str]:
         cn_dir = root / variant
         if not cn_dir.is_dir():
             continue
-        # Match anima*/lllite* substrings so generic SDXL CN checkpoints
-        # don't clutter the dropdown. ``saftensors`` typo handled too.
-        for ext in (".safetensors", ".saftensors"):
-            for p in sorted(cn_dir.glob(f"*{ext}")):
-                lower = p.name.lower()
-                if "anima" in lower or "lllite" in lower:
-                    out.append(p.name)
+        # ``.safetensors`` only: sd-scripts load_lllite_weights hands any other
+        # extension (e.g. the ``.saftensors`` typo) to torch.load, which cannot
+        # read a safetensors file, so such a file would fail at run time.
+        for p in sorted(cn_dir.glob("*.safetensors")):
+            if lllite_cond_in_channels(p) == TILE_REPAIR_COND_IN_CHANNELS:
+                out.append(p.name)
         # only one variant — first hit wins
         if len(out) > 1:
             break
     return out
 
 
+_TILE_REPAIR_NAME = "tilerepair"
+_NAME_VERSION_RE = re.compile(r"v(\d+(?:[._]\d+)*)")
+
+
+def _name_version(name: str) -> tuple[int, ...]:
+    """Version tuple from a file name — ``animaTileRepair_v20`` → (20,),
+    ``..._v2.1`` → (2, 1); () when the name carries none."""
+    stem = re.sub(r"\.safetensors$", "", name.lower())
+    found = _NAME_VERSION_RE.findall(stem)
+    if not found:
+        return ()
+    return tuple(int(part) for part in re.split(r"[._]", found[-1]))
+
+
+def default_lllite_choice(choices: list[str]) -> str:
+    """Default for the LLLite dropdown: the newest Tile & Repair file
+    (civitai 2708551 ships ``animaTileRepair_v10`` / ``_v20``; v20 wins).
+    Without one, the first listed LLLite; with none, ``"None"``."""
+    real = [c for c in choices if c and c != "None"]
+    tiles = [c for c in real if _TILE_REPAIR_NAME in re.sub(r"[^a-z0-9]", "", c.lower())]
+    if tiles:
+        return max(tiles, key=lambda c: (_name_version(c), c.lower()))
+    return real[0] if real else "None"
+
+
+# ---------------------------------------------------------------------------
+# Output size — keep the source aspect ratio
+# ---------------------------------------------------------------------------
+
+# sd-scripts check_inputs: "`height` and `width` have to be divisible by 32".
+TILE_REPAIR_SIZE_MULTIPLE = 32
+TILE_REPAIR_MIN_SIDE = 256
+
+
+def tile_repair_size(src_width: int, src_height: int, short_side: int) -> tuple[int, int]:
+    """``(width, height)`` for a Tile-Repair run on a ``src_width`` × ``src_height``
+    source: the short side becomes ``short_side`` and the long side follows the
+    source aspect ratio (ComfyUI ``ResizeImagesByShorterEdge`` in the reference
+    workflow — ``int(long * (shorter_edge / short))``), then each side is rounded
+    down to a multiple of 32 (sd-scripts ``check_inputs``) with a 256 floor."""
+    w, h = int(src_width), int(src_height)
+    if w <= 0 or h <= 0:
+        raise ValueError(f"source size must be positive, got {w}x{h}")
+    edge = int(short_side)
+    if w < h:
+        new_w, new_h = edge, int(h * (edge / w))
+    else:
+        new_h, new_w = edge, int(w * (edge / h))
+
+    def _snap(v: int) -> int:
+        return max(TILE_REPAIR_MIN_SIDE, (v // TILE_REPAIR_SIZE_MULTIPLE) * TILE_REPAIR_SIZE_MULTIPLE)
+
+    return _snap(new_w), _snap(new_h)
+
+
+# Anima's text encoder is Qwen3 0.6B. Files in models/text_encoder that merely
+# contain "qwen3" are usually something else (Qwen3-VL 4B/8B/32B vision
+# encoders, Qwen3.5, the 3.8B expanded adapter, LLM-CLIP) and fail deep in the
+# vendor loader with a size mismatch — so match the 0.6B spelling explicitly
+# and never pick a file with one of these markers.
+_TE_PATTERNS = ("qwen_3_06b", "qwen3_06b", "qwen3-06b", "qwen3-0.6b", "qwen3_0.6b", "qwen_3_0.6b", "qwen3-0_6b")
+_TE_EXCLUDE = ("qwen35", "qwen3.5", "qwen_3.5", "adapter", "llmclip", "llm_clip")
+# 짧은 표지는 토큰으로만 본다 — 부분 문자열로 보면 'eclipse'·'clipped'·'devlin' 이 든 정상 0.6B TE
+# 까지 떨어진다. 글자가 아닌 것(숫자·구분자)과 camelCase 경계를 토큰 경계로 쳐서 qwen3vl·Qwen3-VL·
+# AnimaQwenVL·clip_l 은 그대로 걸린다.
+_TE_EXCLUDE_TOKENS = ("vl", "vlm", "clip")
+_TE_EXCLUDE_TOKEN_RE = re.compile(
+    r"(?<![a-z])(?:" + "|".join(_TE_EXCLUDE_TOKENS) + r")(?![a-z])"
+)
+
+
+def _looks_like_wrong_te(name: str) -> bool:
+    lower = name.lower()
+    if any(marker in lower for marker in _TE_EXCLUDE):
+        return True
+    split = re.sub(r"(?<=[a-z])(?=[A-Z])", "_", name).lower()
+    return _TE_EXCLUDE_TOKEN_RE.search(split) is not None
+
+
 def default_te_choice(choices: list[str]) -> str:
-    """Pick a sensible default Text Encoder for the dropdown. Anima needs a
-    Qwen3 TE — auto-select a file that looks like one so the panel works out
-    of the box (the user's anima_baseV10_txt.safetensors etc.) instead of the
-    always-failing 'Use Forge current'."""
-    for hint in ("qwen3", "qwen_3", "qwen", "anima", "_txt", "text_encoder", "te"):
-        for c in choices:
-            if c != "Use Forge current" and hint in c.lower():
+    """Pick a sensible default Text Encoder for the dropdown. Anima needs the
+    Qwen3 0.6B TE — auto-select a file that looks like one (qwen_3_06b_base,
+    the user's anima_baseV10_txt.safetensors etc.) so the panel works out of
+    the box. When nothing looks right, fall back to 'Use Forge current':
+    ``run_tile_repair`` then tells the user to pick a TE instead of the vendor
+    dying on a Qwen3-VL / Qwen3.5 size mismatch."""
+    candidates = [c for c in choices if c != "Use Forge current" and not _looks_like_wrong_te(c)]
+    for hint in _TE_PATTERNS + ("anima",):
+        for c in candidates:
+            if hint in c.lower():
                 return c
-    return choices[0] if choices else "Use Forge current"
+    return "Use Forge current"
 
 
 def default_vae_choice(choices: list[str]) -> str:
@@ -462,6 +612,50 @@ def _nullctx():
     yield
 
 
+@contextmanager
+def _vendor_interrupt_guard(ami):
+    """Make Forge's ⏹ Stop reach the vendor's denoising loop.
+
+    ``ami.generate_body`` (anima_minimal_inference.py, replaced by the LLLite
+    module) never looks at ``shared.state``, so Stop used to do nothing until
+    the whole sample finished. While active, the DiT handed to
+    ``generate_body`` carries a forward pre-hook that raises
+    ``InterruptedError`` at the next step once the flags are set;
+    ``run_tile_repair`` turns that into an empty result.
+    """
+    original = ami.generate_body
+
+    def _check(module, inputs):
+        if is_interrupted():
+            raise InterruptedError("SAM3 Anima: Tile-Repair interrupted by Stop")
+
+    def guarded(args, anima, *rest, **kwargs):
+        handle = anima.register_forward_pre_hook(_check)
+        try:
+            return original(args, anima, *rest, **kwargs)
+        finally:
+            handle.remove()
+
+    ami.generate_body = guarded
+    try:
+        yield
+    finally:
+        ami.generate_body = original
+
+
+def _generate_with_stop(ami, args, gen_settings):
+    """``ami.generate`` under ``_vendor_interrupt_guard``. Returns the latent,
+    or ``None`` when ⏹ Stop interrupted sampling — ``run_tile_repair`` then
+    returns an empty result so the panel says "no output produced
+    (interrupted?)" instead of a red traceback. Other errors propagate."""
+    try:
+        with _vendor_interrupt_guard(ami):
+            return ami.generate(args, gen_settings)
+    except InterruptedError:
+        print("[-] SAM3 Anima: Tile-Repair interrupted by Stop.", file=sys.stderr)
+        return None
+
+
 # ---------------------------------------------------------------------------
 # argparse.Namespace builder (matches anima_minimal_inference's CLI shape)
 # ---------------------------------------------------------------------------
@@ -576,12 +770,21 @@ def _build_anima_args(repair: AnimaTileRepairArgs, control_image_path: str) -> S
 # ---------------------------------------------------------------------------
 
 
+def decode_pixels_to_uint8(sample: torch.Tensor) -> np.ndarray:
+    """C×H×W pixels in [-1, 1] → H×W×C uint8, exactly as sd-scripts saves
+    them (``save_images``): clamp, ``(x + 1) * 127.5``, truncating uint8 cast.
+    Fixed — no guessing whether the VAE returned [-1, 1] or [0, 1]."""
+    x = torch.clamp(sample, -1.0, 1.0)
+    x = ((x + 1.0) * 127.5).to(torch.uint8).cpu().numpy()
+    return x.transpose(1, 2, 0)  # C, H, W -> H, W, C
+
+
 def _tensor_to_pil(pixels: torch.Tensor) -> Image.Image:
     """Convert the vendor's decoded pixel tensor to a PIL RGB image.
 
-    vendor decode_latent returns either BCTHW (T=1) or BCHW depending on the
-    Qwen-Image AutoencoderKL flavor. Both layouts collapse to a single
-    HxWx3 numpy array in [0, 1].
+    The vendor's ``decode_latent`` already returns C×H×W float32 on the CPU
+    (batch and frame axes removed); BCTHW / BCHW are accepted too and
+    collapse to their first image.
     """
     t = pixels
     if t.ndim == 5:
@@ -592,13 +795,7 @@ def _tensor_to_pil(pixels: torch.Tensor) -> Image.Image:
         pass  # already C H W
     else:
         raise ValueError(f"unexpected pixel tensor rank {t.ndim}")
-    t = t.float().clamp(-1.0, 1.0)
-    # Anima decode_to_pixels returns either [-1,1] or [0,1] depending on the
-    # vae flavor. Detect and normalize.
-    if float(t.min()) < -0.01:
-        t = (t + 1.0) * 0.5
-    arr = (t.permute(1, 2, 0).cpu().numpy() * 255.0).round().astype(np.uint8)
-    return Image.fromarray(arr, mode="RGB")
+    return Image.fromarray(decode_pixels_to_uint8(t))
 
 
 def _build_infotext(repair: AnimaTileRepairArgs, seed_used: int) -> str:
@@ -614,9 +811,7 @@ def _build_infotext(repair: AnimaTileRepairArgs, seed_used: int) -> str:
             f"Seed: {seed_used}, "
             f"Size: {repair.width}x{repair.height}, "
             f"Flow shift: {repair.flow_shift}, "
-            f"LLLite: {repair.lllite_model} (mult {repair.lllite_multiplier}, "
-            f"strength {repair.lllite_strength}, "
-            f"sched {repair.lllite_start:.2f}-{repair.lllite_end:.2f})"
+            f"LLLite: {repair.lllite_model} (mult {repair.lllite_multiplier})"
         ),
         "Anima Tile-Repair: on",
     ]
@@ -652,7 +847,7 @@ def run_tile_repair(
         )
     if repair.lllite_model in (None, "", "None"):
         raise RuntimeError(
-            "Pick an LLLite model (e.g. animaTileRepair_v10.safetensors)."
+            "Pick an LLLite model (e.g. animaTileRepair_v20.safetensors)."
         )
 
     out_pairs: list[tuple[Image.Image, str]] = []
@@ -690,10 +885,13 @@ def run_tile_repair(
             control_image_path = tf.name
 
         try:
-            # IMPORTANT: dimensions must be divisible by 32 (vendor
-            # check_inputs raises otherwise). Snap to nearest multiple of 32.
-            repair.width = max(256, (int(repair.width) // 32) * 32)
-            repair.height = max(256, (int(repair.height) // 32) * 32)
+            # Output keeps the source aspect ratio (short side = panel value),
+            # each side a multiple of 32 as the vendor's check_inputs requires.
+            # The control image goes to the vendor at its own size; sd-scripts
+            # _load_control_image resizes it to this size (BICUBIC).
+            repair.width, repair.height = tile_repair_size(
+                source.width, source.height, repair.short_side
+            )
 
             args = _build_anima_args(repair, control_image_path)
 
@@ -761,7 +959,11 @@ def run_tile_repair(
                     args.device = device
 
                     gen_settings = ami.get_generation_settings(args)
-                    latent = ami.generate(args, gen_settings)
+                    latent = _generate_with_stop(ami, args, gen_settings)
+                    if latent is None:
+                        # ⏹ Stop — the finally blocks still restore the
+                        # strategies and delete the control image.
+                        return out_pairs
 
                     # Decode — vendor loads VAE separately to keep DiT in VRAM
                     # during sampling and frees it before the VAE pass.

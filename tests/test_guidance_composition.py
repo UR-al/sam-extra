@@ -37,7 +37,8 @@ def _load(module_file: str, test_name: str):
     class Script:
         pass
 
-    modules_stub.script_callbacks = types.SimpleNamespace(on_before_ui=lambda fn: None)
+    modules_stub.script_callbacks = types.SimpleNamespace(
+        on_before_ui=lambda fn: None, on_cfg_denoiser=lambda fn: None)
     modules_stub.scripts = types.SimpleNamespace(
         Script=Script, AlwaysVisible=object(), scripts_data=[]
     )
@@ -60,6 +61,25 @@ def _load(module_file: str, test_name: str):
             sys.modules.pop("modules", None)
         else:
             sys.modules["modules"] = old
+
+
+class _DiscretePredictor:
+    """Skimmed CFG places its window with ``model.predictor.percent_to_sigma``.
+
+    An eps/v-style schedule (Forge ``k_prediction.Prediction``) maps 0% above
+    any sigma, so the sigma 1.0 used below lies inside the default window. (A
+    flow schedule maps 0% to exactly 1.0, a step upstream never skims.)
+    """
+
+    def percent_to_sigma(self, percent):
+        if percent <= 0.0:
+            return 999999999.9
+        if percent >= 1.0:
+            return 0.0
+        return 14.6 * (1.0 - percent)
+
+
+_DISCRETE_MODEL = types.SimpleNamespace(predictor=_DiscretePredictor())
 
 
 class GuidanceCompositionTests(unittest.TestCase):
@@ -121,8 +141,19 @@ class GuidanceCompositionTests(unittest.TestCase):
             mode="preserve", experimental_stack=False, warned=True,
             external_cfg_detected=False, steps=0,
             smc_on=smc, apg_on=False, cwm_on=cwm,
+            # Non-zero CWM alphas: the upstream default 0/0 is neutral CFG.
+            alpha_low=0.30, alpha_high=0.15,
         )
-        p._DCW.update(on=dcw, lambda_low=0.10, lambda_high=0.02, steps=0)
+        p._DCW.update(
+            on=dcw,
+            dcw_on=dcw,
+            rdc_on=False,
+            lambda_low=0.10,
+            lambda_high=0.02,
+            steps=0,
+            dcw_steps=0,
+            rdc_steps=0,
+        )
         p._STATE.update(
             on=pert, adg_skipped=False, attn_scale=3.0, slg_scale=3.0,
             slg_raw=None, rescale=0.0, apg_autooff_rescale=True,
@@ -219,6 +250,7 @@ class GuidanceCompositionTests(unittest.TestCase):
                     "input": live_input,
                     "sigma": torch.tensor([1.0]),
                     "cond_scale": 7.0,
+                    "model": _DISCRETE_MODEL,
                     "model_options": {},
                 }
             )

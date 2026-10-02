@@ -10,6 +10,8 @@ import gradio as gr
 
 from modules import script_callbacks, shared
 
+from sam3ext.layout_lanes import OPT_LAYOUT_SECTIONS
+
 
 OPT_APPEARANCE_THEME = "sam3_appearance_theme"
 OPT_FAST_DROPDOWN_VISIBLE_CHOICES = "sam3_fast_dropdown_visible_choices"
@@ -43,16 +45,27 @@ def on_ui_settings() -> None:
         ),
     )
     shared.opts.add_option(
+        OPT_LAYOUT_SECTIONS,
+        shared.OptionInfo(
+            True,
+            "txt2img 섹션 정리(켜진 기능·고정·더 보기) — Forge 재시작 후 적용",
+            gr.Checkbox,
+            section=section,
+        ).info(
+            "끄면 Forge 기본 순서로 돌아갑니다. 한 페이지에서만 끄려면 주소 끝에 ?sam3_lanes=off 를 붙이세요."
+        ),
+    )
+    shared.opts.add_option(
         OPT_FAST_DROPDOWN_VISIBLE_CHOICES,
         shared.OptionInfo(
             DEFAULT_FAST_DROPDOWN_VISIBLE_CHOICES,
-            "빠른 드롭다운 최대 표시 항목 수",
+            "빠른 드롭다운 한 번에 표시할 항목 수",
             gr.Slider,
             {"minimum": 10, "maximum": 200, "step": 5},
             section=section,
         ).info(
-            "목록이 이 값 이하면 전부 펼쳐 표시합니다. "
-            "더 긴 목록은 여기까지 표시하고 검색으로 나머지를 찾습니다."
+            "처음 열 때와 목록 끝까지 스크롤할 때마다 이 개수씩 표시합니다. "
+            "검색어를 몰라도 아래로 내려 전체 항목에 접근할 수 있습니다."
         ),
     )
 

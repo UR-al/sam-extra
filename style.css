@@ -25,7 +25,9 @@
     scrollbar-color: var(--sam3-color-rule) var(--sam3-color-paper);
 }
 
-[data-sam3-theme] :where(.gradio-container) {
+/* Forge's lightbox toolbar is also `.gradio-container` (div.modalControls) and
+ * must stay transparent until hovered — keep it out of the page background. */
+[data-sam3-theme] :where(.gradio-container:not(.modalControls)) {
     color: var(--sam3-color-ink);
     background: var(--sam3-color-paper) !important;
     font-family: var(--sam3-font-body);
@@ -244,23 +246,262 @@ html.sam3-notebook-layout-active .sam3-notebook-original-root {
     min-width: 0;
 }
 
-.sam3-notebook-floating-script-owner {
-    position: relative !important;
-    overflow: visible !important;
+/*
+ * 묶음별 섹션 배치(v0.22). 노드는 Gradio 가 만든 자리에 그대로 두고 order 로만 자리를 잡는다.
+ * 쌓임 맥락을 만드는 속성(z-index/transform/filter/opacity/contain/will-change/isolation/backdrop-filter)은
+ * 이 블록 안에서 절대 쓰지 않는다 — Gradio 팝업이 그 안에 갇힌다(v0.21.0 회귀).
+ * 시작·끝 표시는 테스트가 잘라 검사하므로 한 줄짜리 주석으로 둔다.
+ */
+/* sam3-lanes:begin */
+#sam3_notebook_layout[data-sam3-lanes] [data-column="parameters"] > div,
+#sam3_notebook_layout[data-sam3-lanes] [data-column="scripts"] > div {
+    display: flex;
+    flex-direction: column;
+    gap: var(--sam3-space-2xs, .25rem);
 }
 
-/*
- * No z-index here on purpose. An integer z-index makes each float a stacking
- * context, and a Gradio popup rendered inside one stays trapped at that level:
- * ul.options is position:fixed, which escapes overflow clipping but not an
- * ancestor stacking context, so it would be capped at 3 instead of Forge's
- * z-index:3000 and the next float would paint and hit-test over it. DOM order
- * already paints these positioned floats above the column background.
- */
-.sam3-notebook-script-float {
-    position: absolute !important;
-    max-width: none !important;
-    margin: 0 !important;
+#sam3_notebook_layout[data-sam3-lanes] #txt2img_settings,
+#sam3_notebook_layout[data-sam3-lanes] #txt2img_script_container,
+#sam3_notebook_layout[data-sam3-lanes] #txt2img_script_container > .styler {
+    display: contents;
+}
+
+#sam3_notebook_layout[data-sam3-lanes] [data-column="scripts"] > h2 {
+    display: none;
+}
+
+#sam3_notebook_layout[data-sam3-lanes] .sam3-lane-head {
+    margin: var(--sam3-space-sm, .75rem) 0 var(--sam3-space-3xs, .125rem);
+    padding-bottom: var(--sam3-space-3xs, .125rem);
+    border-bottom: 1px solid var(--border-color-primary, var(--sam3-color-rule));
+    font-size: var(--sam3-text-xs, .75rem);
+    font-weight: 700;
+    letter-spacing: .06em;
+    color: var(--body-text-color-subdued, var(--sam3-color-muted));
+}
+
+#sam3_notebook_layout[data-sam3-lanes] .sam3-pin-hint {
+    margin: 0;
+    padding: var(--sam3-space-xs, .5rem);
+    border: 1px dashed var(--border-color-primary, var(--sam3-color-rule));
+    border-radius: var(--sam3-radius-md, .375rem);
+    font-size: var(--sam3-text-xs, .75rem);
+    color: var(--body-text-color-subdued, var(--sam3-color-muted));
+}
+
+#sam3_notebook_layout[data-sam3-lanes] .sam3-notebook-columns:has([data-sam3-pinned]) .sam3-pin-hint {
+    display: none;
+}
+
+#sam3_notebook_layout[data-sam3-lanes] .sam3-lane--hidden {
+    display: none;
+}
+
+/* 칸은 어디에 놓이든(1열·2열·고정) 같은 카드 모양. Gradio 의 `div > *` border:none 보다 우선한다. */
+#sam3_notebook_layout[data-sam3-lanes] .sam3-slot {
+    border: 1px solid var(--border-color-primary, var(--sam3-color-rule));
+    border-radius: var(--sam3-radius-md, .375rem);
+    background: var(--background-fill-primary, var(--sam3-color-paper-2));
+}
+
+#sam3_notebook_layout[data-sam3-lanes] .sam3-slot[data-sam3-on] {
+    border-color: var(--sam3-color-accent-strong, var(--primary-500));
+}
+
+/* 순서 주의: 나머지(360)를 먼저 쓰고 스크립트 줄(210)을 나중에 쓴다. :has(> #script_list) 는 id 하나를 품어
+ * 우선순위가 같으므로, 먼저 쓰면 뒤 규칙에 져서 스크립트 칸이 "도구·실험" 아래로 내려간다. */
+#sam3_notebook_layout[data-sam3-lanes] #txt2img_script_container > .styler > * {
+    order: 360;
+}
+
+#sam3_notebook_layout[data-sam3-lanes] #txt2img_script_container > .styler > :has(> #script_list),
+#sam3_notebook_layout[data-sam3-lanes] #txt2img_script_container > .styler > .sam3-script-panel {
+    order: 210;
+}
+
+/* 켜짐 알약과 실험 표시는 CSS ::after 로 그린다 — DOM 글자가 아니라 ko_KR 번역이 건드리지 않고,
+ * 자식을 넣고 빼지 않으므로 Forge 의 childList 관찰자도 깨어나지 않는다. */
+#sam3_notebook_layout[data-sam3-lanes] .sam3-head > .label-wrap {
+    padding-inline-end: 1.75rem;
+}
+
+#sam3_notebook_layout[data-sam3-lanes] .sam3-head > .label-wrap[data-sam3-pill]::after {
+    content: attr(data-sam3-pill);
+    order: 2;
+    margin-inline-start: auto;
+    padding: 0 .5rem;
+    border: 1px solid var(--sam3-color-accent-strong, var(--primary-500));
+    border-radius: 999px;
+    font-size: var(--sam3-text-xs, .75rem);
+    font-weight: 600;
+}
+
+#sam3_notebook_layout[data-sam3-lanes] .sam3-slot[data-sam3-guess] .sam3-head > .label-wrap[data-sam3-pill]::after {
+    border-style: dashed;
+}
+
+#sam3_notebook_layout[data-sam3-lanes] .sam3-head > .label-wrap > .icon {
+    order: 3;
+}
+
+#sam3_notebook_layout[data-sam3-lanes] .sam3-onbar {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: var(--sam3-space-xs, .5rem);
+    padding: var(--sam3-space-xs, .5rem) 0;
+}
+
+#sam3_notebook_layout[data-sam3-lanes] .sam3-onbar-title {
+    font-size: var(--sam3-text-xs, .75rem);
+    font-weight: 700;
+    letter-spacing: .06em;
+    color: var(--body-text-color-subdued, var(--sam3-color-muted));
+}
+
+#sam3_notebook_layout[data-sam3-lanes] .sam3-onbar-title[data-count]::after {
+    content: " " attr(data-count);
+}
+
+#sam3_notebook_layout[data-sam3-lanes] .sam3-onbar-empty {
+    font-size: var(--sam3-text-sm, .875rem);
+    color: var(--body-text-color-subdued, var(--sam3-color-muted));
+}
+
+#sam3_notebook_layout[data-sam3-lanes] .sam3-chip {
+    display: inline-flex;
+    align-items: center;
+    gap: var(--sam3-space-2xs, .25rem);
+    min-height: 1.75rem;
+    padding: 0 .625rem;
+    border: 1px solid var(--sam3-color-accent-strong, var(--primary-500));
+    border-radius: 999px;
+    background: var(--background-fill-secondary, var(--sam3-color-paper-3));
+    color: var(--body-text-color, var(--sam3-color-ink));
+    font-size: var(--sam3-text-sm, .875rem);
+    cursor: pointer;
+}
+
+#sam3_notebook_layout[data-sam3-lanes] .sam3-chip[data-in-more]::after {
+    content: "더 보기 안";
+    margin-inline-start: .375rem;
+    padding-inline-start: .375rem;
+    border-inline-start: 1px solid var(--border-color-primary, var(--sam3-color-rule));
+    font-size: var(--sam3-text-xs, .75rem);
+    color: var(--body-text-color-subdued, var(--sam3-color-muted));
+}
+
+/* [hidden] 은 UA 스타일시트의 display:none 일 뿐이라 위의 display 지정에 진다.
+ * 이 규칙이 없으면 꺼진 기능의 칩까지 전부 보인다. */
+#sam3_notebook_layout[data-sam3-lanes] .sam3-chip[hidden],
+#sam3_notebook_layout[data-sam3-lanes] .sam3-onbar [hidden],
+#sam3_notebook_layout[data-sam3-lanes] .sam3-more [hidden] {
+    display: none;
+}
+
+#sam3_notebook_layout[data-sam3-lanes] .sam3-chip-dot {
+    width: .375rem;
+    height: .375rem;
+    border-radius: 999px;
+    background: var(--sam3-color-accent, var(--primary-400));
+}
+
+/* 핀은 헤더 버튼(.label-wrap)의 형제다 — 안에 넣으면 헤더 클릭과 섞인다. 위치만 겹쳐 놓고 z-index 는 쓰지 않는다. */
+#sam3_notebook_layout[data-sam3-lanes] .sam3-head {
+    position: relative;
+}
+
+#sam3_notebook_layout[data-sam3-lanes] .sam3-pin {
+    position: absolute;
+    inset-inline-end: .25rem;
+    top: .25rem;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 1.5rem;
+    height: 1.5rem;
+    padding: 0;
+    border: none;
+    background: none;
+    color: var(--body-text-color-subdued, var(--sam3-color-neutral));
+    cursor: pointer;
+}
+
+#sam3_notebook_layout[data-sam3-lanes] .sam3-slot[data-sam3-pinned] .sam3-pin {
+    color: var(--sam3-color-accent, var(--primary-400));
+}
+
+#sam3_notebook_layout[data-sam3-lanes] .sam3-head > .label-wrap[data-sam3-tag] > span:first-child::after {
+    content: " · " attr(data-sam3-tag);
+    font-size: var(--sam3-text-xs, .75rem);
+    color: var(--body-text-color-subdued, var(--sam3-color-muted));
+}
+
+#sam3_notebook_layout[data-sam3-lanes] .sam3-more {
+    display: flex;
+    align-items: center;
+    gap: var(--sam3-space-xs, .5rem);
+    width: 100%;
+    min-height: 2.25rem;
+    padding: var(--sam3-space-2xs, .25rem) var(--sam3-space-xs, .5rem);
+    border: 1px dashed var(--border-color-primary, var(--sam3-color-rule));
+    border-radius: var(--sam3-radius-md, .375rem);
+    background: var(--background-fill-primary, var(--sam3-color-paper-2));
+    color: var(--body-text-color, var(--sam3-color-ink));
+    font-size: var(--sam3-text-sm, .875rem);
+    text-align: start;
+    cursor: pointer;
+}
+
+#sam3_notebook_layout[data-sam3-lanes] .sam3-more-title {
+    font-weight: 600;
+}
+
+#sam3_notebook_layout[data-sam3-lanes] .sam3-more-count[data-count]::after {
+    content: attr(data-count) "개";
+    color: var(--body-text-color-subdued, var(--sam3-color-muted));
+}
+
+#sam3_notebook_layout[data-sam3-lanes] .sam3-more-on[data-count="0"] {
+    display: none;
+}
+
+#sam3_notebook_layout[data-sam3-lanes] .sam3-more-on[data-count]::before {
+    content: "켜짐 " attr(data-count) " ·";
+    margin-inline-start: auto;
+    color: var(--sam3-color-accent, var(--primary-400));
+    font-weight: 600;
+}
+
+#sam3_notebook_layout[data-sam3-lanes] .sam3-more-name {
+    color: var(--body-text-color-subdued, var(--sam3-color-muted));
+}
+
+/* 접히면 보이지 않게만 한다 — 아코디언을 여닫지 않으므로 값은 그대로다. */
+#sam3_notebook_layout[data-sam3-lanes][data-sam3-more="closed"] .sam3-lane--lora:not([data-sam3-pinned]),
+#sam3_notebook_layout[data-sam3-lanes][data-sam3-more="closed"] .sam3-lane--etc:not([data-sam3-pinned]),
+#sam3_notebook_layout[data-sam3-lanes][data-sam3-more="closed"] .sam3-lane-head[data-lane="lora"],
+#sam3_notebook_layout[data-sam3-lanes][data-sam3-more="closed"] .sam3-lane-head[data-lane="etc"] {
+    display: none;
+}
+/* sam3-lanes:end */
+
+
+/* 갤러리 밑 "선택 이미지 도구" — 접히는 칸 안의 탭 세 개. Gradio 가 탭 버튼을 다시 만들기 때문에 실험 표시는
+ * JS 속성이 아니라 CSS 로 붙인다. 이 블록에도 쌓임 맥락을 만드는 속성은 쓰지 않는다(Refine 안의 드롭다운이 갇힌다). */
+#sam3_dock_refine-button::after,
+#sam3_dock_tile-button::after {
+    content: "실험";
+    margin-inline-start: .375rem;
+    padding: 0 .375rem;
+    border: 1px dashed var(--border-color-primary, var(--sam3-color-rule));
+    border-radius: var(--sam3-radius-sm, .25rem);
+    font-size: var(--sam3-text-xs, .75rem);
+    color: var(--body-text-color-subdued, var(--sam3-color-muted));
+}
+
+.sam3-dock-panel {
+    gap: var(--sam3-space-xs, .5rem);
 }
 
 /* Hallmark · component: dropdown · genre: atmospheric · theme: design.md

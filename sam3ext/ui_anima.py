@@ -14,7 +14,10 @@ from typing import Any
 
 import gradio as gr
 
+from .panel_container import ACCORDION, panel_container
+
 from .coerce import as_float, as_int
+from .forge_exclusive import run_exclusive, stop_if_job
 from .anima_core import (
     AnimaTileRepairArgs,
     anima_available,
@@ -24,6 +27,7 @@ from .anima_core import (
     list_te_choices,
     list_vae_choices,
     list_pid_checkpoints,
+    default_lllite_choice,
     default_te_choice,
     default_vae_choice,
     run_tile_repair,
@@ -39,7 +43,7 @@ from .ui_refine import _coerce_gallery_item_to_pil, _plaintext_to_html
 
 @dataclass
 class AnimaPanel:
-    accordion: gr.Accordion
+    container: gr.Blocks   # 아코디언(단독) 또는 칼럼(선택 이미지 탭 안)
     selected_index_state: gr.Number
     # Models
     lllite_model: gr.Dropdown
@@ -59,13 +63,11 @@ class AnimaPanel:
     seed: gr.Number = None  # type: ignore[assignment]
     seed_random_button: gr.Button = None  # type: ignore[assignment]
     seed_pull_button: gr.Button = None  # type: ignore[assignment]
-    # Output sizing
-    width: gr.Slider = None  # type: ignore[assignment]
-    height: gr.Slider = None  # type: ignore[assignment]
-    # LLLite schedule
-    lllite_strength: gr.Slider = None  # type: ignore[assignment]
-    lllite_start: gr.Slider = None  # type: ignore[assignment]
-    lllite_end: gr.Slider = None  # type: ignore[assignment]
+    # Output sizing — short side only; the long side follows the source
+    # aspect ratio (anima_core.tile_repair_size)
+    short_side: gr.Slider = None  # type: ignore[assignment]
+    # LLLite — only the multiplier reaches the vendor (audit M14 removed the
+    # Strength / Start % / End % sliders that were never passed anywhere)
     lllite_multiplier: gr.Slider = None  # type: ignore[assignment]
     # Housekeeping
     unload_forge_before: gr.Checkbox = None  # type: ignore[assignment]
@@ -99,11 +101,7 @@ class AnimaPanel:
             self.cfg,
             self.flow_shift,
             self.seed,
-            self.width,
-            self.height,
-            self.lllite_strength,
-            self.lllite_start,
-            self.lllite_end,
+            self.short_side,
             self.lllite_multiplier,
             self.unload_forge_before,
             self.insert_mode,
@@ -132,11 +130,7 @@ ANIMA_ARG_KEYS: tuple[str, ...] = (
     "cfg",
     "flow_shift",
     "seed",
-    "width",
-    "height",
-    "lllite_strength",
-    "lllite_start",
-    "lllite_end",
+    "short_side",
     "lllite_multiplier",
     "unload_forge_before",
     "insert_mode",
@@ -158,7 +152,7 @@ _as_int = as_int
 # ---------------------------------------------------------------------------
 
 
-def build_anima_panel() -> AnimaPanel:
+def build_anima_panel(*, container: str = ACCORDION) -> AnimaPanel:
     """Render the Anima Tile-Repair accordion. Must be called inside an open
     ``gr.Blocks`` context that is a sibling of ``txt2img_gallery``.
 
@@ -173,10 +167,8 @@ def build_anima_panel() -> AnimaPanel:
     vae_choices = list_vae_choices()
     lora_choices = list_lora_choices()
 
-    with gr.Accordion(
-        "SAM3 — Anima Tile-Repair (post-generation)",
-        open=False,
-        elem_id="sam3_anima_panel",
+    with panel_container(
+        container, "SAM3 — Anima Tile-Repair (post-generation)", "sam3_anima_panel"
     ) as acc:
         # Hidden Number — JS shim writes the gallery selection here.
         # gr.State would shift positional args, so we use Number(visible=False)
@@ -199,7 +191,9 @@ def build_anima_panel() -> AnimaPanel:
             lllite_model = gr.Dropdown(
                 label="SAM3 Anima LLLite Model",
                 choices=lllite_choices,
-                value=lllite_choices[1] if len(lllite_choices) > 1 else "None",
+                # Only 3-channel LLLites are listed (header check); default is
+                # the newest Tile & Repair file (v20 over v10).
+                value=default_lllite_choice(lllite_choices),
                 type="value",
                 elem_id="sam3_anima_lllite",
             )
@@ -236,9 +230,10 @@ def build_anima_panel() -> AnimaPanel:
                 elem_id="sam3_anima_positive",
             )
         with gr.Row():
+            # sd-scripts --negative_prompt default is "".
             negative = gr.Textbox(
                 label="SAM3 Anima Negative",
-                value="blurry, low quality",
+                value="",
                 lines=1,
                 elem_id="sam3_anima_negative",
             )
@@ -320,55 +315,32 @@ def build_anima_panel() -> AnimaPanel:
             )
 
         # --- Output sizing ---------------------------------------------
+        # The source keeps its aspect ratio: this sets the short side, the
+        # long side follows, both rounded down to a multiple of 32 (min 256).
         with gr.Row():
-            width = gr.Slider(
-                label="SAM3 Anima Width",
+            short_side = gr.Slider(
+                label="SAM3 Anima Short Side (keeps source aspect ratio)",
                 minimum=256,
                 maximum=4096,
                 step=32,
                 value=1024,
-                elem_id="sam3_anima_width",
-            )
-            height = gr.Slider(
-                label="SAM3 Anima Height",
-                minimum=256,
-                maximum=4096,
-                step=32,
-                value=1024,
-                elem_id="sam3_anima_height",
+                elem_id="sam3_anima_short_side",
             )
 
-        # --- LLLite schedule -------------------------------------------
+        # --- LLLite ------------------------------------------------------
+        # Only the multiplier exists on the vendor side
+        # (networks/control_net_lllite_anima.set_multiplier); there is no
+        # strength or step schedule, so no sliders for them. Range is the
+        # kohya ComfyUI-Anima-LLLite strength input (-10..10, step .01,
+        # default 1.0 = sd-scripts --lllite_multiplier default). The label
+        # is also the ui-config.json key; it changed with the range so the
+        # old saved 0..2 / .05 bounds are not reapplied.
         with gr.Row():
-            lllite_strength = gr.Slider(
-                label="SAM3 Anima LLLite Strength",
-                minimum=0.0,
-                maximum=2.0,
-                step=0.05,
-                value=1.0,
-                elem_id="sam3_anima_lllite_strength",
-            )
-            lllite_start = gr.Slider(
-                label="SAM3 Anima LLLite Start %",
-                minimum=0.0,
-                maximum=1.0,
-                step=0.01,
-                value=0.0,
-                elem_id="sam3_anima_lllite_start",
-            )
-            lllite_end = gr.Slider(
-                label="SAM3 Anima LLLite End %",
-                minimum=0.0,
-                maximum=1.0,
-                step=0.01,
-                value=1.0,
-                elem_id="sam3_anima_lllite_end",
-            )
             lllite_multiplier = gr.Slider(
-                label="SAM3 Anima LLLite Multiplier",
-                minimum=0.0,
-                maximum=2.0,
-                step=0.05,
+                label="SAM3 Anima LLLite Multiplier (-10 ~ 10)",
+                minimum=-10.0,
+                maximum=10.0,
+                step=0.01,
                 value=1.0,
                 elem_id="sam3_anima_lllite_multiplier",
             )
@@ -460,7 +432,7 @@ def build_anima_panel() -> AnimaPanel:
         status = gr.HTML(value="", elem_id="sam3_anima_status")
 
     return AnimaPanel(
-        accordion=acc,
+        container=acc,
         selected_index_state=selected_index_state,
         lllite_model=lllite_model,
         dit_override=dit_override,
@@ -476,11 +448,7 @@ def build_anima_panel() -> AnimaPanel:
         seed=seed,
         seed_random_button=seed_random_button,
         seed_pull_button=seed_pull_button,
-        width=width,
-        height=height,
-        lllite_strength=lllite_strength,
-        lllite_start=lllite_start,
-        lllite_end=lllite_end,
+        short_side=short_side,
         lllite_multiplier=lllite_multiplier,
         unload_forge_before=unload_forge_before,
         insert_mode=insert_mode,
@@ -504,6 +472,19 @@ def _anima_error_return(gallery_value, message: str):
     return gallery_value, message, gr.update(), gr.update()
 
 
+# Job names the two restoration modes run under (shared.state.begin). The
+# Stop button only interrupts while one of them holds shared.state.job.
+TILE_REPAIR_JOB = "sam3_tile_repair"
+PID_UPSCALE_JOB = "sam3_pid_upscale"
+_ANIMA_JOB_PREFIXES = (TILE_REPAIR_JOB, PID_UPSCALE_JOB)
+
+
+def stop_anima():
+    """⏹ handler for the Anima panel — same rule as ``ui_refine.stop_refine``:
+    never interrupt a txt2img that holds the queue while our click waits."""
+    stop_if_job(_ANIMA_JOB_PREFIXES)
+
+
 def _map_widget_values(values: tuple) -> AnimaTileRepairArgs:
     keyed = dict(zip(ANIMA_ARG_KEYS, values))
     lora_slots: list[tuple[str, float]] = []
@@ -523,11 +504,7 @@ def _map_widget_values(values: tuple) -> AnimaTileRepairArgs:
         cfg=_as_float(keyed.get("cfg"), 3.5),
         flow_shift=_as_float(keyed.get("flow_shift"), 5.0),
         seed=_as_int(keyed.get("seed"), -1),
-        width=_as_int(keyed.get("width"), 1024),
-        height=_as_int(keyed.get("height"), 1024),
-        lllite_strength=_as_float(keyed.get("lllite_strength"), 1.0),
-        lllite_start=_as_float(keyed.get("lllite_start"), 0.0),
-        lllite_end=_as_float(keyed.get("lllite_end"), 1.0),
+        short_side=_as_int(keyed.get("short_side"), 1024),
         lllite_multiplier=_as_float(keyed.get("lllite_multiplier"), 1.0),
         unload_forge_before=bool(keyed.get("unload_forge_before", True)),
         insert_mode=str(keyed.get("insert_mode") or "After selected"),
@@ -606,17 +583,27 @@ def handle_anima_click(
             f"image (index {idx}).</span>",
         )
 
+    def _pid():
+        return run_pid_upscale(
+            source,
+            pid_checkpoint=repair.pid_checkpoint,
+            scale=repair.pid_scale,
+            degrade_sigma=repair.pid_degrade,
+            steps=repair.pid_steps,
+        )
+
+    def _tile():
+        return run_tile_repair(source, repair)
+
+    # Like Forge's own Generate (wrap_gradio_gpu_call): queue_lock so we never
+    # unload/swap models under a running txt2img, a fresh shared.state so a
+    # previous ⏹ Stop does not abort this run, and the work on Forge's main
+    # thread. See forge_exclusive.run_exclusive.
     try:
         if is_pid:
-            new_pairs = run_pid_upscale(
-                source,
-                pid_checkpoint=repair.pid_checkpoint,
-                scale=repair.pid_scale,
-                degrade_sigma=repair.pid_degrade,
-                steps=repair.pid_steps,
-            )
+            new_pairs = run_exclusive(PID_UPSCALE_JOB, _pid, on_main_thread=True)
         else:
-            new_pairs = run_tile_repair(source, repair)
+            new_pairs = run_exclusive(TILE_REPAIR_JOB, _tile, on_main_thread=True)
     except Exception as exc:
         traceback.print_exc(file=sys.stderr)
         return _anima_error_return(

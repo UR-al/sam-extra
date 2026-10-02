@@ -2,7 +2,7 @@
 
 The sampler is single-threaded for one WebUI generation, but one denoise step
 may invoke the model wrapper multiple times. Keeping every mutable buffer under
-one object makes pass-boundary cleanup explicit and prevents stale APG/SMC/CNS
+one object makes pass-boundary cleanup explicit and prevents stale APG/SMC/RDC/CNS
 tensors from surviving a hires pass or later generation.
 """
 
@@ -10,6 +10,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from typing import Any, MutableMapping
+
+from .history import HistoryState
 
 
 @dataclass
@@ -22,8 +24,11 @@ class GuidanceRuntime:
     dave: MutableMapping[str, Any] = field(default_factory=dict)
     cns: MutableMapping[str, Any] = field(default_factory=dict)
     smc_prev: Any = None
+    rdc_state: dict[str, Any] = field(default_factory=dict)
     cns_x_t: Any = None
     cns_noise_calls: int = 0
+    # MG/HiGS velocity and prediction EMAs (sam3ext/guidance/history.py), one run at a time.
+    history: HistoryState = field(default_factory=HistoryState)
 
     def reset_cfg_state(self) -> None:
         self.apg["avg"] = None
@@ -32,8 +37,10 @@ class GuidanceRuntime:
 
     def reset_pass(self) -> None:
         self.reset_cfg_state()
+        self.rdc_state.clear()
         self.cns_x_t = None
         self.cns_noise_calls = 0
+        self.history.reset()
         self.state["active"] = 0
         self.state["step_open"] = False
         self.state["attn_raw"] = None
