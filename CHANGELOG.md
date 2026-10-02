@@ -3,6 +3,18 @@
 버전 태그는 GitHub Releases에도 발행됩니다. 아래는 요약이며, guidance/속도 기능의
 상세는 [docs/GUIDANCE.md](docs/GUIDANCE.md)를 참고하세요.
 
+## v0.30.1 — 진단 로그의 Momentum·HiGS 적용 횟수가 생성마다 쌓이던 문제
+
+- **`[VERIFY] detail`의 MG·HiGS 횟수 수정**: `Log Guidance verification summary`를 켜면 남는 `MG=APPLIED(n evals)`와
+  `HiGS=APPLIED(n evals)`가 한 Forge 실행 안에서 생성마다 더해졌습니다. 같은 요청을 보내도 9, 18, 27 …로 늘었습니다.
+  패스가 시작될 때 `GuidanceRuntime.reset_pass()`가 Momentum·HiGS 이력(EMA)만 비우고 횟수는 그대로 두었기 때문입니다.
+  `HistoryState.reset()`은 생성 중간(ADG가 uncond를 건너뛴 스텝)에도 쓰이므로 횟수를 남기는 것이 맞습니다. 그래서 이제
+  패스마다 새 이력으로 시작합니다. TSR처럼 패스마다 0부터 세고, Hires.fix를 켜면 hires 패스의 수가 남습니다.
+- **이미지는 그대로입니다**: 진단 출력만 바뀝니다. Forge 2.29.2 · Anima 3.8B에서 Momentum과 HiGS 요청을 각각 두 번씩
+  보냈습니다. 두 번 모두 MG 9회 · HiGS 24회로 같았고, 결과 md5는 고치기 전과 같았습니다.
+- **검증**: Python 1857개 통과(skip 17). 같은 생성을 두 번 돌려 두 번째 횟수가 첫 번째와 같은지 보는 회귀 테스트를
+  더했습니다. 고치기 전 코드에서는 이 테스트가 4회 · 2회로 실패합니다.
+
 ## v0.30.0 — Anima 3.8B + 캐릭터 레퍼런스 IP-Adapter + 28/40/52블록 LoRA·DoRA + 디테일 가이던스
 
 v0.21.2 이후 쌓인 큰 업데이트입니다. Anima 3.8B(Qwen3.5 / Semantic Connector v2) 런타임을 들여왔고, 캐릭터 레퍼런스 패널(이어붙이기 · IP-Adapter

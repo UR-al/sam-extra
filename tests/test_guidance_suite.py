@@ -354,6 +354,19 @@ class GuidanceRuntimeTests(unittest.TestCase):
         self.assertFalse(state["step_open"])
         self.assertEqual(state["active"], 0)
 
+    def test_reset_pass_starts_a_fresh_mg_higs_history(self):
+        runtime = GuidanceRuntime(state={}, apg={}, adg={})
+        history = runtime.history
+        history.mg_m, history.higs_g, history.last_sigma = torch.ones(1), torch.ones(1), 0.5
+        history.counters.update(mg=9, higs=24)
+
+        runtime.reset_pass()
+
+        self.assertIsNone(runtime.history.mg_m)
+        self.assertIsNone(runtime.history.higs_g)
+        self.assertIsNone(runtime.history.last_sigma)
+        self.assertEqual(runtime.history.counters, {"mg": 0, "higs": 0})   # the [VERIFY] eval counts are per pass
+
 
 if __name__ == "__main__":
     unittest.main()

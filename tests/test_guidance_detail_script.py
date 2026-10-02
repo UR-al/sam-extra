@@ -349,6 +349,26 @@ class DetailStageScriptTests(unittest.TestCase):
         lines = [str(call.args[0]) for call in log.call_args_list if call.args]
         self.assertTrue(any(line.startswith("[VERIFY] detail: TSR=APPLIED(1 evals)") for line in lines), lines)
 
+    def test_mg_higs_eval_counts_restart_every_generation(self):
+        # 2026-10-03 GPU run: the [VERIFY] MG/HiGS counts added up over one Forge session (MG 9, 18, 27 …)
+        # because reset_pass kept the history's counters. Two identical generations report the same counts.
+        self.args[74], self.args[80] = True, True              # MG, HiGS with their defaults
+        schedule = torch.tensor([1.0, 0.8, 0.6, 0.3, 0.2, 0.0])
+        reports = []
+        for _ in range(2):
+            request = self._request()
+            self.process.process_before_every_sampling(request, *self.args)
+            with mock.patch.object(self.pag, "guidance_diagnostics_enabled", return_value=True), \
+                    mock.patch.object(self.pag, "_log") as log:
+                for i, sigma in enumerate([0.8, 0.6, 0.3]):
+                    self._post(sigma, seed=i, schedule=schedule)
+                self.process.postprocess(request, None)
+            reports.append(next(str(call.args[0]) for call in log.call_args_list
+                                if call.args and str(call.args[0]).startswith("[VERIFY] detail:")))
+        self.assertEqual(reports[0], reports[1])
+        self.assertIn("MG=APPLIED(2 evals)", reports[1])           # the first evaluation only seeds
+        self.assertIn("HiGS=APPLIED(1 evals)", reports[1])         # seeds, applies at 0.6, σ 0.3 < t_min
+
     def test_hiflow_records_the_base_pass_and_aligns_its_hires_pass(self):
         p = self.pag
         self.args[87] = True

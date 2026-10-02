@@ -40,7 +40,9 @@ class GuidanceRuntime:
         self.rdc_state.clear()
         self.cns_x_t = None
         self.cns_noise_calls = 0
-        self.history.reset()
+        # A fresh MG/HiGS history: the EMAs and the [VERIFY] eval counters are per pass, like TSR's steps.
+        # HistoryState.reset() keeps the counters — it is also the mid-run reset (an ADG cond-only step).
+        self.history = HistoryState()
         self.state["active"] = 0
         self.state["step_open"] = False
         self.state["attn_raw"] = None
