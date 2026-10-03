@@ -14,12 +14,12 @@ import { JSDOM } from "jsdom";
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..");
 const SCRIPT = readFileSync(path.join(ROOT, "javascript", "notebook.js"), "utf8");
 
-function buildDropdown(choiceCount = 163, pageSize = 60) {
+function buildDropdown(choiceCount = 163, pageSize = 60, inputAttrs = "") {
   const dom = new JSDOM(
     `<!doctype html><html><body>
       <div class="gradio-container">
         <div id="long_axis" class="gradio-dropdown">
-          <div class="container"><input role="listbox" value="Axis 001"></div>
+          <div class="container"><input role="listbox" value="Axis 001"${inputAttrs}></div>
         </div>
       </div>
     </body></html>`,
@@ -117,4 +117,21 @@ test("typing a new query resets pagination to one configured page", () => {
   assert.equal(optionCount(state.list), 60);
   assert.match(state.status.textContent, /64개 중 60개 표시/);
   dom.window.close();
+});
+
+// The proxy hides the Gradio input, so a description the page gave that input
+// (Colorcraft's "편집 중: …" from colorcraft_editor.js) must reach the trigger
+// that replaces it for keyboard and screen-reader users.
+test("the trigger carries the hidden input's description, and none when it has none", () => {
+  const described = buildDropdown(3, 60, ' aria-describedby="axis_note axis_hint"');
+  assert.equal(
+    dropdownState(described).trigger.getAttribute("aria-describedby"),
+    "axis_note axis_hint"
+  );
+  assert.equal(dropdownState(described).trigger.getAttribute("aria-label"), "Long axis");
+  described.window.close();
+
+  const plain = buildDropdown(3);
+  assert.equal(dropdownState(plain).trigger.hasAttribute("aria-describedby"), false);
+  plain.window.close();
 });

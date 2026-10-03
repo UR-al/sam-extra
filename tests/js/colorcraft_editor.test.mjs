@@ -1,6 +1,7 @@
 // Colorcraft 공유 편집기(javascript/colorcraft_editor.js) — DOM 없는 vm 에서 Gradio 4.40 의 frontend_fn 처럼 부른다
-// (inputs 뒤에 outputs 의 현재 값). 끝의 jsdom 부분은 실제 colorcraft_sliders.js 와 함께 올려 빠른 드롭다운 맞추기 ·
-// 숫자 칸 범위 풀기 · Ctrl+Enter 순서를 본다.
+// (inputs 뒤에 outputs 의 현재 값). 끝의 jsdom 부분은 실제 colorcraft_sliders.js 와 함께 올려 빠른 드롭다운 맞추기(0ms 타이머 →
+// 한 프레임 뒤) · 숫자 칸 범위 풀기 · Ctrl+Enter 순서를 본다. 맞추기가 Gradio 가 그린 값과 같은 화면 갱신에 드는지는
+// colorcraft_editor_timing.test.mjs, 접근성(선택 줄 이름, 편집기 칸 설명, 알림)은 colorcraft_editor_a11y.test.mjs 가 본다.
 import test from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
@@ -28,6 +29,8 @@ function defaults(mod = "I", mask = "M1") {
 const modIndex = (name) => schema.modifierFields.findIndex((f) => f.name === name);
 const leafIndex = (name) => N_MOD + schema.leafFields.findIndex((f) => f.name === name);
 const isSkip = (v) => v && typeof v === "object" && v.__type__ === "update" && Object.keys(v).length === 1;
+// 편집기가 Gradio 가 그린 뒤 하는 일(0ms 타이머 → 한 프레임)이 끝난 뒤: 같은 순서로 하나 더 걸면 그 뒤에 돈다.
+const afterNudge = (window) => new Promise((r) => window.setTimeout(() => window.requestAnimationFrame(() => r()), 0));
 
 test("sync: nothing to do when the editors already show the targets of this state", async () => {
     const out = await callJs(env, js("sync"), ["I", "M1", true, false, "", "I|M1|0", ...defaults()], SYNC_OUT);
@@ -192,7 +195,7 @@ test("commit: a combo's Mask A/B outside its own reference list is the default (
     assert.equal(JSON.parse(JSON.stringify(st.map))["C2.mask_a"], "C1");
 });
 
-// jsdom: sam-extra 의 notebook.js 빠른 드롭다운(가짜)이 불러온 값을 두 프레임 뒤에 듣는다
+// jsdom: sam-extra 의 notebook.js 빠른 드롭다운(가짜)이 불러온 값을 Gradio 가 그린 뒤(0ms 타이머 → 한 프레임)에 듣는다
 test("sync nudges the fast-dropdown proxies after Gradio's flush (values and the combo's list)", async (t) => {
     const P = "script_txt2img_colorcraft_samextra_";
     const dd = (name, value) => `<div class="gradio-dropdown" id="${P}${name}"><input role="listbox" value="${value}"></div>`;
@@ -211,7 +214,9 @@ test("sync nudges the fast-dropdown proxies after Gradio's flush (values and the
     const out = window.samextraColorcraft.sync("txt2img", ["I", "C2", true, true, "", "I|M1|0", ...defaults()]);
     assert.equal(out.length, SYNC_OUT);
     assert.deepEqual(synced, []);                                     // not before Gradio has applied the update
-    await new Promise((r) => window.requestAnimationFrame(() => window.requestAnimationFrame(() => setTimeout(r, 0))));
+    await new Promise((r) => window.setTimeout(r, 0));
+    assert.deepEqual(synced, []);                                     // nor in the 0 ms timer: only in the frame after it
+    await afterNudge(window);
     assert.deepEqual(synced.map((x) => x[0]).sort(), ["combo_mask_a", "combo_mask_b", "mod_kind"]);
     assert.deepEqual(synced.find((x) => x[0] === "mod_kind")[1], "Chroma");
     assert.deepEqual(choices.map((x) => x[0]).sort(), ["combo_mask_a", "combo_mask_b"]);
@@ -340,7 +345,7 @@ test("real notebook.js: the nudge updates the installed proxies' value and the c
     assert.equal(out[2 + modIndex("kind")], "Chroma");
     doc.querySelector(`#${PRE}mod_kind input[role='listbox']`).value = "Chroma";
     assert.equal(shown("mod_kind"), "Advanced");                         // nothing before Gradio's flush
-    await new Promise((r) => window.requestAnimationFrame(() => window.requestAnimationFrame(() => setTimeout(r, 0))));
+    await afterNudge(window);
     assert.equal(shown("mod_kind"), "Chroma");
     assert.deepEqual(offered("combo_mask_a"), ["none", ...schema.maskTags, "C1"]);
 });

@@ -1537,3 +1537,20 @@ html:not([data-sam3-theme]) .dark .sam3-progress[data-state="interrupted"]:is([d
     }
 }
 /* sam3-composition:end */
+
+/* samextra-colorcraft:begin */
+/* Colorcraft 공유 편집기의 화면 낭독기 전용 노드(javascript/colorcraft_editor.js 의 SR_CLASS — 탭마다 요약 줄 블록 안에
+ * 마운트 때 한 번 넣는다: 편집 중인 항목의 설명과 항목을 바꾼 알림). 보이지 않고 자리도 차지하지 않는다 — 요약 줄 블록
+ * (Gradio .block)이 position: relative 다. 알림이 읽히도록 display: none 이나 visibility: hidden 은 쓰지 않는다. */
+.samextra-cc-sr {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    margin: -1px;
+    padding: 0;
+    border: 0;
+    overflow: hidden;
+    clip-path: inset(50%);
+    white-space: nowrap;
+}
+/* samextra-colorcraft:end */

@@ -132,7 +132,7 @@ def _component(gr, f, elem_id, value=None, choices=None, visible=True, elem_clas
 
 def _tab(elem_id):
     """``txt2img`` or ``img2img``, from Forge's ``script_<tab>_…`` ids: colorcraft_editor.js finds this panel's
-    dropdowns by it (the fast-dropdown nudge)."""
+    elements by it (the fast-dropdown nudge, and the screen-reader names, descriptions and announcements)."""
     return "img2img" if str(elem_id("accordion")).startswith("script_img2img_") else "txt2img"
 
 

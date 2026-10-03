@@ -205,6 +205,19 @@ class BuildPlanTests(unittest.TestCase):
             with self.assertRaises(PlanError):
                 self.plan(threshold="delta_optimal", delta=delta)
 
+    def test_custom_spectrum_validation(self):
+        """A <= 0 used to escape as ValueError / ZeroDivisionError (only PlanError is caught, so the whole
+        Forge request failed) and a NaN A or beta ran with a NaN sigma*: all are settings errors now."""
+        nan, inf = float("nan"), float("inf")
+        for A, beta in ((-1.0, 1.9), (0.0, 1.9), (nan, 1.9), (inf, 1.9), (203.6, nan), (203.6, inf), (203.6, 1e6)):
+            for threshold in ("delta_optimal", "neo_shift"):
+                with self.subTest(A=A, beta=beta, threshold=threshold):
+                    with self.assertRaises(PlanError) as ctx:
+                        self.plan(threshold=threshold, A=A, beta=beta, full_grid=(128, 128))
+                    self.assertEqual(ctx.exception.kind, "invalid")
+        plan = self.plan(threshold="delta_optimal", A=203.6, beta=-3.0, full_grid=(128, 128))
+        self.assertEqual(len(plan.transitions), 1)          # a negative beta is still a valid power law
+
     def test_grids(self):
         self.assertEqual(schedule.stage_grids("transition", [0.37, 1.0], 27, 33), [(10, 12), (27, 33)])
         self.assertEqual(schedule.stage_grids("respace", [0.5, 1.0], 125, 96), [(62, 48), (125, 96)])

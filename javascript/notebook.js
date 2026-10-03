@@ -616,6 +616,11 @@
         trigger.setAttribute("aria-haspopup", "listbox");
         trigger.setAttribute("aria-controls", listId);
         trigger.setAttribute("aria-expanded", "false");
+        // The trigger stands in for the hidden Gradio input, so it carries the
+        // input's description too (e.g. Colorcraft's "편집 중: …" from
+        // colorcraft_editor.js, which also re-applies it to proxies installed later).
+        var describedBy = input.getAttribute("aria-describedby");
+        if (describedBy) trigger.setAttribute("aria-describedby", describedBy);
         var value = document.createElement("span");
         value.className = "sam3-fast-dropdown-value";
         if (isMulti) value.classList.add("sam3-fast-dropdown-multi-value");
