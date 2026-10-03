@@ -3,7 +3,7 @@
 이 확장의 코드는 GPL-3.0-only(GNU GPL 3판만) 로 배포합니다(루트 [LICENSE](LICENSE)). 예외로 편입한 NegPiP 파일은 AGPL-3.0-or-later
 를 따르므로 저장소 전체는 SPDX `GPL-3.0-only AND AGPL-3.0-or-later` 입니다(아래 절). 아래는 저장소에 함께 들어 있는 제3자 코드·자산과
 그 원래 조건입니다. 편입한 파일에는 원래 고지가 그대로 남고, 이 확장의 GPL-3.0-only 는 이 파일들의 상류 조건을
-대체하지 않습니다(MIT·Apache-2.0 은 GPL-3.0 과 함께 배포할 수 있는 조건이고, AGPL-3.0 인 NegPiP 는 GPL-3.0 13조로 결합합니다 — 아래 절). `install.py` 가 첫 실행 때 받는
+대체하지 않습니다(MIT·BSD-3-Clause·Apache-2.0 은 GPL-3.0 과 함께 배포할 수 있는 조건이고, AGPL-3.0 인 NegPiP 는 GPL-3.0 13조로 결합합니다 — 아래 절). `install.py` 가 첫 실행 때 받는
 vendor(`lora_manager_vendor/`, `anima_vendor/`)와 사용자가 따로 받는 모델 가중치는 저장소에 없으며 README 의
 출처 / 크레딧 절에 적었습니다.
 
@@ -31,6 +31,43 @@ vendor(`lora_manager_vendor/`, `anima_vendor/`)와 사용자가 따로 받는 �
 - `scripts/anima_3_8b.py` — 이 확장에 맞게 다시 작성(API dict 인자, Bypass, 상태 기록·붙여 넣기).
 - 상류의 `bundle_v2.py`(번들 제작 도구)와 `install.py` 는 포함하지 않았습니다.
 - `adapter.py`, `qwen35.py`, `semantic_v2.py`, `tokenizer.py` 는 상류와 같습니다.
+
+## forgeneo-mcp (MIT)
+
+`mcp_server/sam_extra_mcp/forgeneo/` 는 [eduardoabreu81/forgeneo-mcp](https://github.com/eduardoabreu81/forgeneo-mcp)
+(commit `a103dc5`) 의 `forgeneo_mcp` 패키지를 편입한 것이고, `mcp_server/sam_extra_mcp/server.py`·`service.py` 는 그 패키지의
+`server.py` 에서, `tests/test_mcp_forgeneo_upstream.py` 는 상류 `tests/` 에서 나왔습니다. 원본 라이선스는
+MIT(Copyright (c) 2026 Eduardo Abreu)이며, 각 파일 머리에 저작권·허가 고지와 이 확장에서 바꾼 곳 목록이 그대로 남아 있습니다.
+
+이 확장에서 바꾼 부분:
+
+- 패키지 이름 `forgeneo_mcp` → `sam_extra_mcp.forgeneo`. MCP SDK 는 `server.py` 만 불러오고(`mcp>=2.2,<3`, 1.x FastMCP 대체 경로
+  제거) 도구 본문은 SDK 없이 도는 `service.py` 로 옮김. 권한 정책(`policy.py`)·경로 찾기(`forge_paths.py`)는 이 확장의 코드.
+- `config.py` — Forge 가 같은 PC(`localhost` 나 루프백 IP 리터럴)면 FORGE_PATH_MAP 없이 Forge 경로를 그대로 씀, 자격 증명은
+  repr·출력에서 숨김(FORGE_URL 에 적힌 `사용자:비밀번호@` 도 URL 에서 빼 인증으로 옮김), 기록 색인 갱신 주기(`FORGE_HISTORY_MAX_AGE`),
+  한 번 생성의 화소 상한(`SAM_EXTRA_MCP_MAX_PIXELS`).
+- `client.py` — 쓰는 경로만 허용(`/sdapi/v1/cmd-flags`·`/internal/sysinfo` 는 호출하지 않음 — cmd-flags 는 `--api-auth` 자격 증명을
+  그대로 돌려줌), 리디렉션을 따라가지 않고 3xx 는 오류(상류는 따라감), 옵션 쓰기는 체크포인트 전환 키만(요청 경로에서 검사), 진행
+  상황은 미리보기 이미지 없이, 테스트용 transport, httpx 지연 import.
+- `generate.py` — 출력 폴더를 확장 위치에서 찾고 API 결과는 `outdir_samples` 무시(Forge API 와 같게), 결과 파일을 infotext·시드·
+  요청 시간으로 이 요청 것만 고름(동시에 돌린 다른 생성 제외), 디스크에서 못 찾은 이미지는 API 응답에서 대체 폴더에 저장(상류는 렌더
+  뒤 ok:false), 실제 형식 확장자·덮어쓰지 않음, 격자·보조 저장 구분, init 이미지는 이 PC 의 정지 이미지 64 MB 까지(네트워크 공유·
+  장치 경로 거절, 정규화한 절대 경로로 엶), 요청이 그릴 화소 수 계산(`requested_pixels`: 크기·하이레스·배치·반복).
+- `history.py`·`loras.py` — 색인 갱신(요청·생성 뒤·나이 제한), 강제 재구축 때 두 번 세던 문제, 바뀌지 않은 파일은 다시 읽지 않음, 잠금.
+  LoRA 제작자가 쓴 글(제목·기반 모델·트리거·태그·설명)은 길이를 자르고 결과에서 `untrusted_tags`·`untrusted_description`·
+  `untrusted_categories` 로 이름 붙임(상류는 `tags`·`description`·`categories`, 설명 600자 → 400자).
+- `infotext.py` — JPEG·WebP 의 EXIF UserComment, tEXt 는 Latin-1(PNG 규격), 압축 iTXt·zTXt, 메모리 이미지 읽기.
+- `fetcher.py` — httpx 로 교체, 크기와(Hugging Face 가 알려 주면) SHA256 이 맞을 때만 파일을 남기고 크기를 모르면 받지 않음,
+  safetensors 머리 확인, 정책 결과(`permitted`)를 반드시 받음, 크기 확인 HEAD 가 GET 이 되지 않음, 덮어쓰지 않음(이름이 있으면 실패하는
+  이동으로 자리에 놓음 — Windows 는 `os.rename`, 그 밖은 하드 링크).
+- `modules.py` — sam-extra Anima 3.8B 모듈(Qwen3.5-4B, 확장 어댑터)을 인정하는 `extras`, Qwen2D VAE 계열.
+- `profile.py`·`capabilities.py`·`identity.py` — 형 검사 전용 import, extras 전달, 정책·경로 보고, 응답 캐시 폴더 설정·원자적 쓰기,
+  체크포인트 전환 때 넘긴 프리셋은 그 인스턴스에 있는 것만(상류는 그대로 씀), 체크포인트 사이드카 태그는 길이를 잘라
+  `untrusted_checkpoint_tags` 로.
+- `presets.py`·`dialects.py`·`downloads.py`·`civitai.py` 는 상류와 같습니다. 상류의 README·`glama.json`·배너 이미지는 넣지 않았습니다.
+- `tests/test_mcp_forgeneo_upstream.py` 는 상류 pytest 130개 중 128개를 unittest 로 옮긴 것입니다.
+
+MIT 고지 전문은 이 문서 끝에 있습니다. 이 확장의 GPL-3.0-only 라이선스는 이 코드의 상류 조건을 대체하지 않습니다.
 
 ## sd-forge-negpip — NegPiP (AGPL-3.0-or-later)
 
@@ -199,6 +236,38 @@ Apache-2.0 으로 명시합니다. 이 확장의 GPL-3.0-only 라이선스는 �
 (Copyright (c) 2024 Sahand Ahmadian — sd-webui-detail-daemon, Copyright (c) 2024 Jonseed — ComfyUI-Detail-Daemon)
 이며 MIT 고지 전문은 이 문서 끝에 있습니다. 이 확장의 GPL-3.0-only 라이선스는 이 코드의 상류 조건을 대체하지 않습니다.
 
+## ComfyUI-Colorcraft (MIT)
+
+`sam3ext/colorcraft/` 는 [muerrilla/ComfyUI-Colorcraft](https://github.com/muerrilla/ComfyUI-Colorcraft)
+(commit `d28ac6a4e997d0f8a2f1a60b7361b561c4a15bbf`, 2026-09-01) 의 계산을 편입한 것입니다. 원 라이선스는 MIT
+(Copyright (c) 2026 Sahand Ahmadian Tehrani (Muerrilla)) 이며 편입한 파일마다 머리에 원래 고지와 바꾼 내용을 적었습니다.
+
+- 그대로 옮긴 것: `lib_colorcraft/vectors.py` → `vectors.py`, `masking.py` → `masking.py`, `debug.py` → `debug.py`,
+  `schedule.py` 의 `make_schedule` 과 `nodes.py` 35-59줄 `sigma_to_value` → `schedule.py`, `color.py` 의 대비·색 이동·색
+  기준점 함수 → `color.py`, `basis.py` 의 `load_basis`·`resolve_dev` 와 krea2·zimage 보정값 → `basis.py`,
+  `vectors/colorcraft-krea2.safetensors`·`colorcraft-zimage.safetensors` → `data/`(바이트 그대로).
+- 옮겨 쓴 것: `nodes.py` 의 post-CFG 본문(543-728줄) → `engine.py`(색 기준점을 생성 전에 만들어 넘기는 것, family 별 VAE 배율,
+  미리 구한 스케줄 값 — 세 가지 치환만, 테스트가 구문 트리로 대조), Forge 스크립트의 Debug 패널(112-135·820-905·956-966줄) →
+  `debug_panel.py`, 패널의 범위·스택 구조·infotext 형식 → `spec.py`·`ui.py`, `javascript/colorcraft-sliders.js` →
+  `javascript/colorcraft_sliders.js`(범위 선택자를 이 확장의 아코디언으로, 페이지가 바뀔 때마다 숫자 칸 전체를 다시 훑던 감시를
+  아코디언 두 개 안의 바뀐 노드만 보도록 — 범위 밖 값을 받는 blur·Enter 처리는 상류 그대로).
+
+Forge Neo 구조와 Flux2 family 는 포크 [aoleg/ComfyUI-Colorcraft](https://github.com/aoleg/ComfyUI-Colorcraft)
+(commit `f00066c63c9d8f96abc119cada3b51b36688fcac`, Oleg Afonin — 같은 MIT, LICENSE 에는 원본 고지
+"Copyright (c) 2026 Sahand Ahmadiantehrani (Muerrilla)")를 따랐습니다: `lib_colorcraft/core.py` 의 `to_model_space`(latent 차원을 인자로)·
+`family_for_latent_format`·flux2 보정값·VAE 배율 표, `vectors/colorcraft-flux2.safetensors`(바이트 그대로), UNet 복제본의
+post-CFG 로 붙이는 `scripts/colorcraft_neo.py` 의 방식. flux2 보정값에는 원본이 뒤에 더한 `detail_scale`(4.0, Flux2 에서
+재지 않음)을 붙였습니다.
+
+이 확장에서 새로 쓴 것: Forge 훅(`hook.py` — 소유 표시가 붙은 붙이기·떼기, img2img·hires σ 구간, `vae.encode` +
+`process_in` 색 기준점과 요청 사이 캐시, 오류 시 입력 그대로와 status, fp16/bf16, CompVis 샘플러의 원본 Forge 스텝 카운터), 노드
+종류를 고르는 탭·Pass·infotext(이 확장의 키와 원본·포크 키 읽기), `scripts/colorcraft.py`.
+
+`tests/_origin_colorcraft/`(원본 `nodes.py`·`lib_colorcraft/`·`scripts/colorcraft.py`·`LICENSE`)와
+`tests/_origin_colorcraft_fork/`(포크 `core.py`·`params.py`·`spec.py`·`LICENSE`)는 대조 테스트용 사본입니다(머리 주석만
+붙였고 테스트가 파일마다 SHA-256 을 고정). 확장 실행 코드는 이 사본을 import 하지 않습니다. MIT 고지 전문은 이 문서 끝에
+있습니다. 이 확장의 GPL-3.0-only 라이선스는 이 코드의 상류 조건을 대체하지 않습니다.
+
 ## Anima Safe PAG — 적용 구간·번호 파싱 (MIT)
 
 `sam3ext/guidance/sigma_window.py` 는 [iljung1106/comfyui-anima-safe-pag](https://github.com/iljung1106/comfyui-anima-safe-pag)
@@ -242,6 +311,37 @@ forward 마다 한 번만 찾는 캐시입니다. 기본 블록 `8-18` 은 같�
 MIT 고지 전문은 이 문서 끝에 있습니다. DC 감쇠 계산(`sam3ext/guidance/dave.py`)과 블록 래퍼는 이 확장이 다시 작성한
 것입니다.
 
+## Smooth Progress — 진행 막대 (MIT)
+
+`sam3ext/progress_api.py`·`scripts/appearance_progress_bar.py`·`javascript/progress_bar.js` 와 `style.css` 의
+`sam3-progress` 블록은 [diamfang/sd-webui-smooth-progress](https://github.com/diamfang/sd-webui-smooth-progress)
+(commit `7fe58101ae315af1b5e6eda6080e72ac45bfe846`, 코드는 `2b966fc` 와 같음) 를 옮긴 것입니다:
+`scripts/smooth-progress.py` 의 스텝별 ETA(`_step_eta`, 21-54줄)와 `/smooth-progress/api` 처리(57-112줄),
+`javascript/smooth-progress.js` 의 부드러움 세 방식·글자 형식 여덟 가지·글자 위치·끝난 뒤/중단 표시·높이·사라지는
+시간. 원 라이선스는 MIT(Copyright (c) 2026 diamfang)이고 세 파일 머리에 상류 고지 전문을 그대로 두었으며, MIT 고지
+전문은 이 문서 끝에도 있습니다. 대조 테스트 사본 `tests/_origin_smooth_progress.py` 는 `scripts/smooth-progress.py`
+전체를 바꾸지 않고 옮긴 것입니다(머리 주석만 붙였고 `tests/test_progress_origin.py` 가 SHA-256 을 고정합니다).
+
+이 확장에서 바꾼 부분:
+
+- 시작·끝: 'generate' 처럼 보이는 클릭으로 시작을 짐작하고 인증 없는 경로를 100ms 마다 계속 묻던 것을, Forge
+  `requestProgress`(javascript/progressbar.js:77) 감싸기로 바꿨습니다. 인자 여섯 개와 원래 `atEnd`·`onProgress` 는
+  그대로 넘기고, 그 탭이 시작한 작업만 시작부터 끝까지, 페이지가 보일 때만 묻습니다.
+- 경로: `GET /smooth-progress/api` → `GET /sam-extra/progress?id_task=`. 다른 sam-extra 경로와 같은 로그인·
+  `--api-auth` 의존성과 `X-SAM3-Notebook: 1` 헤더, `Cache-Control: no-store`, OpenAPI 스키마 제외. 작업 하나의
+  실행·대기·완료와 대기열 위치를 답합니다.
+- 진행률·ETA: 한 패스가 아니라 Forge 기본 막대와 같은 작업 전체(`job_no`/`job_count`). ETA 는 패스 종류(Hires
+  첫 패스·hires 패스)별 스텝 평균과 끝난 패스 시간으로 잡은 작업 전체의 남은 시간이고, 새 패스는 스텝 0 을 못
+  봐도 스텝 시계를 새로 시작합니다. 모르는 ETA 는 0.1 초 대신 `null`, Skip 은 중단으로 치지 않습니다.
+- 설정: ⚙️ 팝오버와 localStorage 대신 Forge Settings(`sam3_progress_*`, SAM Extra Progress Bar), 기본 꺼짐.
+  그라데이션·움직이는 색 프리셋과 애니메이션 속도는 빼고(디자인 규칙: 그라데이션·빛 번짐 없음) 단색 네 가지와
+  테마 강조색·성공색·직접 지정 색만 남겼습니다. 높이는 10~50px 로 제한하고, 중단 표시 네 가지를 모두 고를 수
+  있습니다(상류 슬라이더는 세 번째까지).
+- 화면: 테마 변수 색, 빛 번짐(filter·drop-shadow) 없는 두 겹 글자, 지속 텍스트 노드의 `.data` 만 바꿈,
+  prefers-reduced-motion 이면 보간 없음. Forge 기본 막대는 지우지 않고 CSS 로 숨깁니다. ETA 를 모를 때
+  Smooth > Accurate 가 99% 로 내달리던 것을 고쳤습니다.
+- sd-webui-smooth-progress 가 함께 설치돼 있으면(`#spb-dynamic-css`) 이 막대는 켜지지 않습니다.
+
 ## ComfyUI TSR — Temporal Score Rescaling (GPL-3.0)
 
 `sam3ext/guidance/tsr.py` 의 식(`rescale_factors`·`apply_tsr`)은 ComfyUI(`comfyanonymous/ComfyUI`, commit
@@ -254,6 +354,18 @@ MIT 고지 전문은 이 문서 끝에 있습니다. DC 감쇠 계산(`sam3ext/g
 - UI 슬라이더 범위를 좁혔습니다.
 
 원본은 이 확장과 같은 GPL-3.0 입니다.
+
+## ComfyUI — Laplace 스케줄러 (GPL-3.0)
+
+`sam3ext/extra_schedulers/schedulers.py` 의 `get_sigmas_laplace` 는 ComfyUI(`comfyanonymous/ComfyUI`, commit
+`36c0b0a687e5e6d7b55e3e61ab24262ffc0f2508`) `comfy/k_diffusion/sampling.py` 52-59줄을 바꾸지 않고 옮긴 것입니다
+(Hang et al., "Improved Noise Schedule for Diffusion Training", [arXiv:2407.03297](https://arxiv.org/abs/2407.03297) 의
+Laplace 스케줄). Forge 의 다른 스케줄러처럼 마지막 0 을 붙이는 것만 이 확장이 더했습니다(노드는 `steps` 개만 내고
+SamplerCustom 이 sigma_min 에서 멈춤). μ/β 의 기본값·범위는 같은 commit `comfy_extras/nodes_custom_sampler.py` 112-133줄
+`LaplaceScheduler` 노드를 따릅니다. `tests/_origin_comfyui_laplace.py` 는 이 두 부분을 그대로 담은 대조 오라클이고(머리 주석과
+구획 줄만 더함, `tests/test_extra_schedulers_origin.py` 가 구획마다 SHA-256 을 고정), 확장 실행 코드는 이 파일을 import 하지
+않습니다. 원본은 이 확장과 같은 GPL-3.0 입니다. 같은 기능의 나머지 스케줄러(Cosine·CosineExponential blend·Phi·Karras
+Dynamic·custom)는 아래 재구현 표에 있습니다.
 
 ## HiFlow — 흐름 정렬 (Apache-2.0)
 
@@ -284,6 +396,79 @@ Apache-2.0 4(b) 에 따라 파일 머리 주석에 적었습니다. 상류 `LICE
 확장 옆에 있을 때만 그 함수를 AST 로 꺼내 대조합니다(사본 없음). 이 확장의 GPL-3.0-only 라이선스는 위 코드·가중치의
 상류 조건을 대체하지 않습니다.
 
+## SPEED — Spectral Progressive Diffusion (MIT)
+
+`sam3ext/speed/`(`spectral.py`·`schedule.py`·`runner.py`·`forge_host.py`)와 `scripts/anima_speed.py` 는 세 상류를 옮겨 다시
+작성한 것입니다.
+
+- [howardhx/speed](https://github.com/howardhx/speed) (공식, commit `ca7801c9bdffe681742e9592345bcf4885959be5`) 의 `utils.py`
+  (`power_spectrum`·`activation_time`·`delta_optimal_transitions`·`kappa`·`align_timestep`·DCT/FFT/DWT 확장·`validate_scales`)와
+  `comfyui/speed_sampler.py`(구간 나눔·전환 σ 패치·첫 DCT 축소) — Copyright (c) 2026 Howard Xiao.
+- [aoleg/ComfyUI-SPEED](https://github.com/aoleg/ComfyUI-SPEED) (ruwwww/ComfyUI-SPEED 의 포크, commit
+  `a8873591a27f2c1e086a2caf546f9b6aeec62b81`) 의 `speed_core.py`(프리셋 표·Adaptive delta·`sigma_divisor`/neo_shift·
+  `_resolve_transitions`)·`spectral_utils.py`(`equivalent_delta`·`reference_coarse_fraction`)·`scripts/speed_forge.py`(Forge 스크립트·
+  가드) — Copyright (c) 2026 A. Izzuddin Al Faruq (포크의 Forge/프리셋 작업은 Oleg Afonin).
+- [sorryhyun/ComfyUI-Spectrum-KSampler](https://github.com/sorryhyun/ComfyUI-Spectrum-KSampler) (commit
+  `b46a364aec3b161b889c9cc26cd976a49eb537ae`) 의 `_vendor/networks/spd_core.py`(DCT 행렬 캐시·`dct_lowpass_init`·`spectral_expand`)와
+  `spd.py`(respace 반복·`resolve_spd_schedule`) — Copyright (c) 2026 sorryhyun.
+
+aoleg 포크의 README 는 공식 저장소를 BSD 3-Clause 로 적지만, 고정한 commit 의 공식 `LICENSE` 는 MIT 이고 이 확장은 그것을
+따릅니다.
+
+이 확장에서 바꾼 부분(파일 머리 주석에 같은 목록): scipy·numpy 변환·PyWavelets 대신 장치 위 float64 DCT 행렬(크기별 캐시)·`torch.fft`·
+Haar 합성 · 공식 ca7801c9 와 같은 FFT 노이즈 수정(aoleg 판의 `/√2` 제거) · 이미지 시드별 확장·SDE·Brownian 노이즈(배치 = 단일 시드) ·
+저해상도 스텝이 없으면 적용하지 않음, 마지막 전환이 없으면 건너뜀 · img2img·Hires 시작 latent 의 flow 형태 보정(설정, 끄면 원본) ·
+두 방식(transition·respace)을 한 실행기로, respace 는 고른 샘플러를 구간마다 · Forge `sampling_sigmas` 갱신 · 가드(마스크·레퍼런스
+latent(Anima·Flux Kontext·Flux.2 Klein·Qwen-Image-Edit·Krea 2)·Wan I2V·PiD·ControlNet·비 flow 모델·Spectrum Integrated·샘플러) ·
+DWT 의 r ≠ 2 를 미리 거절 · 상태를 클래스가 아닌 요청(p)에 보관 · infotext·XYZ·설정.
+
+대조 테스트용 원본 사본(확장 실행 코드는 import 하지 않음, `tests/test_speed_origin.py` 가 SHA-256 을 고정): `tests/_origin_speed_core.py`
+(aoleg `speed_core.py` 무수정), `tests/_origin_speed_spectral_utils.py`(aoleg `spectral_utils.py` — FFT 한 줄만 공식 ca7801c9 처럼 고침,
+머리 주석에 적음), `tests/_origin_speed_official_utils.py`(공식 `utils.py` 무수정), `tests/_origin_spd_core.py`·`tests/_origin_spd_sampler.py`
+(sorryhyun `spd_core.py`·`spd.py` 무수정). `tests/test_anima_speed_script.py`·`test_speed_runner.py`·`test_speed_schedule.py` 는 aoleg
+`tests/test_forge_script.py`·`tests/test_math.py` 의 경우를 옮겨 고친 것입니다. 원 라이선스는 모두 MIT 이며 MIT 고지 전문은 이 문서 끝에
+있습니다. 이 확장의 GPL-3.0-only 라이선스는 이 코드의 상류 조건을 대체하지 않습니다.
+
+## ComfyUI SamplerER_SDE — ER SDE 잡음 척도 (GPL-3.0)
+
+`sam3ext/extra_samplers/er_sde.py` 의 `reverse_time_sde_noise_scaler`·`ode_noise_scaler`·`er_sde_kwargs` 는 ComfyUI
+(`comfyanonymous/ComfyUI`, commit `36c0b0a687e5e6d7b55e3e61ab24262ffc0f2508`) `comfy_extras/nodes_custom_sampler.py` 585-633줄
+`SamplerER_SDE` 의 두 잡음 척도(h(λ)=λ^(η+1), h(λ)=λ)와 ODE 규칙(`solver_type == "ODE" or eta == 0` → `s_noise = 0`),
+`sample_er_sde` 에 넘기는 세 인자를 옮긴 것입니다. 풀이 자체는 Forge 내장 `sample_er_sde`(ComfyUI v0.3.75 사본)를 그대로 부릅니다.
+달라진 곳은 η·stage 를 노드 입력 대신 Extra Samplers 아코디언에서 받고 노드 범위(stage 1–3, η 0–10)로 자르는 것과, 노드의
+ER-SDE 선택지는 Forge 내장 ER SDE 이므로 다시 두지 않은 것입니다. `tests/_origin_comfyui_er_sde.py` 는 위 585-633줄과 같은
+커밋 `comfy/k_diffusion/sampling.py` 78-88·152-176·1592-1656줄을 바꾸지 않고 담은 대조 오라클입니다(블록마다 SHA-256 고정,
+첫 블록 앞의 테스트용 대역 코드는 상류 코드가 아님). 원본은 이 확장과 같은 GPL-3.0 입니다. 바탕 논문: Cui et al.,
+"Elucidating the Solution Space of Extended Reverse-Time SDE for Diffusion Models", [arXiv:2309.06169](https://arxiv.org/abs/2309.06169).
+
+## ComfyUI-Extra-Samplers — DPM++ 4M SDE (BSD-3-Clause)
+
+`sam3ext/extra_samplers/dpmpp_4m_sde.py` 의 `sample_dpmpp_4m_sde` 는 [Clybius/ComfyUI-Extra-Samplers](https://github.com/Clybius/ComfyUI-Extra-Samplers)
+(commit `52eac1b7c847d2727e0ca93ca26d9ffd77029daa`) `extra_samplers.py` 435-524줄 `sample_clyb_4m_sde_momentumized` 를
+`clyb_4m_sde_momentumized` 항목이 쓰는 momentum 0 으로 옮긴 것입니다(Copyright (c) 2024, Clybius). 차수 선택, 비율, `d1`/`d2`,
+φ 식은 원본과 같습니다. 바꾼 곳: Forge DPM++ 3M SDE 처럼 half-log-SNR 로 써서 flow 모델(α=1−σ)을 지원(`α_t` 곱, 첫 σ 보정),
+momentum 항 제외(0 에서 항등), 잡음은 Forge 규칙(`eta > 0 and s_noise > 0`)과 Forge 의 시드별 Brownian 트리. 바뀐 내용은 파일
+머리 주석에 적었고 BSD 고지 전문을 파일 머리에 그대로 두었습니다. `tests/_origin_clybius_extra_samplers.py` 는 같은 파일 전체를
+바꾸지 않고 옮긴 대조 오라클입니다(머리 주석만 더함, SHA-256 고정). BSD 3-Clause 전문은 이 문서 끝에 있습니다. 바탕:
+DPM-Solver++ (Lu et al., [arXiv:2211.01095](https://arxiv.org/abs/2211.01095)). 이 확장의 GPL-3.0-only 라이선스는 이 코드의 상류
+조건을 대체하지 않습니다.
+
+## Euler-Smea-Dyn-Sampler — Euler (SMEA) Dy 보조 스텝 (Apache-2.0)
+
+`sam3ext/extra_samplers/euler_dy.py` 는 [Koishi-Star/Euler-Smea-Dyn-Sampler](https://github.com/Koishi-Star/Euler-Smea-Dyn-Sampler)
+(commit `d98a504c8419be5274068ad91ca6bbf2e13635a8`) `smea_sampling.py` 의 `dy_sampling_step`·`sample_euler_dy`·`smea_sampling_step`·
+`sample_euler_smea_dy`·`_Rescaler`(WebUI 갈래)를 옮겨 바꾼 것입니다(상류 LICENSE 의 저작권 줄 "Copyright 2024 KBlueLeaf",
+NOTICE 파일 없음). 보조 스텝의 위치·해상도·화소 선택·홀수 크기 처리·재잡음 식(`x − eps·sqrt(σ̂²−σ²)`, 매 스텝 잡음 추출)은
+원본과 같습니다. Apache-2.0 4(b) 에 따라 파일 머리에 적은 변경 사항: 모든 Euler 갱신을 Forge 의 CFG++ 갱신으로 바꿈,
+**churn 규칙을 원본의 `max(s_churn/N, √2−1)` 에서 k-diffusion 의 `min` 으로 바꿈**(기본 설정에서 재잡음 없음), flow 모델 churn 을
+eps 등가 잡음 수준에서 계산, 5차원 latent, Forge 의 4·5차원 마스크·`image_cond`·Anima 레퍼런스 latent 크기 맞춤, 보조 평가 표시,
+미리보기 latent 복구, 보조 스텝이 Forge 의 스텝 카운터(`CFGDenoiser.step`)를 늘리지 않음(원본은 보조 스텝마다 한 칸씩 밀림),
+보조 스텝 없이 도는 모드(Spectrum Integrated·Wan 2.2 I2V `concat_latent`·PiD `lq_latent`·`extra_concat_condition` 요청).
+`tests/_origin_koishi_smea_sampling.py` 는 같은 파일 전체를 바꾸지 않고 옮긴 대조 오라클입니다(머리 주석을 붙이고 줄끝을 CRLF 에서
+LF 로 바꿨을 뿐, SHA-256 고정). CFG++ 갱신은 Forge 의 `sample_euler_ancestral_cfg_pp` 와 같고, 바탕 논문은 CFG++ (Chung et al.,
+[arXiv:2406.08070](https://arxiv.org/abs/2406.08070))와 Karras et al. 2022 Algorithm 2 ([arXiv:2206.00364](https://arxiv.org/abs/2206.00364))입니다.
+Apache License 2.0 전문은 이 문서 끝에 있습니다. 이 확장의 GPL-3.0-only 라이선스는 이 코드의 상류 조건을 대체하지 않습니다.
+
 ## 코드를 편입하지 않은 재구현 (참고 출처)
 
 아래 기능은 상류 코드를 파일째 가져오지 않고 이 확장 코드로 다시 작성했습니다. 전체 목록(DCW·DAVE·Modulation
@@ -300,14 +485,37 @@ Guidance 등)은 README 의 출처 / 크레딧 절과 [docs/GUIDANCE.md](docs/GU
 | HiGS | `sam3ext/guidance/history.py` | [arXiv:2509.22300](https://arxiv.org/abs/2509.22300) 식 6·8, 알고리즘 2–3 | 논문 코드는 arXiv 라이선스(사용 안 함) | 논문 식 재구현 |
 | Anima Optimal Scale | `scripts/anima_cfg_optimal_scale.py` | CFG-Zero* [arXiv:2503.18886](https://arxiv.org/abs/2503.18886) optimized-scale 식 | — | 식만 독립 구현(zero-init 제외). 2026-10-02 검토 제안(`docs/review_proposals_20261002/generation/`)을 편입 |
 | PAG 강도 곡선 | `scripts/anima_safe_pag.py` `_pag_envelope_factor` | — | — | 이 확장의 자체 실험(논문 기법 아님) |
+| Extra Schedulers — Cosine · CosineExponential blend · Phi | `sam3ext/extra_schedulers/schedulers.py` | 공개된 식(README 의 Extra Schedulers 표에 적음; Phi 는 황금비 φ) — 이름만 [aoleg/Neo_ExtraSchedulers](https://github.com/aoleg/Neo_ExtraSchedulers) README 에서. Phi 의 착상(황금비 지수)은 Extraltodeus 의 Golden Scheduler([sigmas_tools_and_the_golden_scheduler](https://github.com/Extraltodeus/sigmas_tools_and_the_golden_scheduler), 위 README 가 출처로 적음) | 상류 라이선스 없음(코드 사용 안 함) · Golden Scheduler 는 크레딧만(코드 열람·사용 안 함) | 식 재구현. CosineExponential 의 지수 부분은 k-diffusion `get_sigmas_exponential` 과 같은 식 |
+| Extra Schedulers — Karras Dynamic | `sam3ext/extra_schedulers/schedulers.py` | Karras et al. [arXiv:2206.00364](https://arxiv.org/abs/2206.00364) 램프 + 스텝마다 ρ + 2cos(2πi/n) — 이 변형의 출처는 미확인(위 README 가 "yoinked-h" 를 적음) | 미확인(코드 사용 안 함) | 식 재구현(오버플로 없는 같은 값의 꼴, 마지막 스텝은 정확히 σmin), ρ 는 Forge 의 rho 설정. 시그마가 도중에 올라가는 ρ(약 4 미만)는 오류로 멈춤 |
+| Extra Schedulers — custom (식 · 시그마 목록) | `sam3ext/extra_schedulers/expression.py` · `sigma_list.py` | 변수 이름(m, M, n, s, x, phi)과 목록 규칙은 위 README 의 설명 | 상류 라이선스 없음(코드 사용 안 함) | 이 확장이 새로 쓴 AST 화이트리스트 계산기(eval/exec 없음). 목록 보간은 Forge 의 `sd_schedulers._loglinear_interp` 를 실행 중에 호출(복사 없음) |
+| Extra Samplers — flow churn·CFG++ 결합 | `sam3ext/extra_samplers/euler_dy.py` | [EDM](https://arxiv.org/abs/2206.00364) Algorithm 2, [CFG++](https://arxiv.org/abs/2406.08070) | — | eps 등가 좌표 churn 과 Dy 보조 스텝의 CFG++ 결합은 이 확장의 식(코드 사본 없음) |
+
+## 라이선스 없는 저장소 — 이름만 참고 (코드 미사용)
+
+**라이선스 없는 저장소에서 가져온 코드는 없습니다.** [aoleg/Neo_ExtraSchedulers](https://github.com/aoleg/Neo_ExtraSchedulers)
+(commit `ca55a59b1df7eda18333ae3a501d69f0fed6b27e`)와 그 원본
+[DenOfEquity/webUI_ExtraSchedulers](https://github.com/DenOfEquity/webUI_ExtraSchedulers) 는 라이선스를 공개하지 않았습니다. 이
+확장은 두 저장소의 코드를 열어 보지도 쓰지도 않았습니다 — aoleg 저장소의 README(사용자에게 보이는 이름·설명)만 읽었고,
+DenOfEquity 저장소는 아무 파일도 열지 않았습니다. README 에서 가져온 것은 infotext 가 서로 붙도록 맞춘 이름과 규칙뿐입니다.
+
+- Extra Schedulers: 스케줄 라벨(별칭 `cosine-exponential blend`·`karras dynamic` 포함), custom 식의 변수 이름(m, M, n, s, x,
+  phi), 시그마 목록 규칙, 아코디언 이름. 구현은 공개된 식, 위 논문, ComfyUI(GPL-3.0)의 Laplace 함수로 다시 작성했습니다.
+- Extra Samplers: 샘플러 이름(`ER SDE (Reverse-time)`·`ER SDE (ODE)`·`DPM++ 4M SDE`·`Euler Dy CFG++`·`Euler SMEA Dy CFG++`)과
+  infotext 키 `ER SDE max stage` 의 규칙, 사용자에게 보이는 동작 설명. 구현은 위 절의 ComfyUI(GPL-3.0)·Clybius(BSD-3-Clause)·
+  Koishi-Star(Apache-2.0) 코드와 Forge 의 `sample_er_sde`·CFG++ 갱신을 바탕으로 했습니다.
 
 ## MIT License 전문
 
-`sam3ext/anima38/`(Copyright (c) 2026 GumGum10 contributors), `assets/bpe_simple_vocab_16e6.txt.gz`(Copyright (c) 2021
-OpenAI), `scripts/anima_detail_daemon.py` 의 Detail Daemon 코드(Copyright (c) 2024 Sahand Ahmadian, Copyright (c) 2024
-Jonseed), `sam3ext/guidance/sigma_window.py` 와 PAG 대조 테스트의 Anima Safe PAG 코드(Copyright (c) 2026),
-`sam3ext/guidance/dave_gate.py` 와 DAVE 대조 테스트의 Anima DAVE 코드(Copyright (c) 2026 Seunghyun Ji)에 적용되는
-조건입니다. 저작권 줄은 위 각 절의 것을 넣어 읽습니다.
+`sam3ext/anima38/`(Copyright (c) 2026 GumGum10 contributors),
+`mcp_server/sam_extra_mcp/forgeneo/`·`server.py`·`service.py` 와 `tests/test_mcp_forgeneo_upstream.py` 의 forgeneo-mcp 코드(Copyright (c) 2026 Eduardo Abreu),
+`assets/bpe_simple_vocab_16e6.txt.gz`(Copyright (c) 2021 OpenAI),
+`scripts/anima_detail_daemon.py` 의 Detail Daemon 코드(Copyright (c) 2024 Sahand Ahmadian, Copyright (c) 2024 Jonseed),
+`sam3ext/colorcraft/`·`javascript/colorcraft_sliders.js` 와 Colorcraft 대조 테스트 사본의 ComfyUI-Colorcraft 코드(Copyright (c) 2026 Sahand Ahmadian Tehrani (Muerrilla); 포크 aoleg/ComfyUI-Colorcraft — Oleg Afonin),
+`sam3ext/guidance/sigma_window.py` 와 PAG 대조 테스트의 Anima Safe PAG 코드(Copyright (c) 2026),
+`sam3ext/guidance/dave_gate.py` 와 DAVE 대조 테스트의 Anima DAVE 코드(Copyright (c) 2026 Seunghyun Ji),
+`sam3ext/progress_api.py`·`scripts/appearance_progress_bar.py`·`javascript/progress_bar.js`·`style.css` 의 진행 막대 블록과 대조 테스트 사본 `tests/_origin_smooth_progress.py` 의 Smooth Progress 코드(Copyright (c) 2026 diamfang),
+`sam3ext/speed/`·`scripts/anima_speed.py` 와 SPEED 테스트(원본 사본과 옮겨 온 테스트)의 SPEED 코드(Copyright (c) 2026 Howard Xiao, Copyright (c) 2026 A. Izzuddin Al Faruq, Copyright (c) 2026 sorryhyun)에
+적용되는 조건입니다. 저작권 줄은 위 각 절의 것을 넣어 읽습니다.
 
 ```text
 MIT License
@@ -331,5 +539,250 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-Apache-2.0 전문(TIPO 모델 코드, Qwen3.5 토크나이저, Skimmed_CFG 코드, HiFlow 코드, ComfyUI-NAFNet-Residual 대조 테스트 사본)은
-<https://www.apache.org/licenses/LICENSE-2.0> 에 있습니다.
+## BSD 3-Clause License 전문
+
+`sam3ext/extra_samplers/dpmpp_4m_sde.py` 와 대조 테스트 `tests/_origin_clybius_extra_samplers.py` 의 ComfyUI-Extra-Samplers 코드에
+적용되는 조건입니다(Copyright (c) 2024, Clybius).
+
+```text
+BSD 3-Clause License
+
+Copyright (c) 2024, Clybius
+
+Redistribution and use in source and binary forms, with or without
+modification, are permitted provided that the following conditions are met:
+
+1. Redistributions of source code must retain the above copyright notice, this
+   list of conditions and the following disclaimer.
+
+2. Redistributions in binary form must reproduce the above copyright notice,
+   this list of conditions and the following disclaimer in the documentation
+   and/or other materials provided with the distribution.
+
+3. Neither the name of the copyright holder nor the names of its
+   contributors may be used to endorse or promote products derived from
+   this software without specific prior written permission.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
+FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
+SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
+OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+```
+
+## Apache License 2.0 전문
+
+`sam3ext/extra_samplers/euler_dy.py` 와 대조 테스트 `tests/_origin_koishi_smea_sampling.py` 의 Euler-Smea-Dyn-Sampler 코드
+(Copyright 2024 KBlueLeaf)에 적용되는 조건입니다. 같은 Apache-2.0 인 Skimmed_CFG 코드, HiFlow 코드, TIPO 모델 코드, Qwen3.5
+토크나이저, ComfyUI-NAFNet-Residual 대조 테스트 사본에도 같은 조건이 적용됩니다(저작권 줄은 각 절의 것). 아래는
+Euler-Smea-Dyn-Sampler 의 LICENSE 파일 그대로입니다(부록의 저작권 줄 포함). 같은 전문이
+<https://www.apache.org/licenses/LICENSE-2.0> 에도 있습니다.
+
+```text
+                                 Apache License
+                           Version 2.0, January 2004
+                        http://www.apache.org/licenses/
+
+   TERMS AND CONDITIONS FOR USE, REPRODUCTION, AND DISTRIBUTION
+
+   1. Definitions.
+
+      "License" shall mean the terms and conditions for use, reproduction,
+      and distribution as defined by Sections 1 through 9 of this document.
+
+      "Licensor" shall mean the copyright owner or entity authorized by
+      the copyright owner that is granting the License.
+
+      "Legal Entity" shall mean the union of the acting entity and all
+      other entities that control, are controlled by, or are under common
+      control with that entity. For the purposes of this definition,
+      "control" means (i) the power, direct or indirect, to cause the
+      direction or management of such entity, whether by contract or
+      otherwise, or (ii) ownership of fifty percent (50%) or more of the
+      outstanding shares, or (iii) beneficial ownership of such entity.
+
+      "You" (or "Your") shall mean an individual or Legal Entity
+      exercising permissions granted by this License.
+
+      "Source" form shall mean the preferred form for making modifications,
+      including but not limited to software source code, documentation
+      source, and configuration files.
+
+      "Object" form shall mean any form resulting from mechanical
+      transformation or translation of a Source form, including but
+      not limited to compiled object code, generated documentation,
+      and conversions to other media types.
+
+      "Work" shall mean the work of authorship, whether in Source or
+      Object form, made available under the License, as indicated by a
+      copyright notice that is included in or attached to the work
+      (an example is provided in the Appendix below).
+
+      "Derivative Works" shall mean any work, whether in Source or Object
+      form, that is based on (or derived from) the Work and for which the
+      editorial revisions, annotations, elaborations, or other modifications
+      represent, as a whole, an original work of authorship. For the purposes
+      of this License, Derivative Works shall not include works that remain
+      separable from, or merely link (or bind by name) to the interfaces of,
+      the Work and Derivative Works thereof.
+
+      "Contribution" shall mean any work of authorship, including
+      the original version of the Work and any modifications or additions
+      to that Work or Derivative Works thereof, that is intentionally
+      submitted to Licensor for inclusion in the Work by the copyright owner
+      or by an individual or Legal Entity authorized to submit on behalf of
+      the copyright owner. For the purposes of this definition, "submitted"
+      means any form of electronic, verbal, or written communication sent
+      to the Licensor or its representatives, including but not limited to
+      communication on electronic mailing lists, source code control systems,
+      and issue tracking systems that are managed by, or on behalf of, the
+      Licensor for the purpose of discussing and improving the Work, but
+      excluding communication that is conspicuously marked or otherwise
+      designated in writing by the copyright owner as "Not a Contribution."
+
+      "Contributor" shall mean Licensor and any individual or Legal Entity
+      on behalf of whom a Contribution has been received by Licensor and
+      subsequently incorporated within the Work.
+
+   2. Grant of Copyright License. Subject to the terms and conditions of
+      this License, each Contributor hereby grants to You a perpetual,
+      worldwide, non-exclusive, no-charge, royalty-free, irrevocable
+      copyright license to reproduce, prepare Derivative Works of,
+      publicly display, publicly perform, sublicense, and distribute the
+      Work and such Derivative Works in Source or Object form.
+
+   3. Grant of Patent License. Subject to the terms and conditions of
+      this License, each Contributor hereby grants to You a perpetual,
+      worldwide, non-exclusive, no-charge, royalty-free, irrevocable
+      (except as stated in this section) patent license to make, have made,
+      use, offer to sell, sell, import, and otherwise transfer the Work,
+      where such license applies only to those patent claims licensable
+      by such Contributor that are necessarily infringed by their
+      Contribution(s) alone or by combination of their Contribution(s)
+      with the Work to which such Contribution(s) was submitted. If You
+      institute patent litigation against any entity (including a
+      cross-claim or counterclaim in a lawsuit) alleging that the Work
+      or a Contribution incorporated within the Work constitutes direct
+      or contributory patent infringement, then any patent licenses
+      granted to You under this License for that Work shall terminate
+      as of the date such litigation is filed.
+
+   4. Redistribution. You may reproduce and distribute copies of the
+      Work or Derivative Works thereof in any medium, with or without
+      modifications, and in Source or Object form, provided that You
+      meet the following conditions:
+
+      (a) You must give any other recipients of the Work or
+          Derivative Works a copy of this License; and
+
+      (b) You must cause any modified files to carry prominent notices
+          stating that You changed the files; and
+
+      (c) You must retain, in the Source form of any Derivative Works
+          that You distribute, all copyright, patent, trademark, and
+          attribution notices from the Source form of the Work,
+          excluding those notices that do not pertain to any part of
+          the Derivative Works; and
+
+      (d) If the Work includes a "NOTICE" text file as part of its
+          distribution, then any Derivative Works that You distribute must
+          include a readable copy of the attribution notices contained
+          within such NOTICE file, excluding those notices that do not
+          pertain to any part of the Derivative Works, in at least one
+          of the following places: within a NOTICE text file distributed
+          as part of the Derivative Works; within the Source form or
+          documentation, if provided along with the Derivative Works; or,
+          within a display generated by the Derivative Works, if and
+          wherever such third-party notices normally appear. The contents
+          of the NOTICE file are for informational purposes only and
+          do not modify the License. You may add Your own attribution
+          notices within Derivative Works that You distribute, alongside
+          or as an addendum to the NOTICE text from the Work, provided
+          that such additional attribution notices cannot be construed
+          as modifying the License.
+
+      You may add Your own copyright statement to Your modifications and
+      may provide additional or different license terms and conditions
+      for use, reproduction, or distribution of Your modifications, or
+      for any such Derivative Works as a whole, provided Your use,
+      reproduction, and distribution of the Work otherwise complies with
+      the conditions stated in this License.
+
+   5. Submission of Contributions. Unless You explicitly state otherwise,
+      any Contribution intentionally submitted for inclusion in the Work
+      by You to the Licensor shall be under the terms and conditions of
+      this License, without any additional terms or conditions.
+      Notwithstanding the above, nothing herein shall supersede or modify
+      the terms of any separate license agreement you may have executed
+      with Licensor regarding such Contributions.
+
+   6. Trademarks. This License does not grant permission to use the trade
+      names, trademarks, service marks, or product names of the Licensor,
+      except as required for reasonable and customary use in describing the
+      origin of the Work and reproducing the content of the NOTICE file.
+
+   7. Disclaimer of Warranty. Unless required by applicable law or
+      agreed to in writing, Licensor provides the Work (and each
+      Contributor provides its Contributions) on an "AS IS" BASIS,
+      WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
+      implied, including, without limitation, any warranties or conditions
+      of TITLE, NON-INFRINGEMENT, MERCHANTABILITY, or FITNESS FOR A
+      PARTICULAR PURPOSE. You are solely responsible for determining the
+      appropriateness of using or redistributing the Work and assume any
+      risks associated with Your exercise of permissions under this License.
+
+   8. Limitation of Liability. In no event and under no legal theory,
+      whether in tort (including negligence), contract, or otherwise,
+      unless required by applicable law (such as deliberate and grossly
+      negligent acts) or agreed to in writing, shall any Contributor be
+      liable to You for damages, including any direct, indirect, special,
+      incidental, or consequential damages of any character arising as a
+      result of this License or out of the use or inability to use the
+      Work (including but not limited to damages for loss of goodwill,
+      work stoppage, computer failure or malfunction, or any and all
+      other commercial damages or losses), even if such Contributor
+      has been advised of the possibility of such damages.
+
+   9. Accepting Warranty or Additional Liability. While redistributing
+      the Work or Derivative Works thereof, You may choose to offer,
+      and charge a fee for, acceptance of support, warranty, indemnity,
+      or other liability obligations and/or rights consistent with this
+      License. However, in accepting such obligations, You may act only
+      on Your own behalf and on Your sole responsibility, not on behalf
+      of any other Contributor, and only if You agree to indemnify,
+      defend, and hold each Contributor harmless for any liability
+      incurred by, or claims asserted against, such Contributor by reason
+      of your accepting any such warranty or additional liability.
+
+   END OF TERMS AND CONDITIONS
+
+   APPENDIX: How to apply the Apache License to your work.
+
+      To apply the Apache License to your work, attach the following
+      boilerplate notice, with the fields enclosed by brackets "[]"
+      replaced with your own identifying information. (Don't include
+      the brackets!)  The text should be enclosed in the appropriate
+      comment syntax for the file format. We also recommend that a
+      file or class name and description of purpose be included on the
+      same "printed page" as the copyright notice for easier
+      identification within third-party archives.
+
+   Copyright 2024 KBlueLeaf
+
+   Licensed under the Apache License, Version 2.0 (the "License");
+   you may not use this file except in compliance with the License.
+   You may obtain a copy of the License at
+
+       http://www.apache.org/licenses/LICENSE-2.0
+
+   Unless required by applicable law or agreed to in writing, software
+   distributed under the License is distributed on an "AS IS" BASIS,
+   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+   See the License for the specific language governing permissions and
+   limitations under the License.
+```

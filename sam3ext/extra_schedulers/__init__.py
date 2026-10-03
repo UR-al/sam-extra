@@ -1,0 +1,19 @@
+"""Extra Schedulers — more entries for Forge's "Schedule type" list.
+
+Cosine, CosineExponential blend, Phi, Laplace, Karras Dynamic and a safe ``custom`` scheduler
+(an arithmetic expression or a sigma list). This is a clean reimplementation: the labels are the
+ones specified for infotext compatibility with the unlicensed aoleg/Neo_ExtraSchedulers (a fork of
+the equally unlicensed DenOfEquity/webUI_ExtraSchedulers), but no code of those repositories was
+read or used — only their READMEs, for the user-facing names. Laplace is ComfyUI's
+``get_sigmas_laplace`` (GPL-3.0); the other closed forms are public math (see ``schedulers.py``).
+
+Modules
+    ``expression``  — AST-whitelisted expression compiler/evaluator for the custom scheduler.
+    ``sigma_list``  — strict sigma-list parser and Forge's log-linear interpolation.
+    ``schedulers``  — the scheduler functions (Forge's scheduler signature).
+    ``settings``    — the accordion's per-generation values and the state the schedulers read.
+    ``registry``    — registration in Forge 2.29.2's ``modules.sd_schedulers``.
+
+The Forge hooks (accordion, infotext, XYZ axes) are in ``scripts/anima_extra_schedulers.py`` and
+``sam3ext/ui_extra_schedulers.py``.
+"""

@@ -3,6 +3,273 @@
 버전 태그는 GitHub Releases에도 발행됩니다. 아래는 요약이며, guidance/속도 기능의
 상세는 [docs/GUIDANCE.md](docs/GUIDANCE.md)를 참고하세요.
 
+## v0.31.0 — Colorcraft · Anima SPEED · Extra Schedulers · Extra Samplers · 진행 막대 · MCP 서버 · 구도·카메라
+
+새 기능 일곱 가지입니다. 샘플링 중 latent 색 보정(Colorcraft), 초반 스텝을 저해상도로 돌리는 Anima SPEED(실험), 스케줄러
+6개(Extra Schedulers), 샘플러 5개(Extra Samplers), 부드러운 진행 막대, 같은 PC 의 MCP 클라이언트가 이 Forge 로 이미지를 만들게
+하는 MCP 서버, 사용자 앱에서 옮긴 구도·카메라 칸(태그로 시점 잡기)입니다. Colorcraft·SPEED·진행 막대는 기본으로 꺼져 있습니다. Extra Schedulers·Extra Samplers 는 Schedule type·
+Sampler 에서 골랐을 때만 쓰이고, MCP 서버는 Forge 밖에서 따로 실행합니다(기본은 생성만 허용). 편입한 상류 코드의 출처·커밋·
+고지는 `THIRD_PARTY_NOTICES.md` 에 있습니다.
+
+괄호 표시는 v0.30.0 과 같습니다: (결과 같음) = v0.30.1 과 같은 설정·시드에서 이미지 동일, (새 기능) = v0.30.1 에 없던 기능이라
+비교 대상 없음, 토글 = 끌 수 있는 설정(뒤에 기본값).
+
+### Colorcraft — 샘플링 중 latent 색 보정 (새 기능, 토글 — 기본 꺼짐)
+
+- **Colorcraft (sam-extra)**: [muerrilla/ComfyUI-Colorcraft](https://github.com/muerrilla/ComfyUI-Colorcraft)(`d28ac6a`, MIT)의
+  최신 계산을 Forge 로 옮겼습니다. 매 모델 호출의 CFG 결과(x0)를 latent 의 색 기저 방향으로 밀어 노출·톤 압축·대비·클래리티·
+  샤프니스·색온도·틴트·바이브런스·채도·채도 대비·Lab 축·색 이동을 조정합니다. 추가 모델 호출은 없습니다. Forge 구조와 Flux2 벡터는
+  [aoleg/ComfyUI-Colorcraft](https://github.com/aoleg/ComfyUI-Colorcraft)(`f00066c`, MIT)를 따릅니다. txt2img·img2img 의
+  **Colorcraft (latent 색 보정 · ComfyUI-Colorcraft)** 아코디언에 있습니다(txt2img 는 ANIMA 튜닝 열의 Anima Optimal Scale 바로 아래
+  — Optimal Scale 도 이 열에 등록해, v0.30.x 처럼 '도구·실험' 묶음으로 가서 더 보기를 닫으면 숨지 않습니다).
+  - 모델: Anima·Qwen-Image·Krea 2·Wan(krea2 벡터), Flux·Chroma·Lumina 2·Z-Image(zimage), Flux 2 Klein·ERNIE-Image(flux2).
+    SD 1.5·SDXL 은 Contrast·Color Shift 만 동작하고 이유를 `SAM Extra Colorcraft status` 에 남깁니다.
+  - 수정자 스택 I~X: 탭마다 원본 노드 종류(Advanced·Basic·Luma·Chroma·Chroma Plus·Punch·Shift)와 자기 스케줄(Strength·
+    Start·End·Advanced Schedule), 적용 패스(Base·Hires·Both), 마스크를 고릅니다. Masking 에 축 마스크 M1~M10(clarity·
+    sharpness 디테일 축 포함, Blur·Spread·Normalize·Contrast)과 조합 C1~C5(and·or·subtract·xor), Debug 에 축 투영·마스크
+    미리보기가 있습니다.
+  - 원본 노드와 비트 단위로 같습니다 — krea2·zimage·flux2 에서 20 가지 설정을 스케줄 σ 와 그 사이(2차 샘플러) 마다
+    대조(Forge 의 실제 latent format 클래스, CPU). img2img·hires 는 Forge 가 실제로 도는 σ 구간(`sampling_sigmas[offset:]`)
+    으로 스케줄을 만듭니다.
+  - 색 기준점은 생성 전에 `vae.encode` + `process_in` 으로 한 번 만듭니다(Anima 의 `encode_first_stage` 는 레퍼런스 latent 를
+    덮어써서 쓰지 않음). 같은 VAE 면 다음 요청(XYZ 칸·API)도 다시 인코딩하지 않습니다(최대 32개, VAE 가 바뀌면 버림). 오류가
+    나면 그 호출은 입력을 그대로 넘기고 status 에 남깁니다. fp16·bf16 은 fp32 로 계산해 원래 dtype 으로 돌려줍니다. sam-extra 의
+    다른 post-CFG(Optimal Scale·가이던스) 뒤에 맨 마지막으로 돕니다.
+  - Anima SPEED·Euler (SMEA) Dy CFG++ 와 함께: SPEED 의 전환 뒤에도 보정을 이어 갑니다 — SPEED 가 다시 내놓는 σ 목록(같은 실행
+    표시)을 따라가 스텝마다 그 목록에서 σ 를 찾고(Detail Daemon·DAVE·MG/HiGS·HiFlow 와 같음), 저해상도 격자에서도 마스크 blur 가
+    이미지 픽셀 크기를 지킵니다. Dy/SMEA 보조 스텝은 보정하지 않고 넘겨 스텝마다 한 번만 보정하고, status 에
+    `Dy/SMEA sub-steps passed through xN` 으로 셉니다.
+  - infotext: `SAM Extra Colorcraft`(붙여 넣으면 패널 복원), `SAM Extra Colorcraft status`. 원본·포크 확장이 남긴
+    `Colorcraft` 키도 붙여 넣을 수 있습니다. XYZ 축 `[Colorcraft] …` 14개(탭 I). Settings → **SAM Extra Colorcraft**.
+    API 는 위치 인자 579개 대신 첫 인자 하나(infotext 값 또는 인자 경로 사전)로도 받습니다.
+- **한계**: GPU 는 Anima 3.8B 에서만 확인했습니다(노출·색온도·채도가 맞는 방향, SPEED·Dy/SMEA 와 함께 보정 횟수 같음 — VRAM 은
+  재지 않음, 원본 노드와의 비트 대조는 CPU). CFG++ 샘플러에서는 더 세게 걸립니다 —
+  Anima 3.8B(시드 11, 28 스텝)에서 노출 +0.3 이 평균 밝기를 Forge 의 Euler CFG++ 로 약 +27(186 → 214, Euler Dy CFG++·Euler SMEA Dy
+  CFG++ 도 같음), Res Multistep 으로 +14, Euler 로 +8 올렸습니다. CFG++ 스텝은 보정된 x0 를 스텝의 일부만큼이 아니라 통째로 다음
+  latent 에 싣기 때문으로, sam-extra 의 버그가 아니라 CFG++ 의 방식입니다(원본 ComfyUI-Colorcraft 도 같은 post-CFG 지점에 겁니다).
+  CFG++ 샘플러에서는 세기를 절반쯤으로 두세요. flux2 보정값은 포크가 예전 원본 보정 기준으로 잰 값입니다. 패널이 큽니다 — 탭마다
+  스크립트 인자 579개, Gradio 블록 약 1,200개, `/config` 약 479 KB 로 원본 Forge 패널(인자 495개, 블록 약 1,180개, 476 KB)과
+  비슷합니다. XYZ 축은 탭 I 만 바꾸고, 원본 Forge 확장의 스케줄·마스크 그래프와 탭 색 표시는 옮기지 않았습니다.
+- **Detail Daemon·Guidance Suite 내부 정리 (결과 같음)**: `scripts/anima_detail_daemon.py` 와 `scripts/anima_safe_pag.py`(DAVE
+  게이트 등) 두 곳에 똑같이 있던 `_forge_sampling_offset`·`_is_img2img_request` 를 `sam3ext/guidance/sigmas.py` 로 옮겨 Colorcraft 와
+  함께 씁니다. 기존 테스트와 옛 코드 대조 테스트가 같은 값을 확인합니다.
+- **검증**: 새 Python 테스트 139개(원본·포크 대조, 훅, infotext, 스크립트, Debug, 벡터, σ 오프셋), JS 10개.
+
+### Anima SPEED — 저해상도 선행 샘플링 (실험, 토글 — 기본 꺼짐)
+
+- **새 아코디언 Anima SPEED (저해상도 선행 샘플링 · 실험)**(txt2img 는 ANIMA 튜닝 열, img2img 에도 있음): SPEED(Spectral
+  Progressive Diffusion, arXiv 2605.18736)를 Forge 샘플러에 얹습니다. 초반의 노이즈가 지배적인 스텝을 DCT 로 줄인 저해상도
+  latent 에서 돌리고, 전환 σ 에서 고주파를 σ 크기 노이즈로 채워 원래 크기로 넓힌 뒤(κ = r/(1+(r−1)σ) 로 보정) 고른 샘플러로
+  이어서 샘플링합니다. 앞쪽 스텝의 토큰이 줄어 빨라지는 대신 이미지가 달라집니다. flow 모델 전용입니다(SDXL·SD1.x 는 건너뜀).
+  Anima 3.8B 실측(832×1216, Res Multistep + Linear Quadratic 28 스텝): 기본값은 5/28 스텝 저해상도로 약 1.13배, manual σ 0.7 은
+  22/28 스텝으로 약 1.8배 빠르고 구도가 크게 바뀝니다(저해상도 스텝은 토큰 1/4 에 약 3배 빠름).
+- **두 방식**: `transition`(기본) = 공식 howardhx/speed·aoleg/ComfyUI-SPEED — 전환 스텝의 σ 만 정렬값으로 바꿈. `respace` =
+  sorryhyun/ComfyUI-Spectrum-KSampler — 남은 σ 를 비율로 다시 배치하고 저해상도 격자를 짝수로 맞춤(데스크톱 앱 ComfyUI 팩이 부르는
+  SpectrumSPDKSampler 와 같은 SPD 기하만 맞춤 — 원본의 Spectrum 캐싱은 들어 있지 않고, 홀수 latent 는 원본이 짝수로 채우므로 다름).
+- **전환 σ**: 파워 스펙트럼 프리셋(`anima` 기본, flux·flux2·krea-2·z-image·wan21·custom)과 δ, 1024 px 기준에 고정하는 Adaptive
+  delta, Forge 의 고정 shift 용 `neo_shift` divisor(1.03), 또는 직접 적은 σ. Anima 32스텝 Beta 기준 기본값은 약 6/32 스텝,
+  manual σ 0.7 은 약 18/32 스텝이 저해상도입니다.
+- **원본과 다른 점(버그 수정)**: FFT 고주파 노이즈의 `/√2` 제거(공식 ca7801c9 와 같음, aoleg 판에는 남아 있음) · img2img·Hires 가
+  전환 σ 보다 낮은 σ 에서 시작하면(저해상도 스텝이 없으면) 아무것도 하지 않음(원본은 시작 latent 의 고주파를 노이즈로 바꾸고 σ 를
+  올림) · 배치 이미지마다 자기 시드로 확장·SDE 노이즈를 뽑아 같은 시드를 혼자 만든 결과와 같음 · SDE 샘플러(DPM++ SDE 계열)의
+  저해상도 구간에 시드별 Brownian 노이즈 · 마지막 전환이 스케줄 안에 없으면 작은 latent 를 내지 않고 건너뜀 · Detail Daemon·DAVE·
+  Momentum·HiGS 가 바뀐 σ 를 찾도록 `sampling_sigmas` 를 실행 동안 갱신 · img2img·Hires 의 저해상도 시작 latent 를 flow 형태로 맞춤
+  (설정 `sam3_speed_img2img_rescale`, 기본 켬 — κ 가 기대는 진폭 관계의 역이라 끄면 이미지 성분이 r 배 센 채로 시작, 끄면 원본 동작) ·
+  DWT 는 단계 비율 r 이 2 가 아니면 미리 거절(공식은 저해상도 스텝을 돈 뒤 오류).
+- **쉬는 경우**(이유는 infotext `Anima SPEED status`): 마스크·인페인트, 레퍼런스 latent(Anima·Flux Kontext·Flux.2 Klein·
+  Qwen-Image-Edit·Krea 2), Wan 2.2 I2V 조건(concat_latent), PiD(lq_latent), ControlNet(LLLite 포함), flow 가
+  아닌 모델(SDXL·SD1.x), Forge 내장 Spectrum Integrated, Restart·UniPC 와 σ 목록이 없는 샘플러, 저해상도 스텝이 없는 패스, Hires 패스
+  (`Apply to Hires pass` 를 켜야 적용).
+- **다른 새 기능과 함께**: 전환 뒤 다시 내놓는 σ 목록에 같은 실행 표시(`mark_republished`)를 붙여 Colorcraft 가 원래 크기 꼬리도
+  바뀐 σ 로 계속 보정합니다. `sam_extra_step_offset` 을 받는 샘플러에는 구간마다 시작 스텝(패스 기준)을 넘겨, Euler (SMEA) Dy CFG++
+  의 보조 스텝이 구간마다 다시 돌지 않고 SPEED 없이 돌 때와 같은 스텝에서 돕니다. 두 기능은 함께 돌고, Forge 의 Spectrum Integrated
+  아래에서는 둘 다 물러나 각자 status 에 이유를 남깁니다.
+- **기록**: infotext `Anima SPEED`(설정, 붙여 넣으면 되살아남)·`Anima SPEED status`·`Anima SPEED img2img rescale`. XYZ 축 6개
+  (`[Anima SPEED] Enable/Mode/Manual sigma/Delta/Sigma divisor/Scale`). 설정 `sam3_speed_log`·`sam3_speed_img2img_rescale`.
+- **한계**: 다단계 샘플러는 전환마다 이력을 새로 시작합니다(공식과 같음). img2img-hires-fix 확장이 따로 도는 패스에는 걸리지
+  않습니다. 콘솔의 tqdm 막대는 구간마다 하나씩 나옵니다(웹 UI 진행률은 패스 전체를 셈). GPU 에서는 배치의 첫 이미지가 같은 시드를
+  혼자 만든 것과 조금 다릅니다(CPU 테스트에서는 같음) — 배치 2 와 1 의 GPU 커널이 달라 새 기능을 모두 꺼도 생기는 차이이고(Anima
+  3.8B·시드 11·28 스텝, 0–255 화소 평균 절대 차: 모두 끔 7 · Colorcraft 10 · Euler CFG++ 3), SPEED 는 구도가 저해상도 스텝에서 잡혀
+  23–26 으로 키웁니다(이 시드에서는 머리색이 바뀜).
+- **검증**: 상류 원본(공식 utils·aoleg core·sorryhyun spd_core/spd, SHA-256 고정)과 같은 입력으로 CPU 대조 — transition 모드는
+  세그먼트 모양·패치된 σ 가 비트 단위로 같고 출력은 float 오차 안(원본 float32 scipy, 여기 float64 torch), respace 모드는 모델 호출마다
+  입력 모양·σ 가 비트 단위로 같습니다. Forge 의 실제 k-diffusion 샘플러 6종으로 배치 = 단일 시드, Forge 실제 `sampling_function` +
+  Anima DiT 로 PAG·DCW·TSR·Momentum·HiGS·HiFlow·Detail Daemon 이 크기 변화를 견디는지 확인. 새 Python 테스트 132개.
+
+### Extra Schedulers — 스케줄러 6개 (새 기능)
+
+- **스케줄러 6개 추가**: Schedule type(·Hires schedule type) 목록에 **Cosine · CosineExponential blend · Phi · Laplace ·
+  Karras Dynamic · custom** 이 생겼습니다. Cosine 은 처음 내려가는 폭이 작고, CosineExponential blend 는 Cosine 으로 시작해
+  Exponential 의 긴 꼬리로 끝나며, Phi 는 (1 − p)^(φ²) 곡선입니다(착상: Extraltodeus 의 Golden Scheduler). Laplace 는 ComfyUI
+  `get_sigmas_laplace` 를 그대로 옮겨(arXiv:2407.03297) Forge 처럼 마지막 0 을 붙이고, 노드의 clamp 가 같은 시그마를 되풀이하면
+  (flow 모델은 기본 μ 0 에서 앞쪽 절반이 정확히 1) n 스텝을 같은 곡선 중 sigma min~max 안의 구간에 고르게 다시 놓습니다 — 되풀이가
+  없으면 노드와 비트 단위로 같고, β 가 0 이거나 곡선 전체가 그 범위 밖이면 μ/β 를 적은 오류로 멈춥니다(Anima 3.8B·28 스텝 실측:
+  노드 그대로면 Res Multistep 은 검은 이미지(NaN), Euler 는 정상이지만 14 스텝이 버려짐 — 다시 놓으면 둘 다 정상). Karras Dynamic 은
+  Karras 램프에 스텝마다 ρ + 2cos(2πi/n) 지수를 쓰며(ρ 기본 7, Karras 와 같이 쓰는 Settings 의 rho 로 바꿈 — 2 보다 커야 하고,
+  약 4 보다 작아 시그마가 도중에 올라가면 그 스케줄을 쓰지 않고 생성을 오류로 멈춤), 이 변형의 출처는 확인되지 않았습니다.
+  aoleg/Neo_ExtraSchedulers README 의 이름(`cosine-exponential blend`·`karras dynamic` 등)으로 적힌 Schedule type 도 이 스케줄러로
+  읽습니다. 기존 스케줄러는 그대로라 결과가 같습니다(결과 같음).
+- **custom 스케줄러**: txt2img·img2img 의 **Extra Schedulers** 아코디언(접힘, txt2img 는 ANIMA 튜닝 열의 Anima 3.8B 아래)에 적은
+  식(`m` `M` `n` `s` `x` `phi` `pi` `e`, `+ − * / **`, `sqrt` `exp` `log` 등 함수)을 스텝마다 계산하거나, 시그마 목록(`[1.0, 0.6,
+  0.25, 0.1, 0.0]` — 1.0 으로 시작해 0.0 으로 끝나면 sigma max~min 으로 늘림)을 Forge 의 로그-선형 보간으로 스텝 수에 맞춥니다.
+  식은 파이썬으로 실행하지 않고 AST 화이트리스트 계산기로만 읽습니다 — 속성 접근·`__import__`·람다·컴프리헨션·문자열·64 를 넘는
+  지수·500자 초과는 거절하고, 모든 계산은 유한한 float 이어야 합니다. 잘못된 식·목록은 생성을 오류로 멈춥니다(조용히 다른
+  스케줄로 바꾸지 않음). 켜기 체크박스는 없고, 생성이 custom 이나 Laplace 를 쓸 때만 아코디언 값이 쓰입니다.
+- **시그마가 그대로인 스텝은 쓰지 않음 (6개 모두)**: 마지막 0 앞에 같은 시그마가 두 번 이어지면 생성을 `ExtraSchedulerError`
+  (custom 은 `CustomSchedulerError`, Karras Dynamic 은 `KarrasDynamicError`)로 멈춥니다. 그런 스텝은 Euler 에서는 버려지고, Res
+  Multistep·DPM++ 2M 같은 multistep 샘플러는 0 으로 나눕니다(NaN, 검은 이미지). 평평한 구간이 있는 custom 식(상수, sigma min 을
+  붙드는 `max(m, …)`)·같은 값이 이어지는 custom 목록·sigma min = sigma max 설정도 해당됩니다. 올라가는 custom 스케줄은 그대로 쓰고,
+  Karras Dynamic 은 올라가는 스텝과 제자리 스텝을 모두 거절합니다.
+- **infotext·붙여 넣기·XYZ·API**: `Custom scheduler expression`/`Custom scheduler sigmas`(custom 을 쓴 생성만), `Laplace mu`/`Laplace beta`
+  (Laplace 를 쓴 생성만, 둘 다)를 남기고 PNG Info 로 되살립니다. XYZ 축 `[Extra Schedulers (sam-extra)] Laplace mu`·`Laplace beta`·
+  `Custom expression`·`Custom sigma list` 가 생겼습니다(쉼표가 든 값은 큰따옴표로, μ/β 가 슬라이더 범위 밖이면 그리드 시작 전에 알림).
+  API 키는 `alwayson_scripts["Extra Schedulers (sam-extra)"]` 입니다(같은 이름의 아코디언을 가진 aoleg/Neo_ExtraSchedulers 와 겹치지 않게).
+- **한계**: Cosine · CosineExponential blend · Phi · Karras Dynamic 과 M~m 을 보간하는 custom 식(예: `m + (M - m) * (1 - x) ** 2`)은
+  SD·SDXL 계열(eps/v) 모델용입니다. 모델의 시간 shift 없이 시그마 공간을 나눠 구도·대비가 잡히는 σ = 1 근처를 한두 스텝에
+  지나가므로, Anima 3.8B(flow)에서는 물 빠진 듯 대비가 낮고 뿌연 이미지가 나옵니다. Forge 자체의 Karras·Exponential 도 같은
+  모습이라(평균 밝기 ≈217·표준편차 ≈46, Linear Quadratic 은 ≈182·≈90) 버그가 아닙니다. flow 모델에는 Simple·Beta·Linear Quadratic,
+  Laplace(기본 μ 0), 시간 shift 를 넣은 custom 식(예: `m + (M - m) * 3 * (1 - x) / (1 + 2 * (1 - x))` — shift 3 Simple 에 가까움)을
+  쓰세요. flow 모델에서 Laplace 의 μ 를 음수(−1.5·−2)로 두면 곡선이 한두 스텝 만에 1 에서 0.3~0.8 로 떨어져 Anima 에서는 물 빠진
+  이미지가 나왔습니다. Laplace 는 Euler 계열 샘플러로 쓰세요 — Anima 에서는 마지막 스텝이 ≈0.19 에서 sigma min(≈0.003)으로 크게 뛰어, 2차
+  multistep 샘플러인 Res Multistep 은 잔 입자가 남습니다(시간 shift custom 식도 Res Multistep 에서는 잔 입자가 조금).
+  aoleg/Neo_ExtraSchedulers 로 만든 이미지는 README 에 적힌 이름이면 Schedule type 이 되살아나지만, 그 확장의 식·Laplace 값 infotext
+  키는 알 수 없어 그 값은 되살아나지 않습니다(그 확장의 실제 이미지로는 확인하지 않음).
+- **라이선스**: 라벨은 라이선스 없는 aoleg/Neo_ExtraSchedulers 의 infotext 와 맞췄지만 그 코드는 읽지도 쓰지도 않았습니다
+  (README 의 이름만). 편입한 코드는 ComfyUI(GPL-3.0)의 Laplace 함수뿐입니다(THIRD_PARTY_NOTICES).
+- **검증**: 새 테스트 146개(파서 보안·식 대조·ComfyUI 원본 대조·Laplace 다시 놓기·제자리 스텝 거절·Forge 실제
+  `sd_schedulers`/`get_sigmas`/infotext 조회로 등록 확인). GPU 이미지는 Anima 3.8B 에서만 확인했습니다(위 Laplace·flow 모델
+  결과). SD·SDXL 에서의 화질은 확인하지 않았습니다.
+
+### Extra Samplers — 샘플러 5개 (새 기능)
+
+- **새 샘플러**: Forge 샘플러 목록(Sampler·Hires sampler, XYZ `Sampler` 축, API `sampler_name`)에 `ER SDE (Reverse-time)`,
+  `ER SDE (ODE)`, `DPM++ 4M SDE`, `Euler Dy CFG++`, `Euler SMEA Dy CFG++` 가 생깁니다. 이름은 aoleg/Neo_ExtraSchedulers 와 같아서
+  그 확장으로 만든 이미지의 infotext 를 붙여 넣어도 같은 샘플러가 잡힙니다(그 확장의 코드는 라이선스가 없어 쓰지 않았고 README 만
+  참고했습니다). 같은 이름이 이미 목록에 있으면(그 확장이 설치된 경우) 이 확장은 그 이름을 건너뛰고 콘솔에 한 번 남깁니다.
+- **ER SDE 두 항목**: Forge 내장 `sample_er_sde` 에 ComfyUI `SamplerER_SDE` 노드의 나머지 두 잡음 척도를 넣은 것입니다
+  — Reverse-time h(λ)=λ^(η+1), ODE h(λ)=λ(잡음 없음). 내장 **ER SDE** 는 그대로입니다(노드의 ER-SDE η=1 과 같음을
+  테스트로 확인). **Extra Samplers** 아코디언(txt2img 는 ANIMA 튜닝 열, img2img 는 스크립트 영역, 접힘)의 `ER SDE max stage`
+  (1–3, 기본 3)·`ER SDE eta`(0–10, 기본 1)가 이 두 항목에만 쓰이고, 기본값이 아니면 infotext `ER SDE max stage`·`ER SDE eta` 로
+  남습니다. XYZ 축 `[Extra Samplers] ER SDE max stage`·`[Extra Samplers] ER SDE eta`. API 는 `alwayson_scripts["Extra Samplers"]`
+  (`[max_stage, eta]`, 생략 가능).
+- **DPM++ 4M SDE**: Clybius/ComfyUI-Extra-Samplers(BSD-3-Clause)의 4차 다단계 SDE 를 Forge DPM++ 3M SDE 와 같은
+  방식으로(half-log-SNR) 옮겨 Anima·Flux 같은 flow 모델에서도 돕니다. 3차까지의 스텝은 Forge 3M SDE 와 비트까지 같습니다.
+  옵션·Eta·Sigma noise·스케줄러(Automatic = exponential, 끝에서 두 번째 σ 버림)는 3M SDE 와 같습니다.
+- **Euler (SMEA) Dy CFG++**: Koishi-Star/Euler-Smea-Dyn-Sampler(Apache-2.0)의 Dy(2·3번째 스텝에 반 해상도 보조 스텝)·SMEA
+  (0번째 스텝 ×1.25 보조 스텝)를 Forge 의 CFG++ 갱신으로 바꾼 것입니다. CFG 1~2 를 권장합니다. churn 은 원본의 `max`
+  대신 k-diffusion 의 `min` 이라 기본 설정(sigma churn 0)에서는 다시 잡음을 넣지 않습니다(원본과 다른 점). Anima(5차원
+  latent)·flow 모델·인페인트 마스크·Anima 레퍼런스 latent 를 지원합니다. 보조 스텝은 Forge 의 스텝 카운터를 늘리지 않아
+  프롬프트 편집(`[a:b:N]`)·Skip Early CFG·리파이너 스텝 전환이 밀리지 않습니다(원본은 보조 스텝마다 한 칸씩 밀림).
+- **보조 스텝을 건너뛰는 경우**: Forge 의 **Spectrum Integrated** 가 켜져 있거나(그 예측기가 해상도 변화를 따라가지 못해, 보조
+  스텝을 그대로 돌리면 기본 설정에서 Euler Dy 가 오류로 멈춤) Wan 2.2 I2V(`concat_latent`)·PiD(`lq_latent`)·`extra_concat_condition`
+  처럼 전체 해상도 입력을 쓰는 요청에서는 보조 스텝 없이 일반 CFG++ 스텝(= Euler CFG++)으로 돌고, 이유를 콘솔에 한 번·infotext
+  `Extra Samplers status`(예: `dy sub-steps skipped (Spectrum)`)에 남깁니다.
+- **가이던스와 함께 쓸 때**: Dy/SMEA 보조 평가는 HiFlow 기록·정렬, Momentum/HiGS 이력, SMC 의 이전 오차, APG 모멘텀, RDC
+  이동 평균을 바꾸지도 지우지도 않습니다(표시가 없으면 해상도가 바뀌는 평가에서 HiFlow 의 1차 기록과 SMC·APG·RDC 상태가 지워짐).
+  PAG·CFG base·DCW·TSR 은 보조 평가에도 걸립니다.
+- **Anima SPEED·Colorcraft 와 함께**: SPEED 가 샘플러를 해상도 구간마다 따로 불러도 보조 스텝은 SPEED 가 넘기는 구간 시작 스텝
+  (`sam_extra_step_offset`)으로 패스 안 스텝 번호대로 돌아, 구간마다 다시 돌지 않고 SMEA 의 ×1.25 보조 스텝이 SPEED 의 확장 바로
+  뒤에 돌지도 않습니다. Spectrum Integrated 아래에서는 SPEED 와 보조 스텝이 둘 다 물러나 각자 status 에 남깁니다. Colorcraft 는 보조
+  평가를 보정하지 않고 넘깁니다(스텝마다 한 번 보정).
+- **한계**: SMEA Dy 의 ×1.25 보조 스텝은 Hires 패스에서도 돌아 VRAM 을 더 씁니다. 이 확장이 남긴 `ER SDE eta` 는 aoleg 확장이
+  읽지 않아 그쪽에서는 η 가 되살아나지 않습니다. DPM++ 4M SDE 의 momentum 은 옮기지 않았습니다.
+- **검증**: 새 테스트 123개. ComfyUI·Clybius·Koishi-Star 원본을 그대로 담은 대조 테스트: ER SDE 는 eps·flow 모두 비트 일치,
+  4M SDE 는 Clybius 와 수치 일치(flow 는 eps 등가 좌표에서), Euler Dy 는 CFG++ 를 끄고 `max` 규칙이면 원본과 비트 일치. Forge 의
+  실제 `KDiffusionSampler`·`CFGDenoiser`·`prompt_parser` 로 배치 = 단일 시드, 스텝 카운터, Spectrum·Wan I2V·PiD 가드를
+  확인했습니다. GPU 는 Anima 3.8B 에서만: ER SDE (ODE)·Dy·SMEA 는 정상(Dy·SMEA ≈ Forge Euler CFG++), ER SDE (Reverse-time) 은
+  채도 높은 다른 그림체, DPM++ 4M SDE 는 단순한 얼굴·가장자리 선 — Forge 자체 DPM++ 2M/3M SDE 도 Anima 에서 회색조·가장자리
+  선이라 SDE 잡음 주입과 Anima 의 궁합으로 봅니다. SDXL 은 확인하지 않았습니다.
+
+### 진행 막대 — sd-webui-smooth-progress 편입 (새 기능, 토글 — 기본 꺼짐)
+
+- **부드러운 진행 막대**: Settings → **SAM Extra Progress Bar** 를 켜면 txt2img·img2img 갤러리 위에 부드럽게 채워지는
+  막대가 생기고 Forge 기본 막대는 숨겨집니다. diamfang/sd-webui-smooth-progress(MIT, `7fe5810`)의 스텝별 ETA·부드러움
+  세 방식·글자 형식 여덟 가지·끝난 뒤/중단 표시를 옮겼습니다. 결과 이미지와 생성에는 영향이 없습니다.
+- **다시 만든 부분**: 상류는 'generate' 처럼 보이는 클릭으로 시작을 짐작하고 인증 없는 경로를 100ms 마다 계속
+  물었습니다. 이제 Forge `requestProgress` 를 감싸 그 탭이 시작한 작업만, 작업 중에만(페이지가 보일 때)
+  `GET /sam-extra/progress` 를 묻습니다. 이 경로는 다른 sam-extra 경로와 같은 인증·헤더(`X-SAM3-Notebook: 1`)·
+  `no-store` 입니다.
+- **작업 전체 진행률**: 배치·Hires 패스를 합친 Forge 기본 막대와 같은 진행률과, 패스 종류별 스텝 평균·끝난 패스
+  시간으로 잡은 작업 전체 ETA. 대기 중에는 Forge 의 대기열 글자.
+- **상류 버그 수정**: 중단 표시 네 가지 중 세 가지만 고를 수 있던 것, 생성이 아닌 클릭 뒤 `0/0` 에 멈추던 것,
+  높이 미제한(이제 10~50px), 보호 없는 localStorage(설정은 Forge 옵션으로), ETA 를 모를 때 Smooth > Accurate 가
+  99% 로 내달리던 것, 스텝 0 을 못 본 새 패스의 준비 시간이 스텝 시간에 섞이던 것.
+- **디자인 규칙**: 테마 색, 그라데이션·빛 번짐 없음, 움직이는 동안 DOM 노드를 넣고 빼지 않음(텍스트 노드
+  `.data` 만), prefers-reduced-motion 존중. sd-webui-smooth-progress 가 함께 설치돼 있으면 이 막대는 물러납니다.
+- **한계**: 오류(OOM 등)로 끝난 작업도 완료(100%)처럼 끝납니다. ADetailer·SAM3 가 작업 도중 패스를 더하는 동안은 99.2% 에
+  머물 수 있고, ETA 는 첫 스텝의 준비 시간이 섞여 몇 스텝 뒤에 자리를 잡습니다. Extras·모델 병합·확장 설치는 Forge 기본 막대
+  그대로입니다(상류와 같음).
+- **검증**: Python 61개(상류 `_step_eta`·경로 원본 대조, Forge `progressapi` 대조 포함), JS 37개(jsdom, Forge
+  진짜 `progressbar.js` 와 함께 도는 1개 포함). 실제 Forge 브라우저에서의 확인은 아직입니다(Chromium 정적 하네스로만 확인).
+
+### MCP 서버 — forgeneo-mcp 편입 (새 기능, 기본은 생성만 허용)
+
+- **MCP 서버**: 확장 안의 `mcp_server/` 로 같은 PC 의 Claude Code 같은 MCP 클라이언트가 이 Forge 로 이미지를 만듭니다.
+  [eduardoabreu81/forgeneo-mcp](https://github.com/eduardoabreu81/forgeneo-mcp)(`a103dc5`, MIT)를 편입했고, MCP SDK 와 Forge 의
+  pydantic 고정이 맞지 않아 uv 의 별도 환경에서 돕니다(첫 실행만 네트워크). Forge 는 `--api` 로 켜져 있어야 합니다. 등록:
+  `claude mcp add --scope user sam-extra -- uv run --project <확장>\mcp_server sam-extra-mcp`. 도구는 10개입니다(`capabilities`·
+  `model_profile`·`prompt_dialect`·`loras`·`lora_info`·`models`·`module_check`·`module_download`·`generate`·`progress`).
+- **권한**: Settings → **SAM Extra MCP** 의 네 스위치(`sam3_mcp_allow_generate` 켬, `sam3_mcp_allow_model_switch`·
+  `sam3_mcp_allow_interrupt`·`sam3_mcp_allow_download` 끔)를 서버가 호출마다 Forge 의 `config.json` 에서 다시 읽어 지킵니다 —
+  에이전트의 `confirm=True` 로도 넘을 수 없습니다. Forge 쪽에는 설정 네 개만 더해지며 생성 결과는 그대로입니다.
+- **상류 대비 고친 것**: FORGE_PATH_MAP 없이도 같은 PC 의 출력 폴더를 찾고(상류는 렌더가 끝난 뒤 `ok:false`), 그래도 못 찾은
+  이미지는 응답에서 저장합니다 · 같은 시각 다른 생성의 파일을 돌려주지 않습니다(infotext·시드·시간 대조) · 생성 기록과 LoRA 색인을
+  다시 읽습니다(상류는 한 번만, 강제 재구축 때는 두 번 셈) · Anima 3.8B·Qwen3.5 모듈을 남은 모듈로 오인하지 않습니다 ·
+  `/sdapi/v1/cmd-flags` 를 부르지 않고 리디렉션도 따라가지 않습니다 · 내려받기는 크기·SHA256 을 확인하고 덮어쓰지 않는 이동으로
+  자리에 놓습니다 · 체크포인트 전환의 프리셋은 인스턴스에 있는 것만 받습니다.
+- **더한 안전장치**: init 이미지는 이 PC 파일만, 한 번 생성의 화소 상한(`SAM_EXTRA_MCP_MAX_PIXELS`, 기본 16.8 MP), LoRA·체크포인트
+  제작자 글은 `untrusted_*` 로 표시.
+- **한계**: 권한은 MCP 서버가 지키는 것이지 샌드박스가 아닙니다 — 셸·파일 쓰기 도구도 가진 에이전트는 `config.json` 을 고치거나
+  Forge API 를 직접 부를 수 있습니다(Forge 2.29.2 의 `POST /sdapi/v1/options` 는 `restrict_api` 를 지키지 않음). 같은 PC 전용이라
+  `FORGE_URL` 이 다른 컴퓨터를 가리키면 모든 권한이 꺼집니다. 동영상(Wan) 결과는 모으지 않고, `uv.lock` 은 함께 배포하지 않습니다.
+- **검증**: 새 Python 테스트 312개(상류 pytest 130개 중 128개를 unittest 로 옮긴 것 포함). MCP SDK 가 있어야 도는 등록 테스트 5개는
+  Forge venv 에서 건너뛰고, mcp 2.2.0 · Python 3.11 환경에서는 312개 모두 통과했습니다. SDK 의 `ClientSession` 으로 stdio 에 붙여 도구
+  10개 목록, 정책 읽기, 생성·중단 거절을 확인했습니다. 실제 Forge 생성과 Claude Code 등록으로는 아직 확인하지 않았습니다.
+
+### 구도 · 카메라 — 프롬프트로 시점 잡기 (새 기능, 토글 — 기본 켬, 결과 같음)
+
+- **구도 · 카메라 칸**: txt2img·img2img 스타일 줄 아래(기본 배치에서는 Generate 옆 열, txt2img 는 TIPO 칸 다음)에 접힌 칸이
+  생깁니다. 방향(−180~180°)·높이(−75~75°)·거리·크롭(0~100%)·기울기(−30~30°)·화면 내 인물 위치(−100~100%)를 프리셋 다섯 개·끌 수
+  있는 궤도 그림(방향키 5°, Shift 15°, Home 정면)·슬라이더로 정하면 `facing viewer`·`from above`·`cowboy shot`·`dutch angle`·
+  `centered composition` 같은 태그·구도 문구를 미리 보여 주고, **메인 태그에 추가** 를 눌렀을 때만 메인 프롬프트 끝에 없는 태그만
+  붙입니다. 3D 카메라가 아니라 프롬프트 유도입니다. 사용자 앱 UR_IV 의 `compositionPrompt.ts`·`CompositionControl.vue`(앱
+  `d2fcc70`)를 옮겼고, 화면 글자와 태그는 앱과 같습니다.
+- **적어 둔 프롬프트는 그대로**: 붙일 부분만 끝에 넣습니다(`document.execCommand('insertText')` — 브라우저 Ctrl+Z 한 번에
+  되돌아감, 안 되면 값을 씀). 브라우저가 내는 타이핑 모양의 input 이벤트는 막고 Forge `updateInput` 으로 Gradio 에 알려, 태그
+  자동완성(tagcomplete)이 추천 목록을 띄우지 않습니다 — 목록이 떠 있으면 Enter/Tab 이 방금 붙인 단어를 바꿀 수 있습니다. 같은
+  태그는 대소문자·밑줄·가중치를 가리지 않고 알아보고, 반대 태그가 이미 있으면 경고만 하고 지우지 않습니다(버튼: 메인 태그에 추가 /
+  이미 포함된 구도 / 기존 구도 유지하고 추가). 미리보기·경고는 입력할 때마다 바뀝니다.
+- **설정·저장**: Settings → **SAM Extra Appearance** → `sam3_composition_panel`(기본 켬, Reload UI 또는 재시작 뒤 적용). 조작값은
+  탭마다 이 브라우저의 localStorage 에 두고, 깨진 값은 앱과 같은 규칙으로 고칩니다. 누르기 전에는 프롬프트가 바뀌지 않고 생성·
+  infotext 는 그대로입니다.
+- **검증**: 앱 원본 파일을 `tests/_origin_composition_prompt/` 에 SHA-256 고정으로 두고 Node 가 그대로 불러와 이식본과 대조합니다 —
+  프리셋, 조절값 전 범위와 그 바깥(.5·.49 반올림 경계), 태그 문턱값 안팎 곱 격자 약 26만 상태, NaN·Infinity·문자열 같은 깨진 값,
+  가중치·이스케이프·스케줄·와일드카드·LoRA·끝 쉼표·빈 값 프롬프트 말뭉치와 무작위 문자열 4000개(모두 같음). JS 64개(로직 26 · 원본
+  대조 11 · jsdom 동작 27), Python 27개(자리·설정·Forge 기본/Compact 배치). 타입 지우기가 없는 Node 20(CI)에서는 원본 대조 9개를
+  건너뜁니다. 실제 Forge(헤드리스 Chrome, 진짜 마우스 클릭·Ctrl+Z)에서 txt2img·img2img 모두 확인: 붙이면 Gradio 값도 바뀌고, Ctrl+Z
+  한 번에 화면·Gradio 값이 함께 돌아오며, 자동완성 목록은 뜨지 않습니다(직접 타이핑하면 뜸).
+
+### 설정 · 라이선스 · 검증
+
+- **새 설정 섹션**: **SAM Extra Colorcraft**(`sam3_colorcraft`)·**SAM Extra SPEED**(`sam3_speed`)·**SAM Extra Progress Bar**
+  (`sam3_progress`)·**SAM Extra MCP**(`sam3_mcp`). 구도·카메라는 기존 **SAM Extra Appearance** 에 `sam3_composition_panel`(기본 켬)을
+  더합니다. Extra Schedulers·Extra Samplers 는 설정 키가 없습니다(Karras Dynamic 은 Forge 의 rho, 새 샘플러는 Forge 의 Eta·Sigma
+  churn/tmin/tmax/noise 를 씀).
+- **라이선스**: 편입한 상류 — Colorcraft(muerrilla·aoleg 포크, MIT), SPEED(howardhx·aoleg·sorryhyun, MIT), Smooth Progress
+  (diamfang, MIT), forgeneo-mcp(Eduardo Abreu, MIT), ComfyUI `get_sigmas_laplace`·`SamplerER_SDE` 잡음 척도(GPL-3.0), Clybius
+  DPM++ 4M SDE(BSD-3-Clause), Koishi-Star Euler (SMEA) Dy(Apache-2.0) — 의 커밋과 바꾼 곳을 `THIRD_PARTY_NOTICES.md` 에 적고, MIT
+  고지 적용 목록에 저작권자를 더했으며 BSD 3-Clause·Apache 2.0 전문을 넣었습니다. Extra Schedulers 의 나머지 스케줄러는 식
+  재구현이고, 두 기능이 이름을 맞춘 aoleg/Neo_ExtraSchedulers(라이선스 없음)의 코드는 쓰지 않았습니다(README 만 참고).
+  `mcp_server/pyproject.toml` 의 라이선스는 `GPL-3.0-only AND MIT` 입니다. Colorcraft 색 벡터(`sam3ext/colorcraft/data/*.safetensors`,
+  1.4~6.4 KB)는 `.gitignore` 예외로 저장소에 함께 들어갑니다.
+- **검증**: Python 2841개 통과(skip 22 — 그중 5개는 MCP SDK 가 있어야 도는 등록 테스트, CPU). 새 테스트는 Colorcraft 139 ·
+  Anima SPEED 132 · Extra Schedulers 146 · Extra Samplers 123 · 진행 막대 61 · MCP 312 · 구도·카메라 27 · 기능 조합 44 개입니다.
+  JS 177개 통과(진행 막대 37개·Colorcraft 10개·구도·카메라 64개를 더함). 실제 Forge 에서는 위에 적은 Anima 3.8B GPU 실측과
+  구도·카메라 칸의 브라우저 동작을 확인했고, 진행 막대의 브라우저 표시(설정을 켜야 함)와 실제 MCP 클라이언트 연결은 아직입니다.
+- **검증 — 기능 조합**: 새 통합 테스트 44개(`tests/test_integration_*.py`, CPU 하네스 `tests/_integration_support.py`)가
+  SPEED+Colorcraft, Dy+Colorcraft, SPEED+Dy, Forge 의 실제 `get_sigmas` 로 만든 스케줄러 스케줄을 SPEED 로 돌리기, post-CFG 순서,
+  다섯 샘플러 모두 + 가이던스 전체, 스크립트 22개 전부를 Forge 순서로 불러오기를 확인합니다.
+
 ## v0.30.1 — 진단 로그의 Momentum·HiGS 적용 횟수가 생성마다 쌓이던 문제
 
 - **`[VERIFY] detail`의 MG·HiGS 횟수 수정**: `Log Guidance verification summary`를 켜면 남는 `MG=APPLIED(n evals)`와

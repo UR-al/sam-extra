@@ -108,6 +108,11 @@ the named tokens; existing Forge layout dimensions are not globally rewritten.
 - The txt2img section layout can be turned off: Settings → SAM Extra Appearance
   → `sam3_layout_sections` (Forge restart), or `?sam3_lanes=off` for one page
   load.
+- The smooth progress bar is opt-in: Settings → SAM Extra Progress Bar →
+  `sam3_progress_enabled`. It inserts one `.sam3-progress` node per tab at
+  mount, then writes only `data-*`/`aria-*` attributes, inline
+  `--sam3-progress-*` properties and the `.data` of its two text nodes; Forge's
+  `.progressDiv` is hidden, never removed.
 - Existing preview images and generated galleries are content, not decoration.
 - Third-party extensions may retain their own intentional brand surfaces, but
   common Gradio controls inherit this system.

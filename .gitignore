@@ -6,6 +6,8 @@ models/
 *.pt
 *.pth
 *.safetensors
+# Colorcraft basis vectors (1.4-6.4 KB each) ship with the code — tests pin their SHA-256.
+!sam3ext/colorcraft/data/*.safetensors
 # Keep shared Claude Code config (settings.json + hooks) tracked; ignore only
 # the per-user local overrides.
 .claude/settings.local.json
@@ -29,3 +31,7 @@ node_modules/
 .agents/
 .claude/anima_prompt.json
 .claude/anima_workflow.json
+
+# sam-extra MCP server (mcp_server/): `uv run --project mcp_server ...` creates the lock file on
+# its first run (and .venv/, ignored above). Generated per machine, not shipped.
+mcp_server/uv.lock

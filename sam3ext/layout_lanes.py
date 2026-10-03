@@ -69,7 +69,16 @@ REGISTRY: dict[str, Slot] = {
     "anima-detail-daemon": Slot("anima"),
     "anima-skimmed-cfg": Slot("anima"),
     "anima-safe-pag": Slot("anima"),
+    # CFG-Zero* optimized-scale(실험). ANIMA 섹션에 들어가는데 등록이 없으면 "도구·실험" 으로 분류돼 더 보기를 닫으면
+    # 숨고, 바로 아래에 오도록 정렬한 Colorcraft 와 떨어진다.
+    "anima-cfg-optimal-scale": Slot("anima", exp=True),
+    "colorcraft": Slot("anima"),       # 샘플링 중 latent 색 보정(모든 모델 — 벡터는 Anima·Flux·Flux2 계열)
     "anima-vae-2x": Slot("anima", exp=True),
+    "anima-speed": Slot("anima", exp=True),   # SPEED — 저해상도 선행 샘플링(실험)
+    "anima-extra-schedulers": Slot("anima", on=OnRule(none=True)),   # custom·Laplace 값만 — 켜짐 개념 없음
+    # 샘플러 값(ER SDE max stage·eta)만 담은 묶음이라 켜짐 개념이 없다 — 샘플러 드롭다운에서 고르면 쓰인다.
+    # 파일은 anima_extra_samplers.py — Panchovix/sd_forge_neo_extra_samplers 가 이미 scripts/extra_samplers.py 다.
+    "anima-extra-samplers": Slot("anima", on=OnRule(none=True)),
     "sam3": Slot("det"),
     "anima-vae-degrid": Slot("det"),   # 저장 직전 후처리 — SAM3·ADetailer 와 같은 묶음
     "anima-ref-poc": Slot("etc"),

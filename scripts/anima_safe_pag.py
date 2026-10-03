@@ -79,6 +79,10 @@ try:
     from modules import shared
 except ImportError:  # standalone/unit-test loader
     shared = None  # type: ignore
+try:  # Guidance must keep working even if the extra-sampler package fails to import
+    from sam3ext.extra_samplers.common import SUBSTEP_MARKER as EXTRA_SAMPLER_SUBSTEP
+except Exception:  # noqa: BLE001 - same literal as sam3ext/extra_samplers/common.py
+    EXTRA_SAMPLER_SUBSTEP = "sam_extra_substep"
 from sam3ext.guidance.cns import color_noise_wavelet
 from sam3ext.guidance.cwm_smc import (
     SMC_ADAPTIVE_ALPHA,
@@ -105,6 +109,9 @@ from sam3ext.guidance.sigmas import (
     sampling_schedule,
     schedule_index,
 )
+# Shared with Detail Daemon and Colorcraft (moved unchanged into sam3ext/guidance/sigmas.py).
+from sam3ext.guidance.sigmas import forge_sampling_offset as _forge_sampling_offset
+from sam3ext.guidance.sigmas import is_img2img_request as _is_img2img_request
 from sam3ext.guidance.trajectory import Trajectory
 from sam3ext.guidance.dave import apply_dave
 from sam3ext.guidance.dave_gate import (
@@ -1198,42 +1205,10 @@ def _block_transformer_options(args, kwargs):
     return options if isinstance(options, dict) else None
 
 
-def _is_img2img_request(p) -> bool:
-    """Is ``p`` a ``StableDiffusionProcessingImg2Img`` (or a subclass of it)?
-
-    Checked by class name so the helper needs no ``modules.processing`` import."""
-    return any(
-        cls.__name__ == "StableDiffusionProcessingImg2Img"
-        for cls in type(p).__mro__
-    )
-
-
-def _forge_sampling_offset(p):
-    """Index in Forge's ``sampling_sigmas`` of the first sigma this pass samples.
-
-    txt2img's first pass walks the whole list (``KDiffusionSampler.sample``),
-    so the offset is 0. img2img and the hires pass walk
-    ``sigmas[steps - t_enc - 1:]`` (modules/sd_samplers_kdiffusion.py:145-148).
-    Their ``steps, t_enc`` come from Forge's own ``setup_img2img_steps`` with
-    the argument ``processing.py`` passes it: the hires pass uses
-    ``hr_second_pass_steps or steps`` (:1552), img2img uses None (:1920).
-    Returns None when the offset cannot be worked out; the gate then uses the
-    whole list. It is not inferred from ``shared.state.sampling_steps``,
-    because some schedulers (Forge's ``ddim_scheduler``) return more than
-    ``steps + 1`` sigmas."""
-    if getattr(p, "is_hr_pass", False):
-        requested = getattr(p, "hr_second_pass_steps", 0) or getattr(p, "steps", None)
-    elif _is_img2img_request(p):
-        requested = None
-    else:
-        return 0
-    try:
-        from modules import sd_samplers_common
-
-        steps, t_enc = sd_samplers_common.setup_img2img_steps(p, requested)
-        return int(steps) - int(t_enc) - 1
-    except Exception:
-        return None
+# ``_is_img2img_request`` and ``_forge_sampling_offset`` (index in Forge's ``sampling_sigmas`` of the
+# first sigma this pass samples, from Forge's own ``setup_img2img_steps``) now live in
+# sam3ext/guidance/sigmas.py and are imported above under the same names. When the offset cannot be
+# worked out (None) the DAVE gate uses the whole list.
 
 
 def _sampler_publishes_sigmas(p) -> bool:
@@ -2358,7 +2333,8 @@ def _model_wrapper_inner(apply_model, w):
             # APG momentum from a preceding guided step must not leak through
             # a cond-only interval or into the next periodically-kept step.
             # SMC's e_prev is kept (see _reset_apg_momentum).
-            _reset_apg_momentum()
+            if not _is_extra_sampler_substep(w):
+                _reset_apg_momentum()
             out_full = torch.empty(
                 (batch,) + tuple(out_c.shape[1:]),
                 device=out_c.device, dtype=out_c.dtype,
@@ -2570,8 +2546,9 @@ def _apply_apg(args, effective_scale, guidance_override=None):
                     or (cur is not None and last is not None and cur > last + 1e-6)):
                 avg = torch.zeros_like(guidance)
             avg = mom * avg + guidance
-            _APG["avg"] = avg
-            _APG["last_sigma"] = cur
+            if not _is_extra_sampler_substep(args):   # a Dy/SMEA sub-step reads it, never stores
+                _APG["avg"] = avg
+                _APG["last_sigma"] = cur
             guidance = avg
 
         # Norm clamp: keep the guidance vector under a fixed L2 magnitude.
@@ -2948,12 +2925,15 @@ def _apply_cfg_base(args, incoming):
     sigma = args.get("sigma")
 
     adaptive_smc = _CFG.get("smc_mode") == SMC_MODE_ADAPTIVE
+    # A Dy/SMEA sub-step (another resolution) reads SMC's e_prev but never stores into it.
+    keep_smc = smc_on and not _is_extra_sampler_substep(args)
     if apg_on:
         # SMC -> APG -> CWM. APG consumes the (optionally SMC-smoothed) error
         # and already applies the CFG scale, so CWM runs on its output at 1.0.
         raw_error = cond - uncond
+        smc_next = _RUNTIME.smc_prev
         if smc_on and adaptive_smc:
-            raw_error, _RUNTIME.smc_prev = apply_smc_adaptive(
+            raw_error, smc_next = apply_smc_adaptive(
                 raw_error,
                 sampler_sigma(args),
                 _RUNTIME.smc_prev,
@@ -2961,12 +2941,14 @@ def _apply_cfg_base(args, incoming):
                 float(_CFG["smc_adaptive_lambda"]),
             )
         elif smc_on:
-            raw_error, _RUNTIME.smc_prev = apply_smc_error(
+            raw_error, smc_next = apply_smc_error(
                 raw_error,
                 _RUNTIME.smc_prev,
                 float(_CFG["smc_lambda"]),
                 float(_CFG["smc_k"]),
             )
+        if keep_smc:
+            _RUNTIME.smc_prev = smc_next
         apg_result = _apply_apg(
             args, scale, raw_error if smc_on else None
         )
@@ -3005,7 +2987,7 @@ def _apply_cfg_base(args, incoming):
         smc_sigma=sampler_sigma(args) if adaptive_smc else None,
         smc_alpha=float(_CFG["smc_adaptive_alpha"]),
     )
-    if smc_on:
+    if keep_smc:
         _RUNTIME.smc_prev = next_previous
     _CFG["steps"] += 1
     return result
@@ -3160,6 +3142,20 @@ def _detail_stages_on() -> bool:
     )
 
 
+def _is_extra_sampler_substep(args) -> bool:
+    """An extra evaluation of Euler (SMEA) Dy CFG++ at another resolution (sam3ext/extra_samplers).
+
+    Its x0 is not the step's: the step-keyed state (HiFlow trajectory and alignment, Momentum/HiGS
+    history, SMC e_prev, APG momentum, RDC EMA) is neither updated nor reset by it — the next step
+    carries on as if it had not happened. Stateless TSR still applies. ``args`` is a post-CFG dict
+    (``model_options``) or the UNet wrapper's (``c["transformer_options"]``)."""
+    options = args.get("model_options") or {}
+    transformer_options = (
+        options.get("transformer_options") or (args.get("c") or {}).get("transformer_options") or {}
+    )
+    return bool(transformer_options.get(EXTRA_SAMPLER_SUBSTEP))
+
+
 def _hiflow_position(walked, sigma: float):
     """``(fractional step k, N, on_schedule)`` of ``sigma`` on the hires pass's walked sigmas."""
     if walked is None:
@@ -3215,7 +3211,7 @@ def _hiflow_apply(args, result, sigma: float):
 
 def _hiflow_record(args, result) -> None:
     """Base pass: keep this evaluation's final x0 at the sampler's sigma (last one wins)."""
-    if not _hiflow_run_is_pass():
+    if not _hiflow_run_is_pass() or _is_extra_sampler_substep(args):
         return
     sigma = sampler_sigma(args)
     if sigma is None or sigma <= 0.0 or not torch.is_tensor(result):
@@ -3239,14 +3235,15 @@ def _apply_detail_stages(args, result, adg_skipped: bool):
     flow = _DETAIL["flow"]
     if flow is None:
         flow = is_flow_model(args.get("model"))
+    substep = _is_extra_sampler_substep(args)
 
-    if _HIFLOW["applying"] and sigma is not None and sigma > 0.0 and _hiflow_run_is_pass():
+    if _HIFLOW["applying"] and sigma is not None and sigma > 0.0 and _hiflow_run_is_pass() and not substep:
         try:
             result = _hiflow_apply(args, result, sigma)
         except Exception as e:
             _detail_warn_once("hiflow", f"HiFlow fallback (earlier guidance kept): {type(e).__name__}: {e}")
 
-    if _HIST["mg_on"] or _HIST["higs_on"]:
+    if (_HIST["mg_on"] or _HIST["higs_on"]) and not substep:
         history = _RUNTIME.history
         if adg_skipped:
             # A cond-only Adaptive Guidance step: no guided prediction to extend; start over
@@ -3327,7 +3324,8 @@ def _post_cfg(args):
     _capture_cns_post_cfg_input(live_input)
 
     adg_skipped = bool(_STATE["adg_skipped"])
-    if adg_skipped:
+    substep = _is_extra_sampler_substep(args)   # Dy/SMEA sub-step: no state update or reset
+    if adg_skipped and not substep:
         _reset_apg_momentum()
 
     has_base_override = not adg_skipped and any(_cfg_base_flags())
@@ -3371,7 +3369,8 @@ def _post_cfg(args):
                     ),
                     rdc_alpha_ll=float(_DCW["rdc_alpha_ll"]),
                     rdc_alpha_hh=float(_DCW["rdc_alpha_hh"]),
-                    rdc_state=_RUNTIME.rdc_state,
+                    # Its EMA is per step at the step's resolution: a sub-step gets DCW only.
+                    rdc_state=None if substep else _RUNTIME.rdc_state,
                 )
                 _DCW["steps"] += 1
                 if _DCW["dcw_on"]:

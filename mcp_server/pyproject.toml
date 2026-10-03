@@ -1,0 +1,30 @@
+# sam-extra MCP server - a stdio MCP server that runs in its own uv environment, never inside Forge
+# (the MCP SDK needs pydantic>=2.11; Forge pins 2.10.6 and re-installs its pins at every launch).
+#
+#   claude mcp add --scope user sam-extra -- uv run --project <extension>/mcp_server sam-extra-mcp
+#
+# The first run needs network access: uv builds .venv/ (and uv.lock) next to this file.
+# Vendors forgeneo-mcp (https://github.com/eduardoabreu81/forgeneo-mcp @ a103dc5, MIT,
+# Copyright (c) 2026 Eduardo Abreu) under sam_extra_mcp/forgeneo/; the rest is sam-extra's (GPL-3.0-only).
+
+[project]
+name = "sam-extra-mcp"
+version = "0.1.0"
+description = "Stdio MCP server that lets an AI agent on this PC drive Forge Neo through sam-extra (vendors forgeneo-mcp)"
+requires-python = ">=3.10"
+license = "GPL-3.0-only AND MIT"
+dependencies = [
+    # 2.2.0 is the release the server was verified against (MCPServer, tool annotations, stdio).
+    "mcp>=2.2,<3",
+    "httpx>=0.27",
+]
+
+[project.scripts]
+sam-extra-mcp = "sam_extra_mcp.server:main"
+
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["sam_extra_mcp"]

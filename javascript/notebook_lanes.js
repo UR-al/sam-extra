@@ -18,7 +18,10 @@
         "anima-detail-daemon": "Detail Daemon",
         "anima-skimmed-cfg": "Skimmed CFG",
         "anima-safe-pag": "Guidance",
+        "anima-cfg-optimal-scale": "Optimal Scale",
+        "colorcraft": "Colorcraft",
         "anima-vae-2x": "VAE 2x",
+        "anima-speed": "SPEED",
         "sam3": "SAM3 Mask",
         "anima-vae-degrid": "VAE DeGrid",
         "anima-ref-poc": "Reference PoC"
