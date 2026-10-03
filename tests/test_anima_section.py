@@ -88,6 +88,7 @@ class ScriptSectionTests(unittest.TestCase):
         "anima_skimmed_cfg.py": "AnimaSkimmedCFG",
         "anima_safe_pag.py": "AnimaSafePAG",
         "anima_vae_2x.py": "AnimaVAE2x",
+        "anima_speed.py": "AnimaSpeed",
     }
 
     def test_each_anima_script_joins_the_section_on_txt2img(self):
@@ -132,6 +133,7 @@ class OnClassTests(unittest.TestCase):
             "scripts/anima_skimmed_cfg.py": "anima_skim_enable",
             "scripts/anima_vae_2x.py": "anima_vae2x_enable",
             "scripts/anima_cfg_optimal_scale.py": "anima_optimal_scale_enable",
+            "scripts/anima_speed.py": "anima_speed_enable",
             "scripts/anima_ref_poc.py": "anima_ref_poc_enable",
             "sam3ext/ui.py": 'eid("enable")',
         }

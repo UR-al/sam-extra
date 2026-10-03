@@ -43,7 +43,10 @@ class RegistryTests(unittest.TestCase):
     def test_expected_placement(self):
         expected = {
             "anima-3-8b": "anima", "anima-detail-daemon": "anima", "anima-skimmed-cfg": "anima",
-            "anima-safe-pag": "anima", "anima-vae-2x": "anima",
+            "anima-safe-pag": "anima", "anima-vae-2x": "anima", "anima-speed": "anima", "anima-extra-schedulers": "anima",
+            "anima-extra-samplers": "anima",
+            "anima-cfg-optimal-scale": "anima",
+            "colorcraft": "anima",
             "sam3": "det", "adetailer": "det", "anima-vae-degrid": "det",
             "lora-block-weight": "lora", "dora-infer-mode": "lora", "controlnet": "lora", "dynamic-prompting": "lora",
             "dynamic-thresholding": "lora",
@@ -53,9 +56,9 @@ class RegistryTests(unittest.TestCase):
             with self.subTest(key=key):
                 self.assertEqual(ll.REGISTRY[key].lane, lane)
 
-    def test_only_vae_2x_is_marked_experimental(self):
+    def test_experimental_slots_are_vae_2x_speed_and_optimal_scale(self):
         marked = {key for key, slot in ll.REGISTRY.items() if slot.exp}
-        self.assertEqual(marked, {"anima-vae-2x"})
+        self.assertEqual(marked, {"anima-vae-2x", "anima-speed", "anima-cfg-optimal-scale"})
 
     def test_unknown_extensions_fall_into_tools(self):
         self.assertEqual(ll.lane_for("some-new-extension"), "etc")

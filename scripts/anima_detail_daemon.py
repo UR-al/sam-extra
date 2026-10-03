@@ -70,6 +70,9 @@ from modules import script_callbacks, scripts
 
 from sam3ext import layout_lanes
 from sam3ext.guidance.dave_gate import note_pre_dd_sigma
+# Shared with DAVE's gate and Colorcraft (moved unchanged into sam3ext/guidance/sigmas.py).
+from sam3ext.guidance.sigmas import forge_sampling_offset as _forge_sampling_offset
+from sam3ext.guidance.sigmas import is_img2img_request as _is_img2img_request
 
 try:
     import numpy as np
@@ -233,44 +236,10 @@ def get_dd_schedule(
     return torch.lerp(dd_schedule[idxlow], dd_schedule[idxhigh], ratio).item()
 
 
-def _is_img2img_request(p) -> bool:
-    """``p`` is a ``StableDiffusionProcessingImg2Img`` (or a subclass).
-
-    Checked by class name so the helper needs no ``modules.processing`` import."""
-    return any(
-        cls.__name__ == "StableDiffusionProcessingImg2Img"
-        for cls in type(p).__mro__
-    )
-
-
-def _forge_sampling_offset(p):
-    """Index in Forge's ``sampling_sigmas`` of the first sigma this pass samples.
-
-    txt2img's first pass walks the whole list (``KDiffusionSampler.sample``),
-    so the offset is 0. img2img and the hires pass walk
-    ``sigmas[steps - t_enc - 1:]`` (modules/sd_samplers_kdiffusion.py:145-148).
-    Their ``steps, t_enc`` come from Forge's own ``setup_img2img_steps`` with
-    the argument ``processing.py`` passes it: the hires pass uses
-    ``hr_second_pass_steps or steps`` (:1552), img2img uses None (:1920).
-    Returns None when the offset cannot be worked out; the run then counts back
-    like a run the script did not set up (``_run_offset``). It is not counted
-    back from the end with ``denoiser.steps`` otherwise, because
-    some schedulers (Forge's ``ddim_scheduler``) return more than
-    ``steps + 1`` sigmas. Same rule as DAVE's gate
-    (``scripts/anima_safe_pag.py`` ``_forge_sampling_offset``)."""
-    if getattr(p, "is_hr_pass", False):
-        requested = getattr(p, "hr_second_pass_steps", 0) or getattr(p, "steps", None)
-    elif _is_img2img_request(p):
-        requested = None
-    else:
-        return 0
-    try:
-        from modules import sd_samplers_common
-
-        steps, t_enc = sd_samplers_common.setup_img2img_steps(p, requested)
-        return int(steps) - int(t_enc) - 1
-    except Exception:
-        return None
+# ``_is_img2img_request`` and ``_forge_sampling_offset`` (index in Forge's ``sampling_sigmas`` of the
+# first sigma this pass samples, from Forge's own ``setup_img2img_steps``) now live in
+# sam3ext/guidance/sigmas.py and are imported above under the same names. When the offset cannot be
+# worked out (None) the run counts back like a run the script did not set up (``_run_offset``).
 
 
 def _executed_sigmas(denoiser):

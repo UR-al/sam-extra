@@ -1133,3 +1133,401 @@ html.sam3-notebook-layout-active .sam3-notebook-original-root {
         max-height: none;
     }
 }
+
+/* sam3-progress:begin */
+/* SAM Extra 진행 막대 (javascript/progress_bar.js · Settings → SAM Extra Progress Bar).
+ * diamfang/sd-webui-smooth-progress@7fe5810(MIT, Copyright (c) 2026 diamfang — 고지 전문은 javascript/progress_bar.js 머리와
+ * THIRD_PARTY_NOTICES.md)의 막대를 이 디자인 시스템으로 다시 그렸다: 색은 테마 변수, 그라데이션·움직이는 색·빛 번짐
+ * (filter·drop-shadow·text-shadow) 없음, z-index 없음. JS 는 상태를 data-* 와 인라인 --sam3-progress-* 로만 쓴다.
+ * clip-path·opacity·transform 은 Gradio 노드를 담지 않는 막대 안쪽 잎 요소에만 쓴다(쌓임 맥락 규칙은 레이아웃 조상 대상). */
+
+/* Forge 기본 막대는 지우지 않고 숨긴다 — sd-webui-api-payload-display 가 그 삽입(childList)을 기다린다.
+ * 이 막대가 붙은 곳에서만(막대 뒤 형제 #…_results_panel 안이나, 막대 뒤 형제로 들어온 것), 그리고 이 막대가 맡아 그리는
+ * 작업을 Forge 의 requestProgress 가 아직 붙들고 있는 동안만(data-native="hide", JS syncNative). 맡지 않은 작업 —
+ * 설정을 켜기 전에 시작한 작업 등 — 은 Forge 막대가 그대로 보인다. */
+html[data-sam3-progress="on"] .sam3-progress[data-native="hide"] ~ .progressDiv,
+html[data-sam3-progress="on"] .sam3-progress[data-native="hide"] ~ * .progressDiv {
+    display: none !important;
+}
+
+html:not([data-sam3-progress="on"]) .sam3-progress {
+    display: none;
+}
+
+.sam3-progress {
+    --sam3-progress-value: 0;
+    --sam3-progress-height: 20px;
+    --sam3-progress-align: 50;
+    --sam3-progress-fade: .4s;
+    --sam3-progress-fill: var(--sam3-progress-color, var(--color-accent, var(--sam3-color-accent)));
+    --sam3-progress-fill-ink: var(--sam3-progress-color-ink, var(--button-primary-text-color, var(--sam3-color-accent-ink)));
+    position: relative;
+    box-sizing: border-box;
+    flex: none;
+    width: 100%;
+    height: var(--sam3-progress-height);
+    overflow: hidden;
+    border: 1px solid var(--input-border-color, var(--sam3-color-rule));
+    border-radius: var(--sam3-radius-md, .375rem);
+    background: var(--input-background-fill, var(--sam3-color-paper-3));
+    color: var(--body-text-color, var(--sam3-color-ink));
+    font-family: var(--sam3-font-body, inherit);
+    font-size: clamp(.5rem, calc(var(--sam3-progress-height) * .62), .8125rem);
+    font-variant-numeric: tabular-nums;
+    font-weight: 600;
+    line-height: 1;
+}
+
+/* 채움: 늘 막대 전체 크기이고 clip-path 로 왼쪽 value% 만 보인다. 그래서 안쪽 글자(채움 위 색)가 바깥 글자(바탕 위 색)와
+ * 같은 자리에 겹치고, 경계에서 글자가 두 색으로 갈린다 — 어느 쪽에서도 읽히고 빛 번짐이 필요 없다. */
+.sam3-progress-fill {
+    position: absolute;
+    inset: 0;
+    color: var(--sam3-progress-fill-ink);
+    background: var(--sam3-progress-fill);
+    clip-path: inset(0 calc(100% - var(--sam3-progress-value) * 1%) 0 0 round var(--sam3-radius-sm, .25rem));
+    opacity: 0;
+    transition: opacity var(--sam3-progress-fade) var(--sam3-ease-in-out, ease-in-out);
+}
+
+/* 글자 위치: 0 왼쪽 · 50 가운데 · 100 오른쪽(상류 Text Alignment 0~100%). */
+.sam3-progress-label {
+    position: absolute;
+    inset-block: 0;
+    inset-inline-start: calc(var(--sam3-progress-align) * 1%);
+    display: flex;
+    align-items: center;
+    padding-inline: var(--sam3-space-xs, .5rem);
+    transform: translateX(calc(var(--sam3-progress-align) * -1%));
+    white-space: nowrap;
+    pointer-events: none;
+    opacity: 0;
+    transition: opacity var(--sam3-progress-fade) var(--sam3-ease-in-out, ease-in-out);
+}
+
+.sam3-progress[data-fill="1"] > .sam3-progress-fill,
+.sam3-progress[data-text="1"] .sam3-progress-label {
+    opacity: 1;
+}
+
+/* 새 작업은 서서히가 아니라 바로 보인다(상류: transition none + reflow). */
+.sam3-progress[data-instant],
+.sam3-progress[data-instant] * {
+    transition: none !important;
+}
+
+/* 중단: 빨간 막대 / 빨간 글자(바탕 위 글자만 — 빨간 막대 위 글자는 오류 색의 글자색). 글자 '중단됨' 이 늘 함께 있어
+ * 색만으로 알리지 않는다. */
+.sam3-progress[data-state="interrupted"]:is([data-interrupt="text_red_bar"], [data-interrupt="red_text_red_bar"]) {
+    --sam3-progress-fill: var(--sam3-color-error);
+    --sam3-progress-fill-ink: var(--sam3-color-error-ink);
+}
+
+.sam3-progress[data-state="interrupted"]:is([data-interrupt="red_text"], [data-interrupt="red_text_red_bar"]) > .sam3-progress-label {
+    color: var(--error-text-color, var(--sam3-color-error-hover));
+}
+/* sam3-progress:end */
+
+/* sam3-composition:begin */
+/* 구도 · 카메라 (javascript/composition_ui.js · scripts/composition_camera.py · Settings → SAM Extra Appearance).
+ * 사용자 앱 CompositionControl.vue 의 배치·간격(접힌 칸 → 설명 → 프리셋 → 궤도 그림 → 슬라이더 → 미리보기 → 경고 → 버튼 →
+ * 알림)을 그대로 두고, 색은 Gradio 테마 변수로 바꿨다 — Forge 기본 밝은·어두운 테마와 sam-extra 테마(tokens.css 가 Gradio
+ * 변수를 다시 잇는다) 모두. 글자 크기는 Forge 의 --text-* 단계(앱보다 1px 쯤 큼, 머리글은 바로 위 TIPO 칸 머리와 같은 크기).
+ * 움직임 없음: transition·animation 을 쓰지 않는다(그림은 입력을 바로 따른다). z-index 없음, 투명도는 잎 요소에만.
+ * 칸은 Gradio HTML 의 .prose 안에 있다 — 선택자를 (0,3,0) 이상으로 써서 Gradio 의 .prose p · ul · li · button · input
+ * (0,2,1), [type=button](0,2,0), .prose *(0,2,0) 의 색을 불러온 순서와 상관없이 이긴다(.prose :last-child 의 아래 여백
+ * 0 !important 는 그대로 둔다). 터치(pointer: coarse)에서는 누르는 것 모두 44px 이상. */
+
+/* .prose * 가 모든 자손에 본문 색을 박는다 — 패널 안에서는 부모 색을 따르게 되돌리고, 아래 규칙이 필요한 곳만 정한다. */
+.sam3-composition-mount .sam3-composition[data-tab] * {
+    color: inherit;
+}
+
+.sam3-composition-mount .sam3-composition[data-tab] [hidden] {
+    display: none !important;
+}
+
+.sam3-composition-mount .sam3-composition[data-tab] {
+    box-sizing: border-box;
+    min-width: 0;
+    margin: 0;
+    border: 1px solid var(--block-border-color, var(--border-color-primary, var(--sam3-color-rule)));
+    border-radius: var(--block-radius, var(--sam3-radius-lg, .5rem));
+    background: var(--block-background-fill, var(--sam3-color-paper-2));
+    color: var(--body-text-color, var(--sam3-color-ink));
+    font-size: var(--text-sm, 12px);
+    font-weight: normal;
+    line-height: 1.5;
+}
+
+.sam3-composition-mount .sam3-composition .sam3-composition__summary {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 8px;
+    box-sizing: border-box;
+    min-height: 36px;
+    margin: 0;
+    padding: 4px 10px;
+    color: var(--body-text-color, var(--sam3-color-ink));
+    font-size: var(--text-md, 14px);
+    font-weight: 600;
+    list-style: none;
+    cursor: pointer;
+    user-select: none;
+}
+
+.sam3-composition-mount .sam3-composition .sam3-composition__summary::-webkit-details-marker {
+    display: none;
+}
+
+.sam3-composition-mount .sam3-composition .sam3-composition__summary::before {
+    content: "\203A";
+    font-size: 16px;
+    line-height: 1;
+}
+
+.sam3-composition-mount .sam3-composition[open] .sam3-composition__summary::before {
+    content: "\2304";
+}
+
+.sam3-composition-mount .sam3-composition .sam3-composition__summary > span {
+    color: var(--body-text-color-subdued, var(--sam3-color-muted));
+    font-size: var(--text-sm, 12px);
+    font-weight: normal;
+}
+
+.sam3-composition-mount .sam3-composition .sam3-composition__body {
+    min-width: 0;
+    padding: 0 10px 8px;
+}
+
+.sam3-composition-mount .sam3-composition .sam3-composition__help {
+    margin: 5px 0 8px;
+    color: var(--body-text-color-subdued, var(--sam3-color-muted));
+    font-size: var(--text-sm, 12px);
+    line-height: 1.5;
+    overflow-wrap: anywhere;
+}
+
+.sam3-composition-mount .sam3-composition .sam3-composition__presets,
+.sam3-composition-mount .sam3-composition .sam3-composition__actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 5px;
+}
+
+.sam3-composition-mount .sam3-composition .sam3-composition__button {
+    box-sizing: border-box;
+    min-height: 32px;
+    margin: 0;
+    padding: 5px 8px;
+    border: 1px solid var(--button-secondary-border-color, var(--border-color-primary, var(--sam3-color-rule)));
+    border-radius: var(--button-small-radius, 5px);
+    color: var(--button-secondary-text-color, var(--body-text-color, var(--sam3-color-ink)));
+    background: var(--button-secondary-background-fill, var(--sam3-color-paper-3));
+    font: inherit;
+    font-size: var(--text-sm, 12px);
+    line-height: 1.25;
+    text-align: center;
+    white-space: normal;
+    cursor: pointer;
+}
+
+/* 고른 프리셋: 강조 테두리·옅은 강조 바탕에 굵은 글자(색만으로 알리지 않는다). */
+.sam3-composition-mount .sam3-composition .sam3-composition__button[aria-pressed="true"] {
+    border-color: var(--color-accent, var(--sam3-color-accent));
+    color: var(--body-text-color, var(--sam3-color-ink));
+    background: var(--color-accent-soft, var(--sam3-color-accent-subtle));
+    font-weight: 600;
+}
+
+.sam3-composition-mount .sam3-composition .sam3-composition__actions {
+    margin-top: 8px;
+}
+
+.sam3-composition-mount .sam3-composition .sam3-composition__append {
+    flex: 1;
+    border-color: var(--button-primary-border-color, var(--sam3-color-accent));
+    color: var(--button-primary-text-color, var(--sam3-color-accent-ink));
+    background: var(--button-primary-background-fill, var(--sam3-color-accent));
+}
+
+.sam3-composition-mount .sam3-composition .sam3-composition__button:disabled {
+    opacity: .5;
+    cursor: default;
+}
+
+.sam3-composition-mount .sam3-composition :is(button, input, summary, .sam3-composition__orbit):focus-visible {
+    outline: 2px solid var(--color-accent, var(--sam3-color-focus));
+    outline-offset: 2px;
+}
+
+.sam3-composition-mount .sam3-composition .sam3-composition__orbit {
+    position: relative;
+    margin: 8px 0 4px;
+    border: 1px solid var(--border-color-primary, var(--sam3-color-rule));
+    border-radius: 6px;
+    background: var(--input-background-fill, var(--sam3-color-paper-3));
+    touch-action: none;
+    user-select: none;
+    -webkit-user-select: none;
+    cursor: grab;
+}
+
+.sam3-composition-mount .sam3-composition .sam3-composition__orbit:active {
+    cursor: grabbing;
+}
+
+.sam3-composition-mount .sam3-composition .sam3-composition__orbit svg {
+    display: block;
+    width: 100%;
+    height: 170px;
+}
+
+.sam3-composition-mount .sam3-composition .sam3-composition__orbit-line {
+    fill: none;
+    stroke: var(--border-color-primary, var(--sam3-color-rule));
+    stroke-width: 1.5;
+}
+
+.sam3-composition-mount .sam3-composition .sam3-composition__diagram-label {
+    fill: var(--body-text-color-subdued, var(--sam3-color-muted));
+    font-size: 11px;
+}
+
+.sam3-composition-mount .sam3-composition .sam3-composition__camera-ray {
+    stroke: var(--color-accent, var(--sam3-color-accent));
+    stroke-opacity: .7;
+}
+
+.sam3-composition-mount .sam3-composition .sam3-composition__subject {
+    fill: var(--block-background-fill, var(--sam3-color-paper-2));
+    stroke: var(--block-label-text-color, var(--sam3-color-ink-2));
+    stroke-width: 2;
+    stroke-linecap: round;
+}
+
+.sam3-composition-mount .sam3-composition .sam3-composition__camera {
+    fill: var(--color-accent, var(--sam3-color-accent));
+    stroke: var(--background-fill-primary, var(--sam3-color-paper));
+    stroke-width: 1.5;
+}
+
+.sam3-composition-mount .sam3-composition .sam3-composition__readout {
+    position: absolute;
+    top: 6px;
+    left: 8px;
+    color: var(--body-text-color-subdued, var(--sam3-color-muted));
+    font-size: var(--text-xs, 10px);
+    font-variant-numeric: tabular-nums;
+    pointer-events: none;
+}
+
+.sam3-composition-mount .sam3-composition .sam3-composition__ranges {
+    display: grid;
+    gap: 4px;
+}
+
+.sam3-composition-mount .sam3-composition .sam3-composition__range {
+    display: block;
+    min-width: 0;
+    margin: 0;
+    color: var(--block-label-text-color, var(--sam3-color-ink-2));
+    font-size: var(--text-sm, 12px);
+}
+
+.sam3-composition-mount .sam3-composition .sam3-composition__range > span {
+    display: flex;
+    justify-content: space-between;
+    gap: 6px;
+}
+
+.sam3-composition-mount .sam3-composition .sam3-composition__range output {
+    color: var(--body-text-color, var(--sam3-color-ink));
+    font-variant-numeric: tabular-nums;
+    font-weight: 600;
+}
+
+.sam3-composition-mount .sam3-composition .sam3-composition__range input {
+    display: block;
+    box-sizing: border-box;
+    width: 100%;
+    min-height: 28px;
+    margin: 0;
+    padding: 0;
+    accent-color: var(--color-accent, var(--sam3-color-accent));
+    cursor: pointer;
+}
+
+.sam3-composition-mount .sam3-composition .sam3-composition__preview {
+    padding: 8px;
+    border: 1px solid var(--border-color-primary, var(--sam3-color-rule));
+    border-radius: 5px;
+    color: var(--body-text-color, var(--sam3-color-ink));
+    background: var(--input-background-fill, var(--sam3-color-paper-3));
+    font-size: var(--text-sm, 12px);
+}
+
+.sam3-composition-mount .sam3-composition .sam3-composition__preview strong {
+    color: var(--block-label-text-color, var(--sam3-color-ink-2));
+    font-size: var(--text-xs, 10px);
+    font-weight: 600;
+}
+
+.sam3-composition-mount .sam3-composition .sam3-composition__preview p {
+    margin: 5px 0 0;
+    line-height: 1.5;
+    overflow-wrap: anywhere;
+}
+
+.sam3-composition-mount .sam3-composition .sam3-composition__warning {
+    margin: 8px 0;
+    color: var(--error-text-color, var(--sam3-color-error-hover));
+    font-size: var(--text-sm, 12px);
+    line-height: 1.5;
+    overflow-wrap: anywhere;
+}
+
+.sam3-composition-mount .sam3-composition .sam3-composition__warning ul {
+    margin: 4px 0;
+    padding-left: 16px;
+    list-style: disc outside;
+}
+
+.sam3-composition-mount .sam3-composition .sam3-composition__warning li {
+    margin: 0;
+}
+
+/* Gradio 의 어두운 테마는 --error-text-color 가 #fef2f2(빨간 오류 상자 위 글자용)라 여기서는 본문처럼 보인다 — 밝은 빨강으로.
+ * sam-extra 테마(늘 어둡고 body.dark 도 붙는다)는 자기 오류 색을 쓴다. */
+.dark .sam3-composition-mount .sam3-composition .sam3-composition__warning {
+    color: var(--color-red-400, var(--sam3-color-error-hover));
+}
+
+[data-sam3-theme] .sam3-composition-mount .sam3-composition .sam3-composition__warning {
+    color: var(--sam3-color-error-hover);
+}
+
+.sam3-composition-mount .sam3-composition .sam3-composition__feedback {
+    display: block;
+    margin-top: 5px;
+    color: var(--body-text-color-subdued, var(--sam3-color-muted));
+    font-size: var(--text-sm, 12px);
+    overflow-wrap: anywhere;
+}
+
+@media (hover: hover) and (pointer: fine) {
+    .sam3-composition-mount .sam3-composition .sam3-composition__button:not(:disabled):hover {
+        border-color: var(--color-accent, var(--sam3-color-accent));
+    }
+}
+
+@media (pointer: coarse) {
+    .sam3-composition-mount .sam3-composition .sam3-composition__summary,
+    .sam3-composition-mount .sam3-composition .sam3-composition__button,
+    .sam3-composition-mount .sam3-composition .sam3-composition__range input {
+        min-height: 44px;
+    }
+}
+/* sam3-composition:end */

@@ -1,0 +1,5 @@
+{
+  "description": "Test oracle only (tests/js/composition_prompt_origin.test.mjs): the user's app compositionPrompt.ts, verbatim after its header. This file only declares the module type so Node imports the .ts as ESM without a MODULE_TYPELESS_PACKAGE_JSON warning.",
+  "private": true,
+  "type": "module"
+}

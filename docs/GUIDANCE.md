@@ -62,6 +62,7 @@ shared.state.sampling_step / sampling_steps (한 스텝 지연 — 아래 참고
       6. DCW / RDC
       7. HiFlow 기록(hires fix 생성의 1차 패스, DCW까지 끝난 x0)
   → post-CFG (순서 미보장): Anima Optimal Scale(별도 스크립트, 켰을 때만)
+  → post-CFG (마지막): Colorcraft(별도 스크립트 colorcraft.py, 켰을 때만 — 파일 이름 순서로 Optimal Scale·Suite 뒤)
   → ancestral/SDE noise sampler: CNS 재색칠
 ```
 
@@ -702,6 +703,8 @@ D'   = D + w(t)·iDCT(H·DCT(ΔD(η))),   H = sigmoid(50·(R − R_c))   (정규
   않았습니다.
 - hires 스케줄 밖의 σ(2차 sampler 중간점)와 바로 앞과 같은 σ는 방향 정렬만 하고, 가속도 상태는 건드리지 않습니다.
 - ADetailer 내부 img2img처럼 그 요청 안에서 따로 도는 샘플링은 `on_cfg_denoiser`로 가려 기록·정렬하지 않습니다.
+- Euler (SMEA) Dy CFG++(Extra Samplers)의 보조 평가(다른 해상도)는 기록하지도 정렬하지도 않습니다. 기록은 해상도가 바뀌면
+  처음부터 다시 쌓이므로, 이 표시가 없으면 보조 스텝 때문에 1차 기록이 지워집니다.
 - 1차 기록과 hires latent의 배치·채널이 다르면(예: 다른 계열 hires 체크포인트) 건너뜁니다(콘솔 1회).
 - 붙일 때 콘솔에 `HiFlow=record|align` 또는 꺼진 이유(`no hires fix`, `no base-pass trajectory`)가 나옵니다.
   infotext `Anima HiFlow: alpha=…, beta=…, cutoff=…, reference=<기록 σ 수> sigmas`는 hires 패스에서 정렬할 때만
@@ -728,10 +731,38 @@ v0.30.0에서는 MG·HiGS 수가 한 Forge 실행 동안 생성마다 더해졌�
 - HiFlow는 hires fix 전용이고 나머지와 겹치지 않습니다. 다만 hires 패스의 디테일 단계 결과는 HiFlow가 정렬한 x0
   위에서 계산됩니다.
 - Anima Optimal Scale은 CFG 보정이라 SMC·APG·CWM과 같은 자리를 다룹니다. 처음에는 CFG base를 모두 끄고 비교하세요.
+- Colorcraft는 sam-extra post-CFG의 맨 마지막(Optimal Scale·Suite가 끝난 x0)에 돕니다. Forge가
+  `process_before_every_sampling`을 스크립트 로드 순서로 부르기 때문이며(테스트가 Forge 코드로 확인), 색 보정이 디테일
+  단계의 결과까지 포함해 적용됩니다. Detail Daemon과 함께 쓰면 스케줄 위치는 기본으로 Detail Daemon이 바꾸기 전 σ로
+  찾습니다(`sam3_colorcraft_pre_dd_sigma`).
 - Modulation Guidance는 cond/uncond/PAG weak 행에 같은 block modulation을 적용합니다.
 - CNS는 ancestral/SDE에서만 의미가 있습니다.
 - TeaCache는 이 Suite에 포함하지 않습니다. ADG `keep_every`의 batch 크기 진동 및 stateful guidance와
   캐시가 충돌할 수 있습니다.
+- `Euler Dy CFG++`·`Euler SMEA Dy CFG++`(README의 Extra Samplers)는 한 스텝 안에서 모델을 다른 해상도로 한 번 더 부릅니다(반
+  해상도, ×1.25). 이 보조 평가에도 PAG·CFG base·DCW는 그대로 걸립니다. HiFlow 기록·정렬과 Momentum·HiGS 이력은 보조 평가를
+  건너뛰고(`transformer_options["sam_extra_substep"]` 표시), TSR은 적용합니다. SMC의 이전 오차와 APG 모멘텀은 보조 평가에서
+  읽기만 하고 저장하거나 지우지 않으며(ADG의 cond-only 초기화도 건너뜀), RDC는 보조 평가에 걸지 않아(DCW만 걸림) 이동 평균이
+  그대로 남습니다. 보조 평가는 Forge의 스텝 카운터(`CFGDenoiser.step`)도 늘리지 않아 프롬프트 편집·Skip Early CFG가 밀리지
+  않습니다. 표시가 없는 평가에서 해상도가 바뀌면 예전처럼 처음부터 다시 쌓습니다.
+
+### Anima SPEED와 함께 쓸 때
+
+`Anima SPEED`(README 별도 기능)는 샘플링 도중 latent 크기를 바꿉니다(기본 0.5배 → 원래 크기). 가이던스 단계는 모델 호출마다 그
+호출의 크기로 계산하므로 함께 쓸 수 있고, 크기가 바뀌는 순간 이전 기록은 새로 시작합니다.
+
+- PAG·SEG·SLG·S²: weak 행·블록 선택은 크기와 무관. SEG의 blur σ는 토큰 단위라 저해상도 구간에서는 같은 σ가 이미지의 더 넓은
+  부분을 흐립니다.
+- APG momentum·SMC `e_prev`·RDC EMA·Momentum·HiGS 기록: 크기가 다르면 다시 시작합니다(전환 뒤 첫 스텝은 기록만).
+- Detail Daemon·DAVE·Momentum·HiGS·HiFlow의 σ 조회: SPEED가 실행 동안 `sampling_sigmas`를 바뀐 σ 목록(transition = 전환 스텝
+  하나, respace = 남은 전체)으로 바꾸므로 전환 뒤 스텝도 스케줄에서 찾습니다.
+- HiFlow: 1차 패스 기록은 크기가 바뀌면 지워져 원래 크기 기록만 남습니다(전환 σ 위쪽 기록 없음 — 보통 Hires 시작 σ는 그보다
+  낮아 영향 없음). Hires 패스에 SPEED를 켜면 기준을 그 호출의 크기로 다시 맞춥니다.
+- CNS: 노이즈와 같은 크기의 x_t로 재색칠합니다(저해상도 구간은 저해상도 노이즈).
+- Forge 내장 Spectrum Integrated를 켜면 SPEED가 쉽니다.
+
+CPU 스모크 테스트(`tests/test_speed_guidance_stack.py`)가 Forge 실제 `sampling_function`과 Anima DiT로 PAG·DCW·TSR·Momentum·HiGS·
+HiFlow·Detail Daemon을 함께 켠 채 transition·respace 두 방식과 Hires 패스를 돌려 확인합니다. 화질 영향은 GPU로 확인하지 않았습니다.
 
 ## XYZ Plot
 
@@ -782,6 +813,7 @@ Anima Perturbation ControlNet guard  (ControlNet 가드로 PAG/SEG/SLG 가 막�
 Anima Skimmed CFG           (별도 스크립트)
 Anima Detail Daemon         (별도 스크립트)
 Anima Optimal Scale         (별도 스크립트, + Anima Optimal Scale status)
+SAM Extra Colorcraft        (별도 스크립트, + SAM Extra Colorcraft status)
 ```
 
 `Anima DCW`는 DCW가 실제로 돌 때(lambda가 0이 아니거나 RDC가 켜짐), `Anima RDC`는 RDC가 켜졌을 때(Enable DCW +
@@ -883,6 +915,7 @@ Detail Daemon 슬라이더는 이 이전의 대상이 아닙니다. Amount는 �
 | HiFlow | [Bujiazi/HiFlow](https://github.com/Bujiazi/HiFlow) (Apache-2.0), [HiFlow 논문](https://arxiv.org/abs/2504.06232) | 공식 코드의 정렬 식 이식(`sam3ext/guidance/hiflow.py`, 고지는 THIRD_PARTY_NOTICES.md), Forge hires fix 연결 |
 | Anima Optimal Scale | [CFG-Zero* 논문](https://arxiv.org/abs/2503.18886) | optimized-scale 식만 독립 구현(zero-init 제외) |
 | PAG 강도 곡선 | — | 이 확장의 자체 실험(논문 기법 아님) |
+| Anima SPEED (가이던스 아님, 함께 쓰는 규칙만) | [howardhx/speed](https://github.com/howardhx/speed) `ca7801c9` · [aoleg/ComfyUI-SPEED](https://github.com/aoleg/ComfyUI-SPEED) `a8873591` · [sorryhyun/ComfyUI-Spectrum-KSampler](https://github.com/sorryhyun/ComfyUI-Spectrum-KSampler) `b46a364a` (모두 MIT), [SPEED 논문](https://arxiv.org/abs/2605.18736) | 별도 스크립트(README 별도 기능). 수식·프리셋·Forge 스크립트를 `sam3ext/speed/`에 편입(torch로 다시 작성, 고지는 THIRD_PARTY_NOTICES.md) — 이 문서에는 함께 쓰는 규칙만 |
 
 원본 저장소를 통째로 포함하지 않았으며, Forge 연결과 상태 관리는 이 확장에서 별도로 작성했습니다.
 각 기법과 참조 코드의 저작권·라이선스는 원저자/원 저장소에 따릅니다.
