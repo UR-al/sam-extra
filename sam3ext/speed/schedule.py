@@ -518,11 +518,22 @@ def build_plan(
             raise PlanError(f"delta must be in (0, 1); got {delta}", kind="invalid")
         if not (float(sigma_divisor) > 0.0):
             raise PlanError(f"sigma divisor must be positive; got {sigma_divisor}", kind="invalid")
+        # custom spectrum: A <= 0 has no activation time (math domain / division by zero) and a NaN A or
+        # beta would hand the adaptive cap a NaN sigma* that silently runs — refuse both as settings errors
+        if not (math.isfinite(float(A)) and float(A) > 0.0):
+            raise PlanError(f"spectrum A must be a positive number; got {A}", kind="invalid")
+        if not math.isfinite(float(beta)):
+            raise PlanError(f"spectrum beta must be a finite number; got {beta}", kind="invalid")
         divisor = float(sigma_divisor) if threshold == "neo_shift" else 1.0
-        tp = delta_threshold_plan(
-            n_steps, scales, float(delta), float(A), float(beta), H, W,
-            adaptive=bool(adaptive), ref_latent=int(ref_latent), ref_shift=ref_shift, sigma_divisor=divisor,
-        )
+        try:
+            tp = delta_threshold_plan(
+                n_steps, scales, float(delta), float(A), float(beta), H, W,
+                adaptive=bool(adaptive), ref_latent=int(ref_latent), ref_shift=ref_shift, sigma_divisor=divisor,
+            )
+        except (ArithmeticError, ValueError) as exc:   # e.g. P(omega) underflows to 0 for a huge beta
+            raise PlanError(
+                f"spectrum A {float(A):g} / beta {float(beta):g} gives no transition time ({exc})", kind="invalid",
+            ) from None
         values, caps = list(tp.values), list(tp.caps)
         notes.extend(tp.notes)
 

@@ -404,6 +404,42 @@ class ScriptTests(unittest.TestCase):
                 self.assertEqual(refresh[0]["inputs"][6:], _ids(head + editors))
                 self.assertEqual(refresh[0]["outputs"], [p["gallery"]._id])
 
+    def test_a11y_anchors_match_the_editor_js(self):
+        """colorcraft_editor.js names the selector (and Pass) radio groups, describes every editor control by these
+        elem ids and mounts its hidden description/status node in the summary block; style.css hides that node.
+        tests/js/colorcraft_editor_a11y.test.mjs builds its Gradio-shaped panel from the same labels."""
+        source = (ROOT / "javascript" / "colorcraft_editor.js").read_text(encoding="utf-8")
+        a11y_test = (ROOT / "tests" / "js" / "colorcraft_editor_a11y.test.mjs").read_text(encoding="utf-8")
+        self.assertIn("const prefix = (tab) => `script_${tab}_colorcraft_samextra_`;", source)
+        self.assertIn('for (const name of ["modifier_select", "mask_select", "mod_pass"])', source)
+        self.assertIn("doc.getElementById(`${pre}summary`)", source)
+        for kind in ("mod", "leaf", "combo"):
+            self.assertIn(f"doc.getElementById(`${{pre}}{kind}_${{f.name}}`)", source)
+        self.assertIn(f'const MOD_MARKS = "{ui.MOD_MARKS}";', a11y_test)
+        self.assertIn(f'const MASK_MARKS = "{ui.MASK_MARKS}";', a11y_test)
+        for tab, (_, _, p) in self.wired.items():
+            pre = f"script_{tab}_colorcraft_samextra_"
+            with self.subTest(tab=tab):
+                self.assertIsInstance(p["summary"], gr.HTML)
+                self.assertEqual(p["summary"].elem_id, pre + "summary")
+                for key, elem, label, info in (("mod_select", "modifier_select", "수정자", ui.MOD_MARKS),
+                                               ("mask_select", "mask_select", "마스크 · 조합", ui.MASK_MARKS)):
+                    radio = p[key]
+                    self.assertIsInstance(radio, gr.Radio)
+                    self.assertEqual((radio.elem_id, radio.label, radio.info), (pre + elem, label, info))
+                self.assertIsInstance(p["mod"]["pass"], gr.Radio)
+                for kind, names in (("mod", panel_state.MOD_NAMES), ("leaf", panel_state.LEAF_NAMES),
+                                    ("combo", panel_state.COMBO_NAMES)):
+                    for name in names:
+                        self.assertEqual(p[kind][name].elem_id, f"{pre}{kind}_{name}")
+        css = (ROOT / "style.css").read_text(encoding="utf-8")
+        begin, end = "/* samextra-colorcraft:begin */", "/* samextra-colorcraft:end */"
+        self.assertIn(begin, css)
+        block = css[css.index(begin):css.index(end)]
+        self.assertIn('const SR_CLASS = "samextra-cc-sr";', source)
+        self.assertIn(".samextra-cc-sr {", block)
+        self.assertNotRegex(block, r"(?m)^\s*(display|visibility)\s*:")    # a live region must stay rendered
+
     def test_js_dependencies(self):
         deps = self.demo.get_config_file()["dependencies"]
         js_only = [d for d in deps if not d.get("backend_fn")]
