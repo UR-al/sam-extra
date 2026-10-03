@@ -37,8 +37,9 @@ def _support():
 
 S = _support()
 
-from sam3ext.colorcraft import engine, hook, schedule, spec  # noqa: E402
+from sam3ext.colorcraft import engine, hook, panel_state, schedule, spec  # noqa: E402
 from sam3ext.guidance import dave_gate  # noqa: E402
+from tests import _colorcraft_panel_support as PS  # noqa: E402
 
 Mod, Scenario = S.Mod, S.Scenario
 
@@ -738,6 +739,114 @@ class UnsupportedModelTests(unittest.TestCase):
         self.assertIn("vector controls off on this model", status)
         self.assertIn("nothing to apply", status)
         self.assertIn(spec.INFOTEXT_KEY, p.extra_generation_params)
+
+
+class PanelLayoutTests(unittest.TestCase):
+    """v0.32.0's 67-argument panel layout (panel_state) at the real hook: the same grading as v0.31.0's 579
+    positional values, and the loud refusal of the old positional form sent through Forge's API."""
+
+    def setUp(self):
+        S.require_forge(self)
+
+    def test_bit_identical_to_v031_positional(self):
+        """20 scenarios × krea2 / zimage / flux2 × {fresh, stale} panel layouts against v0.31.0's hook reader
+        (``spec.config_from_args`` / ``spec.args_enabled`` on the 579 positional values)."""
+        walked = S.flow_sigmas(8)
+        evals = S.midpoints(walked)
+        checked = moved = 0
+        for family in ("krea2", "zimage", "flux2"):
+            for scenario in S.SCENARIOS:
+                config = S.scenario_config(scenario)
+                mod = spec.MODIFIER_TAGS[len(scenario.mods) - 1]
+                mask = (list(scenario.leaves) + list(scenario.combos) + ["M1"])[0]
+                layouts = {"fresh": panel_state.args_from_config(config, mod, mask),
+                           "stale": PS.stale_args(config, mod, mask, "r0")}
+                for name, args in layouts.items():
+                    self.assertEqual(len(args), panel_state.ARG_COUNT)
+                    p_old = _p(family)
+                    with mock.patch.object(hook.panel_state, "config_from_script_args", spec.config_from_args), \
+                            mock.patch.object(hook.panel_state, "args_enabled", spec.args_enabled):
+                        cb_old = _attach(p_old, spec.config_to_args(config))
+                    p_new = _p(family)
+                    cb_new = _attach(p_new, args)
+                    self.assertIsNotNone(cb_old, scenario.label)
+                    self.assertIsNotNone(cb_new, scenario.label)
+                    for unet in (p_old.sd_model.forge_objects.unet, p_new.sd_model.forge_objects.unet):
+                        unet.model_options.setdefault("transformer_options", {})["sampling_sigmas"] = walked
+                    for k, sigma in enumerate(evals):
+                        x0 = S.latent(family, 1000 + k)
+                        a = cb_old(S.forge_args(x0.clone(), sigma, p_old.sd_model.forge_objects.unet))
+                        b = cb_new(S.forge_args(x0.clone(), sigma, p_new.sd_model.forge_objects.unet))
+                        self.assertTrue(torch.equal(a, b), f"{family} {scenario.label} {name} {k}")
+                        checked += 1
+                        moved += not torch.equal(a, x0)
+                    self.assertEqual(p_old.extra_generation_params, p_new.extra_generation_params)
+        self.assertEqual(checked, 3 * len(S.SCENARIOS) * 2 * len(evals))
+        self.assertGreater(moved, checked * 9 // 10)
+
+    def _process(self, p, args):
+        logged = []
+        with mock.patch.dict(sys.modules, {"modules": S.forge_modules()}), \
+                mock.patch.object(hook, "_log", side_effect=logged.append):
+            result = hook.process(p, args)
+        return result, logged
+
+    def test_v031_positional_list_through_the_api_is_refused(self):
+        config = S.scenario_config(S.SCENARIOS[0])
+        legacy = spec.config_to_args(config)                         # v0.31.0's 579 values, Enable on
+        p = _p()
+        base, logged_base = self._process(p, PS.forge_api_fill(legacy))
+        p.is_hr_pass = True
+        hires, logged_hires = self._process(p, PS.forge_api_fill(legacy))
+        self.assertIsNone(base)
+        self.assertIsNone(hires)
+        self.assertEqual(p.sd_model.forge_objects.unet.clones, 0)
+        self.assertNotIn("sampler_post_cfg_function", p.sd_model.forge_objects.unet.model_options)
+        self.assertEqual(p.extra_generation_params, {spec.STATUS_KEY: (
+            "not applied: v0.31.0 positional arguments (579 values) are no longer read - send the infotext "
+            "string or a dict of argument paths as the first argument, or the old list wrapped in one list")})
+        self.assertEqual(logged_base + logged_hires, ["not applied: " + panel_state.LEGACY_NOTE])
+        self.assertIs(getattr(p, hook.REFUSED_ATTR), True)
+        # a job that runs only the hires pass (Forge's upscale of a finished image) reports it as well
+        p = _p()
+        p.is_hr_pass = True
+        hires_only, logged = self._process(p, PS.forge_api_fill(legacy))
+        self.assertIsNone(hires_only)
+        self.assertEqual(p.extra_generation_params, {spec.STATUS_KEY: "not applied: " + panel_state.LEGACY_NOTE})
+        self.assertEqual(logged, ["not applied: " + panel_state.LEGACY_NOTE])
+        # ... wrapped in one list it grades exactly like before
+        p = _p()
+        self.assertIsNotNone(_attach(p, PS.forge_api_fill([legacy])))
+        self.assertEqual(p.extra_generation_params[spec.INFOTEXT_KEY], spec.to_infotext(config))
+
+    def test_v031_positional_list_with_null_in_slot_2_is_refused_too(self):
+        legacy = spec.config_to_args(S.scenario_config(S.SCENARIOS[0]))
+        legacy[2] = None                                             # v0.31.0 read null as I's default
+        p = _p()
+        result, logged = self._process(p, PS.forge_api_fill(legacy))
+        self.assertIsNone(result)
+        self.assertEqual(p.extra_generation_params, {spec.STATUS_KEY: "not applied: " + panel_state.LEGACY_NOTE})
+        self.assertEqual(logged, ["not applied: " + panel_state.LEGACY_NOTE])
+        self.assertEqual(p.sd_model.forge_objects.unet.clones, 0)
+
+    def test_refusal_writes_nothing_when_enable_is_off(self):
+        legacy = spec.config_to_args(S.scenario_config(S.SCENARIOS[0]))
+        legacy[0] = False
+        p = _p()
+        result, logged = self._process(p, PS.forge_api_fill(legacy))
+        self.assertIsNone(result)
+        self.assertEqual((p.extra_generation_params, logged), ({}, []))
+        self.assertFalse(hasattr(p, hook.REFUSED_ATTR))
+        self.assertEqual(p.sd_model.forge_objects.unet.clones, 0)
+
+    def test_unreadable_state_is_refused(self):
+        p = _p()
+        result, logged = self._process(p, PS.forge_api_fill([True, False, "{not json"]))
+        self.assertIsNone(result)
+        status = p.extra_generation_params[spec.STATUS_KEY]
+        self.assertTrue(status.startswith("not applied: unreadable panel state (state is not valid JSON"), status)
+        self.assertEqual(logged, [status])
+        self.assertEqual(p.sd_model.forge_objects.unet.clones, 0)
 
 
 class ScriptSafetyTests(unittest.TestCase):

@@ -69,7 +69,8 @@ UPSTREAM_FUNCTION_HASHES = {
         "NegPiP._getScheduledNegPip": "f7f57a1293668259",
     },
 }
-# 상류 LICENSE (AGPL-3.0 전문) 의 SHA-256
+# 상류 LICENSE (AGPL-3.0 전문) 의 SHA-256 — 줄 끝을 LF 로 맞춘 바이트 (다른 원본 고정 테스트처럼; Windows
+# autocrlf 체크아웃은 CRLF 로 바꿔 놓는다)
 LICENSE_SHA256 = "ce3fb82d9ee80a1cb0e548f9b0560ead52378ee2b4e826fd9459b4acf7075d89"
 
 
@@ -467,7 +468,7 @@ class LicenseNoticeTests(unittest.TestCase):
     AGPL_FILES = ("__init__.py", "anima.py", "sd.py", "utils.py", "mask.py")
 
     def test_licence_text_ships_next_to_the_code(self):
-        data = (VENDOR / "LICENSE").read_bytes()
+        data = (VENDOR / "LICENSE").read_bytes().replace(b"\r\n", b"\n")
         self.assertEqual(hashlib.sha256(data).hexdigest(), LICENSE_SHA256)
         self.assertTrue(data.lstrip().startswith(b"GNU AFFERO GENERAL PUBLIC LICENSE"))
 

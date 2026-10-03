@@ -728,6 +728,19 @@ class PageContractTests(unittest.TestCase):
                       "var(--sam3-color-paper-3)", "var(--sam3-progress-height)"):
             self.assertIn(token, self.block)
 
+    def test_red_text_stays_red_in_forge_default_dark(self):
+        # Gradio's dark --error-text-color is the text ON its error background (#fef2f2): on the real Forge Default
+        # dark theme the "red text" interruption came out near white. There the bar uses the theme's error
+        # signal colour; Forge Default light and the sam-extra themes keep --error-text-color (red in both).
+        block = self.block.replace("\r\n", "\n")
+        labels = ':is([data-interrupt="red_text"], [data-interrupt="red_text_red_bar"]) > .sam3-progress-label {\n'
+        self.assertIn('.sam3-progress[data-state="interrupted"]' + labels
+                      + "    color: var(--error-text-color, var(--sam3-color-error-hover));", block)
+        self.assertIn('html:not([data-sam3-theme]) .dark .sam3-progress[data-state="interrupted"]' + labels
+                      + "    color: var(--error-icon-color, var(--sam3-color-error-hover));", block)
+        self.assertLess(block.index("var(--error-text-color"), block.index("var(--error-icon-color"),
+                        "the dark override comes after the general rule")
+
     def test_every_derived_file_keeps_the_upstream_notice(self):
         for relative in ("javascript/progress_bar.js", "sam3ext/progress_api.py",
                          "scripts/appearance_progress_bar.py"):

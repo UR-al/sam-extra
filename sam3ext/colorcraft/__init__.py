@@ -13,6 +13,7 @@ the changes made here.
 * ``basis``     families krea2 / zimage (upstream) and flux2 (fork), calibration, vector loading
 * ``engine``    the per-evaluation modifier chain (upstream's post-CFG body)
 * ``spec``      script arguments, chain building, infotext (ours, upstream's and the fork's)
+* ``panel_state`` the panel's script arguments: hidden state, editor overlay, paste, labels
 * ``hook``      the Forge post-CFG hook on a cloned UNet
 * ``debug``     axis-projection / mask-preview rendering (upstream, unchanged)
 * ``debug_panel`` upstream's Forge Debug panel: capture during sampling, render on demand

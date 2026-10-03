@@ -6,8 +6,8 @@ library and every change made to it are in ``sam3ext/colorcraft/`` (see the modu
 
 This file is the WebUI seam only:
 
-* ``ui`` builds the panel (``sam3ext.colorcraft.ui``) — one collapsed accordion, ``spec.ARG_COUNT``
-  positional arguments in ``spec.arg_names()`` order;
+* ``ui`` builds the panel (``sam3ext.colorcraft.ui``) — one collapsed accordion, ``panel_state.ARG_COUNT``
+  (67) script arguments in ``panel_state.ARG_NAMES`` order;
 * ``process_before_every_sampling`` attaches the post-CFG function to a clone of the pass's UNet
   (``sam3ext.colorcraft.hook.process``); it is appended last, after every other sam-extra post-CFG
   function of the pass, because this file loads after the ``anima_*`` scripts and Forge calls

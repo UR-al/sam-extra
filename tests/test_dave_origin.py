@@ -23,6 +23,7 @@ which returns ``steps + 2`` sigmas at 24/28/30/32 steps
 from __future__ import annotations
 
 import ast
+import functools
 import importlib.util
 import sys
 import types
@@ -40,6 +41,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from sam3ext.guidance import dave_gate  # noqa: E402
+from tests._forge_checkout import require_forge_file  # noqa: E402
 
 
 def _load_base_tests():
@@ -142,19 +144,20 @@ def _flow_sigmas(shift=3.0, timesteps=1000):
 
 
 _SIGMAS = _flow_sigmas()
-_FORGE = ROOT.parents[1]
 
 
 def _forge_function(relpath, name, namespace):
     """One top-level function of the Forge checkout, executed in ``namespace``.
 
     The body is Forge's own source (read with ``ast``), so the tests follow the
-    host code the gate relies on without importing Forge's module graph."""
-    source = (_FORGE / relpath).read_text(encoding="utf-8")
+    host code the gate relies on without importing Forge's module graph. Without
+    a Forge checkout (GitHub CI) the calling test is skipped."""
+    path = require_forge_file(relpath)
+    source = path.read_text(encoding="utf-8")
     for node in ast.parse(source).body:
         if isinstance(node, ast.FunctionDef) and node.name == name:
             module = ast.Module(body=[node], type_ignores=[])
-            code = compile(module, str(_FORGE / relpath), "exec")
+            code = compile(module, str(path), "exec")
             scope = dict(namespace)
             exec(code, scope)  # noqa: S102 - Forge's own function body
             return scope[name]
@@ -172,12 +175,14 @@ def _setup_img2img_steps(fix_steps=False):
 # origin: Haoming02/sd-webui-forge-classic@e33f40e4:modules/sd_schedulers.py:124-133
 # (ddim_scheduler, Forge's "DDIM" schedule type; the same list as
 # Comfy-Org/ComfyUI@387f98aa:comfy/samplers.py:654-669, "ddim_uniform")
-_FORGE_DDIM = _forge_function("modules/sd_schedulers.py", "ddim_scheduler", {"torch": torch})
+@functools.cache
+def _forge_ddim():
+    return _forge_function("modules/sd_schedulers.py", "ddim_scheduler", {"torch": torch})
 
 
 def _ddim_sigmas(steps):
     inner = types.SimpleNamespace(sigmas=_SIGMAS)
-    return _FORGE_DDIM(steps, float(_SIGMAS[0]), float(_SIGMAS[-1]), inner, "cpu")
+    return _forge_ddim()(steps, float(_SIGMAS[0]), float(_SIGMAS[-1]), inner, "cpu")
 
 
 def _simple_sigmas(steps):

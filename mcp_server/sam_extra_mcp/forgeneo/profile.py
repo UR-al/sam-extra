@@ -31,7 +31,11 @@
 #   (known_presets: its forge_checkpoint_<preset> / forge_additional_modules_<preset> options,
 #   matched case-insensitively); anything else is refused before any write. Upstream wrote it as is.
 # - The checkpoint's sidecar text is bounded (SIDECAR_TEXT_CHARS) and its tags are reported as
-#   "untrusted_checkpoint_tags" (upstream "checkpoint_tags"). Everything else is upstream's.
+#   "untrusted_checkpoint_tags" (upstream "checkpoint_tags").
+# - preset_for_checkpoint() compares names without the " [hash]" of Forge's titles: the
+#   forge_checkpoint_<preset> record and the name asked for (a title from `models`) can differ in
+#   it, and upstream then lost the registry signal, loading the checkpoint without its preset and
+#   modules. Everything else is upstream's.
 
 """What the agent is currently working with, and how to prompt it.
 
@@ -48,6 +52,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 from . import civitai, identity, modules
+from .history import drop_trailing_bracket
 from .presets import LINEAGE_PROMPT_STYLE, PROMPT_STYLE, defaults_for, detect_lineage
 
 if TYPE_CHECKING:
@@ -191,8 +196,9 @@ def resolve_dialect(
     """Work out how this checkpoint expects to be prompted.
 
     Tries, in order: a previously cached answer, an optional CivitAI lookup by
-    hash, the prompts actually used with this checkpoint, what the architecture
-    implies, and finally the shape of the installed LoRA library.
+    hash, the prompts actually used with this checkpoint (unless they contradict
+    the dialect the architecture implies), what the architecture implies, and
+    finally the shape of the installed LoRA library.
     """
     sha, declared = _checkpoint_identity(client, checkpoint)
     identifier = sha or (checkpoint or "")
@@ -488,7 +494,9 @@ def preset_from_folder(options: dict, checkpoint: str) -> str | None:
 
 
 def _bare_name(value: str) -> str:
-    return os.path.basename(str(value or "").replace("\\", "/")).strip().lower()
+    """The file name, without the " [hash]" a title carries once Forge knows it: Forge records
+    forge_checkpoint_<preset> in whichever form its dropdown held, with or without the hash."""
+    return drop_trailing_bracket(os.path.basename(str(value or "").replace("\\", "/")).strip()).lower()
 
 
 PRESET_OPTION_PREFIXES = ("forge_checkpoint_", "forge_additional_modules_")

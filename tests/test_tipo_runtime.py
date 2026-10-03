@@ -234,9 +234,15 @@ _TINY_WORDS = ["<|bos|>", "<|eos|>", "<|pad|>", "<|unk|>", "tag:", "target:", "1
 
 
 def _save_tiny_model(directory, words=_TINY_WORDS, hidden=32, seed=0):
-    """실제 파일 형식(config·tokenizer·safetensors, fp16)으로 아주 작은 무작위 Kohaku 모델을 저장한다."""
+    """실제 파일 형식(config·tokenizer·safetensors, fp16)으로 아주 작은 무작위 Kohaku 모델을 저장한다.
+
+    ``model.save_pretrained`` 대신 파일을 직접 쓴다 — transformers 4.57(Forge)의 save_pretrained 와 가중치 바이트·
+    config 가 같고, 저장이 transformers 판에 매이지 않는다(5.x 의 save_pretrained 는 상류 원문 그대로인 list 형식
+    ``_tied_weights_keys`` 를 dict 로 읽다가 ``'list' object has no attribute 'keys'`` 로 죽는다). 런타임이 지나는
+    것은 읽기(``from_pretrained``)뿐이고, 그 판 차이는 아래 RealLoaderTests 가 잡는다."""
     import json
 
+    from safetensors.torch import save_file
     from tokenizers import Tokenizer, models, pre_tokenizers
 
     from sam3ext.tipo.kohaku import KohakuConfig, KohakuForCausalLM
@@ -254,7 +260,13 @@ def _save_tiny_model(directory, words=_TINY_WORDS, hidden=32, seed=0):
         num_experts_per_tok=2, first_k_dense=1, bos_token_id=0, eos_token_id=1, pad_token_id=2,
     )
     torch.manual_seed(seed)
-    KohakuForCausalLM(config).to(torch.float16).save_pretrained(directory)
+    model = KohakuForCausalLM(config).to(torch.float16)
+    model.config.architectures = [type(model).__name__]   # save_pretrained 가 config 에 더 적는 두 항목
+    model.config.dtype = torch.float16
+    model.config.save_pretrained(directory)
+    model.generation_config.save_pretrained(directory)
+    save_file({name: tensor.contiguous() for name, tensor in model.state_dict().items()},
+              str(Path(directory) / "model.safetensors"), metadata={"format": "pt"})
 
 
 class RealLoaderTests(unittest.TestCase):
@@ -270,6 +282,13 @@ class RealLoaderTests(unittest.TestCase):
         self.assertIsInstance(result.text, str)
         self.assertEqual(runtime._model.dtype, torch.float32, "CPU 로 돌린 뒤에는 fp32 로 둔다 — 다음 CPU 클릭에 캐스트 없음")
         self.assertEqual(runtime._model.model.rotary_emb.inv_freq.dtype, torch.float32)
+        # inv_freq 는 비영속 버퍼라 safetensors 에 없다. transformers 5 의 from_pretrained 는 meta 장치로 만든 뒤
+        # 이 버퍼를 torch.empty_like 로만 채우고 상류 _init_weights 는 다시 채우지 않는다 — RoPE 가 쓰레기가 된다
+        # (requirements-dev.txt 가 transformers<5 로 묶는 까닭; Forge Neo 는 4.57.6).
+        from sam3ext.tipo.kohaku.modeling_kohaku import KohakuRotary
+
+        expected = KohakuRotary(runtime._model.config).inv_freq
+        self.assertTrue(torch.equal(runtime._model.model.rotary_emb.inv_freq, expected), "RoPE 주파수가 __init__ 값 그대로다")
 
 
 class _OldRuntime(tr.TipoRuntime):

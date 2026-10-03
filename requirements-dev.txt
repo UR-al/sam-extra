@@ -6,8 +6,13 @@
 # (pip decodes it with the locale code page on Windows).
 pytest
 safetensors
-transformers
+# Forge Neo pins transformers==4.57.6. The TIPO model code (sam3ext/tipo/kohaku, verbatim upstream)
+# is 4.x code: transformers 5 leaves its RoPE buffer uninitialised in from_pretrained.
+transformers<5
 einops
+# Forge Neo installs gradio==4.40.0 (modules/launch_utils.py), but 4.40 declares pillow<11, which
+# pip cannot resolve with Pillow>=11.1.0 below (Forge itself runs Pillow 12), so CI gets the newest
+# 5.x. The suite passes on both; tests build script UIs inside gr.Blocks, as Forge does.
 gradio<6.0,>=4.0
 pydantic
 numpy
@@ -15,5 +20,9 @@ Pillow>=11.1.0
 fastapi
 packaging
 opencv-python-headless
+# Reference oracles of the origin-parity tests only (SPEED: scipy DCT and Beta schedule, the official
+# utils' PyWavelets); the extension never imports them. Both ship with the Forge venv.
+scipy
+PyWavelets
 # gradio -> pydub imports audioop, which Python 3.13 removed (Forge installs this too).
 audioop-lts; python_version >= "3.13"

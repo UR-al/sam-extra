@@ -494,6 +494,49 @@ test("a job that ends before any look saw its first step does not finish with th
   seen.end();
 });
 
+test("after the last pass Forge's nextjob zeroes the step: decoding and saving show the finished pass, not 0/20", async (t) => {
+  // 실측: 마지막 스텝 뒤 디코드·저장 동안의 응답이 job_no 1/1, step 0/20 — 글자가 '0/20 • 99% • ?' 였다.
+  const env = await started(t);
+  env.server.set("task(z)", { active: true, job_no: 0, job_count: 1, step: 19, steps: 20, progress: 0.95, eta: 1,
+    pass_eta: 1 });
+  const single = env.submit("txt2img", "task(z)");
+  await env.clock.advance(500);
+  assert.match(env.text("txt2img"), /^19\/20 • /);
+  env.server.set("task(z)", { active: true, job_no: 1, job_count: 1, step: 0, steps: 20, progress: 1 });
+  await env.clock.advance(500);
+  assert.match(env.text("txt2img"), /^20\/20 • \d+% • \?$/);
+  env.server.set("task(z)", { completed: true });
+  await env.clock.advance(300);
+  single.end();
+  // Between images the step really starts again at 0, of the next pass; after the last one it is finished.
+  env.server.set("task(y)", { active: true, job_no: 1, job_count: 2, step: 0, steps: 20, progress: 0.5, eta: 9,
+    pass_eta: 4 });
+  env.submit("txt2img", "task(y)");
+  await env.clock.advance(500);
+  assert.match(env.text("txt2img"), /^\[2\/2\] 0\/20 • /);
+  env.server.set("task(y)", { active: true, job_no: 2, job_count: 2, step: 0, steps: 20, progress: 1 });
+  await env.clock.advance(500);
+  assert.match(env.text("txt2img"), /^\[2\/2\] 20\/20 • /);
+});
+
+test("a job joined mid-run (Forge's Restore progress after a reload) starts where the job is", async (t) => {
+  // 실측: 32/80 스텝(40%)에서 붙자 Smooth > Accurate 가 0% 에서 출발해 '32/80 • 1%', 실제 56% 일 때 '19%' 였다.
+  const env = await started(t);
+  const t0 = env.clock.now;
+  const elapsed = () => (env.clock.now - t0) / 1000;
+  env.server.set("task(r)", () => ({ active: true, step: 32 + Math.floor(elapsed() * 2.4), steps: 80,
+    progress: Math.min(0.99, 0.4 + elapsed() * 0.03), eta: Math.max(0, 20 - elapsed()),
+    pass_eta: Math.max(0, 20 - elapsed()) }));
+  // ui.js restoreProgressTxt2img: requestProgress(id, gallery_container, gallery, atEnd, null, 0)
+  env.window.requestProgress("task(r)", env.container("txt2img"), env.gallery("txt2img"), () => {}, null, 0);
+  await env.clock.advance(500);
+  assert.ok(env.value("txt2img") >= 40, `starts at the job's 40%: ${env.value("txt2img")}`);
+  assert.match(env.text("txt2img"), /^3[23]\/80 • 4[0-2]% • /);
+  await env.clock.advance(5000);
+  const value = env.value("txt2img");
+  assert.ok(Math.abs(value - 56.5) < 4, `keeps pace with the job (~56%): ${value}`);
+});
+
 // ---- 끝 ---------------------------------------------------------------------------------
 
 test("a finished job fills to 100%, then fades bar and text (default)", async (t) => {
@@ -933,6 +976,73 @@ test("changing the after-finish mode re-applies it to a finished bar", async (t)
   assert.equal(env.state("txt2img"), "idle");
 });
 
+// jsdom 은 사용자 정의 속성을 캐스케이드·상속하지 않는다: <html> 인라인의 테마 변수를 모든 요소가 물려받는 것처럼 읽게 한다.
+function inheritRootVars(env) {
+  const real = env.window.getComputedStyle.bind(env.window);
+  env.window.getComputedStyle = (element, pseudo) => new Proxy(real(element, pseudo), {
+    get(target, prop) {
+      if (prop === "getPropertyValue") {
+        return (name) => target.getPropertyValue(name)
+          || (name.startsWith("--") ? env.doc.documentElement.style.getPropertyValue(name) : "");
+      }
+      const value = target[prop];
+      return typeof value === "function" ? value.bind(target) : value;
+    },
+  });
+}
+
+test("colour lightness reads the theme notations: hex, rgb(), oklch()", async (t) => {
+  const env = await started(t);
+  const lum = env.hooks.colorLuminance;
+  const near = (a, b) => Math.abs(a - b) < 1e-9;
+  assert.ok(near(lum("#ffffff"), 1));
+  assert.equal(lum("#000"), 0);
+  assert.ok(near(lum("rgb(249, 115, 22)"), lum("#f97316")));
+  assert.ok(near(lum("rgba(249 115 22 / 50%)"), lum("#F97316")));
+  assert.ok(near(lum("oklch(86% .025 70)"), 0.86 ** 3));
+  assert.ok(near(lum(" oklch(0.5 0.1 200) "), 0.125));
+  for (const unread of ["", "red", "hsl(0 0% 50%)", "rgb(100%, 0%, 0%)", "oklch(.", "color-mix(in srgb, red, blue)", null]) {
+    assert.equal(lum(unread), null, String(unread));
+  }
+  assert.equal(env.hooks.isLight("#f97316"), true);
+  assert.equal(env.hooks.isLight("#1e3a8a"), false);
+});
+
+test("the theme-accent bar gets readable text in every theme, Forge Default included", async (t) => {
+  // 실측(Forge Default 밝은 테마): 막대 #f97316 위 글자가 --button-primary-text-color #ea580c — 주황 위 주황(1.2:1).
+  const env = buildDom(t);
+  inheritRootVars(env);
+  const root = env.doc.documentElement.style;
+  root.setProperty("--color-accent", "#f97316");
+  root.setProperty("--button-primary-text-color", "#ea580c");
+  await start(env);
+  const ink = (tab = "txt2img") => env.bar(tab).style.getPropertyValue("--sam3-progress-color-ink");
+  const theme = () => env.doc.dispatchEvent(new env.window.CustomEvent("sam3:appearance-theme", { detail: {} }));
+  assert.equal(env.bar("txt2img").style.getPropertyValue("--sam3-progress-color"), "", "the bar keeps the theme colour");
+  assert.equal(ink(), "var(--sam3-color-accent-ink)", "light accent: dark text");
+  assert.equal(ink("img2img"), "var(--sam3-color-accent-ink)");
+  // A theme switch (appearance_theme.js announces it) picks the ink again.
+  root.setProperty("--color-accent", "oklch(45% .15 265)");
+  theme();
+  assert.equal(ink(), "var(--sam3-color-ink)", "dark accent: light text");
+  root.setProperty("--color-accent", "oklch(86% .025 70)");       // OLED Mono: the same ink its own buttons use
+  theme();
+  assert.equal(ink(), "var(--sam3-color-accent-ink)");
+  // No --color-accent: style.css falls back to --sam3-color-accent, so does the ink.
+  root.removeProperty("--color-accent");
+  root.setProperty("--sam3-color-accent", "rgb(30, 58, 138)");
+  theme();
+  assert.equal(ink(), "var(--sam3-color-ink)");
+  root.setProperty("--sam3-color-accent", "color-mix(in srgb, red, blue)");
+  theme();
+  assert.equal(ink(), "", "a colour it cannot read leaves style.css's ink");
+  env.setOptions({ sam3_progress_color: "dandelion" });
+  assert.equal(ink(), "var(--sam3-color-accent-ink)", "presets keep their own pair");
+  env.setOptions({ sam3_progress_enabled: false });
+  theme();                                                        // nothing to restyle, no error
+  assert.equal(env.doc.querySelector(".sam3-progress"), null);
+});
+
 // ---- 움직임 -------------------------------------------------------------------------------
 
 test("Smooth > Accurate waits for a known ETA instead of racing to 99% (upstream bug)", async (t) => {
@@ -950,6 +1060,30 @@ test("Smooth > Accurate waits for a known ETA instead of racing to 99% (upstream
   assert.ok(value > 40 && value < 70, `about half way through a 10 s estimate: ${value}`);
   await env.clock.advance(8000);
   assert.ok(env.value("txt2img") <= 99.2, "never past 99.2% before the end");
+});
+
+test("Smooth > Accurate holds still while the ETA is unknown — no creep through a long model load", async (t) => {
+  // 실측: Forge 를 띄운 뒤 첫 생성은 첫 스텝 전 14초 동안 서버 진행률 0 — 막대와 글자가 7.7%('7% • ?')까지 올라갔다.
+  const env = await started(t, { options: { sam3_progress_smoothness: "smooth_gt_acc" } });
+  env.server.set("task(m)", { active: true, step: 0, steps: 20, progress: 0, eta: null, pass_eta: null });
+  env.submit("txt2img", "task(m)");
+  await env.clock.advance(60000);
+  assert.equal(env.value("txt2img"), 0, "nothing reported, nothing shown");
+  assert.equal(env.text("txt2img"), "0% • ?");
+  env.server.set("task(m)", { active: true, step: 1, steps: 20, progress: 0.05, eta: null, pass_eta: null });
+  await env.clock.advance(3000);
+  const value = env.value("txt2img");
+  assert.ok(value > 4 && value <= 5, `follows the server, not past it: ${value}`);
+  assert.equal(env.text("txt2img"), "1/20 • 5% • ?");
+});
+
+test("Smooth ~ Accurate keeps upstream's coast while the server reports nothing", async (t) => {
+  const env = await started(t, { options: { sam3_progress_smoothness: "smooth_eq_acc" } });
+  env.server.set("task(q)", { active: true, step: 0, steps: 20, progress: 0, eta: null, pass_eta: null });
+  env.submit("txt2img", "task(q)");
+  await env.clock.advance(10000);
+  const value = env.value("txt2img");
+  assert.ok(value > 3 && value < 6, `upstream COAST_SPEED_PER_FRAME 0.008: ${value}`);
 });
 
 test("Smooth > Accurate snaps to the server's progress when the page is shown again", async (t) => {

@@ -1226,6 +1226,12 @@ html:not([data-sam3-progress="on"]) .sam3-progress {
 .sam3-progress[data-state="interrupted"]:is([data-interrupt="red_text"], [data-interrupt="red_text_red_bar"]) > .sam3-progress-label {
     color: var(--error-text-color, var(--sam3-color-error-hover));
 }
+
+/* Forge Default 의 어두운 테마(Gradio .dark)에서 --error-text-color 는 오류 바탕 위 글자라 거의 흰색(#fef2f2)이다 — 빨간 글자가
+ * 되지 않는다. 그 테마가 오류를 알리는 빨강(--error-icon-color)을 쓴다. sam-extra 테마는 --error-text-color 가 빨강이다. */
+html:not([data-sam3-theme]) .dark .sam3-progress[data-state="interrupted"]:is([data-interrupt="red_text"], [data-interrupt="red_text_red_bar"]) > .sam3-progress-label {
+    color: var(--error-icon-color, var(--sam3-color-error-hover));
+}
 /* sam3-progress:end */
 
 /* sam3-composition:begin */

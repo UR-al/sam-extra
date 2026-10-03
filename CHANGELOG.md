@@ -3,6 +3,199 @@
 버전 태그는 GitHub Releases에도 발행됩니다. 아래는 요약이며, guidance/속도 기능의
 상세는 [docs/GUIDANCE.md](docs/GUIDANCE.md)를 참고하세요.
 
+## v0.32.0 — Colorcraft 공유 편집기 (API 위치 인자 변경) · 진행 막대 · MCP 서버 수정 · CI
+
+v0.31.0 에서 들인 기능을 다듬은 판입니다. Colorcraft 패널을 수정자·마스크마다 따로 있던 컨트롤 대신 편집기 한 벌로 바꿔 가볍게
+했습니다 — 계산과 infotext 는 그대로이고, 그 대신 v0.31.0 의 위치 인자 579개 API 형식은 더 읽지 않습니다(옛 배열을 한 겹 감싸면
+그대로 읽음). 진행 막대와 MCP 서버는 이번에 처음 실제 Forge 에서 돌려 보고 찾은 버그(진행 막대 4개, MCP 4개)를 고쳤고, GitHub CI 는
+프런트엔드 검사를 Node 24 의 별도 잡으로 나누고 Python 잡의 오류 17개를 없앴습니다. 새 설정은 없습니다.
+
+괄호 표시는 v0.31.0 과 같습니다: (결과 같음) = v0.31.0 과 같은 설정·시드에서 이미지 동일, (새 기능) = v0.31.0 에 없던 기능이라 비교
+대상 없음. 이번에 더한 (바뀜) = v0.31.0 과 같은 요청·조작에서 동작이나 표시가 달라짐.
+
+**업그레이드할 때**
+
+- Forge 를 재시작하고 페이지를 새로 고치세요 — Colorcraft 패널의 스크립트 인자가 579 → 67개로 바뀌고, 새
+  `javascript/colorcraft_editor.js` 가 있어야 편집기가 항목을 바꿉니다.
+- API 로 Colorcraft 를 **위치 인자 579개**로 보내던 호출은 이제 적용되지 않습니다(이미지는 Colorcraft 없이, status 에 이유). 옛 배열을
+  한 겹 더 감싸거나(`{"args": [[…579개…]]}`) 첫 인자 하나(infotext 값 · 인자 경로 사전)로 보내세요 — 아래 **API** 항목. 첫 인자 하나,
+  `[true]` · `[true, true]` 로 보내던 호출은 그대로입니다.
+
+### Colorcraft — 공유 편집기 (결과 같음, API 위치 인자는 바뀜)
+
+- **패널을 편집기 한 벌로 (결과 같음 — CPU 비트 대조 · 실제 Forge GPU 대조)**: 수정자 I–X · 마스크 M1–M10 · 조합 C1–C5 마다
+  따로 있던 컨트롤(탭마다 579개)을, 선택 줄에서 고른 항목을 보여 주는 편집기 하나(수정자 44칸 · 마스크 10칸 · 조합 7칸)로 바꿨습니다. 다른 항목의 값은 숨은 칸(JSON state)에 들고
+  있다가, 생성할 때 그 위에 편집기의 지금 값을 얹어 읽습니다 — 슬라이더를 놓자마자 Generate(Ctrl+Enter)를 눌러도 편집기에 보이는
+  값이 그대로 쓰이고, 어떤 이벤트가 먼저 끝나기를 기다리지 않습니다. 항목 고르기 · Reset(수정자 Reset 은 Active 를 그대로 둠) · 표시
+  갱신은 브라우저(`javascript/colorcraft_editor.js`, 필드 표는 `spec.py` 에서 만든 `javascript/colorcraft_schema.js`)에서만 돌아 서버
+  요청이 없습니다. Forge 처럼 큰 페이지에서는 항목을 바꾸는 데 0.2초 남짓 걸립니다(Gradio 4.40 이 갱신마다 레이아웃을 다시 그림).
+- **한눈에 보기 (새 기능)**: 선택 줄의 ● 는 켠 수정자 · 켠 수정자가 실제로 쓰는 마스크, ○ 는 값을 바꿨지만 꺼 둔 수정자 · 값만 바꾼
+  마스크입니다(선택 줄 이름 밑에 `● 켬 · ○ 값을 바꿨지만 꺼 둠` · `● 켠 수정자가 씀 · ○ 값만 바꿈`). Enable 아래 요약 한 줄이 켠
+  수정자의 Type · 마스크 · 패스와 쓰는 마스크를 보여 줍니다 — 예: `켠 수정자: I Advanced, III Chroma ➜ C2 · 쓰는 마스크: M1, M2, M3,
+  C1, C2`(Enable 이 꺼져 있으면 앞에 `꺼짐 — `, 켠 수정자가 없으면 `켠 수정자 없음`). A·B 가 다 차지 않은 조합은 ● 가 붙지 않고
+  요약에 `➜ C1(미완성)` 으로 보입니다(그 수정자는 예전처럼 마스크 없이 적용).
+- **편집기 스크립트가 없거나 오류가 나면**: 선택 줄이 편집기에 보이는 항목으로 돌아가고, 요약 줄에 `편집기 스크립트(javascript/
+  colorcraft_editor.js)가 동작하지 않아 다른 항목을 고를 수 없습니다 — 페이지를 새로 고치세요. …` 가 뜹니다(브라우저 콘솔에 오류 한
+  줄). Type 에 따라 칸을 숨기는 것도 멈추지만 생성은 편집기에 보이는 값 그대로입니다 — 다른 항목을 고른 것처럼 보이면서 보이지 않는
+  항목에 편집이 들어가는 일은 없습니다.
+- **가벼워짐**: 탭마다 스크립트 인자 579 → 67(enabled · masking · state · debug · debug_step · ref · 편집기 61칸), Gradio 블록 1,203 →
+  154, 붙여 넣기 필드 579 → 65. 두 탭을 합쳐 이벤트 80 → 20(10개는 브라우저 전용), Generate 요청 하나의 Colorcraft 몫 약 2.9 KB →
+  0.3 KB, 패널 만들기(`ui()`) 약 190 ms → 19 ms, 페이지 설정(`/config`, 실제 Gradio 4.40 의 두 탭 하네스) 943,946 B → 154,659 B(16.4 %).
+  실제 Forge 전체 `/config` 는 v0.31.0 의 5,354,074 B → 4,521,310 B(−15.6 %, 컴포넌트 8,382 → 6,284)이고, 페이지를 열고
+  Colorcraft 아코디언이 생기기까지가 5.06 초 → 3.65 초(8번 중앙값)로 줄었습니다.
+- **그대로인 것**: 계산(엔진 · `spec.py` 해석), infotext(`SAM Extra Colorcraft` · `… status` · `… pre-DD sigma`), 붙여 넣기(이 확장 ·
+  원본 · 포크 키, API 의 `infotext` 필드), XYZ 축(수정자 I), Debug 미리보기(편집기에 보이는 값까지 반영), Settings, 레이아웃 열의
+  "켜짐" 표시(Enable 만 — 편집기의 Active 는 켜지 않음), 범위 밖 숫자 입력(`colorcraft_sliders.js`), txt2img · img2img 따로,
+  ui-config.json 에 저장하지 않음(Reload UI · 새로 고침은 기본값).
+- **붙여 넣기**: PNG Info · ↙ 로 붙여 넣으면 state · 선택 줄 · 요약 · 편집기가 Python 응답 하나로 함께 바뀌고, 편집기는 첫 켠 수정자
+  (없으면 I)와 쓰는 첫 마스크 M(없으면 M1 — 조합 편집기에는 놓이지 않음)을 보여 줍니다.
+- **API: 위치 인자 579개 형식을 더 읽지 않음 (바뀜 — 호환 깨짐)**: Forge 는 요청에서 스크립트 인자 수(이제 67)만큼만 잘라 넘기므로,
+  v0.31.0 의 위치 인자 579개 요청은 Colorcraft 를 적용하지 않고 `SAM Extra Colorcraft status: not applied: v0.31.0 positional
+  arguments (579 values) are no longer read - …` 와 콘솔 `[Colorcraft] not applied: …` 한 줄(생성마다, XYZ 는 칸마다)을 남깁니다.
+  이미지는 Colorcraft 없이 만들어집니다(스크립트는 API 요청을 실패시킬 수 없음). 옛 형식은 세 번째 값(I.active)이 bool · 숫자이거나
+  4–6번째 값이 옛 I.kind · I.pass · I.mask 값이면 알아보므로 I.active 가 null 이어도 거절되고, Enable(첫 값)이 false 면 예전처럼
+  조용히 꺼져 있습니다.
+  - **옮기는 법**: 옛 배열을 한 겹 더 감싸 보내면(`{"args": [[true, false, true, "Advanced", …579개…]]}`) v0.31.0 과 똑같이 읽습니다.
+  - **짧은 형식 (그대로)**: 첫 인자 하나 — infotext 값 `{"args": ["v1;mods=I;I.exposure=0.3"]}` 또는 인자 경로 사전
+    `{"args": [{"I.exposure": 0.3}]}`(`enabled` 생략 = 켬). `[true]`(기본값으로 켜기) · `[true, true]`(마스킹까지) · `[false]` 도 뜻이
+    같습니다.
+  - 패널의 67개 인자는 내부 형식입니다(script-info 에 보이지만 바뀔 수 있음). Python 에서 훅에 579개를 그대로 넘기는 호출은 그대로
+    읽습니다.
+- **고침**: 패널 소개 글의 "M1~M10 … C1~C5" 가 취소선으로 보이던 것(Gradio 4.40 Markdown 이 `~` 쌍을 취소선으로 그림 — README 의 같은
+  줄도 GitHub 에서 그랬음, `–` 로 바꿈), Masking · Debug 아코디언이 안의 체크박스와 같은 elem_id 를 쓰던 것(`…_masking_panel` ·
+  `…_debug_panel` 로 바꿔 겹치는 id 4개 → 0).
+- **실제 Forge 대조 (Anima 3.8B, 1024², 50 스텝, ER SDE · Beta57, 시드 11)**: v0.31.0 패널로 만든 기준 4개 — Colorcraft 끔 ·
+  I 노출 0.3 · M1 마스크로 I 노출 −0.4 · I 노출 0.3 + II 채도 −0.3 — 를 새 패널에서 같은 값으로 다시 만들면 픽셀 md5 와 PNG 파일 md5 가
+  모두 같습니다(infotext 도 바이트 단위로 같음, 반복 생성도 같음). API 의 압축 첫 인자(`{"I.exposure": 0.3}` · 문자열)와 한 겹 감싼 579개
+  배열은 UI 와 같은 이미지이고, 감싸지 않은 579개는 Colorcraft 없이(끈 것과 같은 이미지) `not applied: …` 상태를 남깁니다. XYZ
+  `[Colorcraft] Exposure` 0 · 0.3 · −0.3 은 칸마다 값대로 따로 생성됐습니다. 실제 페이지 점검 94개 중 92개 통과 — 레이아웃 열 "켜짐"
+  표시, 붙여 넣기 16개(↙ · PNG Info, 이 확장 · 원본 · 포크 키), Reload UI, img2img 독립. 나머지 2개는 항목을 바꿀 때 Type 드롭다운
+  글자가 약 0.35~0.49 초 뒤에 바뀌는 표시 지연이고(값 자체는 그보다 먼저 바뀌며 생성은 늘 맞음), 고치지 않았습니다.
+- **한계**: 붙여 넣기는 조합 편집기에 놓이지 않고, 항목을 고른 뒤 약 2 프레임 안의 편집은 로드에 덮입니다(손으로는 닿지 않음). 선택 줄은
+  라디오라 v0.31.0 탭의 tablist 역할이 없고 편집기 칸 이름에 항목이 붙지 않습니다(어느 항목인지는 고른 라디오와 `Reset II` 같은 버튼
+  이름). 브라우저 전용 갱신 · 숨은 칸 · 라디오 change 같은 Gradio 4.40 동작에 기대므로 Gradio · Forge Neo 를 올리면 다시 확인해야
+  합니다. ui-config.json 에 남은 옛 키 6개(`…/Tabs@script_*_colorcraft_samextra_{modifier,mask,combo}_tabs/selected`)는 쓰이지 않습니다
+  (해 없음).
+- **검증**: Colorcraft 테스트 모듈(`tests/test_colorcraft*.py`) 135 → 184개 — 무작위 설정 400개 × 세 배치(새 state · 지난 state · rev 불일치)가 v0.31.0 위치
+  인자와 같은 `Config` · infotext · 체인, 실제 훅이 krea2 · zimage · flux2 에서 v0.31.0 과 비트 단위로 같음(평가 1,920번 `torch.equal`,
+  그중 1,884번은 x0 를 바꿈, CPU), API 형식 · 거절 · 감싼 배열, UI · API 붙여 넣기(이 확장 · 원본 · 포크), Python ↔ JS 대조(커밋 ·
+  요약 각 무작위 설정 150개, 무작위 세션 60 × 40 스텝), 이벤트 배선(입력 · 출력 id 와 순서 고정). JS 21개(Gradio 처럼 부르는 vm 테스트와
+  jsdom — 실제 `notebook.js` 빠른 드롭다운 · `colorcraft_sliders.js` 와 함께). 돌연변이 37/37 검출. 헤드리스 Chrome 으로 실제 패널을 띄운 프로세스 안 Gradio
+  4.40 에서 점검 T1–T18 · T22(끌기 · 입력 직후 Generate 40/40, 빠른 드롭다운이 항목 전환을 44–58 ms 에 따라감), 편집기 스크립트 ·
+  스키마가 없는 페이지, 실제 입력 무작위 480 동작(확인점 81개)과 검토 하네스 16,000 스텝 모두 실패 0.
+
+### 진행 막대 — 실제 Forge 에서 찾은 버그 4개 (바뀜 — 표시만, 생성 결과 같음)
+
+v0.31.0 에서 남겨 둔 실제 Forge 확인(설정을 켜고 헤드리스 Chrome 으로 테스트 Forge 에서 실제 생성)을 하며 찾았습니다.
+
+- **테마 강조색 막대 위 글자**: Forge Default 테마에서 채운 부분 위 글자가 읽히지 않았습니다 — 밝은 테마는 주황 막대(`#f97316`) 위
+  주황 글자(`#ea580c`, 대비 1.2:1), 어두운 테마는 흰 글자(2.9:1). 글자색을 `--button-primary-text-color` 대신 테마의 실제 강조색(hex ·
+  `rgb()` · `oklch()`)의 밝기로 고르고(이제 두 테마 모두 어두운 글자), SAM Extra 테마를 바꾸면 다시 고릅니다. SAM Extra 테마의 모양은
+  그대로입니다.
+- **'빨간 글자' 중단 표시**: Forge Default 어두운 테마에서는 Gradio 의 `--error-text-color` 가 오류 바탕 위 글자색(`#fef2f2`)이라 거의
+  흰색으로 나왔습니다. 그 테마에서만 오류 빨강(`--error-icon-color`, 실측 `rgb(239,68,68)`)을 씁니다(`style.css`). 밝은 테마
+  (`rgb(185,28,28)`)와 SAM Extra 테마는 그대로입니다.
+- **첫 스텝 전 미끄러짐**: 기본 방식 Smooth > Accurate 에서 서버 진행률이 0 인 첫 스텝 전(모델 불러오기 등)에도 막대 · 글자가 조금씩
+  올라갔습니다(실측 14.3초 동안 7.7% — 막는 값이 없어 약 3분 반이면 99.2%). 이제 그동안 0% 에 머뭅니다. 상류에서 온 미끄러짐은
+  Smooth ~ Accurate 에만 남겼습니다.
+- **끝과 복원의 글자**: 마지막 패스 뒤 Forge 의 `nextjob` 이 스텝을 0 으로 돌려 디코드 · 저장하는 동안 `0/20 • 99% • ?` 로 보이던
+  것을 끝난 패스(`20/20`)로 보입니다. 새로 고친 뒤 Forge 의 Restore progress 로 붙은 작업이 0 에서 출발해 한참 뒤처지던 것(32/80
+  스텝에서 `1%`, 실제 56% 일 때 `19%`)은 처음 '돌고 있음' 을 본 응답에서 그 자리로 옮깁니다(`29/80 • 37%`).
+- **검증**: 실제 Forge(테스트 Forge, 헤드리스 Chrome, 20 스텝)에서 — 막대는 뒤로 가지 않음(100 ms 표본 227개, 가장 큰 도약 2.16%),
+  이 탭의 작업만 물음(요청 102개, 간격 중앙값 209 ms, 끝나면 멈춤), Forge 막대는 숨김, 중단(`10/20 • 41% • 중단됨` — Forge 가 작업을
+  놓을 때까지 남았다가 사라짐), 연달은 생성, img2img, 다른 클라이언트의 API 작업에는 그리지 않음(뒤에 선 이 탭 작업은 `Waiting...` →
+  `In queue: 1/1`), 막대를 끄면 Forge 막대, Settings 의 Apply 로 바로 반영, 설정 변형(부드러움 세 방식 · 글자 형식 · 높이 · 색 · 중단
+  표시 · 움직임 줄이기). `GET /sam-extra/progress`: 헤더 없음 403 · `X-SAM3-Notebook: 1` 200 · 257자 `id_task` 400 · POST 405,
+  `no-store`, `/openapi.json` 에 없음. Forge Default 밝은 · 어두운 테마는 페이지 안에서 테마를 바꿔 확인했습니다. JS 43개(새 6개 —
+  5개는 고치기 전 코드에서 실패, 1개는 Smooth ~ Accurate 의 미끄러짐을 지킴), Python 62개(새 1개).
+- **한계**: `--gradio-auth` · `--api-auth` 를 켠 실제 Forge(Gradio 4.40 앱 안에서만 확인: 쿠키 없음 401 · 로그인 200, 자격 없음 401 ·
+  Basic 200), 배치 2 이상 · Hires, "Don't Interrupt in the middle", 숨은 탭에서 돌아온 뒤 맞추기는 실제 Forge 에서 보지 않았습니다.
+  그대로 남은 것: 작업마다 마지막 1초쯤은 ETA 가 `?`(상류와 같음), 작업 시작 뒤 첫 응답까지 약 0.2초 글자가 빔, 페이지를 연 뒤 약
+  3.4초는 Forge 가 시작할 때의 옵션을 내주므로 Forge 시작 뒤 꺼 둔 막대가 잠깐 보였다 사라짐.
+
+### MCP 서버 — 실제 클라이언트로 찾은 버그 4개 (바뀜)
+
+v0.31.0 에서 남겨 둔 실제 Forge 생성과 실제 클라이언트 연결을 확인하며 찾았습니다. 고친 상류 파일의 머리 주석과
+`THIRD_PARTY_NOTICES.md` 의 수정 목록에 적었습니다.
+
+- **불러온 체크포인트가 자기 생성 기록과 맞지 않던 것** (`forgeneo/history.py` `normalise_checkpoint`): Forge 는 해시를 알면 체크포인트
+  이름 끝에 붙이는데(`name.safetensors [0123456789]`, `sd_model_checkpoint` 도 이 모양), 상류는 확장자를 먼저 떼려다 실패해
+  `.safetensors` 가 남았습니다. 그래서 해시가 붙은 이름(보통의 Forge 설정)에서는 샘플링 값 추천이 기록 없이 기본값으로
+  떨어졌습니다. 이제 `[해시]` 를 먼저 뗍니다. 실측(테스트 Forge, Anima 3.8B): 기록 0개 · 50 스텝(인스턴스 기본값) · turbo
+  "unknown" → 기록 17개 · 20 스텝 · turbo "no".
+- **체크포인트 전환의 프리셋 신호** (`forgeneo/profile.py` `preset_for_checkpoint`): Forge 가 프리셋마다 적어 둔 체크포인트
+  (`forge_checkpoint_<프리셋>`)와 `models` 목록에서 고른 이름이 `[해시]` 만 달라도 신호를 잃어, 모델을 바꿀 때 그 체크포인트의 VAE ·
+  텍스트 인코더 없이 불러올 수 있었습니다. 이제 `[해시]` 를 빼고 비교합니다(단위 테스트로만 확인 — 실제 모델 전환은 하지 않음).
+- **프롬프트 방언** (`forgeneo/identity.py`): 위 수정으로 기록이 읽히자, Anima 의 품질 태그(`masterpiece, best quality`, `score_*`)가
+  든 과거 프롬프트 때문에 `prompt_dialect` 가 Anima 체크포인트를 높은 확신으로 Illustrious(또는 Pony)라고 했습니다. 이제 과거
+  프롬프트는 아키텍처가 정하지 못하는 경우(SDXL 계열)의 갈래를 고르거나 아키텍처의 방언을 확인할 뿐 뒤집지 않습니다. 실측: `anima`.
+- **Anima 태그를 산문으로 본 것** (`forgeneo/history.py` `_looks_danbooru`): 역시 기록이 읽히자 드러났습니다. Anima 는 태그를 공백으로
+  써서(`short hair, black hair, 1boy, solo`) "natural language (94% prose)" 로 보고했습니다. 이제 방언 모듈의 태그 판별도 셉니다.
+  실측: "danbooru tags (100%)".
+- **테스트**: `tests/test_mcp_layout.py` 가 `tomllib` 을 무조건 불러와, Python 3.10(서버 자신의 uv 환경 — MCP SDK 가 있어 등록 테스트가
+  실제로 도는 곳)에서 MCP 테스트가 모두 깨지던 것을 그 테스트 하나만 건너뛰게 고쳤습니다.
+- **검증**: MCP SDK(uv 환경: mcp 2.3.0 · Python 3.10.11)의 stdio 클라이언트로 테스트 Forge(7860)에 붙여 — 도구 10개와 읽기 전용 ·
+  파괴 표시, 설정 파일에서 읽은 권한(생성만 켬), 불러온 체크포인트 · 프리셋 · 체크포인트 21개 · LoRA 385개, 읽기 도구 응답, 실제 생성
+  한 장(768×768, 16 스텝, 7.4초 — 디스크의 파일을 생성 정보로 찾아 돌려줌, 대체 폴더는 만들지 않음), 거절(모델 불러오기 · 중단 ·
+  건너뛰기 `denied_by_policy`, 내려받기가 꺼져 있으면 네트워크 요청 없음, 화소 상한 초과, 네트워크 공유 init 이미지, 빈 프롬프트,
+  모르는 동작), 서버가 도는 중 설정 파일을 바꾸면 다음 호출부터 적용(문자열 `"true"` 는 끔, 깨진 JSON 은 모두 끔), 한국어 · 일본어
+  인자 · 경로. **Claude Code**(`claude` 2.1.252, `-p`, 임시 MCP 설정 · `--strict-mcp-config`, 읽기 도구 5개만 허용)에서는 서버가
+  연결되고(connected) 도구 5개가 올라오는 것까지 확인했습니다 — 안에서 띄운 CLI 가 로그인(OAuth 세션 갱신)에 실패해 Claude Code 를
+  통한 도구 호출은 확인하지 못했습니다. Python 테스트 312 → 327개(새 `test_mcp_checkpoint_titles` 7 · `test_mcp_observed_prompts` 8) —
+  Forge venv(SDK 없음, 5개 건너뜀)와 uv 환경(SDK 2.3.0, 1개 건너뜀) 모두 통과.
+- **한계**: 생성 중 `progress`, img2img, 동시에 돈 다른 생성과의 분리, 스위치를 켠 모델 불러오기 · 중단 · 내려받기는 실제로 돌리지
+  않았습니다. 그대로 남은 것: `capabilities` 는 Forge 가 API 출력 폴더를 처음 만들기 전까지 `readable:false`, `generate` 결과에 쓴
+  스케줄러 · shift 값이 없음(Forge 응답에 없음), Forge 의 "Output Directory" 덮어쓰기를 켜면 서버가 만든 이미지는 생성 기록에 들어가지
+  않음, Settings 에 보이는 등록 명령에는 `FORGE_URL` · `SAM_EXTRA_MCP_FORGE_CONFIG` 가 없음(README **등록** 절).
+
+### CI — 프런트엔드 잡 따로 (Node 24) · Python 잡 복구 (결과 같음 — 테스트와 CI 만)
+
+- **프런트엔드 잡 따로, Node 20 → 24**: 프런트엔드 검사(`node --check javascript/*.js` · `npm ci` · `npm test`)를 Python 과 따로 도는
+  `frontend` 잡으로 나눴습니다. 한 잡이던 때는 Python 단계가 실패하면 JS 단계가 통째로 건너뛰어져, GitHub 에서는 적어도 2026-09-19
+  부터 JS 검사가 돌지 않았습니다. Node 20 은 타입 지우기가 없어 앱 원본 `compositionPrompt.ts` 대조 11개 중 9개를 건너뛰었는데, 이제
+  Node 24 로 모두 돌고, CI(`CI=true`)에서 타입 지우기가 없는 Node 로 돌면 건너뛰지 않고 실패합니다(로컬은 예전처럼 건너뜀). `test`
+  잡 이름(`CI / test`)은 그대로입니다.
+- **Python 잡 복구 (오류 17개 → 0)**: GitHub 의 Python 잡은 v0.31.0(`6adeb83`)에서 `errors=17` 로 실패했습니다(확인한 2026-09-19 이후
+  실행도 모두 실패).
+  - Forge 본체 파일을 실행하는 원본 대조 테스트(오류 10개 — `test_anima_safe_pag` · `test_cns_origin` · `test_dave_origin` ·
+    `test_dcw_origin` · `test_detail_daemon_origin` · `test_ui_config_migration`)는 Forge 체크아웃이 없으면 그 파일이 필요한 테스트만
+    이유를 남기고 skip 합니다(`tests/_forge_checkout.py` — 확장이 놓인 `<Forge>/extensions/` 위, 없으면 `SAM3_FORGE_ROOT`, 없으면 개발
+    PC 의 설치에서 찾음). Forge 를 찾았는데 파일이 없으면 여전히 실패하고, Forge 안에서는 하나도 건너뛰지 않습니다. Forge 로더는 import
+    때가 아니라 처음 쓸 때 불러, Forge 없이도 나머지 테스트는 돕니다.
+  - `test_speed_origin` 4개(scipy 없음): `requirements-dev.txt` 에 SPEED 원본 대조용 `scipy` 와 `PyWavelets`(공식 SPEED 대조 · haar
+    테스트가 CI 에서 조용히 건너뛰던 것)를 더했습니다. 확장 코드는 둘 다 import 하지 않고, 둘 다 Forge venv 에 있습니다.
+  - `test_anima_vae_2x` 1개: gradio 5 의 Accordion 은 `gr.Blocks` 안에서만 만들어지므로 Forge(`modules/ui.py`)처럼 `gr.Blocks()` 안에서
+    UI 를 만듭니다. gradio 는 묶지 않았습니다 — 4.40 은 `pillow<11` 이라 `Pillow>=11.1.0` 과 함께 설치되지 않습니다(Forge 는 gradio 를
+    먼저 설치해 피함). CI 는 gradio 5.x, Forge 는 4.40 으로 돕니다.
+  - `test_tipo_runtime` 2개: CI 가 transformers 5.18 을 받았습니다 → `transformers<5`(4.57.6 · huggingface-hub 0.36.2 · tokenizers
+    0.22.2 — Forge Neo 와 같음).
+  - Windows autocrlf 체크아웃에서는 `test_negpip_vendor` 가 `sam3ext/negpip/LICENSE` 의 원래 바이트로 해시를 재 실패했습니다 → 다른 원본
+    고정 테스트처럼 줄 끝을 LF 로 맞춰 비교합니다(`.gitattributes` 는 Forge 가 `git clone` 으로 설치하는 방식까지 바꾸므로 넣지 않음).
+- **transformers 를 `<5` 로 묶은 이유**: 상류 원문 그대로(SHA 고정)인 TIPO 모델 코드(`sam3ext/tipo/kohaku`)는 transformers 4 용입니다.
+  5.x 에서는 `_tied_weights_keys` 가 목록이라 `save_pretrained` 가 실패하고(테스트 보조 함수만 씀 — 이제 파일을 직접 써서 4.57.6 에서
+  가중치 파일이 바이트까지 같음), 더 큰 문제로 `from_pretrained` 가 RoPE 버퍼(`inv_freq`)를 채우지 않아 위치 인코딩이 0 이나 쓰레기
+  값이 됩니다 — 런타임이 조용히 틀린 출력을 냅니다. Forge Neo 는 4.57.6 이라 지금은 영향이 없고, 불러온 `inv_freq` 가 새로 계산한 값과
+  같은지 보는 검사를 `RealLoaderTests` 에 더했습니다(transformers 5.18 에서 실패함을 확인).
+- **검증**: Forge 가 없는 새 Python 3.13 venv 에 `ci.yml` 과 같은 설치(CPU torch 2.14.1, gradio 5.50.0, transformers 4.57.6)로 — 고치기
+  전 `errors=17`(GitHub 과 같은 17개) → `Ran 2698 tests … OK (skipped=342)`, 모든 파일을 CRLF 로 바꿔도 통과, Forge 를 찾게 하면
+  skip 208. WSL · Docker 가 없어 Linux 가 아니라 Windows 에서 돌렸습니다. Colorcraft 공유 편집기를 넣은 트리로 다시 돌려 `Ran 2747 tests
+  … OK (skipped=347)`, 프런트엔드 잡은 Node 24.19 로 CI 처럼(`CI=true`) 돌려 204개 중 203개 통과(1개는 Forge 의 `progressbar.js` 가
+  옆에 있어야 도는 진행 막대 테스트라 건너뜀). GitHub Actions 위에서는 이 판을 올린 뒤 처음 돕니다.
+- **한계**: GitHub 이 `actions/checkout@v4` · `setup-node@v4` · `setup-python@v5` 에 다는 "Node.js 20 is deprecated" 경고는 테스트가
+  쓰는 Node 가 아니라 그 액션 자체의 실행 환경이라 그대로 두었습니다. CI 에는 spandrel 이 없어 그 테스트 8개는 건너뜁니다.
+
+### 설정 · 라이선스 · 검증
+
+- **설정**: 새 설정은 없습니다.
+- **라이선스**: `THIRD_PARTY_NOTICES.md` — forgeneo-mcp 수정 목록에 `history.py`(`normalise_checkpoint` · `_looks_danbooru`) ·
+  `profile.py`(`preset_for_checkpoint`) · `identity.py`(`resolve`)를 더하고, ComfyUI-Colorcraft 절에 패널이 이제 sam-extra 가 새로 쓴
+  공유 편집기임을 적었습니다.
+- **검증**: Python 2906개 통과(skip 22 — 그중 5개는 MCP SDK 가 있어야 도는 등록 테스트, Forge venv · CPU), JS 204개 통과(진행 막대 6 ·
+  Colorcraft 편집기 21개를 더함), `node --check javascript/*.js` 이상 없음. 새 Python 테스트는 Colorcraft 49 · MCP 15 · 진행 막대 1개이고,
+  CI 를 위해 고친 테스트는 Forge 안에서 하나도 건너뛰지 않습니다. 실제 Forge 에서는 진행 막대 · MCP 서버와 Colorcraft 공유 편집기
+  (위 **실제 Forge 대조**)를 확인했습니다. GitHub CI 와 같은 깨끗한 Python 3.13 · gradio 5.50 venv(Forge 없음)에서 공유 편집기까지 넣고
+  2747개 통과(skip 347), 프런트엔드 잡 204개 통과(1개는 Forge 의 `progressbar.js` 가 있어야 해 skip).
+
 ## v0.31.0 — Colorcraft · Anima SPEED · Extra Schedulers · Extra Samplers · 진행 막대 · MCP 서버 · 구도·카메라
 
 새 기능 일곱 가지입니다. 샘플링 중 latent 색 보정(Colorcraft), 초반 스텝을 저해상도로 돌리는 Anima SPEED(실험), 스케줄러
@@ -245,8 +438,8 @@ Sampler 에서 골랐을 때만 쓰이고, MCP 서버는 Forge 밖에서 따로 
 - **검증**: 앱 원본 파일을 `tests/_origin_composition_prompt/` 에 SHA-256 고정으로 두고 Node 가 그대로 불러와 이식본과 대조합니다 —
   프리셋, 조절값 전 범위와 그 바깥(.5·.49 반올림 경계), 태그 문턱값 안팎 곱 격자 약 26만 상태, NaN·Infinity·문자열 같은 깨진 값,
   가중치·이스케이프·스케줄·와일드카드·LoRA·끝 쉼표·빈 값 프롬프트 말뭉치와 무작위 문자열 4000개(모두 같음). JS 64개(로직 26 · 원본
-  대조 11 · jsdom 동작 27), Python 27개(자리·설정·Forge 기본/Compact 배치). 타입 지우기가 없는 Node 20(CI)에서는 원본 대조 9개를
-  건너뜁니다. 실제 Forge(헤드리스 Chrome, 진짜 마우스 클릭·Ctrl+Z)에서 txt2img·img2img 모두 확인: 붙이면 Gradio 값도 바뀌고, Ctrl+Z
+  대조 11 · jsdom 동작 27), Python 27개(자리·설정·Forge 기본/Compact 배치). 타입 지우기가 없는 Node 20(그때 CI)에서는 원본 대조
+  9개를 건너뛰었습니다 — v0.32.0 에서 CI 를 Node 24 로 올려 고쳤습니다. 실제 Forge(헤드리스 Chrome, 진짜 마우스 클릭·Ctrl+Z)에서 txt2img·img2img 모두 확인: 붙이면 Gradio 값도 바뀌고, Ctrl+Z
   한 번에 화면·Gradio 값이 함께 돌아오며, 자동완성 목록은 뜨지 않습니다(직접 타이핑하면 뜸).
 
 ### 설정 · 라이선스 · 검증

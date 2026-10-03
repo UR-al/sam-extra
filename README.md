@@ -363,6 +363,13 @@ Settings에서 선택 후 **Apply settings**를 누르면 현재 페이지에 �
 개발·테스트: `pip install -r requirements-dev.txt`(CPU torch 는 따로:
 `pip install torch --index-url https://download.pytorch.org/whl/cpu`) 뒤 확장 폴더에서
 `python -m unittest discover -s tests -p "test_*.py"`. CI(`.github/workflows/ci.yml`)도 Python 3.13 에서 같은 명령을 씁니다.
+`requirements-dev.txt` 는 transformers 를 Forge Neo 와 같은 4.x(`transformers<5`)로 묶습니다 — 상류 그대로인 TIPO 모델 코드가
+transformers 4 용이라 5.x 에서는 RoPE 버퍼가 채워지지 않습니다. SPEED 원본 대조용 scipy·PyWavelets 도 들어 있고(확장은 import 하지
+않음), gradio 는 묶지 않습니다(4.40 은 `pillow<11` 이라 함께 설치되지 않아 CI 는 5.x). Forge 밖(GitHub CI 처럼 확장만 받은 곳)에서는
+Forge 본체 파일(`modules/ui_loadsave.py`·`backend/sampling/condition.py` 등)을 실행하는 테스트가 이유를 남기고 skip 됩니다 — 확장이
+`<Forge>/extensions/` 안에 있지 않으면 `SAM3_FORGE_ROOT` 로 Forge 위치를 알려 주세요.
+JS 테스트는 Node 24(앱 원본 `.ts` 를 그대로 불러오는 대조에 Node 의 타입 지우기가 필요)에서 `npm ci` 뒤 `npm test`
+(= `node --test tests/js/*.test.mjs`)입니다. CI 는 이를 `node --check javascript/*.js` 와 함께 Python 과 따로 `frontend` 잡으로 돌립니다.
 
 ControlNet 통합은 `sd_forge_controlnet` 익스텐션에 lazy import 의존. 없으면 해당 UI/로직만 비활성화.
 
@@ -1005,17 +1012,24 @@ API: `alwayson_scripts["Anima SPEED"] = {"args": [true, "transition", "neo_shift
 
 ### 사용
 
-- **Enable Colorcraft** 를 켜고 탭 **I**(처음부터 Active)의 값을 움직입니다. 값은 작게(0.1~0.3) 두고 구간을 넓히는 편이
+- **Enable Colorcraft** 를 켜고 수정자 **I**(처음부터 Active)의 값을 움직입니다. 값은 작게(0.1–0.3) 두고 구간을 넓히는 편이
   안전합니다 — 원본 안내대로 너무 세거나 마지막 스텝까지 걸면 latent 가 깨질 수 있습니다.
 - **CFG++ 샘플러에서는 세기를 절반쯤**: Euler CFG++·Euler (SMEA) Dy CFG++ 같은 CFG++ 샘플러에서는 같은 값이 더 세게 걸립니다.
   CFG++ 스텝은 보정된 x0 를 스텝의 일부만큼이 아니라 통째로 다음 latent 에 싣기 때문입니다. CFG++ 의 방식이지 sam-extra 의 버그가
   아니며, 원본 ComfyUI-Colorcraft 도 같은 post-CFG 지점에 겁니다. Anima 3.8B(시드 11, 28 스텝)에서 노출 +0.3 이 평균 밝기를 Forge 의
   Euler CFG++ 로 약 +27(186 → 214 — Euler Dy CFG++·Euler SMEA Dy CFG++ 도 같음), Res Multistep 으로 +14, Euler 로 +8 올렸습니다.
-- **탭 I~X**: 켠(Active) 탭이 위에서부터 차례로 적용되는 수정자 스택입니다. **Type** 은 원본 노드(Advanced 전체 ·
-  Basic 대비·색 이동 · Luma 노출·톤 · Chroma 색온도·틴트·바이브런스·채도·채도 대비 · Chroma Plus Lab·대각 축 · Punch
-  대비·클래리티·샤프니스 · Shift 색 이동)이고 그 노드의 계산 순서와 칸만 보입니다. Advanced 의 **Apply Chroma Plus /
+- **수정자 I–X**: 선택 줄(**수정자**)에서 고른 수정자를 아래 편집기가 보여 주고 고칩니다(편집기는 한 벌, 다른 수정자의 값은
+  그대로 남아 있음). 켠(Active) 수정자가 I 부터 차례로 적용되는 스택입니다. 선택 줄의 **●** 는 켠 수정자, **○** 는 값을 바꿨지만
+  꺼 둔 수정자이고, Enable 아래 요약 줄이 켠 수정자의 Type · 마스크 · 패스와 쓰는 마스크를 보여 줍니다(예: `켠 수정자: I Advanced,
+  III Chroma ➜ C2 · 쓰는 마스크: M1, M2, M3, C1, C2` — Enable 이 꺼져 있으면 앞에 `꺼짐 — `, A·B 가 다 차지 않은 조합은
+  `➜ C1(미완성)`). **Reset I** 처럼 이름이 붙은 버튼은 보고 있는 수정자를 기본값으로 되돌립니다(Active 는 그대로). **Type** 은 원본
+  노드(Advanced 전체 · Basic 대비·색 이동 · Luma 노출·톤 · Chroma 색온도·틴트·바이브런스·채도·채도 대비 · Chroma Plus Lab·대각 축 ·
+  Punch 대비·클래리티·샤프니스 · Shift 색 이동)이고 그 노드의 계산 순서와 칸만 보입니다. Advanced 의 **Apply Chroma Plus /
   Apply Color Shift** 는 노드의 게이트(기본 켬 — 원본 Forge 탭과 같음), **Dev** 는 모델별 보정값(recenter·max chroma·
   chroma plane) 덮어쓰기입니다.
+- **생성은 편집기에 보이는 값 그대로**: 다른 수정자 · 마스크의 값은 숨은 칸에 들고 있다가 생성할 때 편집기의 지금 값을 얹어 읽으므로,
+  슬라이더를 놓자마자 Generate(Ctrl+Enter)를 눌러도 보이는 값이 쓰입니다. 항목 고르기 · Reset · ●/○ · 요약은 브라우저에서만 돌아 서버
+  요청이 없습니다(Forge 처럼 큰 페이지에서는 항목을 바꾸는 데 0.2초 남짓).
 - **스케줄**: Strength(−1~1)·Start·End(스텝 비율). **Advanced Schedule** 을 켜면 Exponent·Bias·Start/End Offset·Smooth.
   매 호출의 σ 로 스케줄 위치를 찾습니다(원본 노드와 같음). img2img·Hires 는 실제로 도는 σ 구간으로 스케줄을 만듭니다.
 - **Pass**: Base(기본 패스·img2img) / Hires(Hires 패스만) / Both. SAM3·ADetailer 내부 패스에서는 돌지 않습니다.
@@ -1025,9 +1039,11 @@ API: `alwayson_scripts["Anima SPEED"] = {"args": [true, "transition", "neo_shift
   이미지 픽셀 기준 크기를 지킵니다(Forge 가 넘기는 패스의 latent 격자로 비율을 잼). Euler (SMEA) Dy CFG++ 의 보조 스텝(반 해상도·
   ×1.25)은 보정하지 않고 넘겨 스텝마다 한 번만 보정합니다 — 보조 스텝까지 보정하면 그 스텝이 옮긴 화소에 같은 스텝의 보정이 두 번
   걸립니다.
-- **Masking**: M1~M10 은 x0 에서 바로 읽는 축 마스크(exposure·hue·saturation·temperature·tint·대각·Lab·clarity·sharpness,
-  highs/lows/split/range/protect range, Blur→Spread→Normalize→Contrast), C1~C5 는 퍼지 조합(and·or·subtract·xor, 앞 조합만
-  참조). 탭의 **Mask ➜** 로 고릅니다(Basic 은 마스크 없음). A·B 가 다 차지 않은 조합을 고르면 마스크 없이 적용됩니다(원본과 같음).
+- **Masking**: M1–M10 은 x0 에서 바로 읽는 축 마스크(exposure·hue·saturation·temperature·tint·대각·Lab·clarity·sharpness,
+  highs/lows/split/range/protect range, Blur→Spread→Normalize→Contrast), C1–C5 는 퍼지 조합(and·or·subtract·xor, 앞 조합만
+  참조). 수정자의 **Mask ➜** 로 고릅니다(Basic 은 마스크 없음). A·B 가 다 차지 않은 조합을 고르면 마스크 없이 적용됩니다(원본과 같음).
+  마스크 · 조합도 선택 줄(**마스크 · 조합**)에서 골라 편집기 하나로 고칩니다(● = 켠 수정자가 실제로 쓰는 마스크 — A·B 가 다 찬
+  조합만, ○ = 값만 바꾼 것, **Reset M1** 같은 버튼은 보고 있는 마스크를 기본값으로).
 - **Debug**: **Capture debug latent** 를 켜고 생성하면 **Debug Step** 의 편집 전 x0 를 잡아 두고, **Refresh Debug Images** 가
   고른 축 투영·마스크·조합을 아코디언 안 갤러리에 그립니다(지금 마스크 칸 값으로 — 다시 생성하지 않고 마스크를 다듬기).
   Composite 색을 고르면 VAE 로 디코드해 겹칩니다(GPU).
@@ -1035,12 +1051,13 @@ API: `alwayson_scripts["Anima SPEED"] = {"args": [true, "transition", "neo_shift
 
 ### 기록과 붙여 넣기
 
-- `SAM Extra Colorcraft`: 켠 탭과 그 탭 Type 의 기본값이 아닌 값(`v1;mods=I,II;I.exposure=0.3;…`). 붙여 넣으면 패널 전체가
-  그 값으로 바뀌고, 이 키가 없는 이미지는 Colorcraft 를 끕니다. 원본·포크 확장이 남긴 `Colorcraft` 키도 읽습니다(포크의
-  Chroma Center 는 지금 원본 눈금으로 바꾸고, 바이브런스는 값만 같고 지금 계산으로 렌더).
-- `SAM Extra Colorcraft status`: 패스마다 벡터 family·latent format, 적용 탭, 호출 수·실제로 바꾼 호출 수와 알림(벡터 없음,
+- `SAM Extra Colorcraft`: 켠 수정자와 그 수정자 Type 의 기본값이 아닌 값(`v1;mods=I,II;I.exposure=0.3;…`). 붙여 넣으면 패널
+  전체가 그 값으로 바뀌고(편집기는 첫 켠 수정자와 쓰는 첫 마스크 M — 없으면 M1 — 를 보여 줌, 조합 편집기에는 놓이지 않음), 이 키가
+  없는 이미지는 Colorcraft 를 끕니다. 원본·포크 확장이 남긴 `Colorcraft` 키도 읽습니다(포크의 Chroma Center 는 지금 원본 눈금으로
+  바꾸고, 바이브런스는 값만 같고 지금 계산으로 렌더).
+- `SAM Extra Colorcraft status`: 패스마다 벡터 family·latent format, 적용 수정자, 호출 수·실제로 바꾼 호출 수와 알림(벡터 없음,
   색 기준점 실패, 덜 찬 조합, 넘긴 Dy/SMEA 보조 스텝 수 `Dy/SMEA sub-steps passed through xN`, 다른 샘플링 실행, 오류 → 입력
-  그대로).
+  그대로). 스크립트 인자를 읽지 않기로 한 요청(아래 API 의 옛 위치 인자 579개)은 `not applied: …` 로 이유를 남깁니다.
 - `SAM Extra Colorcraft pre-DD sigma`: Detail Daemon 이 σ 를 바꾼 생성에만.
 
 ### Settings → **SAM Extra Colorcraft**
@@ -1048,16 +1065,22 @@ API: `alwayson_scripts["Anima SPEED"] = {"args": [true, "transition", "neo_shift
 | 설정 | 기본 | 뜻 |
 |---|---|---|
 | `sam3_colorcraft_pre_dd_sigma` | 켬 | Detail Daemon 과 함께: 스케줄 위치를 Detail Daemon 이 바꾸기 전 σ 로 찾기. 끄면 ComfyUI 에서 두 노드를 이은 것과 같음 |
-| `sam3_colorcraft_log` | 끔 | 패스마다 σ 목록과 탭별 스케줄 값을 콘솔에 |
+| `sam3_colorcraft_log` | 끔 | 패스마다 σ 목록과 수정자별 스케줄 값을 콘솔에 |
 
 ### XYZ · API
 
-- XYZ 축(탭 I 대상, 축을 쓰면 탭 I 이 켜짐): `[Colorcraft] Enable, Strength, Start, End, Exposure, Tone Compression,
+- XYZ 축(수정자 I 대상, 축을 쓰면 수정자 I 이 켜짐): `[Colorcraft] Enable, Strength, Start, End, Exposure, Tone Compression,
   Contrast, Clarity, Sharpness, Temperature, Tint, Vibrance, Saturation, Chroma Contrast`.
-- API: `alwayson_scripts["Colorcraft (sam-extra)"] = {"args": [...]}` — 위치 인자 579개(`enabled, masking`, 탭 I~X 각 44칸,
-  M1~M10 각 10칸, C1~C5 각 7칸, `debug, debug_step`). 빠진 뒤쪽 인자는 기본값입니다. 첫 인자 하나로 줄여도 됩니다:
-  infotext 값 그대로(`{"args": ["v1;mods=I;I.exposure=0.3"]}`) 또는 인자 경로 사전(`{"args": [{"I.exposure": 0.3}]}`,
-  `enabled` 생략 = 켬).
+- API: `alwayson_scripts["Colorcraft (sam-extra)"] = {"args": [...]}` — 첫 인자 하나로 보냅니다: infotext 값 그대로
+  (`{"args": ["v1;mods=I;I.exposure=0.3"]}`) 또는 인자 경로 사전(`{"args": [{"I.exposure": 0.3}]}`, `enabled` 생략 = 켬).
+  `[true]` 는 기본값으로 켜기, `[true, true]` 는 마스킹까지 켜기, `[false]` 는 끄기입니다.
+- v0.31.0 의 위치 인자 579개(`enabled, masking`, 수정자 I–X 각 44칸, M1–M10 각 10칸, C1–C5 각 7칸, `debug, debug_step`)는
+  v0.32.0 부터 그대로는 읽지 않습니다. Forge 가 패널의 인자 수(67)만큼만 넘기므로, 확장이 옛 형식을 알아보고(세 번째 값이 bool ·
+  숫자이거나 4–6번째 값이 옛 I.kind · I.pass · I.mask 값) Colorcraft 없이 생성하며 status 에 `not applied: v0.31.0 positional
+  arguments (579 values) are no longer read - …` 를, 콘솔에 한 줄을 남깁니다(첫 값 Enable 이 false 면 조용히 꺼짐). 옛 배열은 한 겹
+  더 감싸면(`{"args": [[true, false, true, "Advanced", …579개…]]}`) 그대로 읽습니다.
+- 패널의 67개 인자(enabled · masking · state · debug · debug_step · ref · 편집기 61칸)는 내부 형식입니다(script-info 에 보이지만
+  바뀔 수 있음).
 
 ### 한계
 
@@ -1065,9 +1088,18 @@ API: `alwayson_scripts["Anima SPEED"] = {"args": [true, "transition", "neo_shift
   움직였고, SPEED·Dy/SMEA 와 같이 돌 때도 보정 횟수가 단독과 같았습니다. VRAM 은 따로 재지 않았고 다른 모델의 화질은 확인하지
   않았습니다(원본 노드와의 비트 대조는 CPU). flux2 보정값은 포크가 예전 원본 보정
   기준으로 잰 값이고, clarity·sharpness 마스크 축의 flux2 정규화(4.0)는 원본 값을 그대로 썼습니다.
-- 패널이 큽니다. 탭마다 스크립트 인자 579개, Gradio 블록 약 1,200개로 원본 Forge 패널과 비슷한 무게이고, 두 탭을 합치면
-  페이지 설정(`/config`)이 약 0.96 MB 늘어납니다. 접힌 아코디언도 DOM 에는 그려집니다(Gradio 4.40).
-- 원본 Forge 확장의 스케줄·마스크 그래프(캔버스)와 탭 색 표시는 옮기지 않았습니다.
+- v0.32.0 의 공유 편집기는 v0.31.0 과 같은 이미지를 냅니다 — 실제 Forge(Anima 3.8B)에서 v0.31.0 패널로 만든 기준 4개를 새 패널로 다시
+  만들면 픽셀 · PNG 파일 md5 가 같고(infotext 도 같음), API 압축 첫 인자 · 감싼 579개 배열도 UI 와 같은 이미지입니다. CPU 에서는 같은
+  설정의 훅 출력이 krea2 · zimage · flux2 에서 비트 단위로 같습니다.
+- 패널은 편집기 한 벌이라 탭마다 스크립트 인자 67개, Gradio 블록 154개입니다(v0.31.0 은 579개 · 약 1,200개). 두 탭의 페이지 설정
+  (`/config`)은 하네스에서 약 0.94 MB → 0.15 MB 로 줄었습니다(실제 Forge 전체 약 5.35 MB → 4.52 MB, 페이지가 뜨는 데 약 5.1 초 → 3.7 초). 접힌
+  아코디언도 DOM 에는 그려집니다(Gradio 4.40).
+- 항목 고르기 · Reset · ●/○ · 요약 · Type 에 따른 칸 숨기기는 `javascript/colorcraft_editor.js` 가 브라우저에서 합니다. 이 스크립트가
+  없거나 오류가 나면 선택 줄이 편집기에 보이는 항목으로 돌아가고 요약 줄에 경고(`편집기 스크립트(…)가 동작하지 않아 다른 항목을 고를 수
+  없습니다 — 페이지를 새로 고치세요. …`)가 뜨며 Type 칸 숨기기는 멈춥니다. 생성은 편집기에 보이는 값 그대로입니다.
+- 선택 줄은 라디오라 v0.31.0 탭 같은 tablist 역할이 없고, 편집기 칸 이름에 항목이 붙지 않습니다(어느 항목인지는 고른 라디오와 Reset
+  버튼 이름).
+- 원본 Forge 확장의 스케줄·마스크 그래프(캔버스)와 탭 색 표시는 옮기지 않았습니다(대신 선택 줄의 ●/○).
 
 ---
 
@@ -1445,12 +1477,20 @@ txt2img·img2img 갤러리 위에 이 확장의 진행 막대가 생기고 Forge
 
 - **무엇을 보여 주나**: 막대와 % 는 작업 전체(배치·Hires 패스 포함, Forge 기본 막대와 같은 계산), ETA 는 작업
   전체의 남은 시간입니다. 스텝은 지금 패스 기준이고, 패스가 여럿이면 `[2/4] 12/28 • 45% • 01:10` 처럼 몇 번째
-  패스인지 앞에 붙습니다. 대기 중에는 Forge 의 대기열 글자(`In queue: 1/2`)를 그대로 보여 줍니다.
+  패스인지 앞에 붙습니다. 대기 중에는 Forge 의 대기열 글자(`In queue: 1/2`)를 그대로 보여 줍니다. 마지막 패스가 끝나고
+  디코드·저장하는 동안은 끝난 패스(`20/20`)로 보이고, 새로 고친 뒤 Forge 의 Restore progress 로 다시 붙은 작업은 0 이 아니라
+  그 작업이 있는 자리에서 시작합니다.
 - **그 탭의 작업만**: 그 페이지의 그 탭에서 시작한 작업만 그립니다. 다른 창이나 다른 탭에서 시작한 작업은 나오지
   않고, 서버에는 작업이 도는 동안에만(페이지가 보일 때) 0.2초마다 묻습니다.
 - **설정**(저장하면 바로 반영): 부드러움(Smooth > / ~ / < Accurate), 글자 형식 8가지, 글자 위치(0~100%),
   끝난 뒤(막대와 글자 서서히 숨김 / 글자만 / 그대로), 숨기는 시간(0.1~4초), 중단했을 때(글자 / 빨간 글자 / 빨간
   막대 / 둘 다), 높이(10~50px), 색(테마 강조색·성공색·Blue·Green·Red·Dandelion·직접 지정).
+  - 기본 방식 Smooth > Accurate 는 첫 스텝 전(모델 불러오기 등 — 서버 진행률 0)에는 0% 에 머뭅니다. Smooth ~ Accurate 만 상류처럼
+    그동안에도 조금씩 미끄러집니다.
+  - 막대 위 글자색은 막대 색의 밝기로 어두운 글자와 밝은 글자 중에서 고릅니다. 테마 강조색이면 그 테마의 실제 강조색으로 고르므로
+    Forge Default 테마(주황 막대)에서도 읽히고, SAM Extra 테마를 바꾸면 다시 고릅니다.
+  - '빨간 글자' 중단 표시는 Forge Default 어두운 테마에서 그 테마의 오류 빨강(`--error-icon-color`)을 씁니다(그 테마의
+    `--error-text-color` 는 거의 흰색).
 - **중단**: Interrupt(또는 Esc)로 멈추면 멈춘 자리에 `중단됨` 이 남습니다. Skip 은 다음 배치로 넘어갈 뿐이라
   중단으로 치지 않고, "Don't Interrupt in the middle" 로 그 이미지까지만 멈췄는데 마지막 이미지였으면 완료로
   표시합니다.
@@ -1596,13 +1636,21 @@ stdio MCP 서버입니다. [eduardoabreu81/forgeneo-mcp](https://github.com/edua
 claude mcp add --scope user sam-extra -- uv run --project "<Forge>\extensions\forge_sam3_extension\mcp_server" sam-extra-mcp
 ```
 
-- 경로는 이 확장의 `mcp_server` 폴더입니다. Settings → **SAM Extra MCP** 의 첫 항목 설명에 이 설치의 정확한 명령이 나옵니다.
+- 경로는 이 확장의 `mcp_server` 폴더입니다. Settings → **SAM Extra MCP** 의 첫 항목 설명에 이 설치의 경로가 든 명령이 나옵니다.
+  **그 명령에는 환경 변수가 없습니다** — Forge 를 `--ui-settings-file` 로 켜거나 포트가 7860 이 아니면 아래 두 변수를 직접 더하세요.
 - **첫 실행은 네트워크가 필요합니다** — uv 가 `mcp`·`httpx` 와 의존성을 받아 `.venv` 와 `uv.lock` 을 만듭니다(둘 다 git 이 무시).
   그 뒤로는 오프라인으로 뜹니다.
-- 포트가 7860 이 아니면 `-e FORGE_URL=http://127.0.0.1:7861` 처럼 넘깁니다. `--api-auth` 를 쓰면 `-e FORGE_AUTH=사용자:비밀번호` 를
-  더하되 **반드시 `--scope user`** 로 등록하세요 — 프로젝트의 `.mcp.json` 에 넣으면 저장소와 함께 퍼집니다.
+- 포트가 7860 이 아니면 `-e FORGE_URL=http://127.0.0.1:7861` 처럼 넘깁니다(없으면 7860 에 붙음). `--api-auth` 를 쓰면
+  `-e FORGE_AUTH=사용자:비밀번호` 를 더하되 **반드시 `--scope user`** 로 등록하세요 — 프로젝트의 `.mcp.json` 에 넣으면 저장소와 함께
+  퍼집니다.
 - FORGE_PATH_MAP 은 필요 없습니다. 서버가 자기 위치(`<Forge>/extensions/<확장>/mcp_server`)에서 Forge 의 `config.json`·출력·models
-  폴더를 찾습니다. `--ui-settings-file` 을 쓰면 `SAM_EXTRA_MCP_FORGE_CONFIG` 로 설정 파일을 알려 주세요.
+  폴더를 찾습니다. `--ui-settings-file` 을 쓰면 `-e SAM_EXTRA_MCP_FORGE_CONFIG=<그 설정 파일>` 로 알려 주세요 — 없으면 서버가 기본
+  위치(`<Forge>/config.json`, 없으면 기본값 — 생성만 켬)의 스위치를 읽어 Settings 에서 바꾼 권한이 적용되지 않습니다. 둘 다 쓰는
+  예(옵션은 서버 이름 `sam-extra` 앞에):
+
+```
+claude mcp add --scope user -e FORGE_URL=http://127.0.0.1:7861 -e SAM_EXTRA_MCP_FORGE_CONFIG="D:\forge\settings.json" sam-extra -- uv run --project "<Forge>\extensions\forge_sam3_extension\mcp_server" sam-extra-mcp
+```
 
 ### 에이전트가 바꿀 수 있는 것 (Settings → SAM Extra MCP)
 
@@ -1623,6 +1671,13 @@ claude mcp add --scope user sam-extra -- uv run --project "<Forge>\extensions\fo
   시각 웹 UI 에서 만든 이미지가 섞이지 않습니다.
 - 출력 폴더에서 찾지 못한 이미지(자동 저장을 껐을 때 등)는 Forge 응답에서 꺼내 `<Forge>/sam-extra/mcp/outputs` 에 저장합니다.
 - 샘플링 값 추천의 근거인 과거 생성 기록은 생성 뒤와 5분마다 다시 읽습니다(`FORGE_HISTORY_MAX_AGE`, 즉시는 `refresh=true`).
+  Forge 가 체크포인트 이름 끝에 붙이는 해시(`name.safetensors [0123456789]`)를 떼고 기록과 맞추므로, 불러온 체크포인트로 실제 만든
+  생성들이 추천에 쓰입니다(v0.31.0 은 해시가 붙은 이름이 기록과 맞지 않아 기본값으로 떨어졌음). 체크포인트를 바꿀 때 프리셋을 찾는
+  비교도 해시를 뺍니다.
+- 프롬프트 방언(`prompt_dialect` 등)은 아키텍처가 정하는 방언을 과거 프롬프트로 뒤집지 않습니다. 과거 프롬프트는 SDXL 계열처럼
+  아키텍처만으로 모르는 갈래(Illustrious · Pony 등)를 고르거나 아키텍처의 방언을 확인할 때만 씁니다 — Anima 체크포인트가 그 품질 태그
+  (`masterpiece, best quality`, `score_*`) 때문에 Illustrious · Pony 로 읽히지 않습니다. 공백으로 쓴 Anima 태그
+  (`short hair, black hair, 1boy`)도 태그 프롬프트로 셉니다.
 - Anima 3.8B 의 `qwen35_4b`·`Anima-3.8B-expanded_adapter` 를 모듈 목록에 넣어 둬도 '다른 프리셋에서 남은 모듈'로 경고하지 않습니다.
 - 내려받기는 받은 크기와(허깅페이스가 알려 주면) SHA256 이 맞을 때만 파일을 남기고, 있는 파일은 덮어쓰지 않습니다.
 - `/sdapi/v1/cmd-flags`(실행 인자 — `--api-auth` 비밀번호 포함)는 부르지 않습니다.

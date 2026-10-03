@@ -14,11 +14,15 @@ import ast
 import os
 import subprocess
 import sys
-import tomllib
 import unittest
 from pathlib import Path
 
 from _mcp_support import MCP_PROJECT, ROOT
+
+try:  # Python 3.11+; the server's own uv environment may be 3.10 (requires-python >=3.10)
+    import tomllib
+except ModuleNotFoundError:  # pragma: no cover - only test_pyproject needs it
+    tomllib = None
 
 PACKAGE = MCP_PROJECT / "sam_extra_mcp"
 VENDORED = PACKAGE / "forgeneo"
@@ -71,6 +75,7 @@ class LayoutTests(unittest.TestCase):
                 self.assertFalse(data.startswith(b"\xef\xbb\xbf"))
                 data.decode("utf-8")
 
+    @unittest.skipIf(tomllib is None, "tomllib needs Python 3.11+")
     def test_pyproject(self):
         project = tomllib.loads((MCP_PROJECT / "pyproject.toml").read_text(encoding="utf-8"))
         self.assertEqual(project["project"]["name"], "sam-extra-mcp")

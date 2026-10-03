@@ -27,6 +27,10 @@
 #   FORGENEO_CACHE_DIR, else ~/.forgeneo-mcp as upstream. cache_file() names the file.
 # - remember() writes through a temporary file and os.replace, so a crash mid-write cannot
 #   leave a truncated cache that silently forgets every answer.
+# - resolve(): past prompts no longer outrank an architecture that implies its dialect. They
+#   choose among the lineages of an ambiguous one (xl) or confirm the implied one. Upstream let
+#   them win, so an Anima checkpoint whose prompts carried Anima's own quality tags
+#   ("masterpiece, best quality", score_*) came back as Illustrious or Pony with high confidence.
 
 """Working out which prompt dialect a checkpoint expects.
 
@@ -182,8 +186,12 @@ def resolve(
     if declared:
         return DialectResolution(declared, "declared base model", "high", f"baseModel: {declared_base}")
 
+    # Past prompts choose among the lineages of an ambiguous architecture (xl) or confirm the one
+    # the architecture implies; they never replace it. Anima's own quality prefix has
+    # "masterpiece, best quality" and score_* tags, which read as Illustrious or Pony here.
+    implied = dialects.for_architecture(architecture)
     observed = dialects.from_observed_prompts(observed_prompts or [])
-    if observed and len(observed_prompts or []) >= MIN_LORA_SAMPLE:
+    if observed and len(observed_prompts or []) >= MIN_LORA_SAMPLE and implied in (None, observed):
         return DialectResolution(
             observed,
             "observed prompts",
@@ -191,7 +199,6 @@ def resolve(
             f"inferred from {len(observed_prompts or [])} past generations with this checkpoint",
         )
 
-    implied = dialects.for_architecture(architecture)
     if implied:
         return DialectResolution(implied, "architecture", "medium", f"{architecture} implies this dialect")
 

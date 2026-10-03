@@ -227,7 +227,15 @@ class DcwOriginTestCase(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.pag = _BASE._load_pag_module()
-        cls.sampler, cls.Condition, cls.memory = _BASE._load_forge_sampler()
+        cls._forge = None   # Forge's real sampler, loaded by the first _forge_step
+
+    def _forge_sampler(self):
+        """``(sampling_function module, Condition)``; skips the test without a Forge checkout (GitHub CI)."""
+        cls = type(self)
+        if cls._forge is None:
+            sampler, condition, _memory = _BASE._load_forge_sampler()
+            cls._forge = (sampler, condition)
+        return cls._forge
 
     def setUp(self):
         _BASE.AnimaSafePagTests.setUp(self)
@@ -269,11 +277,11 @@ class DcwOriginTestCase(unittest.TestCase):
                     model=None):
         """One Forge model call. ``uncond_pred=None`` is Forge at CFG == 1, which encodes no
         negative prompt (modules/processing.py:481-483, hires :1606-1608)."""
-        Condition = self.Condition
+        sampler, Condition = self._forge_sampler()
         cond = [{"model_conds": {"bias": Condition(cond_pred)}, **(cond_extra or {})}]
         uncond = None if uncond_pred is None else [{"model_conds": {"bias": Condition(uncond_pred)}}]
-        with mock.patch.dict(sys.modules, {"backend.sampling.sampling_function": self.sampler}):
-            return self.sampler.sampling_function_inner(
+        with mock.patch.dict(sys.modules, {"backend.sampling.sampling_function": sampler}):
+            return sampler.sampling_function_inner(
                 model or _ForgeModel(), x, sigma, uncond, cond, cond_scale, model_options,
             )
 

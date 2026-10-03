@@ -56,6 +56,9 @@ MIT(Copyright (c) 2026 Eduardo Abreu)이며, 각 파일 머리에 저작권·허
 - `history.py`·`loras.py` — 색인 갱신(요청·생성 뒤·나이 제한), 강제 재구축 때 두 번 세던 문제, 바뀌지 않은 파일은 다시 읽지 않음, 잠금.
   LoRA 제작자가 쓴 글(제목·기반 모델·트리거·태그·설명)은 길이를 자르고 결과에서 `untrusted_tags`·`untrusted_description`·
   `untrusted_categories` 로 이름 붙임(상류는 `tags`·`description`·`categories`, 설명 600자 → 400자).
+- `history.py` — `normalise_checkpoint` 는 Forge 체크포인트 제목 끝의 `[해시]`(`name.safetensors [0123456789]`, `sd_model_checkpoint`)를
+  확장자보다 먼저 뗌(새 `drop_trailing_bracket`; 상류는 `.safetensors` 가 남아 불러온 체크포인트가 자기 생성 기록과 맞지 않았음),
+  `_looks_danbooru` 는 `dialects._looks_tagged` 의 태그 판별도 셈(공백으로 쓴 Anima 태그를 산문으로 보던 것).
 - `infotext.py` — JPEG·WebP 의 EXIF UserComment, tEXt 는 Latin-1(PNG 규격), 압축 iTXt·zTXt, 메모리 이미지 읽기.
 - `fetcher.py` — httpx 로 교체, 크기와(Hugging Face 가 알려 주면) SHA256 이 맞을 때만 파일을 남기고 크기를 모르면 받지 않음,
   safetensors 머리 확인, 정책 결과(`permitted`)를 반드시 받음, 크기 확인 HEAD 가 GET 이 되지 않음, 덮어쓰지 않음(이름이 있으면 실패하는
@@ -64,6 +67,12 @@ MIT(Copyright (c) 2026 Eduardo Abreu)이며, 각 파일 머리에 저작권·허
 - `profile.py`·`capabilities.py`·`identity.py` — 형 검사 전용 import, extras 전달, 정책·경로 보고, 응답 캐시 폴더 설정·원자적 쓰기,
   체크포인트 전환 때 넘긴 프리셋은 그 인스턴스에 있는 것만(상류는 그대로 씀), 체크포인트 사이드카 태그는 길이를 잘라
   `untrusted_checkpoint_tags` 로.
+- `profile.py` — `preset_for_checkpoint` 는 체크포인트 이름을 `[해시]` 없이 비교(`_bare_name`; Forge 의 `forge_checkpoint_<프리셋>` 기록과
+  `models` 에서 고른 이름이 해시만 달라도 상류는 프리셋 신호를 잃어 그 체크포인트의 VAE·텍스트 인코더 없이 불러올 수 있었음),
+  `resolve_dialect` 설명을 아래 `identity.py` 에 맞춤.
+- `identity.py` — `resolve` 에서 과거 프롬프트는 아키텍처가 뜻하는 방언을 뒤집지 않음: 모호한 아키텍처(xl)의 갈래를 고르거나 같은
+  방언을 확인할 때만 씀(상류는 과거 프롬프트가 이겨, Anima 품질 태그 `masterpiece, best quality`·`score_*` 가 든 Anima 체크포인트를
+  Illustrious·Pony 로 봄).
 - `presets.py`·`dialects.py`·`downloads.py`·`civitai.py` 는 상류와 같습니다. 상류의 README·`glama.json`·배너 이미지는 넣지 않았습니다.
 - `tests/test_mcp_forgeneo_upstream.py` 는 상류 pytest 130개 중 128개를 unittest 로 옮긴 것입니다.
 
@@ -261,7 +270,9 @@ post-CFG 로 붙이는 `scripts/colorcraft_neo.py` 의 방식. flux2 보정값�
 
 이 확장에서 새로 쓴 것: Forge 훅(`hook.py` — 소유 표시가 붙은 붙이기·떼기, img2img·hires σ 구간, `vae.encode` +
 `process_in` 색 기준점과 요청 사이 캐시, 오류 시 입력 그대로와 status, fp16/bf16, CompVis 샘플러의 원본 Forge 스텝 카운터), 노드
-종류를 고르는 탭·Pass·infotext(이 확장의 키와 원본·포크 키 읽기), `scripts/colorcraft.py`.
+종류를 고르는 Type·Pass·infotext(이 확장의 키와 원본·포크 키 읽기), 공유 편집기(`ui.py` 의 편집기 한 벌과 선택 줄 — 상류는 노드마다
+탭, `panel_state.py`, `javascript/colorcraft_editor.js` · 생성 파일 `javascript/colorcraft_schema.js`), `scripts/colorcraft.py`. 패널의
+범위·스택 구조는 여전히 상류에서 온 것입니다(위 `spec.py`·`ui.py`).
 
 `tests/_origin_colorcraft/`(원본 `nodes.py`·`lib_colorcraft/`·`scripts/colorcraft.py`·`LICENSE`)와
 `tests/_origin_colorcraft_fork/`(포크 `core.py`·`params.py`·`spec.py`·`LICENSE`)는 대조 테스트용 사본입니다(머리 주석만
