@@ -71,7 +71,7 @@ except Exception:  # noqa: BLE001 - same literal as sam3ext/extra_samplers/commo
 
 from . import basis as basis_mod
 from . import debug_panel
-from . import spec
+from . import panel_state, spec
 from .color import build_color_latent, to_model_space
 from .engine import apply_chain, build_entries, needed_colors
 from .schedule import forge_step_position, sigma_to_value
@@ -79,6 +79,7 @@ from .schedule import forge_step_position, sigma_to_value
 OWNER = "sam-extra/colorcraft"
 OWNER_ATTR = "_sam_extra_colorcraft_owner"
 STATE_ATTR = "_sam3_colorcraft"
+REFUSED_ATTR = "_sam3_colorcraft_refused"
 INFOTEXT_PRE_DD = "SAM Extra Colorcraft pre-DD sigma"
 OPT_PRE_DD = "sam3_colorcraft_pre_dd_sigma"
 OPT_LOG = "sam3_colorcraft_log"
@@ -346,6 +347,19 @@ def write_status(p):
     text = " | ".join(passes[name].render() for name in ("base", "hires") if name in passes)
     if text:
         _params(p)[spec.STATUS_KEY] = text
+
+
+def _refuse(p, exc):
+    """Script arguments the reader will not guess at (``panel_state.RefusedArgs``, e.g. v0.31.0's 579 positional
+    values cut to 67 by Forge's API): nothing is attached, the status says why, and the console gets one line
+    per processing job (``REFUSED_ATTR`` keeps its hires pass quiet; an XYZ grid gives every cell its own copy of
+    ``p``, so one line per cell, like the status). A script cannot fail an API request, so the image is made
+    without Colorcraft."""
+    reason = f"unreadable panel state ({exc})" if isinstance(exc, panel_state.UnreadableState) else str(exc)
+    _params(p)[spec.STATUS_KEY] = f"not applied: {reason}"
+    if not getattr(p, REFUSED_ATTR, False):
+        setattr(p, REFUSED_ATTR, True)
+        _log(f"not applied: {reason}")
 
 
 # ---------------------------------------------------------------------------
@@ -662,9 +676,13 @@ def process(p, args, full_hw=None):
     if inner_pass(p):
         return None
     xyz = getattr(p, spec.XYZ_ATTR, None)
-    if not spec.args_enabled(args) and not (xyz and "enabled" in xyz):
-        return None                     # off: not even the ~580 arguments are read
-    config = spec.config_from_args(args)
+    if not panel_state.args_enabled(args) and not (xyz and "enabled" in xyz):
+        return None                     # off: nothing past the first argument is read
+    try:
+        config = panel_state.config_from_script_args(args)
+    except panel_state.RefusedArgs as exc:
+        _refuse(p, exc)
+        return None
     config = spec.apply_xyz(config, xyz)
     if not config.enabled:
         return None

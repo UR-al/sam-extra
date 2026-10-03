@@ -33,6 +33,11 @@
 # - Builds and queries hold a lock: the MCP SDK runs sync tools on worker threads.
 # - `revision` counts rebuilds (the LoRA index uses it to notice new usage counts);
 #   diagnostics() also reports the revision, the index age and the folder it reads.
+# - normalise_checkpoint() drops the bracketed hash before the extension. Forge's checkpoint
+#   titles ("name.safetensors [0123456789]", sd_model_checkpoint) put it after the extension, so
+#   upstream kept ".safetensors" and the loaded checkpoint never matched its own history.
+# - _looks_danbooru() also counts what dialects._looks_tagged counts, so Anima's space-separated
+#   tags ("short hair, black hair, 1boy, solo") are no longer reported as prose.
 
 """Aggregation of past generations into per-combination sampling regimes.
 
@@ -55,6 +60,7 @@ from collections import Counter, defaultdict
 from collections.abc import Callable
 from dataclasses import dataclass, field
 
+from .dialects import _looks_tagged as looks_tagged
 from .infotext import parse_infotext, read_generation_metadata
 from .presets import looks_like_accelerator
 
@@ -72,17 +78,25 @@ def normalise_checkpoint(name: str) -> str:
     ("Anima\\animeMix_v10.safetensors") while infotext records the bare
     name ("animeMix_v10"). Without this the history lookup never matches
     and every profile silently falls back to preset defaults.
+
+    Once Forge knows the hash, the title carries it after the extension
+    ("animeMix_v10.safetensors [0123456789]"), so the bracket goes first.
     """
-    cleaned = (name or "").replace("\\", "/").split("/")[-1].strip()
+    cleaned = drop_trailing_bracket((name or "").replace("\\", "/").split("/")[-1].strip())
     lowered = cleaned.lower()
     for suffix in CHECKPOINT_SUFFIXES:
         if lowered.endswith(suffix):
             cleaned = cleaned[: -len(suffix)]
             break
     # Forge appends a hash in brackets in some infotext variants.
-    if cleaned.endswith("]") and "[" in cleaned:
-        cleaned = cleaned[: cleaned.rindex("[")].strip()
-    return cleaned.lower()
+    return drop_trailing_bracket(cleaned).lower()
+
+
+def drop_trailing_bracket(text: str) -> str:
+    """Drop a trailing "[...]" (a hash, in Forge's titles and some infotext variants)."""
+    if text.endswith("]") and "[" in text:
+        return text[: text.rindex("[")].strip()
+    return text
 
 
 @dataclass(frozen=True)
@@ -421,4 +435,8 @@ def _looks_danbooru(prompt: str) -> bool:
     if any(marker in lowered for marker in DANBOORU_MARKERS):
         return True
     # Underscore-joined tags are the other strong signal of a booru dialect.
-    return lowered.count("_") >= 2 and "," in lowered
+    if lowered.count("_") >= 2 and "," in lowered:
+        return True
+    # Anima writes its tags with spaces: the dialect module's test (subject-count and quality
+    # vocabulary, short comma-separated fragments) catches those.
+    return looks_tagged(prompt)

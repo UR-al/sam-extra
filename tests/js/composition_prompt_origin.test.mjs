@@ -8,7 +8,8 @@
 // 격자: 프리셋 전부 · 각 조절값의 범위 전체와 그 바깥(정수·.5·.49 반올림 경계) · 태그 문턱값(방향 20/65/115/160,
 // 높이 ±20/60, 거리 15/30/50/65/85, 기울기 ±6, 화면 위치 ±25) 바로 안팎의 곱 격자 · NaN·Infinity·문자열·객체 같은 깨진 값 ·
 // 프롬프트 말뭉치(가중치, 이스케이프, 스케줄, 와일드카드, LoRA, 끝 쉼표, 빈 값)와 시드 고정 무작위 문자열.
-// 타입 지우기가 없는 Node(CI 의 Node 20)에서는 해시 고정만 돌고 대조는 건너뛴다.
+// CI 도 Node 24 다(.github/workflows/ci.yml). 타입 지우기가 없는 Node 에서는 해시 고정만 돌고 대조는 건너뛰되, CI 변수가
+// 있으면(GitHub Actions 는 CI=true) 건너뛰지 않고 실패한다 — Node 를 내려도 대조 9개가 조용히 빠지지 않게.
 import { after, test } from "node:test";
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
@@ -25,7 +26,8 @@ const MARKER = "// ---- app frontend/src/utils/compositionPrompt.ts below (verba
 // (git blob d083758ad318339bdda996e038f6f924b1e949eb).
 const ORIGIN_SHA256 = "69eb03cf56132fd64dfb3958dc848fc6b74b09fefce3c69817a03ff8a571ded7";
 const STRIP = Boolean(process.features && process.features.typescript);
-const SKIP = STRIP ? false : "this Node cannot import TypeScript (process.features.typescript is unset; Node 24 can)";
+const NO_STRIP = `this Node (${process.version}) cannot import TypeScript (process.features.typescript is off; Node 24 strips types by default)`;
+const SKIP = STRIP || process.env.CI ? false : NO_STRIP;
 
 const PORT_SOURCE = path.join(ROOT, "javascript", "composition_prompt.js");
 vm.runInThisContext(readFileSync(PORT_SOURCE, "utf8"), { filename: PORT_SOURCE });
@@ -38,6 +40,7 @@ const originBody = originText.split(MARKER)[1];
 let originModules = null;
 let scratch = null;
 async function origin() {
+  assert.ok(STRIP, NO_STRIP);
   if (!originModules) {
     const app = await import(pathToFileURL(ORIGIN).href);
     scratch = mkdtempSync(path.join(tmpdir(), "sam3-composition-origin-"));

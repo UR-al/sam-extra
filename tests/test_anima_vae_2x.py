@@ -18,6 +18,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+import gradio as gr
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -715,7 +716,10 @@ class ScriptEntryTests(unittest.TestCase):
         self.assertEqual(self.built, [])
 
     def test_ui_returns_five_components(self):
-        comps = self.script.ui(False)
+        # Forge builds every script UI inside gr.Blocks (modules/ui.py). gradio 5 needs that
+        # context here (Accordion reads each child's ``page``); 4.40 also builds without it.
+        with gr.Blocks():
+            comps = self.script.ui(False)
         self.assertEqual(len(comps), 5)
         self.assertEqual(comps[0].elem_id, "anima_vae2x_enable")
         self.assertFalse(comps[0].value)

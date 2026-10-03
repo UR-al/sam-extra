@@ -14,6 +14,10 @@ import torch
 
 
 ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from tests._forge_checkout import require_forge_file  # noqa: E402
 
 
 def _load_pag_module():
@@ -50,10 +54,11 @@ def _load_pag_module():
 
 
 def _load_forge_sampler():
-    """Execute Forge's real batching/area math with only host services stubbed."""
-    forge = ROOT.parents[1]
+    """Execute Forge's real batching/area math with only host services stubbed.
+
+    Skips the calling test (``unittest.SkipTest``) without a Forge checkout, as on GitHub CI."""
     spec = importlib.util.spec_from_file_location(
-        "_pag_test_conditions", forge / "backend" / "sampling" / "condition.py"
+        "_pag_test_conditions", require_forge_file("backend/sampling/condition.py")
     )
     conditions = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(conditions)
@@ -69,7 +74,7 @@ def _load_forge_sampler():
         "backend.sampling.condition": conditions,
     }):
         spec = importlib.util.spec_from_file_location(
-            "_pag_test_sampler", forge / "backend" / "sampling" / "sampling_function.py"
+            "_pag_test_sampler", require_forge_file("backend/sampling/sampling_function.py")
         )
         sampler = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(sampler)

@@ -409,6 +409,8 @@ def arg_names():
 #     paths keep the panel defaults (modifier I Active), unknown ones are ignored, values are coerced like
 #     positional ones, and ``"enabled"`` defaults to True (sending the dict asks for Colorcraft).
 # The remaining positional arguments are then ignored. Forge's API fills them with the panel defaults.
+# The panel's own 67-argument layout and the wrapped old list are read by ``panel_state.config_from_script_args``;
+# ``config_from_args`` stays v0.31.0's positional reader.
 _COMPACT_TEXT_RE = re.compile(r"v1\s*;\s*mods\s*=")
 
 
@@ -454,9 +456,11 @@ def args_enabled(args):
 
 
 def config_from_args(args):
-    """The script's positional arguments (``ui()`` order) as a ``Config``. Missing ones are defaults.
+    """v0.31.0's positional arguments (``arg_names()`` order) as a ``Config``. Missing ones are defaults.
 
-    A compact first argument (``is_compact_arg``) replaces all of them."""
+    A compact first argument (``is_compact_arg``) replaces all of them. Since v0.32.0 the panel sends its own
+    67 arguments (``panel_state.config_from_script_args``); this reads the API's compact forms, the wrapped old
+    list and direct callers."""
     args = list(args or ())
     if args and isinstance(args[0], dict):
         return config_from_mapping(args[0])
@@ -1078,7 +1082,7 @@ def decode(params):
     own paste callback turns it into when that extension is installed too). Memoised per value, since
     every one of the panel's fields asks. A value that cannot be read (e.g. a dict of another shape left by
     some other extension's paste callback) is treated like an unknown value: None, remembered, never an
-    exception — Forge would otherwise log one traceback per panel field (~580) on every paste."""
+    exception — Forge would otherwise log one traceback per paste field (65) on every paste."""
     if not isinstance(params, dict):
         return None
     if INFOTEXT_KEY in params:

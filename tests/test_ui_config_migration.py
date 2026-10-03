@@ -8,11 +8,12 @@ The PAG parity change raised the Attn Scale maximum 15 -> 100 under the same lab
 Forge's real ``UiLoadsave`` (modules/ui_loadsave.py, loaded from the install below) reapplies
 the saved value/minimum/maximum/step per label, so these tests feed it a ui-config holding the
 pre-parity keys (the values an install saved before the change) and check what the UI and the
-script then use.
+script then use. Without a Forge checkout (GitHub CI) only the tests that build that UI skip.
 """
 
 from __future__ import annotations
 
+import functools
 import importlib.util
 import json
 import sys
@@ -26,11 +27,11 @@ import gradio as gr
 
 
 ROOT = Path(__file__).resolve().parents[1]
-FORGE = ROOT.parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from sam3ext.guidance import ui_config_migration as migration  # noqa: E402
+from tests._forge_checkout import require_forge_file  # noqa: E402
 
 
 def _load_base_tests():
@@ -43,8 +44,12 @@ def _load_base_tests():
     return module
 
 
+@functools.cache
 def _load_forge_ui_loadsave():
-    """Forge's ``modules/ui_loadsave.py`` with only ``errors``/``ui_components`` stubbed."""
+    """Forge's ``modules/ui_loadsave.py`` with only ``errors``/``ui_components`` stubbed, loaded once.
+
+    Skips the calling test (``unittest.SkipTest``) without a Forge checkout, as on GitHub CI."""
+    path = require_forge_file("modules/ui_loadsave.py")
     errors = types.ModuleType("modules.errors")
 
     def display(error, task):
@@ -60,9 +65,7 @@ def _load_forge_ui_loadsave():
     with mock.patch.dict(sys.modules, {
         "modules": package, "modules.errors": errors, "modules.ui_components": components,
     }):
-        spec = importlib.util.spec_from_file_location(
-            "_forge_ui_loadsave", FORGE / "modules" / "ui_loadsave.py"
-        )
+        spec = importlib.util.spec_from_file_location("_forge_ui_loadsave", path)
         module = importlib.util.module_from_spec(spec)
         assert spec.loader is not None
         spec.loader.exec_module(module)
@@ -70,7 +73,6 @@ def _load_forge_ui_loadsave():
 
 
 _BASE = _load_base_tests()
-_LOADSAVE = _load_forge_ui_loadsave()
 
 PREFIX = "customscript/anima_safe_pag.py"
 TAU = "RDC tau (EMA 기억 구간)"
@@ -179,7 +181,7 @@ class UiConfigMigrationTests(unittest.TestCase):
             inputs = self.pag.AnimaSafePAG().ui(tab == "img2img")
         for component in inputs:  # modules/scripts.py:672-673
             component.custom_script_source = "anima_safe_pag.py"
-        loadsave = _LOADSAVE.UiLoadsave(str(self.path))
+        loadsave = _load_forge_ui_loadsave().UiLoadsave(str(self.path))
         loadsave.add_block(block, tab)
         return inputs, loadsave
 

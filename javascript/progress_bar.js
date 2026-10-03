@@ -42,14 +42,16 @@
  *   지우므로 중단으로 치지 않고, 시작 뒤에 닿은 중단은 서버의 interrupted 표시로 안다. Skip 은 중단이 아니다.
  * - 설정: ⚙️ 팝오버와 localStorage 대신 Forge Settings(sam3_progress_*), 저장하면 바로 반영한다. 높이는 10~50px.
  * - 모양: 색은 테마 변수(tokens.css·Gradio). 그라데이션·움직이는 색·빛 번짐(glow, drop-shadow) 없음. 막대 위 글자는
- *   두 겹(바탕용·채움용)으로 그려 어느 쪽에서도 읽힌다. 각 겹은 처음 만든 텍스트 노드의 .data 만 바꾼다 — 자식을
+ *   두 겹(바탕용·채움용)으로 그려 어느 쪽에서도 읽힌다. 채움 위 글자색은 막대 색의 밝기로 고른다(테마 강조색이면 그
+ *   테마의 실제 강조색 — Forge Default 도). 각 겹은 처음 만든 텍스트 노드의 .data 만 바꾼다 — 자식을
  *   넣고 빼지 않으므로 Forge 의 childList 관찰자(onUiUpdate)가 깨지 않는다. prefers-reduced-motion 이면 보간
  *   애니메이션 없이 실제 값으로만 움직인다.
  * - Forge 기본 막대(.progressDiv)는 지우지 않고 CSS 로 숨긴다 — sd-webui-api-payload-display 가 그 삽입을 기다린다.
  *   이 막대가 맡아 그리는 작업을 Forge 의 requestProgress 가 아직 붙들고 있는 동안만 숨기므로(data-native) 설정을
  *   켜기 전에 시작한 작업은 Forge 막대가 그대로 보이고, 사라지기 방식이면 Forge 가 작업을 놓을 때까지 끝 상태를 보인다.
  * - 상류 버그: 중단 표시 슬라이더가 4가지 중 3가지만 골랐던 것, 생성 아닌 클릭 뒤 0/0 에 멈추던 것, 높이 미제한,
- *   보호 없는 localStorage, ETA 를 모를 때(첫 스텝 전) Smooth > Accurate 가 99% 로 내달리던 것.
+ *   보호 없는 localStorage, ETA 를 모를 때(첫 스텝 전) Smooth > Accurate 가 99% 로 내달리던 것(여기서는 그동안 서버
+ *   진행률을 따라가기만 한다 — 미끄러짐도 없이).
  * - sd-webui-smooth-progress 가 함께 설치돼 있으면(#spb-dynamic-css) 이 막대는 물러난다.
  */
 (function () {
@@ -215,26 +217,67 @@
         };
     }
 
-    // WCAG 상대 휘도. 밝은 막대에는 어두운 글자, 어두운 막대에는 밝은 글자.
-    function isLight(hex) {
-        var channels = [1, 3, 5].map(function (offset) {
-            var c = parseInt(hex.slice(offset, offset + 2), 16) / 255;
+    // WCAG 상대 휘도(sRGB 채널 0~255 세 개).
+    function relativeLuminance(rgb) {
+        var linear = rgb.map(function (value) {
+            var c = clamp(value, 0, 255) / 255;
             return c <= 0.04045 ? c / 12.92 : Math.pow((c + 0.055) / 1.055, 2.4);
         });
-        var luminance = 0.2126 * channels[0] + 0.7152 * channels[1] + 0.0722 * channels[2];
-        return luminance > 0.179;
+        return 0.2126 * linear[0] + 0.7152 * linear[1] + 0.0722 * linear[2];
     }
 
-    function colorVars(cfg) {
-        if (cfg.color === "accent") return null;   // style.css 의 기본값: 테마 강조색
+    // CSS 색 글자의 밝기(상대 휘도 0~1). #rgb·#rrggbb·rgb()/rgba()(Forge 의 Gradio 테마)와 oklch()(sam-extra 테마)만
+    // 읽고, 그 밖의 표기는 null. oklch 는 L³ 으로 어림한다(무채색이면 같은 값).
+    function colorLuminance(value) {
+        var text = typeof value === "string" ? value.trim().toLowerCase() : "";
+        var result = null;
+        var hex = hexColor(text);
+        var rgb = /^rgba?\(\s*([\d.]+)\s*[,\s]\s*([\d.]+)\s*[,\s]\s*([\d.]+)\s*[,/)]/.exec(text);
+        var oklch = /^oklch\(\s*([\d.]+)(%?)[\s/)]/.exec(text);
+        if (hex) {
+            result = relativeLuminance([1, 3, 5].map(function (offset) {
+                return parseInt(hex.slice(offset, offset + 2), 16);
+            }));
+        } else if (rgb) {
+            result = relativeLuminance([rgb[1], rgb[2], rgb[3]].map(Number));
+        } else if (oklch) {
+            result = Math.pow(clamp(parseFloat(oklch[1]) / (oklch[2] ? 100 : 1), 0, 1), 3);
+        }
+        return result !== null && isFinite(result) ? result : null;
+    }
+
+    function isLight(hex) {
+        return colorLuminance(hex) > 0.179;
+    }
+
+    // 밝은 막대에는 어두운 글자, 어두운 막대에는 밝은 글자.
+    function inkFor(luminance) {
+        return luminance > 0.179 ? "var(--sam3-color-accent-ink)" : "var(--sam3-color-ink)";
+    }
+
+    // 테마 강조색 막대 위 글자색. sam-extra 테마는 --button-primary-text-color 가 강조색의 짝이지만 Forge Default 의
+    // Gradio 테마는 아니다(밝은 테마는 #f97316 막대 위 #ea580c 글자 1.2:1, 어두운 테마는 흰 글자 2.9:1). 그래서 실제
+    // 강조색 — style.css 처럼 --color-accent, 없으면 --sam3-color-accent — 의 밝기로 고른다. 못 읽으면 null(style.css 기본값).
+    function accentInk(root) {
+        try {
+            var style = window.getComputedStyle(root);
+            var accent = style.getPropertyValue("--color-accent").trim()
+                || style.getPropertyValue("--sam3-color-accent").trim();
+            var luminance = colorLuminance(accent);
+            return luminance === null ? null : inkFor(luminance);
+        } catch (_error) {
+            return null;
+        }
+    }
+
+    function colorVars(cfg, root) {
+        // 막대 색은 style.css 의 기본값(테마 강조색), 글자색만 고른다.
+        if (cfg.color === "accent") return { color: null, ink: accentInk(root) };
         if (cfg.color === "success") {
             return { color: "var(--sam3-color-success)", ink: "var(--sam3-color-accent-ink)" };
         }
         var hex = cfg.color === "custom" ? cfg.customColor : hexColor(PRESET_COLORS[cfg.color]);
-        return {
-            color: hex,
-            ink: isLight(hex) ? "var(--sam3-color-accent-ink)" : "var(--sam3-color-ink)",
-        };
+        return { color: hex, ink: inkFor(colorLuminance(hex)) };
     }
 
     function interruptAfterCurrent() {
@@ -442,14 +485,11 @@
         style.setProperty("--sam3-progress-height", config.height + "px");
         style.setProperty("--sam3-progress-align", String(config.align));
         style.setProperty("--sam3-progress-fade", config.fadeSeconds + "s");
-        var colors = colorVars(config);
-        if (colors) {
-            style.setProperty("--sam3-progress-color", colors.color);
-            style.setProperty("--sam3-progress-color-ink", colors.ink);
-        } else {
-            style.removeProperty("--sam3-progress-color");
-            style.removeProperty("--sam3-progress-color-ink");
-        }
+        var colors = colorVars(config, bar.root);
+        [["--sam3-progress-color", colors.color], ["--sam3-progress-color-ink", colors.ink]].forEach(function (pair) {
+            if (pair[1]) style.setProperty(pair[0], pair[1]);
+            else style.removeProperty(pair[0]);
+        });
         setAttr(bar, "data-interrupt", config.interruptStyle);
     }
 
@@ -680,6 +720,9 @@
     function applySnapshot(job, data) {
         if (job.ended || !data || typeof data !== "object") return;
         if (data.active) {
+            // 처음 본 '돌고 있음': Forge 의 진행 복원(새로 고친 뒤 Restore progress)처럼 도중에 붙은 작업이면 막대를 그 자리로
+            // 옮긴다(resync). 생성을 눌러 시작한 작업은 이때 0% 라 그대로다.
+            if (!job.everActive) job.resync = true;
             job.everActive = true;
             job.queued = false;
             job.phase = "running";
@@ -689,6 +732,12 @@
             job.jobNo = int(data.job_no);
             if (job.step > 0 || job.jobNo > 0) job.stepsSeen = true;
             job.jobCount = int(data.job_count);
+            if (job.jobCount > 0 && job.jobNo >= job.jobCount && job.step === 0) {
+                // Forge 는 마지막 패스 뒤에도 nextjob 을 부른다(job_no == job_count, sampling_step 0). 디코드·저장하는 동안
+                // '0/20' 이 아니라 끝난 마지막 패스('20/20')로 보인다.
+                job.jobNo = job.jobCount - 1;
+                job.step = job.steps;
+            }
             job.perImage = Math.max(1, int(data.passes_per_image));
             job.eta = finite(data.eta);
             job.passEta = finite(data.pass_eta);
@@ -732,6 +781,7 @@
         if (job.ended || !res || typeof res !== "object") return;
         var bar = job.bar;
         if (res.active) {
+            if (!job.everActive) job.resync = true;   // 도중에 붙은 작업이면 그 자리에서 시작한다(applySnapshot 과 같음)
             job.everActive = true;
             if (!shown(job) && bars[bar.tab] === bar && (!bar.job || bar.job.phase !== "running")) {
                 if (bar.job && !bar.job.ended) bar.backlog.unshift(bar.job);
@@ -1001,7 +1051,9 @@
             var ratio = dt / 16.666;
             var distance = target - bar.visual;
             if (distance > 0) bar.visual += distance * (1 - Math.pow(1 - 0.035, ratio));
-            else bar.visual += 0.008 * ratio;
+            // 상류 Smooth ~ Accurate 의 미끄러짐(서버 값에 닿은 뒤에도 조금씩 간다). ETA 를 모르는 Smooth > Accurate 에는 쓰지
+            // 않는다 — 첫 스텝 전(모델 불러오기 등)에는 서버 진행률이 0 인데 끝없이 올라갔다(실측 14초에 7.7%, 약 3분 반이면 99.2%).
+            else if (mode === "smooth_eq_acc") bar.visual += 0.008 * ratio;
             bar.visual = Math.min(bar.visual, CAP_PCT);
         }
 
@@ -1082,7 +1134,9 @@
 
     // 숨어 있던 동안 애니메이션 프레임이 멈춰 막대도 멈춰 있었다. Smooth > Accurate 는 남은 거리를 남은 시간으로 나눠
     // 가므로 그대로 두면 끝날 때까지 실제보다 한참 뒤처진다(상류도 같았다) — 다시 보인 뒤 첫 응답에서 서버의 진행률로
-    // 바로 옮긴다. 앞으로만 간다. 다른 두 방식은 원래 서버 값을 쫓아가므로 그대로 둔다.
+    // 바로 옮긴다. 앞으로만 간다. 다른 두 방식은 원래 서버 값을 쫓아가므로 그대로 둔다. 도중에 붙은 작업(Forge 의 진행
+    // 복원)도 처음 '돌고 있음' 을 본 응답에서 같은 이유로 옮긴다 — 0% 에서 출발하면 남은 시간 동안 100% 를 다 채우느라
+    // 실제보다 한참 뒤처진다(실측: 32/80 스텝(40%)에서 붙자 '1%', 56% 일 때 '19%').
     function resync(job) {
         job.resync = false;
         var bar = job.bar;
@@ -1093,6 +1147,14 @@
             setValue(bar, target);
         }
         bar.speed = 0;
+    }
+
+    // SAM Extra Appearance 테마를 바꾸면(appearance_theme.js 의 sam3:appearance-theme) 강조색도 바뀐다 — 글자색을 다시 고른다.
+    function onThemeChange() {
+        if (!config || !config.enabled || steppedAside) return;
+        TABS.forEach(function (tab) {
+            if (bars[tab]) styleBar(bars[tab]);
+        });
     }
 
     function onMotionChange() {
@@ -1123,6 +1185,7 @@
         listening = true;
         document.addEventListener("click", onClick, true);
         document.addEventListener("visibilitychange", onVisibility);
+        document.addEventListener("sam3:appearance-theme", onThemeChange);
         if (typeof window.matchMedia === "function") {
             motionQuery = window.matchMedia("(prefers-reduced-motion: reduce)");
             if (typeof motionQuery.addEventListener === "function") {
@@ -1231,6 +1294,7 @@
         hooks.formatTime = formatTime;
         hooks.readConfig = readConfig;
         hooks.isLight = isLight;
+        hooks.colorLuminance = colorLuminance;
         hooks.bars = function () { return bars; };
         hooks.config = function () { return config; };
         hooks.steppedAside = function () { return steppedAside; };

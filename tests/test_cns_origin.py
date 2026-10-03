@@ -106,7 +106,6 @@ def _load_test_module(name, filename):
 ORIGIN = _load_origin()
 _MIGRATION_TESTS = _load_test_module("_cns_origin_migration_tests", "test_ui_config_migration.py")
 _BASE = _MIGRATION_TESTS._BASE
-_LOADSAVE = _MIGRATION_TESTS._LOADSAVE
 
 UPSTREAM_INPUTS = ORIGIN.CNSSamplerPatch.INPUT_TYPES()["required"]
 PARAMS = ("strength", "gamma_power", "gamma_scale")
@@ -761,7 +760,7 @@ class CnsUiConfigMigrationTests(unittest.TestCase):
             inputs = self.pag.AnimaSafePAG().ui(tab == "img2img")
         for component in inputs:  # modules/scripts.py:672-673
             component.custom_script_source = "anima_safe_pag.py"
-        loadsave = _LOADSAVE.UiLoadsave(str(self.path))
+        loadsave = _MIGRATION_TESTS._load_forge_ui_loadsave().UiLoadsave(str(self.path))  # skips without Forge
         loadsave.add_block(block, tab)
         by_id = {c.elem_id: c for c in inputs}
         return {name: by_id[ELEM_IDS[name]] for name in PARAMS}, loadsave

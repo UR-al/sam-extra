@@ -20,11 +20,6 @@ jobs:
           cache: pip
           cache-dependency-path: requirements-dev.txt
 
-      - name: Set up Node
-        uses: actions/setup-node@v4
-        with:
-          node-version: "20"
-
       - name: Install test dependencies
         run: |
           python -m pip install --upgrade pip
@@ -38,6 +33,23 @@ jobs:
       # skipped tests stay visible in the log.
       - name: Run Python tests
         run: python -m unittest discover -s tests -p "test_*.py"
+
+  # Its own job: in a single job a failing Python step skipped these steps, so
+  # the frontend checks never ran. Each job now reports its own status.
+  frontend:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      # Node 24 strips TypeScript types itself (process.features.typescript), so
+      # tests/js/composition_prompt_origin.test.mjs imports the app's original
+      # compositionPrompt.ts. Node 20 skipped nine of its parity tests; under CI
+      # (CI=true) a Node without type stripping now fails them instead.
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
 
       - name: Check JavaScript syntax
         run: |

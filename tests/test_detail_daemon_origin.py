@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import ast
 import copy
+import functools
 import importlib.util
 import os
 import sys
@@ -40,6 +41,9 @@ import torch
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
+
+from tests._forge_checkout import require_forge_file  # noqa: E402
+
 # Building the UI below must not phone home for a gradio version check.
 os.environ.setdefault("GRADIO_ANALYTICS_ENABLED", "False")
 
@@ -337,15 +341,16 @@ def flow_sigmas(steps, shift=3.0):
 # checkout this extension lives in (not re-derived).
 # ---------------------------------------------------------------------------
 
-_FORGE = ROOT.parents[1]
-
 
 def _forge_function(relpath, name, namespace):
-    """One top-level function of the Forge checkout, executed in ``namespace``."""
-    source = (_FORGE / relpath).read_text(encoding="utf-8")
+    """One top-level function of the Forge checkout, executed in ``namespace``.
+
+    Without a Forge checkout (GitHub CI) the calling test is skipped."""
+    path = require_forge_file(relpath)
+    source = path.read_text(encoding="utf-8")
     for node in ast.parse(source).body:
         if isinstance(node, ast.FunctionDef) and node.name == name:
-            code = compile(ast.Module(body=[node], type_ignores=[]), str(_FORGE / relpath), "exec")
+            code = compile(ast.Module(body=[node], type_ignores=[]), str(path), "exec")
             scope = dict(namespace)
             exec(code, scope)  # noqa: S102 - Forge's own function body
             return scope[name]
@@ -362,14 +367,16 @@ def _setup_img2img_steps(fix_steps=False):
 
 # origin: Haoming02/sd-webui-forge-classic@e33f40e4:modules/sd_schedulers.py:124-133
 # (ddim_scheduler, the "DDIM" schedule type; ComfyUI's "ddim_uniform" is the same list)
-_FORGE_DDIM = _forge_function("modules/sd_schedulers.py", "ddim_scheduler", {"torch": torch})
+@functools.cache
+def _forge_ddim():
+    return _forge_function("modules/sd_schedulers.py", "ddim_scheduler", {"torch": torch})
 
 
 def ddim_sigmas(steps, shift=3.0):
     """Forge's DDIM schedule type on Anima's flow model sigmas (k_prediction.py:190-194)."""
     t = torch.arange(1, 1001, 1) / 1000
     inner = types.SimpleNamespace(sigmas=shift * t / (1 + (shift - 1) * t))
-    return _FORGE_DDIM(steps, float(inner.sigmas[0]), float(inner.sigmas[-1]), inner, "cpu")
+    return _forge_ddim()(steps, float(inner.sigmas[0]), float(inner.sigmas[-1]), inner, "cpu")
 
 
 class StableDiffusionProcessingImg2Img(types.SimpleNamespace):

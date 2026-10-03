@@ -40,7 +40,7 @@ def _support():
 S = _support()
 
 from sam3ext.colorcraft import debug as debug_mod  # noqa: E402
-from sam3ext.colorcraft import debug_panel, hook, spec  # noqa: E402
+from sam3ext.colorcraft import debug_panel, hook, panel_state, spec, ui  # noqa: E402
 
 Mod, Scenario = S.Mod, S.Scenario
 
@@ -225,6 +225,63 @@ class RendererParityTests(unittest.TestCase):
         expected = debug_panel.build_debug_gallery_images(capture, ["tint"], ["M1"], ["C1"], "none", "white",
                                                           "colormap", leaf_specs, combo_specs, warn=lambda *_: None)
         self.assertTrue(np.array_equal(np.asarray(images[0][0]), np.asarray(expected[0][0])))
+
+
+class PanelRefreshAdapterTests(unittest.TestCase):
+    """The shared editor's Refresh (``ui.build``) hands ``render_for_panel`` v0.31.0's ``mask_values`` (every leaf,
+    then every combo) of the effective config: the hidden state with the visible editors laid over."""
+
+    @classmethod
+    def setUpClass(cls):
+        import gradio as gr
+
+        cls.calls = []
+        parts = {}
+        with gr.Blocks() as demo:
+            components, _ = ui.build(lambda item: f"script_txt2img_colorcraft_samextra_{item}",
+                                     on_debug_refresh=lambda *a: cls.calls.append(a) or a, parts=parts)
+        fns = demo.fns.values() if isinstance(demo.fns, dict) else demo.fns
+        python = [f for f in fns if f.fn is not None]
+        assert len(python) == 1, python
+        cls.handler = staticmethod(python[0].fn)
+
+    def _refresh(self, args, panel=("tint",), masks=("M1",), combos=("C1",)):
+        head = [list(panel), list(masks), list(combos), "none", "white", "colormap"]
+        enabled, masking, state, _, _, ref = args[:6]
+        return self.handler(*head, enabled, masking, state, ref, *args[panel_state.EDITOR_OFFSET:])
+
+    def test_renders_like_v031_with_an_edit_only_in_the_visible_leaf_editor(self):
+        config = _mask_config()
+        config.enabled = config.masking = True
+        stale = config.copy()
+        stale.leaves[0] = {f.name: f.default for f in spec.LEAF_FIELDS}       # M1's edits are only in the editor
+        args = ([True, True, panel_state.dump_state(stale, "r1"), False, 5, "I|M1|r1"]
+                + panel_state.editor_values(config, "I", "M1"))
+        got = self._refresh(args)
+        v031 = spec.config_to_args(config)[spec.LEAF_OFFSET:spec.DEBUG_OFFSET]
+        self.assertEqual([repr(v) for v in got[6:]], [repr(v) for v in v031])
+        self.assertEqual(got[:6], (["tint"], ["M1"], ["C1"], "none", "white", "colormap"))
+        capture = debug_panel.Capture(torch.randn(1, 16, 8, 8, generator=torch.Generator().manual_seed(4)),
+                                      False, "krea2")
+        ours = debug_panel.render_for_panel(capture, ["tint"], ["M1"], ["C1"], "none", "white", "colormap", got[6:],
+                                            warn=lambda *_: None)
+        theirs = debug_panel.render_for_panel(capture, ["tint"], ["M1"], ["C1"], "none", "white", "colormap", v031,
+                                              warn=lambda *_: None)
+        self.assertEqual([c for _, c in ours], [c for _, c in theirs])
+        self.assertEqual(len(ours), 3)
+        for (a, _), (b, _) in zip(ours, theirs):
+            self.assertTrue(np.array_equal(np.asarray(a), np.asarray(b)))
+        # the stale state alone would draw another M1
+        stale_only = debug_panel.render_for_panel(capture, [], ["M1"], [], "none", "white", "colormap",
+                                                  spec.config_to_args(stale)[spec.LEAF_OFFSET:spec.DEBUG_OFFSET],
+                                                  warn=lambda *_: None)
+        self.assertFalse(np.array_equal(np.asarray(stale_only[0][0]), np.asarray(ours[1][0])))
+
+    def test_an_unreadable_state_draws_the_defaults(self):
+        args = panel_state.default_args()
+        args[panel_state.STATE_INDEX] = "{not json"
+        got = self._refresh(args)
+        self.assertEqual(list(got[6:]), spec.config_to_args(spec.default_config())[spec.LEAF_OFFSET:spec.DEBUG_OFFSET])
 
 
 class CaptureTests(unittest.TestCase):
