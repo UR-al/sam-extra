@@ -24,6 +24,11 @@ Checked when Forge initialises the sampler (``registry.ExtraKDiffusionSampler.in
 every script's ``process_before_every_sampling`` and after the model load / conditioning / image
 encode that set these inputs. Each reason is logged once per session and recorded in the infotext as
 ``Extra Samplers status: dy sub-steps skipped (<reason> + <reason>)`` — not read back on paste.
+
+``Extra Samplers status`` is shared: ``record_status_part`` keeps one text per part (the Dy part
+above, the ER SDE noise-window part ``params.WINDOW_SKIPPED_STATUS``) and writes them joined by
+``"; "`` in the order they first appeared, so a request with only Dy reasons keeps exactly the text
+above.
 """
 
 from __future__ import annotations
@@ -41,12 +46,15 @@ __all__ = [
     "blocking_reasons",
     "explain",
     "record_status",
+    "record_status_part",
     "spectrum_active",
 ]
 
 STATUS_KEY = "Extra Samplers status"
 _STATUS_PREFIX = "dy sub-steps skipped"
 _SKIPS_ATTR = "_sam_extra_substep_skips"   # the reasons already recorded for this request (all passes)
+_PARTS_ATTR = "_sam_extra_status_parts"    # {part key: text} of the request's status, in first-seen order
+_DY_PART = "dy"
 
 REASON_SPECTRUM = "Spectrum"
 REASON_WAN = "Wan I2V concat_latent"
@@ -138,7 +146,23 @@ def record_status(p, reasons) -> str | None:
     except Exception:
         pass
     text = f"{_STATUS_PREFIX} ({' + '.join(seen)})"
+    record_status_part(p, _DY_PART, text)
+    return text
+
+
+def record_status_part(p, key: str, text: str) -> str:
+    """Set the status part ``key`` of the request to ``text`` (a part keeps its first position) and
+    write ``Extra Samplers status`` as every part joined by ``"; "``; returns the whole value."""
+    parts = getattr(p, _PARTS_ATTR, None)
+    if not isinstance(parts, dict):
+        parts = {}
+    parts[key] = text
+    try:
+        setattr(p, _PARTS_ATTR, parts)
+    except Exception:
+        pass
+    value = "; ".join(parts.values())
     params = getattr(p, "extra_generation_params", None)
     if isinstance(params, dict):
-        params[STATUS_KEY] = text
-    return text
+        params[STATUS_KEY] = value
+    return value

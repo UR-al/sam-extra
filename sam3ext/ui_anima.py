@@ -182,7 +182,7 @@ def build_anima_panel(*, container: str = ACCORDION) -> AnimaPanel:
             "The vendor's Anima DiT runs with the ControlNet-LLLite you select; the "
             "source image is fed as the LLLite control signal (same mechanism as the "
             "ComfyUI `AnimaLLLiteApply` node). Result inserts next to the selected "
-            "image. **First Tile-Repair click can take ~20-40 s** because the Anima DiT/VAE/TE "
+            "image. **First Tile-Repair click can take \\~20-40 s** because the Anima DiT/VAE/TE "
             "weights load from disk."
         )
 

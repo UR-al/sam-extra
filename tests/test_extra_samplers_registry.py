@@ -26,6 +26,7 @@ import types
 import unittest
 from collections import namedtuple
 from pathlib import Path
+from unittest import mock
 
 import torch
 
@@ -46,8 +47,15 @@ from sam3ext.extra_samplers import params as sampler_params  # noqa: E402
 from sam3ext.extra_samplers import registry  # noqa: E402
 
 LABELS = [
-    "ER SDE (Reverse-time)", "ER SDE (ODE)", "DPM++ 4M SDE", "Euler Dy CFG++", "Euler SMEA Dy CFG++",
+    "ER SDE (Reverse-time)", "ER SDE (ODE)", "ER SDE (Tunable)", "DPM++ 4M SDE", "Euler Dy CFG++", "Euler SMEA Dy CFG++",
+    "Euler Dy", "Euler SMEA Dy", "DPM++ 2M SDE Heun", "DPM++ 2M (flow ODE)", "DPM++ 2M Heun (flow ODE)",
+    "DPM++ 3M (flow ODE)", "UniPC bh2", "CFG++ UD10 AB", "IPNDM", "IPNDM_V", "DEIS", "Restart (flow)",
 ]
+BEFORE_0_33 = ("ER SDE (Reverse-time)", "ER SDE (ODE)", "DPM++ 4M SDE", "Euler Dy CFG++", "Euler SMEA Dy CFG++")
+NEW_IN_0_33 = [label for label in LABELS if label not in BEFORE_0_33]
+FLOW_ODE_LABELS = ("DPM++ 2M (flow ODE)", "DPM++ 2M Heun (flow ODE)", "DPM++ 3M (flow ODE)")
+# v0.33.0 entries that take none of the ER SDE values and none of Forge's Eta
+PLAIN_NEW = ("CFG++ UD10 AB", "IPNDM", "IPNDM_V", "DEIS", "Restart (flow)")
 
 
 def _k_sampling_stub(missing=()):
@@ -57,6 +65,27 @@ def _k_sampling_stub(missing=()):
         for name in spec.requires:
             if name not in missing:
                 setattr(module, name, object())
+    return module
+
+
+def _deis_stub(*, function=True):
+    """``k_diffusion.deis`` stand-in (Forge's vendored DEIS coefficients; DEIS's forge_requires)."""
+    module = types.ModuleType("k_diffusion.deis")
+    if function:
+        module.get_deis_coeff_list = lambda t_steps, max_order, N=10000, deis_mode="tab": [[] for _ in t_steps[:-1]]
+    return module
+
+
+def _sd_samplers_extra_stub(*, variant=True):
+    """``modules.sd_samplers_extra`` stand-in: Forge's ``sample_unipc`` signature (with or without ``variant``)."""
+    module = types.ModuleType("modules.sd_samplers_extra")
+    if variant:
+        def sample_unipc(model, x, sigmas, extra_args=None, callback=None, disable=False, variant="bh1"):
+            return ("unipc", variant)
+    else:
+        def sample_unipc(model, x, sigmas, extra_args=None, callback=None, disable=False):
+            return ("unipc", None)
+    module.sample_unipc = sample_unipc
     return module
 
 
@@ -126,7 +155,8 @@ def _stub_sd_samplers(with_add=True, preset=()):
 class _Host:
     """``modules`` + ``k_diffusion.sampling`` stand-ins installed for one test."""
 
-    def __init__(self, *, with_add=True, preset=(), missing=(), base=_StubKDiffusionSampler):
+    def __init__(self, *, with_add=True, preset=(), missing=(), base=_StubKDiffusionSampler, samplers_extra=True,
+                 deis=True):
         self.sd_samplers = _stub_sd_samplers(with_add, preset)
         self.common = types.ModuleType("modules.sd_samplers_common")
         self.common.SamplerData = _StubSamplerData
@@ -140,15 +170,29 @@ class _Host:
         self.modules.sd_samplers_common = self.common
         self.modules.sd_samplers_kdiffusion = self.kdiffusion
         self.k_sampling = _k_sampling_stub(missing)
+        # Forge's UniPC module (UniPC bh2's forge_requires): True = with ``variant``, "no-variant", or None
+        self.samplers_extra = None
+        if samplers_extra:
+            self.samplers_extra = _sd_samplers_extra_stub(variant=samplers_extra is True)
+            self.modules.sd_samplers_extra = self.samplers_extra
+        # Forge's vendored k_diffusion.deis (DEIS's forge_requires): True, "no-function", or None (no module)
+        self.deis = None if not deis else _deis_stub(function=deis is True)
 
     def install(self, case: unittest.TestCase):
-        case.enterContext(fx.stub_modules({
+        stubs = {
             "modules": self.modules,
             "modules.sd_samplers": self.sd_samplers,
             "modules.sd_samplers_common": self.common,
             "modules.sd_samplers_kdiffusion": self.kdiffusion,
-        }))
+        }
+        # None in sys.modules makes the import fail (a Forge without the module)
+        stubs["modules.sd_samplers_extra"] = self.samplers_extra
+        case.enterContext(fx.stub_modules(stubs))
         case.enterContext(fx.installed_k_sampling(self.k_sampling))
+        # None in sys.modules makes ``importlib.import_module("k_diffusion.deis")`` fail (a Forge without it)
+        case.enterContext(fx.stub_modules({"k_diffusion.deis": self.deis}))
+        if self.deis is not None:
+            sys.modules["k_diffusion"].deis = self.deis
         return self
 
 
@@ -183,6 +227,9 @@ class StubForgeTests(_Reset):
             self.assertEqual(table[label].extra_params, ("s_churn", "s_tmin", "s_tmax", "s_noise"))
             self.assertTrue(table[label].cfg_pp)
             self.assertEqual(table[label].options, {})
+        self.assertEqual(table["ER SDE (Tunable)"].extra_params, ("s_noise",))
+        self.assertEqual([spec.label for spec in registry.SPECS if spec.cfg_pp],
+                         ["Euler Dy CFG++", "Euler SMEA Dy CFG++", "CFG++ UD10 AB"])
         for spec in registry.SPECS:
             with self.subTest(label=spec.label):
                 parameters = inspect.signature(spec.func).parameters
@@ -193,6 +240,115 @@ class StubForgeTests(_Reset):
                 self.assertEqual(len(set(spec.aliases)), len(spec.aliases))
         aliases = [alias for spec in registry.SPECS for alias in spec.aliases]
         self.assertEqual(len(aliases), len(set(aliases)))
+
+    def test_the_v0_33_entries(self):
+        table = {spec.label: spec for spec in registry.SPECS}
+        expected = {
+            # label: (aliases, options, extra_params, kind, cfg_pp, forge_requires)
+            "Euler Dy": (("euler_dy", "k_euler_dy"), {}, ("s_churn", "s_tmin", "s_tmax", "s_noise"), "dy", False, ()),
+            "Euler SMEA Dy": (("euler_smea_dy", "k_euler_smea_dy"), {}, ("s_churn", "s_tmin", "s_tmax", "s_noise"),
+                              "dy", False, ()),
+            "DPM++ 2M SDE Heun": (("dpmpp_2m_sde_heun", "k_dpmpp_2m_sde_heun"), {"brownian_noise": True},
+                                  ("eta", "s_noise"), "", False, ()),
+            "DPM++ 2M (flow ODE)": (("dpmpp_2m_flow_ode",), {}, (), "", False, ()),
+            "DPM++ 2M Heun (flow ODE)": (("dpmpp_2m_heun_flow_ode",), {}, (), "", False, ()),
+            "DPM++ 3M (flow ODE)": (("dpmpp_3m_flow_ode",), {"discard_next_to_last_sigma": True}, (), "", False, ()),
+            "UniPC bh2": (("uni_pc_bh2",), {"discard_next_to_last_sigma": True}, (), "", False,
+                          ("modules.sd_samplers_extra:sample_unipc(variant)",)),
+            # batch 2
+            "ER SDE (Tunable)": (("er_sde_tunable",), {}, ("s_noise",), "er_sde", False, ()),
+            "CFG++ UD10 AB": (("cfgpp_ud10_ab",), {}, (), "", True, ()),
+            "IPNDM": (("ipndm",), {}, (), "", False, ()),
+            "IPNDM_V": (("ipndm_v",), {}, (), "", False, ()),
+            "DEIS": (("deis",), {}, (), "", False, ("k_diffusion.deis:get_deis_coeff_list",)),
+            "Restart (flow)": (("restart_flow",), {"second_order": True}, ("s_noise",), "", False, ()),
+        }
+        self.assertEqual(sorted(expected), sorted(NEW_IN_0_33))
+        for label, (aliases, options, extra_params, kind, cfg_pp, forge_requires) in expected.items():
+            with self.subTest(label=label):
+                spec = table[label]
+                self.assertEqual(spec.aliases, aliases)
+                self.assertEqual(spec.options, options)
+                self.assertEqual(spec.extra_params, extra_params)
+                self.assertEqual(spec.kind, kind)
+                self.assertIs(spec.cfg_pp, cfg_pp)
+                self.assertEqual(spec.forge_requires, forge_requires)
+                self.assertIn(label, [value for name, value in vars(registry).items() if name.startswith("LABEL_")])
+        # Flow first: no new entry asks Forge's Automatic for Karras/Exponential (only the existing 4M SDE does).
+        self.assertEqual([spec.label for spec in registry.SPECS if "scheduler" in spec.options], ["DPM++ 4M SDE"])
+        # The flow ODE entries cannot receive Forge's global Eta (and so never write it to the infotext).
+        for label in FLOW_ODE_LABELS:
+            with self.subTest(label=label):
+                parameters = inspect.signature(table[label].func).parameters
+                self.assertNotIn("eta", parameters)
+                self.assertNotIn("s_noise", parameters)
+                self.assertNotIn("noise_sampler", parameters)
+        heun = inspect.signature(table["DPM++ 2M SDE Heun"].func).parameters
+        self.assertIn("eta", heun)
+        self.assertIn("s_noise", heun)
+        self.assertNotIn("solver_type", heun)   # fixed inside, never taken from Forge's options
+        # none of the batch-2 entries can receive Forge's global Eta; the window is the ER SDE SDEs' only
+        for label in ("ER SDE (Tunable)", *PLAIN_NEW):
+            with self.subTest(label=label):
+                self.assertNotIn("eta", inspect.signature(table[label].func).parameters)
+        for label in LABELS:
+            accepts = "er_sde_window" in inspect.signature(table[label].func).parameters
+            self.assertEqual(accepts, label in ("ER SDE (Reverse-time)", "ER SDE (Tunable)"), label)
+        self.assertNotIn("sam_extra_step_offset", inspect.signature(table["Restart (flow)"].func).parameters)
+
+    def test_app_pinned_constants_are_module_level_literals(self):
+        """The desktop app pins sam-extra constants by AST (a module-level ``NAME = <literal>``)."""
+        expected = {
+            "params.py": {
+                "LABEL_ER_SDE_TUNABLE": "ER SDE (Tunable)",
+                "ARG_NAMES": ("max_stage", "eta", "noise_window", "noise_start", "noise_end"),
+                "DEFAULT_NOISE_WINDOW": False, "DEFAULT_NOISE_START": 0.2, "DEFAULT_NOISE_END": 0.8,
+                "NOISE_PERCENT_MIN": 0.0, "NOISE_PERCENT_MAX": 1.0, "NOISE_PERCENT_STEP": 0.01,
+                "KEY_NOISE_WINDOW": "ER SDE noise window", "NOISE_WINDOW_OFF": "off",
+                "WINDOW_SKIPPED_STATUS": "noise window skipped (no percent_to_sigma)",
+            },
+            "cfgpp_ud10_ab.py": {"UD10_HISTORY_WEIGHT": 0.25, "UD10_ZERO_WEIGHT": 1.0, "UD10_UNCOND_HISTORY_WEIGHT": 0.1},
+            "ipndm_deis.py": {"IPNDM_MAX_ORDER": 4, "DEIS_MAX_ORDER": 3, "DEIS_MODE": "tab"},
+            "restart_flow.py": {"RESTART_S_MIN": 0.1, "RESTART_S_MAX": 2.0, "RESTART_MIN_STEPS": 20, "RESTART_TIMES": 1,
+                                "RESTART_TIMES_LONG": 2, "RESTART_LONG_FROM": 36},
+            "er_sde.py": {"ER_SDE": "ER-SDE"},
+        }
+        def literal(node):
+            try:
+                return ast.literal_eval(node)
+            except ValueError:   # a module-level expression (not a literal): not pinnable
+                return ValueError
+
+        folder = Path(registry.__file__).parent
+        for filename, constants in expected.items():
+            tree = ast.parse((folder / filename).read_text(encoding="utf-8"))
+            literals = {
+                node.targets[0].id: literal(node.value) for node in tree.body
+                if isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name)
+            }
+            for name, value in constants.items():
+                with self.subTest(file=filename, name=name):
+                    self.assertIn(name, literals)
+                    self.assertEqual(literals[name], value)
+
+    def test_label_literals_are_module_level_constants(self):
+        """The desktop app pins the labels by AST: a module-level ``LABEL_* = "<literal>"`` in registry.py."""
+        tree = ast.parse(Path(registry.__file__).read_text(encoding="utf-8"))
+        literals = {
+            node.targets[0].id: node.value.value for node in tree.body
+            if isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name)
+            and node.targets[0].id.startswith("LABEL_") and isinstance(node.value, ast.Constant)
+        }
+        self.assertEqual(sorted(literals.values()), sorted(label for label in LABELS if not label.startswith("ER SDE")))
+        # … and the package exports every one of them
+        package = sys.modules["sam3ext.extra_samplers"]
+        for name, value in literals.items():
+            with self.subTest(name=name):
+                self.assertEqual(getattr(package, name), value)
+                self.assertEqual(getattr(registry, name), value)
+                self.assertIn(name, package.__all__)
+                self.assertIn(name, registry.__all__)
+        self.assertEqual(package.LABELS, tuple(LABELS))
 
     def test_register_adds_every_entry(self):
         host = _Host().install(self)
@@ -257,10 +413,81 @@ class StubForgeTests(_Reset):
         host = _Host(missing=("sample_er_sde",)).install(self)
         logged = []
         report = registry.register(log=logged.append)
-        self.assertEqual(sorted(report.skipped_missing), ["ER SDE (ODE)", "ER SDE (Reverse-time)"])
-        self.assertEqual(report.added, ["DPM++ 4M SDE", "Euler Dy CFG++", "Euler SMEA Dy CFG++"])
-        self.assertEqual(len(logged), 2)
+        self.assertEqual(sorted(report.skipped_missing), ["ER SDE (ODE)", "ER SDE (Reverse-time)", "ER SDE (Tunable)"])
+        self.assertEqual(report.added, [label for label in LABELS if not label.startswith("ER SDE")])
+        self.assertEqual(len(logged), 3)
         self.assertTrue(all("sample_er_sde" in line for line in logged))
+
+    def test_missing_dpmpp_sde_functions_skip_the_entries_built_on_them(self):
+        host = _Host(missing=("sample_dpmpp_2m_sde",)).install(self)
+        report = registry.register(log=lambda m: None)
+        self.assertEqual(sorted(report.skipped_missing),
+                         ["DPM++ 2M (flow ODE)", "DPM++ 2M Heun (flow ODE)", "DPM++ 2M SDE Heun"])
+        self.assertIn("DPM++ 3M (flow ODE)", report.added)
+        self.assertEqual(len(host.sd_samplers.all_samplers), len(LABELS) - 3)
+
+    def test_unipc_bh2_needs_forges_sample_unipc_with_a_variant_parameter(self):
+        for samplers_extra, reason in ((None, "modules.sd_samplers_extra.sample_unipc with the parameter 'variant'"),
+                                       ("no-variant", "with the parameter 'variant'")):
+            with self.subTest(samplers_extra=samplers_extra):
+                registry._LOGGED.clear()
+                _Host(samplers_extra=samplers_extra).install(self)   # the later host's stand-ins win
+                logged = []
+                first = registry.register(log=logged.append)
+                second = registry.register(log=logged.append)
+                self.assertEqual(first.skipped_missing,
+                                 {"UniPC bh2": ["modules.sd_samplers_extra:sample_unipc(variant)"]})
+                self.assertEqual(second.skipped_missing, first.skipped_missing)
+                self.assertEqual(first.added, [label for label in LABELS if label != "UniPC bh2"])
+                self.assertEqual(len(logged), 1)   # logged once
+                self.assertIn('"UniPC bh2" not registered', logged[0])
+                self.assertIn(reason, logged[0])
+
+    def test_deis_needs_forges_vendored_deis_module(self):
+        for deis, reason in ((None, "k_diffusion.deis.get_deis_coeff_list"),
+                             ("no-function", "k_diffusion.deis.get_deis_coeff_list")):
+            with self.subTest(deis=deis):
+                registry._LOGGED.clear()
+                _Host(deis=deis).install(self)   # the later host's stand-ins win
+                logged = []
+                first = registry.register(log=logged.append)
+                second = registry.register(log=logged.append)
+                self.assertEqual(first.skipped_missing, {"DEIS": ["k_diffusion.deis:get_deis_coeff_list"]})
+                self.assertEqual(second.skipped_missing, first.skipped_missing)
+                self.assertEqual(first.added, [label for label in LABELS if label != "DEIS"])
+                self.assertEqual(len(logged), 1)
+                self.assertIn('"DEIS" not registered', logged[0])
+                self.assertIn(reason, logged[0])
+
+    def test_missing_multistep_helpers_skip_the_new_entries_that_need_them(self):
+        host = _Host(missing=("linear_multistep_coeff", "default_noise_sampler")).install(self)
+        report = registry.register(log=lambda m: None)
+        # UD10's AB2 coefficients; the Dy samplers and Restart (flow) draw from Forge's default noise sampler
+        self.assertEqual(sorted(report.skipped_missing),
+                         sorted(["CFG++ UD10 AB", "Restart (flow)", "Euler Dy CFG++", "Euler SMEA Dy CFG++",
+                                 "Euler Dy", "Euler SMEA Dy"]))
+        self.assertIn("IPNDM", report.added)
+        self.assertEqual(len(host.sd_samplers.all_samplers), len(LABELS) - 6)
+
+    def test_forge_requirement_strings(self):
+        parse = registry._parse_forge_requirement
+        self.assertEqual(parse("modules.sd_samplers_extra:sample_unipc(variant)"),
+                         ("modules.sd_samplers_extra", "sample_unipc", ("variant",)))
+        self.assertEqual(parse("k_diffusion.deis:get_deis_coeff_list"), ("k_diffusion.deis", "get_deis_coeff_list", ()))
+        self.assertEqual(parse("m:f( a, b )"), ("m", "f", ("a", "b")))
+        module = types.ModuleType("_sam_extra_requirement_probe")
+        module.f = lambda a, b=1: None
+        module.not_callable = 3
+        with fx.stub_modules({"_sam_extra_requirement_probe": module}):
+            self.assertTrue(registry._forge_requirement_met("_sam_extra_requirement_probe:f"))
+            self.assertTrue(registry._forge_requirement_met("_sam_extra_requirement_probe:f(a, b)"))
+            self.assertFalse(registry._forge_requirement_met("_sam_extra_requirement_probe:f(variant)"))
+            self.assertFalse(registry._forge_requirement_met("_sam_extra_requirement_probe:g"))
+            self.assertTrue(registry._forge_requirement_met("_sam_extra_requirement_probe:not_callable"))
+            self.assertFalse(registry._forge_requirement_met("_sam_extra_requirement_probe:not_callable(x)"))
+        self.assertFalse(registry._forge_requirement_met("_sam_extra_no_such_module_:f"))
+        self.assertEqual(registry._describe_forge_requirement("m:f(a, b)"), "m.f with the parameters 'a', 'b'")
+        self.assertEqual(registry._describe_forge_requirement("m:f"), "m.f")
 
     def test_forge_without_add_sampler_gets_the_same_steps(self):
         host = _Host(with_add=False).install(self)
@@ -307,12 +534,94 @@ class StubForgeTests(_Reset):
         self.assertEqual(p_default.extra_generation_params, {})
 
         self.assertEqual(samplers["DPM++ 4M SDE"].initialize(_p()), {"base": True})
-        for label in ("Euler Dy CFG++", "Euler SMEA Dy CFG++"):
+        for label in ("Euler Dy CFG++", "Euler SMEA Dy CFG++", "Euler Dy", "Euler SMEA Dy"):
             kwargs = samplers[label].initialize(_p())
             self.assertEqual(set(kwargs), {"base", "after_substep"})
             latent = torch.zeros(1)
             kwargs["after_substep"](latent)
             self.assertIs(host.stored[-1], latent)
+        for label in ("DPM++ 2M SDE Heun", *FLOW_ODE_LABELS, "UniPC bh2", *PLAIN_NEW):
+            with self.subTest(label=label):
+                p = _p()
+                sampler_params.apply_to(p, sampler_params.ErSdeSettings(max_stage=1, eta=0.5, noise_window=True))
+                self.assertEqual(samplers[label].initialize(p), {"base": True})
+                self.assertEqual(p.extra_generation_params, {})   # the ER SDE values are not theirs
+
+        p_tunable = _p()
+        sampler_params.apply_to(p_tunable, sampler_params.ErSdeSettings(max_stage=2, eta=0.5))
+        self.assertEqual(samplers["ER SDE (Tunable)"].initialize(p_tunable),
+                         {"base": True, "max_stage": 2, "er_sde_eta": 0.5})
+        self.assertEqual(p_tunable.extra_generation_params, {"ER SDE max stage": 2, "ER SDE eta": 0.5})
+
+    def test_the_noise_window_reaches_reverse_time_and_tunable(self):
+        host = _Host().install(self)
+        logged = []
+        self.enterContext(mock.patch.object(registry, "_log", logged.append))
+        registry.register(log=lambda m: None)
+        samplers = {data.name: data.constructor(object()) for data in host.sd_samplers.all_samplers}
+        for sampler in samplers.values():   # Forge's KDiffusionSampler has model_wrap.predictor
+            sampler.model_wrap = types.SimpleNamespace(predictor=fx.FlowSampling(3.0))
+        window = sampler_params.ErSdeSettings(max_stage=3, eta=1.0, noise_window=True, noise_start=0.1, noise_end=0.9)
+        for label in ("ER SDE (Reverse-time)", "ER SDE (Tunable)"):
+            with self.subTest(label=label):
+                p = _p()
+                sampler_params.apply_to(p, window)
+                self.assertEqual(samplers[label].initialize(p),
+                                 {"base": True, "max_stage": 3, "er_sde_eta": 1.0, "er_sde_window": (0.1, 0.9)})
+                self.assertEqual(p.extra_generation_params, {"ER SDE noise window": "0.1-0.9"})
+        p = _p()
+        sampler_params.apply_to(p, window)
+        self.assertEqual(samplers["ER SDE (ODE)"].initialize(p), {"base": True, "max_stage": 3})
+        self.assertEqual(p.extra_generation_params, {})
+        # η 0 is the ODE: no window, no key
+        p = _p()
+        sampler_params.apply_to(p, sampler_params.ErSdeSettings(3, 0.0, True, 0.1, 0.9))
+        self.assertEqual(samplers["ER SDE (Tunable)"].initialize(p), {"base": True, "max_stage": 3, "er_sde_eta": 0.0})
+        self.assertEqual(p.extra_generation_params, {"ER SDE eta": 0.0})
+        # the box off: nothing
+        p = _p()
+        sampler_params.apply_to(p, sampler_params.ErSdeSettings(3, 1.0, False, 0.1, 0.9))
+        self.assertEqual(samplers["ER SDE (Tunable)"].initialize(p), {"base": True, "max_stage": 3, "er_sde_eta": 1.0})
+        self.assertEqual(p.extra_generation_params, {})
+        self.assertEqual(logged, [])
+
+    def test_a_window_the_model_cannot_place_is_dropped_with_a_status(self):
+        host = _Host().install(self)
+        logged = []
+        self.enterContext(mock.patch.object(registry, "_log", logged.append))
+        registry.register(log=lambda m: None)
+        samplers = {data.name: data.constructor(object()) for data in host.sd_samplers.all_samplers}
+        settings = sampler_params.ErSdeSettings(3, 1.5, True, 0.2, 0.8)
+        for predictor in (None, fx.EpsSampling()):   # no model_wrap at all / a predictor without percent_to_sigma
+            for label in ("ER SDE (Tunable)", "ER SDE (Reverse-time)"):
+                with self.subTest(predictor=predictor, label=label):
+                    if predictor is not None:
+                        samplers[label].model_wrap = types.SimpleNamespace(predictor=predictor)
+                    p = _p()
+                    sampler_params.apply_to(p, settings)
+                    self.assertEqual(samplers[label].initialize(p), {"base": True, "max_stage": 3, "er_sde_eta": 1.5})
+                    self.assertEqual(p.extra_generation_params,
+                                     {"ER SDE eta": 1.5, "Extra Samplers status": "noise window skipped (no percent_to_sigma)"})
+        self.assertEqual(len(logged), 2)   # once per sampler
+        self.assertTrue(all("percent_to_sigma" in line for line in logged))
+
+    def test_the_status_keeps_dy_reasons_and_adds_the_window_part(self):
+        """``Extra Samplers status`` parts joined by "; " in first-seen order; the Dy text is unchanged."""
+        from sam3ext.extra_samplers import substep_guard
+
+        p = _p()
+        substep_guard.record_status(p, [substep_guard.REASON_SPECTRUM])
+        self.assertEqual(p.extra_generation_params["Extra Samplers status"], "dy sub-steps skipped (Spectrum)")
+        substep_guard.record_status_part(p, "noise_window", sampler_params.WINDOW_SKIPPED_STATUS)
+        substep_guard.record_status(p, [substep_guard.REASON_PID])
+        substep_guard.record_status_part(p, "noise_window", sampler_params.WINDOW_SKIPPED_STATUS)
+        self.assertEqual(p.extra_generation_params["Extra Samplers status"],
+                         "dy sub-steps skipped (Spectrum + PiD lq_latent); noise window skipped (no percent_to_sigma)")
+        q = _p()
+        substep_guard.record_status_part(q, "noise_window", sampler_params.WINDOW_SKIPPED_STATUS)
+        substep_guard.record_status(q, [substep_guard.REASON_WAN])
+        self.assertEqual(q.extra_generation_params["Extra Samplers status"],
+                         "noise window skipped (no percent_to_sigma); dy sub-steps skipped (Wan I2V concat_latent)")
 
     def test_a_request_without_the_script_uses_the_last_requests_values(self):
         host = _Host().install(self)
@@ -336,6 +645,16 @@ class StubForgeTests(_Reset):
         with self.assertNoLogs(level="WARNING"):
             samplers["Euler Dy CFG++"].sample(_p(cfg_scale=2.0))
             samplers["DPM++ 4M SDE"].sample(_p(cfg_scale=7.0))
+            samplers["CFG++ UD10 AB"].sample(_p(cfg_scale=2.0))
+            for label in NEW_IN_0_33:   # none of them but CFG++ UD10 AB is a CFG++ sampler
+                if label == "CFG++ UD10 AB":
+                    continue
+                samplers[label].sample(_p(cfg_scale=7.0))
+                samplers[label].sample_img2img(_p(cfg_scale=7.0))
+        with self.assertLogs(level="WARNING") as logs:   # ComfyUI recommends CFG 2 for it; Forge warns above
+            samplers["CFG++ UD10 AB"].sample(_p(cfg_scale=4.5))
+            samplers["CFG++ UD10 AB"].sample_img2img(_p(cfg_scale=2.1))
+        self.assertEqual(len(logs.output), 2)
 
 
 # ---------------------------------------------------------------------------
@@ -366,7 +685,8 @@ def _forge_class(name: str, bases: str, methods, namespace: dict, extra: str = "
 class _CFGDenoiserKDiffusion:
     def __init__(self, sampler):
         self.sampler = sampler
-        self.inner_model = types.SimpleNamespace(sigmas=torch.tensor([0.03, 14.6]))
+        # Forge's ForgeScheduleLinker: the model's predictor (here Anima's flow parameterisation)
+        self.inner_model = types.SimpleNamespace(sigmas=torch.tensor([0.03, 14.6]), predictor=fx.FlowSampling(3.0))
 
 
 def _forge_host(opts):
@@ -407,7 +727,22 @@ def _forge_host(opts):
     modules = types.ModuleType("modules")
     modules.__path__ = []
     modules.sd_samplers, modules.sd_samplers_common, modules.sd_samplers_kdiffusion = sd_samplers, common, kd_module
+    modules.sd_samplers_extra = fx.forge_sd_samplers_extra()   # Forge's own file (UniPC bh2's forge_requires)
     return modules
+
+
+def _forge_sampler_table() -> dict:
+    """Forge's ``samplers_k_diffusion`` (modules/sd_samplers_kdiffusion.py) as ``{label: (function, aliases,
+    options)}``, read with ``ast`` (a label written as a conditional expression is taken from its else branch)."""
+    table = {}
+    for entry in _forge_assignment(_KDIFFUSION, "samplers_k_diffusion").elts:
+        label_node, function_node, aliases_node, options_node = entry.elts
+        if isinstance(label_node, ast.IfExp):
+            label_node = label_node.orelse
+        label = ast.literal_eval(label_node)
+        function = ast.unparse(function_node) if not isinstance(function_node, ast.Constant) else function_node.value
+        table[label] = (function, ast.literal_eval(aliases_node), ast.literal_eval(options_node))
+    return table
 
 
 class ForgeCodeTests(_Reset):
@@ -420,10 +755,13 @@ class ForgeCodeTests(_Reset):
             "modules": modules, "modules.sd_samplers": modules.sd_samplers,
             "modules.sd_samplers_common": modules.sd_samplers_common,
             "modules.sd_samplers_kdiffusion": modules.sd_samplers_kdiffusion,
+            "modules.sd_samplers_extra": modules.sd_samplers_extra,
         }))
         self.enterContext(fx.installed_k_sampling(fx.forge_k_sampling()))
+        self.enterContext(fx.installed_k_diffusion_deis(fx.forge_deis()))   # Forge's vendored DEIS (DEIS's forge_requires)
         self.sd_samplers = modules.sd_samplers
         self.kd_module = modules.sd_samplers_kdiffusion
+        self.sd_samplers_extra = modules.sd_samplers_extra
 
     def _registered(self):
         registry.register(log=lambda m: None)
@@ -472,6 +810,66 @@ class ForgeCodeTests(_Reset):
                          {"s_churn": 0.0, "s_tmin": 0.0, "s_tmax": float("inf"), "s_noise": 1.0})
         self.assertIn("after_substep", kwargs)
 
+        for label in ("Euler Dy", "Euler SMEA Dy"):
+            with self.subTest(label=label):
+                p = _p()
+                kwargs = samplers[label].initialize(p)
+                self.assertEqual({k: v for k, v in kwargs.items() if k != "after_substep"},
+                                 {"s_churn": 0.0, "s_tmin": 0.0, "s_tmax": float("inf"), "s_noise": 1.0})
+                self.assertIn("after_substep", kwargs)
+                self.assertEqual(p.extra_generation_params, {})
+
+        p = _p(eta=0.6)   # Forge's global Eta reaches the Heun SDE entry like Forge's DPM++ 2M SDE …
+        self.assertEqual(samplers["DPM++ 2M SDE Heun"].initialize(p), {"eta": 0.6, "s_noise": 1.0})
+        self.assertEqual(p.extra_generation_params, {"Eta": 0.6})
+        for label in (*FLOW_ODE_LABELS, "UniPC bh2", "CFG++ UD10 AB", "IPNDM", "IPNDM_V", "DEIS"):   # … no Eta key
+            with self.subTest(label=label):
+                p = _p(eta=0.6)
+                self.assertEqual(samplers[label].initialize(p), {})
+                self.assertEqual(p.extra_generation_params, {})
+
+        p = _p(eta=0.6)   # Restart (flow): Forge's s_noise only
+        self.assertEqual(samplers["Restart (flow)"].initialize(p), {"s_noise": 1.0})
+        self.assertEqual(p.extra_generation_params, {})
+
+        p = _p()   # ER SDE (Tunable): Forge's s_noise + the accordion's values, the window placed by the model's predictor
+        sampler_params.apply_to(p, sampler_params.ErSdeSettings(2, 0.35, True, 0.2, 0.8))
+        self.assertEqual(samplers["ER SDE (Tunable)"].initialize(p),
+                         {"s_noise": 1.0, "max_stage": 2, "er_sde_eta": 0.35, "er_sde_window": (0.2, 0.8)})
+        self.assertEqual(p.extra_generation_params,
+                         {"ER SDE max stage": 2, "ER SDE eta": 0.35, "ER SDE noise window": "0.2-0.8"})
+        self.assertIs(samplers["ER SDE (Tunable)"].model_wrap.predictor, samplers["ER SDE (Tunable)"].model_wrap_cfg.inner_model.predictor)
+
+    def test_the_options_match_forges_own_entries(self):
+        """Forge's table (modules/sd_samplers_kdiffusion.py): the 3M flow ODE keeps "DPM++ 3M SDE"'s discard flag,
+        UniPC bh2 has "UniPC"'s options, the Heun SDE "DPM++ 2M SDE"'s without its scheduler hint; the 2M ODE
+        entries discard nothing (like Forge's 2M SDE)."""
+        forge = _forge_sampler_table()
+        table = {spec.label: spec for spec in registry.SPECS}
+        self.assertEqual(forge["DPM++ 3M SDE"][0], "sample_dpmpp_3m_sde")
+        self.assertEqual(table["DPM++ 3M (flow ODE)"].options["discard_next_to_last_sigma"],
+                         forge["DPM++ 3M SDE"][2]["discard_next_to_last_sigma"])
+        self.assertEqual(forge["UniPC"][0], "sd_samplers_extra.sample_unipc")
+        self.assertEqual(table["UniPC bh2"].options, forge["UniPC"][2])
+        forge_2m_sde = dict(forge["DPM++ 2M SDE"][2])
+        self.assertEqual(forge_2m_sde.pop("scheduler"), "exponential")
+        self.assertEqual(table["DPM++ 2M SDE Heun"].options, forge_2m_sde)
+        for label in ("DPM++ 2M (flow ODE)", "DPM++ 2M Heun (flow ODE)"):
+            self.assertNotIn("discard_next_to_last_sigma", table[label].options)
+            self.assertNotIn("discard_next_to_last_sigma", forge["DPM++ 2M SDE"][2])
+        # Forge's own sample_unipc takes the variant UniPC bh2 passes
+        self.assertIn("variant", inspect.signature(self.sd_samplers_extra.sample_unipc).parameters)
+        # Restart (flow) runs Heun steps: Forge's "Heun" options, not Forge's "Restart" ones (its karras hint)
+        self.assertEqual(table["Restart (flow)"].options, forge["Heun"][2])
+        self.assertEqual(forge["Restart"][2].get("scheduler"), "karras")
+        self.assertNotIn("scheduler", table["Restart (flow)"].options)
+        # No new label or alias collides with Forge's built-in entries
+        forge_names = {name.lower() for label, (_f, aliases, _o) in forge.items() for name in (label, *aliases)}
+        for label in NEW_IN_0_33:
+            spec = table[label]
+            with self.subTest(label=label):
+                self.assertFalse({name.lower() for name in (spec.label, *spec.aliases)} & forge_names)
+
     def test_our_eta_is_written_when_the_infotext_carries_forges_eta(self):
         """Forge writes its ancestral η as ``Eta`` for a pass whose sampler takes ``eta`` (here a DPM++ 4M
         SDE hires pass); ``paste_eta`` reads ``Eta`` as the Reverse-time η when ``ER SDE eta`` is missing
@@ -502,6 +900,12 @@ class ForgeCodeTests(_Reset):
         self.opts.s_churn = 0.5
         self.opts.s_tmax = 10.0
         samplers = self._registered()
+
+        for label in ("ER SDE (Tunable)", "Restart (flow)"):
+            with self.subTest(label=label):
+                p = _p()
+                self.assertEqual(samplers[label].initialize(p)["s_noise"], 0.97)
+                self.assertEqual(p.extra_generation_params, {"Sigma noise": 0.97})
 
         p = _p()
         self.assertEqual(samplers["ER SDE (Reverse-time)"].initialize(p)["s_noise"], 0.97)

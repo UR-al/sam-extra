@@ -222,7 +222,10 @@ def _numbers(text) -> list[float]:
             continue
         if "/" in token:
             num, den = token.split("/", 1)
-            value = float(num) / float(den)
+            try:
+                value = float(num) / float(den)
+            except ZeroDivisionError:   # a ValueError, so the callers report it as a settings error
+                raise ValueError(f"division by zero: {token!r}") from None
         else:
             value = float(token)
         if not math.isfinite(value):

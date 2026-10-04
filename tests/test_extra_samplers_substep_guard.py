@@ -151,22 +151,30 @@ class RuntimeKeywordTests(unittest.TestCase):
         self.specs = {spec.label: spec for spec in registry.SPECS}
 
     def test_the_dy_samplers_get_substeps_false_and_the_status(self):
-        for label in (registry.LABEL_EULER_DY_CFG_PP, registry.LABEL_EULER_SMEA_DY_CFG_PP):
+        dy_labels = (registry.LABEL_EULER_DY_CFG_PP, registry.LABEL_EULER_SMEA_DY_CFG_PP,
+                     registry.LABEL_EULER_DY, registry.LABEL_EULER_SMEA_DY)
+        self.assertEqual(sorted(dy_labels), sorted(spec.label for spec in registry.SPECS if spec.kind == "dy"))
+        for label in dy_labels:
             with self.subTest(label=label):
                 p = _request(fx.UnetPatcherStandIn({"model_function_wrapper": spectrum_unet_wrapper}))
                 kwargs = registry.runtime_kwargs(self.specs[label], p)
                 self.assertIs(kwargs["substeps"], False)
                 self.assertEqual(p.extra_generation_params, {"Extra Samplers status": "dy sub-steps skipped (Spectrum)"})
-        self.assertEqual(len(self.logged), 2)   # once per sampler and reason
+        self.assertEqual(len(self.logged), 4)   # once per sampler and reason
+        for label, line in zip(dy_labels, self.logged):
+            with self.subTest(label=label):
+                self.assertTrue(line.startswith(label + ": sub-steps skipped"))
+                steps = "plain CFG++ Euler steps" if self.specs[label].cfg_pp else "plain Euler steps"
+                self.assertIn(f"it runs {steps} instead", line)
         registry.runtime_kwargs(self.specs[registry.LABEL_EULER_DY_CFG_PP],
                                 _request(fx.UnetPatcherStandIn({"model_function_wrapper": spectrum_unet_wrapper})))
-        self.assertEqual(len(self.logged), 2)
+        self.assertEqual(len(self.logged), 4)
 
     def test_ordinary_requests_and_other_samplers_are_unchanged(self):
         kwargs = registry.runtime_kwargs(self.specs[registry.LABEL_EULER_DY_CFG_PP], _request(fx.UnetPatcherStandIn()))
         self.assertNotIn("substeps", kwargs)
         p = _request(fx.UnetPatcherStandIn({"model_function_wrapper": spectrum_unet_wrapper}))
-        for label in (registry.LABEL_DPMPP_4M_SDE, registry.LABEL_ER_SDE_ODE):
+        for label in (spec.label for spec in registry.SPECS if spec.kind != "dy"):
             self.assertNotIn("substeps", registry.runtime_kwargs(self.specs[label], p))
         self.assertNotIn("Extra Samplers status", p.extra_generation_params)
         self.assertEqual(self.logged, [])

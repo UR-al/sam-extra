@@ -801,6 +801,78 @@ html.sam3-notebook-layout-active .sam3-notebook-original-root {
     display: none;
 }
 
+/* '기본값 저장' (javascript/notebook_save_defaults.js) — the right end of that tab row, after Forge's
+ * extra-network search/sort controls whatever their DOM order. */
+#sam3_notebook_layout .sam3-notebook-extra-tabs > .tab-nav > .sam3-save-defaults {
+    order: 1;
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    justify-content: flex-end;
+    gap: .2rem .45rem;
+    min-width: 0;
+    margin-left: auto;
+    padding: .2rem .25rem;
+    align-self: center;
+}
+
+#sam3_notebook_layout .sam3-notebook-extra-tabs > .tab-nav:has(> .extra-networks-controls-div) > .sam3-save-defaults {
+    margin-left: 0;
+}
+
+.sam3-save-defaults-button {
+    box-sizing: border-box;
+    min-height: 2rem;
+    padding: .3rem .7rem;
+    border: 1px solid var(--border-color-primary, var(--sam3-color-rule));
+    border-radius: .4rem;
+    color: var(--body-text-color, var(--sam3-color-ink));
+    background: var(--button-secondary-background-fill, var(--sam3-color-paper-3));
+    font: inherit;
+    font-size: .82rem;
+    line-height: 1.25;
+    white-space: nowrap;
+    cursor: pointer;
+}
+
+.sam3-save-defaults-button:hover,
+.sam3-save-defaults-button:focus-visible {
+    border-color: var(--color-accent, var(--sam3-color-accent));
+}
+
+.sam3-save-defaults-button:focus-visible {
+    outline: 2px solid var(--sam3-color-focus, var(--border-color-accent));
+    outline-offset: 1px;
+}
+
+/* busy while saving: aria-disabled, not disabled — the button keeps the keyboard focus */
+.sam3-save-defaults-button[aria-disabled="true"] {
+    opacity: .6;
+    cursor: progress;
+}
+
+.sam3-save-defaults-status {
+    max-width: min(30rem, 70vw);
+    overflow: hidden;
+    color: var(--body-text-color-subdued, var(--sam3-color-muted));
+    font-size: .76rem;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.sam3-save-defaults-status:empty {
+    display: none;
+}
+
+.sam3-save-defaults-status[data-tone="saved"] {
+    color: var(--color-accent, var(--sam3-color-accent));
+}
+
+.sam3-save-defaults-status[data-tone="error"] {
+    color: var(--error-text-color, var(--sam3-color-error-hover));
+    white-space: normal;
+}
+
 /*
  * Forge keeps the results column sticky in its stock two-column layout. In
  * this three-column layout Notebook follows that column in normal flow, so a

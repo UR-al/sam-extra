@@ -125,10 +125,12 @@ DEFAULTS = {
 }
 # Samplers that re-plan their own schedule (Restart: karras re-spacing + restarts up to sigma 2,
 # expects a final sigma of 0) or need a fixed minimum length (UniPC order), and the k-diffusion
-# solvers without a sigma list.
+# solvers without a sigma list. Keyed by the function's ``__name__``: sam-extra's ``UniPC bh2``
+# (``extra_samplers/unipc.py``) is Forge's ``sample_unipc`` under another name, so it is listed too.
 UNSUPPORTED_SAMPLERS = {
     "restart_sampler": "Restart re-plans its own schedule",
     "sample_unipc": "UniPC is not segment-safe",
+    "sample_unipc_bh2": "UniPC is not segment-safe",
     "sample_dpm_fast": "DPM fast has no sigma schedule",
     "sample_dpm_adaptive": "DPM adaptive has no sigma schedule",
 }
@@ -157,7 +159,7 @@ def _as_bool(value, default: bool) -> bool:
 def _as_float(value, default: float) -> float:
     try:
         out = float(value)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):   # OverflowError: an int too large for a float (API)
         return default
     return out if math.isfinite(out) else default
 

@@ -1,7 +1,7 @@
-"""The five extra samplers under the guidance stack, base pass + hires pass, on Forge's real CFG path.
+"""The extra samplers under the guidance stack, base pass + hires pass, on Forge's real CFG path.
 
-ER SDE (Reverse-time), ER SDE (ODE), DPM++ 4M SDE (Forge's per-image Brownian tree), Euler Dy CFG++ and
-Euler SMEA Dy CFG++, each with PAG, adaptive SMC, DCW + RDC, APG momentum, TSR, Momentum Guidance, HiGS
+Every entry of ``registry.SPECS`` (ER SDE, DPM++ 4M SDE with Forge's per-image Brownian tree, the Dy family, the
+flow ODEs, UniPC bh2, CFG++ UD10 AB, IPNDM/IPNDM_V/DEIS, Restart (flow)), each with PAG, adaptive SMC, DCW + RDC, APG momentum, TSR, Momentum Guidance, HiGS
 and HiFlow (the base pass of a hires request records its trajectory, the hires pass aligns to it), with
 Detail Daemon scaling the sigmas:
 
@@ -15,6 +15,11 @@ Detail Daemon scaling the sigmas:
 
 HiFlow keeps its trajectory in float16; the batch comparison stores it in float32 so the float noise of
 a batched matmul is not rounded into a visible difference (that is storage precision, not coupling).
+IPNDM_V's variable-step weights (about 3.0, -5.5, 5.6, -2.2 late on a shift-3 grid, against AB4's fixed
+2.29, -2.46, 1.54, -0.38) amplify that float noise about 5x more than IPNDM's, so its bound is 5x wider
+(measured 1.34e-4 in 1 of 4096 values). Coupling is ruled out exactly elsewhere: with an elementwise model
+every deterministic entry, IPNDM_V included, keeps each batch image bit-exact
+(``test_extra_samplers_forge_path...test_the_deterministic_entries_keep_every_batch_image_bit_exact``).
 """
 
 from __future__ import annotations
@@ -41,6 +46,8 @@ PER_IMAGE = {
 }
 ADAPTIVE_SMC = {"anima_guidance_smc_master_enable": True, "anima_guidance_smc_mode": "Adaptive sign"}
 UNIT_SMC = {"anima_guidance_smc_master_enable": True, "anima_guidance_smc_mode": "Unit-L2"}
+# batch-vs-alone float-noise bound per label (module docstring); every other entry keeps 1e-4
+BATCH_NOISE_BOUND = {registry.LABEL_IPNDM_V: 5e-4}
 
 
 def runtime(spec):
@@ -135,11 +142,12 @@ class SamplersUnderTheStackTests(unittest.TestCase):
                     stack = {**PER_IMAGE, **UNIT_SMC}
                     base, hires, _, _ = self._generation(spec, seeds=(31, 32), stack=stack)
                     self.scripts.teardown()
+                    bound = BATCH_NOISE_BOUND.get(spec.label, 1e-4)
                     for index, seed in enumerate((31, 32)):
                         single_base, single_hires, _, _ = self._generation(spec, seeds=(seed,), stack=stack)
                         self.scripts.teardown()
-                        torch.testing.assert_close(base.out[index:index + 1], single_base.out, atol=1e-4, rtol=1e-4)
-                        torch.testing.assert_close(hires.out[index:index + 1], single_hires.out, atol=1e-4, rtol=1e-4)
+                        torch.testing.assert_close(base.out[index:index + 1], single_base.out, atol=bound, rtol=bound)
+                        torch.testing.assert_close(hires.out[index:index + 1], single_hires.out, atol=bound, rtol=bound)
         finally:
             trajectory.storage_dtype = previous
 

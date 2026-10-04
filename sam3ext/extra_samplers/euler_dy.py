@@ -16,9 +16,13 @@
 # (https://github.com/Koishi-Star/Euler-Smea-Dyn-Sampler, commit
 # d98a504c8419be5274068ad91ca6bbf2e13635a8, ``smea_sampling.py``); the copyright line above is the
 # one in that repository's LICENSE (Apache License 2.0, no NOTICE file).
-# MODIFIED by sam-extra, 2026-10-03 (Apache-2.0 section 4(b)) — every change is listed in the
-# docstring below.
-"""Euler Dy CFG++ and Euler SMEA Dy CFG++ — Koishi-Star's Dy/SMEA sub-steps with Forge's CFG++ update.
+# MODIFIED by sam-extra, 2026-10-03 and 2026-10-04 (Apache-2.0 section 4(b)) — every change is listed in
+# the docstring below.
+"""Euler Dy / Euler SMEA Dy and their CFG++ entries — Koishi-Star's Dy/SMEA sub-steps on Forge.
+
+Four registered samplers share one core (``euler_dy``): ``Euler Dy`` and ``Euler SMEA Dy`` (plain Euler
+steps, ``cfg_pp=False`` — upstream's samplers with the changes below) and ``Euler Dy CFG++`` /
+``Euler SMEA Dy CFG++`` (Forge's CFG++ update, item 1).
 
 Upstream (``smea_sampling.py``):
 
@@ -36,7 +40,7 @@ Upstream (``smea_sampling.py``):
 
 What sam-extra changed:
 
-1. **CFG++.** Every Euler update — the step's and both sub-steps' — is Forge's CFG++ update
+1. **CFG++ (the CFG++ entries only).** Every Euler update — the step's and both sub-steps' — is Forge's CFG++ update
    (``sample_euler_ancestral_cfg_pp`` at η = 0, as Forge's built-in Euler CFG++):
    ``x' = α_t·x0 + σ_t·(x − α_s·x0_uncond)/σ_s`` with ``α = σ·e^{λ(σ)}`` from Forge's half-log-SNR
    helpers and the unconditional x0 kept by the same post-CFG hook (``common.install_uncond_capture``).
@@ -46,9 +50,10 @@ What sam-extra changed:
    reaches σ = 0 returns the guided x0, as Forge's does. Without an unconditional prediction (none
    was evaluated) the update falls back to the plain Euler one.
 2. **Churn rule.** Upstream clamps ``gamma = max(s_churn / N, √2 − 1)``, i.e. at least √2 − 1 on every
-   step inside ``[s_tmin, s_tmax]`` even with ``s_churn = 0``. The registered samplers use
-   ``min`` — k-diffusion's ``sample_euler`` / Karras et al. 2022 (arXiv:2206.00364) Algorithm 2 —
-   so the default ``s_churn = 0`` does not churn. ``churn_rule="max"`` reproduces upstream and is what
+   step inside ``[s_tmin, s_tmax]`` even with ``s_churn = 0``. All four registered samplers — the plain
+   ``Euler Dy`` / ``Euler SMEA Dy`` too — use ``min`` — k-diffusion's ``sample_euler`` / Karras et al. 2022
+   (arXiv:2206.00364) Algorithm 2 — so the default ``s_churn = 0`` does not churn (on a flow model an
+   always-on γ ≥ √2 − 1 in σ would move σ̂ above 1). ``churn_rule="max"`` reproduces upstream and is what
    the origin-parity test uses. Upstream's ``eps = randn_like(x) * s_noise`` drawn on every step
    (also when gamma is 0) and its ``x = x − eps·sqrt(σ̂² − σ²)`` are kept; the noise comes from Forge's
    ``k_diffusion.sampling.default_noise_sampler`` (per-image seeds, see ``common``) instead of the
@@ -77,8 +82,9 @@ What sam-extra changed:
    (``sd_samplers_common.apply_refiner``). A sub-step is evaluated with ``step`` one lower — as the
    step it belongs to — and leaves the count as it found it, so those schedules stay on the step
    index (upstream: every sub-step shifted them by one call).
-7. **Plain steps.** ``substeps=False`` runs no sub-step at all: Euler Dy CFG++ / Euler SMEA Dy CFG++
-   are then Forge's Euler CFG++ with the churn above. ``registry`` passes it when the request has
+7. **No sub-steps.** ``substeps=False`` runs no sub-step at all: Euler Dy CFG++ / Euler SMEA Dy CFG++
+   are then Forge's Euler CFG++ with the churn above, Euler Dy / Euler SMEA Dy Euler with that churn
+   (Forge's ``sample_euler`` at ``s_churn = 0``). ``registry`` passes it when the request has
    full-resolution machinery a sub-step cannot follow (``substep_guard``: Forge's Spectrum
    Integrated, Wan 2.2 I2V ``concat_latent``, PiD ``lq_latent``, ``unet.extra_concat_condition``).
 8. Host bookkeeping: Forge's ``trange``; a latent smaller than 2×2 skips the Dy sub-step (upstream
@@ -106,7 +112,9 @@ __all__ = [
     "CHURN_MIN",
     "churn_gamma",
     "euler_dy",
+    "sample_euler_dy",
     "sample_euler_dy_cfg_pp",
+    "sample_euler_smea_dy",
     "sample_euler_smea_dy_cfg_pp",
     "spatial_interpolate",
 ]
@@ -371,6 +379,38 @@ def euler_dy(
             if callback is not None:
                 callback({"x": x, "i": i, "sigma": sigma, "sigma_hat": sigma_hat, "denoised": denoised})
     return x
+
+
+@torch.no_grad()
+def sample_euler_dy(
+    model, x, sigmas, extra_args=None, callback=None, disable=None,
+    s_churn=0.0, s_tmin=0.0, s_tmax=float("inf"), s_noise=1.0,
+    noise_sampler=None, after_substep=None, substeps=True, sam_extra_step_offset=0,
+):
+    """Euler Dy with plain Euler steps (half-resolution sub-step at steps 2 and 3), the ``min`` churn rule."""
+    return euler_dy(
+        model, x, sigmas, extra_args=extra_args, callback=callback, disable=disable,
+        s_churn=s_churn, s_tmin=s_tmin, s_tmax=s_tmax, s_noise=s_noise,
+        noise_sampler=noise_sampler, after_substep=after_substep,
+        smea=False, cfg_pp=False, churn_rule=CHURN_MIN, substeps=bool(substeps),
+        sam_extra_step_offset=sam_extra_step_offset,
+    )
+
+
+@torch.no_grad()
+def sample_euler_smea_dy(
+    model, x, sigmas, extra_args=None, callback=None, disable=None,
+    s_churn=0.0, s_tmin=0.0, s_tmax=float("inf"), s_noise=1.0,
+    noise_sampler=None, after_substep=None, substeps=True, sam_extra_step_offset=0,
+):
+    """Euler SMEA Dy with plain Euler steps (×1.25 sub-step at step 0, half-resolution at step 1), ``min`` churn."""
+    return euler_dy(
+        model, x, sigmas, extra_args=extra_args, callback=callback, disable=disable,
+        s_churn=s_churn, s_tmin=s_tmin, s_tmax=s_tmax, s_noise=s_noise,
+        noise_sampler=noise_sampler, after_substep=after_substep,
+        smea=True, cfg_pp=False, churn_rule=CHURN_MIN, substeps=bool(substeps),
+        sam_extra_step_offset=sam_extra_step_offset,
+    )
 
 
 @torch.no_grad()

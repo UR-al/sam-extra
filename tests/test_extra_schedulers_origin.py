@@ -224,7 +224,8 @@ class NodeInputParityTests(unittest.TestCase):
     def test_sliders(self):
         with gr.Blocks():
             controls = ues.build_controls(lambda item: f"t_{item}")
-        _mode, _expression, _sigmas, mu_slider, beta_slider = controls
+        self.assertEqual(len(controls), len(ues.ARG_NAMES))
+        mu_slider, beta_slider = (controls[ues.ARG_NAMES.index(name)] for name in ("laplace_mu", "laplace_beta"))
         for slider, spec in ((mu_slider, self.inputs["mu"]), (beta_slider, self.inputs["beta"])):
             with self.subTest(slider=slider.label):
                 self.assertEqual(slider.value, spec["default"])

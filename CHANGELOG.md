@@ -3,6 +3,292 @@
 버전 태그는 GitHub Releases에도 발행됩니다. 아래는 요약이며, guidance/속도 기능의
 상세는 [docs/GUIDANCE.md](docs/GUIDANCE.md)를 참고하세요.
 
+## v0.33.0 — 샘플러 13종 · React Cosinusoidal DynSF · Flow Cosmos rho7 · Flow Cosmos Dynamic 스케줄러 · ER SDE 잡음 구간 · 목록 계열 순서 · 한 열 드롭다운 · 기본값 저장 버튼
+
+Forge 의 Sampler 목록에 13종(18종이 됨), Schedule type 목록에 3종(9종이 됨)을 더하고, ER SDE 에 η 척도 항목과 잡음 구간을 더하며,
+Forge 의 Sampling method · Schedule type 목록을 계열별 순서로 늘어놓습니다(이름 · 기본값은 그대로). txt2img 의 notebook 레이아웃에는
+Settings → Defaults Apply 와 지금 UI Preset 의 설정을 한 번에 저장하는 `기본값 저장` 버튼이 생기고, 확장의 빠른 드롭다운은 화면 폭과
+관계없이 한 열로 열립니다. 새 항목은
+모두 스케줄러 힌트가 없어 Automatic 이 모델의 기본 스케줄(flow 모델은 Normal = 모델의 shift 표)을 쓰고, flow 모델(Anima)에서 잡음을
+넣는 곳은 모두 α = 1 − σ 로 계산합니다. **기존 항목의 결과는 그대로**입니다(Extra Samplers 5종 · Extra Schedulers 6종, 같은 설정·시드에서
+같은 이미지 — 기존 대조 테스트 그대로 통과). **Extra Samplers 스크립트 인자가 2개에서 5개**가 됩니다(`[max_stage, eta, noise_window,
+noise_start, noise_end]`) — 0.32 까지의 `[]`·`[max_stage]`·`[max_stage, eta]` 요청은 구간 끔으로 전과 같이 돕니다. **Extra
+Schedulers 스크립트 인자도 5개에서 8개**가 됩니다(맨 뒤에 Flow Cosmos rho7 의 `flow_cosmos_rho, flow_cosmos_sigma_max,
+flow_cosmos_sigma_min`) — 0.32 까지의 5개(또는 그보다 적은) 요청은 그대로 돌고 Flow Cosmos 는 기본값을 씁니다. 새 infotext 키는
+`ER SDE noise window` 와 `Flow Cosmos rho` · `Flow Cosmos sigma max` · `Flow Cosmos sigma min`, 새 XYZ 축은
+`[Extra Samplers] ER SDE noise window` 와 `[Extra Schedulers (sam-extra)] Flow Cosmos rho` · `… sigma max` · `… sigma min` 입니다.
+Anima 에서 새 항목의 화질은 확인하지 않았습니다(GPU 미사용, CPU 테스트만).
+
+### Extra Samplers (새 기능)
+
+- **Euler Dy · Euler SMEA Dy**: Euler Dy CFG++ · Euler SMEA Dy CFG++ 와 같은 코어(Koishi-Star, Apache-2.0)에 일반 Euler 갱신 —
+  보통 CFG 로 씁니다. 보조 스텝 · 미리보기 복구 · 보조 스텝 가드(Spectrum Integrated · Wan I2V · PiD · `extra_concat_condition`) ·
+  SPEED 의 `sam_extra_step_offset` · 가이던스의 `sam_extra_substep` 표시가 CFG++ 판과 똑같이 적용됩니다. churn 은 k-diffusion 의
+  `min` 규칙(기본 churn 0 = 재잡음 없음)과 flow 의 eps 등가 churn 입니다 — 상류 · reForge 의 같은 이름 샘플러가 매 스텝
+  γ ≥ √2−1 로 다시 잡음을 넣는(flow 에서 σ > 1) 판은 쓰지 않았습니다. 기본값에서 상류 원본(재잡음을 끈 실행)과 비트 단위로 같습니다.
+  가드가 보조 스텝을 끄면 콘솔에 `plain Euler steps` 로 알립니다(CFG++ 판은 그대로 `plain CFG++ Euler steps`).
+- **DPM++ 2M SDE Heun**: Forge 의 `sample_dpmpp_2m_sde` 에 k-diffusion 의 Heun 보정(`solver_type="heun"`) — A1111 · ComfyUI
+  (`dpmpp_2m_sde_heun`)의 같은 이름 항목. Forge 의 Eta · Sigma noise · 시드별 Brownian 잡음을 쓰고 `Eta` 를 남깁니다. Forge 의
+  DPM++ 2M SDE 를 `solver_type: heun` 옵션으로 돌린 것과 비트 단위로 같습니다. 스케줄러 힌트는 붙이지 않았습니다(A1111 의
+  exponential 은 Anima 에서 물 빠진 이미지).
+- **DPM++ 2M (flow ODE) · DPM++ 2M Heun (flow ODE) · DPM++ 3M (flow ODE)**: Forge 의 DPM++ 2M/3M SDE 를 η 0 으로 — 모델의
+  half-log-SNR λ(flow 면 log((1−σ)/σ))에서 푸는 잡음 없는 DPM-Solver++. Eta 인자가 없어 Forge 의 전역 Eta 를 받지도 `Eta` 를 남기지도
+  않고, 잡음을 뽑지 않습니다(Brownian 트리도 만들지 않음). DPM++ 3M (flow ODE) 는 Forge 의 끝에서 두 번째 σ 버림을 그대로 둬 Forge 의
+  "DPM++ 3M SDE + Eta 0" 과 비트 단위로 같습니다. ε 모델에서 2M 은 Forge 의 DPM++ 2M, 2M Heun 은 Res Multistep 과 같고(부동소수
+  연산 순서만 다름), flow 모델에서는 Res Multistep(−log σ 로 풂)의 flow 판 비교용입니다. 가우스 데이터의 닫힌 해로 flow ODE 를
+  2차 이상으로 푸는 것을 확인했습니다(스텝을 두 배로 할 때 오차 3배 이상 감소, Euler 는 2배).
+- **UniPC bh2**: Forge 의 UniPC(`modules/sd_samplers_extra.py` `sample_unipc`)를 `variant="bh2"` 로 — 나머지(끝에서 두 번째 σ 버림,
+  flow 모델 처리)는 Forge UniPC 와 같습니다. SPEED 는 Forge 의 UniPC 처럼 이 항목도 구간으로 나누지 않고 건너뜁니다(`Anima SPEED
+  status: base: skipped - UniPC is not segment-safe` — SPEED 의 거절 목록이 함수 이름으로 찾으므로 `sample_unipc_bh2` 를 더함).
+  이 Forge 의 `sample_unipc` 가 없거나 `variant` 인자를 받지 않으면 등록하지 않고 콘솔에
+  한 번 알립니다.
+- **ER SDE (Tunable)**: Forge 내장 ER-SDE 풀이에 ComfyUI 노드의 `ER-SDE` 척도 h(λ)=λ·(e^(λ^0.3)+10)^η(ComfyUI `40e46c71`, PR #15428).
+  η 1 · 잡음 구간 끔이면 Forge 내장 **ER SDE** 와 비트 단위로 같습니다(`t ** 1.0` 이 정확 — Forge 경로 테스트로 확인). η 는 Reverse-time 과
+  같은 `ER SDE eta` 슬라이더, stage 는 `ER SDE max stage`, 잡음 세기는 Forge 의 Sigma noise 입니다. 별칭 `er_sde_tunable`. ComfyUI 노드의
+  세 척도 · ODE 규칙(η 0 → 잡음 없음)과 비트 단위로 같습니다(새 오라클 `tests/_origin_comfyui_er_sde_eta.py`).
+- **ER SDE 잡음 구간 (Reverse-time · Tunable)**: 아코디언 둘째 줄 — `ER SDE noise window`(체크, 기본 끔) · `ER SDE noise start` ·
+  `ER SDE noise end`(샘플링 진행률 0–1, 기본 0.2 · 0.8 = Anima shift 3 에서 σ 0.92\~0.43). 켜면 스텝이 내려가는 σ 가
+  `[percent_to_sigma(끝), percent_to_sigma(시작)]` 안인 스텝만 SDE 잡음을 넣고, 나머지 스텝은 같은 풀이를 ODE 척도로 풀어 잡음을 뽑지
+  않습니다(스텝마다 ER-SDE 의 한 SDE — 주변분포 유지, 가우스 데이터 시험으로 확인). 시작 ≥ 끝은 빈 구간(잡음 없음, 바꿔 쓰지 않음).
+  Forge 내장 `sample_er_sde` 를 한 번 부르며 콜백으로 스텝 번호를 알아 척도 · 잡음 함수를 고르는 이 확장의 코드
+  (`sam3ext/extra_samplers/er_sde_window.py`)이고, 착상은 pamparamm/ComfyUI-ppm 의 `er_sde_scheduled`(AGPL-3.0 — 코드 미사용, 크레딧만)
+  입니다. Forge 가 콜백을 척도보다 먼저 부르는 순서를 테스트가 소스에서 확인합니다. infotext `ER SDE noise window: 0.2-0.8`(켜고 η > 0
+  일 때), 붙여 넣으면 체크와 시작 · 끝이 되살아나고 키가 없으면 끔 · 0.2 · 0.8. XYZ `[Extra Samplers] ER SDE noise window`(값 `off` 또는
+  `시작-끝`, 그 밖은 그리드 시작 전 오류). 모델 예측기에 `percent_to_sigma` 가 없으면 구간 없이 돌고 `Extra Samplers status` 에
+  `noise window skipped (no percent_to_sigma)` 를 남깁니다.
+- **CFG++ UD10 AB**: ComfyUI `cfgpp_ud10_ab`(`3ac5d794`, PR #15951, GPL-3.0 — 작성자가 기본 Anima 에서 조정)를 옮긴 것 — CFG++ Euler
+  에 AB2 이력 · 무조건 미분 외삽 · σ=0 외삽. ComfyUI 함수와 비트 단위로 같습니다(CFG 1 · 1.5 · 2 · 4.5, ε · flow, 새 오라클
+  `tests/_origin_comfyui_cfgpp_history.py`). CFG 1 에서 Forge 는 무조건 예측을 0 으로 두고 `uncond` 를 그대로 넘기므로, Forge 자신의
+  건너뛰기 조건으로 그 호출을 알아보고 ComfyUI 처럼 조건부 예측을 씁니다(Skip Early CFG · NGMS 스텝 포함). CFG++ 항목이라 CFG 2 를
+  넘으면 Forge 의 권장 경고. 별칭 `cfgpp_ud10_ab`.
+- **IPNDM · IPNDM_V · DEIS**: zju-pi/diff-sampler(`68d5ce4`, Apache-2.0)의 다단계 ODE — ComfyUI(`387f98aa`)의 k-diffusion 판을 따라
+  옮겨 ComfyUI 의 `ipndm` · `ipndm_v` · `deis` 와 비트 단위로 같습니다(새 오라클 `tests/_origin_comfyui_ipndm_deis.py`). 스텝당 모델 1회,
+  d=(x−D)/σ 가 flow 의 속도라 flow ODE 를 그대로 풉니다(Anima shift 3 격자의 가우스 데이터 시험에서 스텝 두 배에 오차 약 1/4, IPNDM_V
+  ≤ IPNDM). DEIS 계수는 Forge 가 이미 가진 `k_diffusion/deis.py` 를 부르고(`forge_requires`, 없으면 DEIS 만 건너뜀), 차수는 ComfyUI
+  기본(4 · 4 · 3, 'tab') 고정입니다. 바꾼 곳: 콜백에 현재 latent, 차수 1 은 이력 없는 Euler(상류는 IndexError), 4 를 넘는 차수는 4.
+- **Restart (flow)**: Restart 논문(Xu et al., arXiv:2306.14878)을 이 확장이 새로 작성(참조 저장소는 라이선스가 없어 열어 보지 않음).
+  Heun 스텝에, ε 등가 잡음 수준 s=σ/α 의 0.1\~2 구간(flow σ 0.09\~0.67, 스케줄러의 σ 그대로)을 flow 의 정확한 순방향 잡음
+  x ← (α_hi/α_lo)·x + α_hi·√(s_hi²−s_lo²)·ε 로 다시 올렸다가 되짚습니다 — 20 스텝부터 한 번, 36 스텝부터 두 번(A1111 규칙). 20 스텝
+  미만이면 Forge Heun 과 비트 단위로 같고, ε 모델에서는 같은 창을 준 Forge Restart 와 같은 결과입니다(Forge 의 float32 Karras 재구성
+  반올림만). 모델 호출이 Heun 보다 많습니다(Anima 28 스텝 75회 vs 55회, 36 스텝 123회 vs 71회). Forge 의 스텝 카운터는 되짚는 스텝을
+  원래 그 스텝으로 셉니다(프롬프트 편집 · Skip Early CFG). Forge 내장 Restart 는 flow 모델에서 σ>1 로 잡음을 넣으므로 Settings → Hide
+  samplers 로 숨기기를 권합니다(이 확장은 그 항목을 바꾸지 않음). 별칭 `restart_flow`, 옵션은 Forge Heun 과 같은 `second_order`.
+- 등록부: 샘플러 항목에 `forge_requires`(`"module:attribute(param)"`)를 더해 Forge 함수가 없으면 그 항목만 건너뜁니다(UniPC bh2 ·
+  DEIS). 아코디언의 건너뜀 안내 문구를 "이 Forge 에 필요한 함수가 없어 건너뜀" 으로 바꿨습니다(k-diffusion 밖 함수도 있어서).
+  `Extra Samplers status` 는 이유마다 `; ` 로 잇습니다(Dy 이유만 있으면 이전과 같은 글자).
+
+### Extra Schedulers (새 기능)
+
+- **React Cosinusoidal DynSF**: σmax·((σmin + (σmax − σmin)·cos(πp/2)) / σmax)^(2.15·p) — reForge 와 같은 라벨 · 식(yoinked-h,
+  reForge `25a5fb38f`)을 공개된 한 줄 식으로 새로 작성(reForge AGPL-3.0 코드 미사용). 계수 2.15 고정(다른 값은 custom 식 — 2.15 면
+  비트 단위로 같음). σ 범위식이지만 높은 σ 에 스텝이 몰립니다: Anima shift 3 · 28 스텝에서 0.5 위 17 스텝, 중앙값 0.720, 0.05 아래 4
+  스텝, 마지막 σ ≈ 3.7e-6. float32 에서 448 스텝(Anima 범위; SDXL 범위는 489)부터 첫 두 σ 가 같아져 기존 규칙대로
+  `ExtraSchedulerError` 로 멈춥니다. reForge 이미지의 `Schedule type: React Cosinusoidal DynSF` 가 그대로 붙여 넣어집니다.
+- **Flow Cosmos rho7**(이름 `flow_cosmos_rho7`): flow 모델에서 쓰는 Karras — VE 단위 σ̃ 범위에 ρ 램프
+  s = (σ̃max^(1/ρ) + p(σ̃min^(1/ρ) − σ̃max^(1/ρ)))^ρ 를 깔고 flow 시간 t = s/(1 + s) 로 바꾼 목록(모델의 sigma min/max 와 Settings 값은
+  쓰지 않음). 기본값 ρ 7 · σ̃ 0.002\~80 은 Anima 의 부모 모델 Cosmos-Predict2 의 스케줄(80/81 ≈ 0.988 → ≈ 0.002)이고, 그때 GPU A/B 에
+  쓴 custom 식과 비트 단위로 같으며 KeithZ117/Comfyui-anima-sampler(`effba3c5`, MIT)의 `build_flow_cosmos_rho_sigmas` 와는 30,000
+  스텝까지 float32 값이 같습니다(그보다 훨씬 많은 스텝에서는 원소 하나가 1 ulp 다를 수 있음, 예: 180,836 스텝 — A/B 식의 연산 순서를
+  따름. 이름과 착상만 크레딧, 식에서 새로 작성 — 코드 미사용). eps/v 모델(SD·SDXL)에서는 Forge 가 넘기는 σ 범위(모델의 것, 또는
+  Settings 의 sigma min/max)에 Forge 의 Karras 함수(`k_diffusion.sampling.get_sigmas_karras`)를 실행 중에 아코디언의 ρ 로 불러 쓰고
+  (σ̃ 범위는 쓰지 않음) 콘솔에 한 번 알립니다 — Settings → rho 도 붙여 넣은 `Schedule rho` 도 닿지 않으므로, ρ 7 이면 Settings → rho 가
+  0 또는 7 일 때만 Forge 의 Karras 와 같습니다. flow 인지는 Forge 가 넘기는 모델의
+  `prediction_type`(이 확장의 `is_flow_model`)으로 정합니다 — 이 스케줄러만 `need_inner_model` 을 씁니다. 기본값에서는 float32 에서
+  1,119,764 스텝부터 이웃한 두 값이 같아져 기존 규칙대로 `ExtraSchedulerError` 로 멈춥니다. Anima 화질은 기본값을 시드 2개로 A/B 한
+  번 한 것 말고는 확인하지 않았습니다.
+- **Flow Cosmos rho7 의 값 셋**(아코디언 · API · infotext · XYZ — Laplace μ/β 와 같은 방식): **Flow Cosmos rho**(1\~15, 0.1 단위, 기본 7),
+  **Flow Cosmos sigma max (σ̃)**(1\~1000, 0.1 단위, 기본 80), **Flow Cosmos sigma min (σ̃)**(0.0001\~1, 0.0001 단위, 기본 0.002). 생성이
+  돌 때 읽고(Laplace 처럼), 기본값이면 위 목록과 비트 단위로 같습니다. σ̃ 범위를 k 배 하면 flow 시간 shift k 와 같습니다
+  (t' = k·t/(1 + (k − 1)·t) ⇔ σ̃' = k·σ̃) — Anima 의 shift 3 은 σ̃ 0.006\~240 에 해당(수식상의 사실, 화질 주장 아님). eps/v 모델에서는 ρ 만
+  쓰고 σ̃ 범위는 쓰지 않습니다. 슬라이더 범위 밖의 API 값은 Laplace 처럼 범위 끝으로 잘리고, 숫자가 아니거나 유한하지 않은 값(float 로
+  바꿀 수 없을 만큼 큰 JSON 정수 포함)은 기본값. ρ 는 유한하고 0 보다 커야 하며 flow 모델에서는 0 < σ̃ min < σ̃ max(둘 다 유한)여야
+  합니다 — 아니면 생성이 `ExtraSchedulerError` 로 멈춤(슬라이더로는 σ̃ min = σ̃ max = 1 만 걸림). 마지막 0 앞의 시그마는 모두
+  float32 의 가장 작은 정규값 이상이어야 하고(custom 과 같은 규칙) 넘침도 같은 오류로 멈춥니다 — 슬라이더 밖 값(예: ρ 0.05 면 램프의
+  끝이 0)이나, eps/v 모델에서 Settings 의 sigma min 을 아주 작게 바꾼 설정(ρ 1 이면 약 1e-7 아래 — 그때 Forge 의 Karras 자체가 마지막
+  0 앞에 0 이나 비정규 수를 냄)에서만 걸립니다. flow 모델에서 σ̃ 범위를 아주 좁혀 이웃한 두 값이 같아지면 기존 규칙대로 멈추고
+  (예: σ̃ 0.9999\~1 은 841 스텝부터), 그 메시지는 Settings 의 sigma min/max 대신 이 값들을 적습니다. 콘솔 한 줄은 그 생성의 ρ 를 적습니다(기본 7 이면 `… using Karras rho 7 on the model's own sigma range`).
+- **Flow Cosmos Dynamic**(이름 `flow_cosmos_dynamic`, Flow Cosmos rho7 바로 뒤): Karras Dynamic 의 flow 모델판 — 이 확장이 Karras
+  Dynamic 과 Flow Cosmos rho7 을 합친 것입니다(다른 프로젝트의 코드나 스케줄이 아님; Karras Dynamic 변형 자체의 출처는 미확인).
+  flow 모델: Flow Cosmos rho7 과 같은 σ̃ 범위에 Karras Dynamic 의 램프(스텝마다 ρᵢ = ρ + 2cos(2πi/n), 같은 비율 꼴과 마지막 스텝 규칙 —
+  Karras Dynamic 과 같은 함수 `_karras_dynamic_values` 로 계산)를 깔고 t = s/(1 + s), float64 → float32 + 마지막 0. ρ · σ̃ max · σ̃ min 은
+  Flow Cosmos rho7 의 아코디언 값 셋을 같이 씁니다(새 칸 없음, 기본 ρ 7 · σ̃ 0.002\~80). eps/v 모델: Forge 가 넘기는 σ 범위에 Karras
+  Dynamic 그대로(아코디언의 ρ, 비트 단위로 같음) + 콘솔 한 줄 `[Extra Schedulers] Flow Cosmos Dynamic: not a flow model - using Karras
+  Dynamic rho 7 on the model's own sigma range`(숫자는 그 생성의 ρ). 두 모델 모두 Karras Dynamic 의 규칙(ρ > 2, 매 스텝 내려가야 함 —
+  아니면 `KarrasDynamicError`, 메시지는 아코디언 값을 가리킴)과 Flow Cosmos rho7 의 규칙(양수 σ, 그리고 flow 모델에서 σ̃ 범위 · float32
+  최소 정규값 · 평평한 스텝 — eps/v 모델은 Karras Dynamic 그 자체라 Settings 의 아주 작은 sigma min 도 Karras Dynamic 처럼 돎)을
+  지킵니다 — 기본 σ̃ 범위에서 ρ 3.8 까지는 300 스텝 안의 어떤 스텝 수에서 시그마가 올라가 멈추고, 3.9 부터는
+  그런 스텝 수가 없습니다. ρᵢ = ρ 인 스텝(첫 · 마지막, 4 의 배수 스텝 수면 n/4 · 3n/4 번째)에서만 같은 값의 Flow Cosmos rho7 과 같고,
+  처음과 마지막 4분의 1 은 더 낮게, 가운데 절반은 더 높게 갑니다(기본값 28 스텝: 0.5 위 18 스텝, 중앙값 0.792 — rho7 은 17 · 0.680).
+  기본값에서 float32 의 이웃한 두 값은 1,277,194 스텝부터 같아집니다(기존 규칙대로 멈춤). 스케줄러 힌트 없음. Anima 화질은 확인하지
+  않았습니다(GPU 미사용).
+- Extra Schedulers 스크립트 인자 5 → 8개(`flow_cosmos_rho`, `flow_cosmos_sigma_max`, `flow_cosmos_sigma_min` 을 맨 뒤에). infotext 키
+  `Flow Cosmos rho` · `Flow Cosmos sigma max` · `Flow Cosmos sigma min`(Flow Cosmos rho7 또는 Flow Cosmos Dynamic 을 쓴 생성에 셋 모두),
+  XYZ 축 셋(기존 넷 뒤 — 두 스케줄러 모두에 닿음). 키가 없는 Flow Cosmos 이미지를 붙여 넣으면 기본값.
+
+### 샘플러 · 스케줄러 목록 순서 (새 기능)
+
+- Forge 가 화면을 만들기 직전(`script_callbacks.on_before_ui` — 모든 확장이 등록을 마친 뒤, 시작 · Reload UI 때마다, `--nowebui`
+  에서도) Sampling method 와 Schedule type 목록을 계열별로 다시 늘어놓습니다: DPM++ → Euler → ER SDE → Res Multistep → Heun → LMS ·
+  IPNDM · DEIS → UniPC → Restart → LCM · DDIM · PLMS 등 → `(RES4LYF)` 묶음 → 나머지, 스케줄러는 Automatic → Simple · Normal 등 → Beta →
+  Linear Quadratic · KL Optimal → Karras · Karras Dynamic · Flow Cosmos 둘 → Exponential · Cosine · Phi 등 → Laplace · React · Tan →
+  Align Your Steps · Turbo 등 → 나머지 → `custom`(맨 끝). 표에 없는 항목은 이름이 계열 이름이나 머리말(`DPM` · `EXP Heun` · `SEEDS` ·
+  `Flow Cosmos` 등)로 시작하면 그 계열 끝에, 아니면 원래 순서대로 맨 뒤에. 설정 · 켜기 칸 없음.
+- txt2img · img2img · Hires 드롭다운, XYZ 의 Sampler · Hires sampler · Schedule type 선택지, `/sdapi/v1/samplers` · `/sdapi/v1/schedulers`,
+  Settings → Hide samplers / Hide schedulers 가 이 순서를 따릅니다. 이름 · 라벨 · 별칭과 Forge 의 조회 표(`all_samplers_map` ·
+  `samplers_map` · `schedulers_map` — 키와 값 모두)는 그대로라 infotext · API · XYZ 값은 전과 같이 찾아지고, 첫 항목(DPM++ 2M,
+  Automatic — Hide samplers 로 숨기지 않은 첫 샘플러도)은 그대로 첫 자리라 기본값이 바뀌지 않습니다. 목록 객체는 제자리에서 바꾸고
+  Forge 의 `set_samplers()` 를 다시 부르며, 옛 infotext 풀이(`get_sampler_and_scheduler`)의 캐시를 비웁니다. 새 파일
+  `sam3ext/list_order.py` · `scripts/list_order.py`(콜백 하나, `negpip.py` 가 여전히 마지막 스크립트).
+- Reload UI 때 Forge 는 목록을 새로 만들지 않아 정렬된 목록이 그대로 남고, `set_samplers()` 가 그 순서로 `samplers_map` 을 다시
+  계산합니다. 그래서 매번 먼저 등록 순서(Forge 만 있을 때의 순서 — 처음 본 순서를 Forge 의 모듈에 기억하고, 나중에 생긴 항목은 뒤에)로
+  되돌리고, 두 항목이 같이 쓰는 키를 Forge 의 식이 정렬된 순서 때문에 다른 항목에 넘긴 것도 되돌린 뒤 정렬합니다 — Settings → Hide
+  samplers(Reload UI 만 하면 되는 설정)를 바꿔도 첫 보이는 샘플러 · 목록 · 조회 표가 새로 시작했을 때와 같습니다(전에는 정렬된 목록에서
+  첫 보이는 항목을 골라, 예: DPM++ 2M 을 숨기면 DPM++ SDE 대신 DPM++ 2M SDE 가 기본값이 됐음). 바뀐 것이 없는 Reload UI 는 로그를 남기지
+  않습니다.
+
+### Extra Schedulers (고침)
+
+- **API 의 아주 큰 정수**(Laplace mu · beta 에 float 로 바꿀 수 없는 정수, v0.31.0 부터): `OverflowError` 로 그 요청의 아코디언 값
+  전부(custom 식 · 목록 포함)가 기본값으로 바뀌고 콘솔에 `bad arguments, using the defaults` 만 남던 것을, 그 값만 기본값으로 읽고(`1e400`
+  같은 유한하지 않은 값처럼) 나머지는 그대로 씁니다 — 새 Flow Cosmos 값 셋도 같음. SPEED 의 같은 고침과 같은 처리입니다.
+
+### Anima SPEED (고침)
+
+- **Scales · Manual sigma(s) 칸의 `x/0`**: `1/0` 같은 값이 `ZeroDivisionError` 로 설정 읽기 밖으로 빠져 Forge 가 스크립트 오류를 남기고
+  SPEED 없이 돌았고 `Anima SPEED status` 도 남지 않았습니다(Manual sigma(s) 는 Transition sigma 가 manual 이 아니어도 읽음). 이제
+  `division by zero: '1/0'` 로 다른 잘못된 값처럼 `invalid settings - …` 상태를 남기고(manual 이 아닐 때 Manual 칸의 값은 예전처럼
+  무시) 그 패스는 순정으로 돕니다.
+- **API 의 아주 큰 정수**(Delta · Sigma divisor · Spectral noise seed 등에 float 로 바꿀 수 없는 정수): `OverflowError` 로 빠지던 것을
+  다른 숫자가 아닌 값처럼 기본값으로 읽습니다.
+- UniPC bh2 를 SPEED 가 구간으로 나누지 않고 건너뜀(위 UniPC bh2 항목).
+
+### txt2img 화면 · 도구
+
+- **기본값 저장 버튼 (새 기능)**: notebook 레이아웃의 탭 줄(Generation · 임베딩 · 체크포인트 · 로라 · Manage) 오른쪽 끝, 갤러리 열
+  위의 빈자리에 `기본값 저장` 버튼 하나가 생깁니다. 한 번 누르면 확인 없이 두 가지를 저장하고 버튼 옆에 짧은 결과를 보여 줍니다
+  (예: `기본값 + anima 프리셋 저장됨 · 바뀐 항목: 기본값 3개, 프리셋 2개` — 같은 칸이 두 파일에 다 쓰이므로 개수는 파일마다 따로,
+  실패하면 그 이유 — 마우스를 올리면 항목별로 무엇이 바뀌었는지):
+  1. Forge 의 **Settings → Defaults → Apply** 를 그대로 누릅니다(`#ui_defaults_apply` — 지금 화면 값을 `ui-config.json` 에, Forge 의
+     결과 글 `Wrote N changes.` / `No changes.` 에서 개수를 읽음).
+  2. **지금 UI Preset 의 설정 22개**를 `config.json` 에 씁니다 — 체크포인트 · VAE / Text Encoder · Diffusion in Low Bits ·
+     txt2img/img2img 스텝(Hires steps 포함) · 샘플러 · 스케줄러 · 너비 · 높이 · CFG(Hires CFG 포함) · Distilled CFG / Shift · 배치.
+     Forge 는 페이지를 열 때와 프리셋을 바꿀 때마다 이 칸들을 프리셋 값으로 덮어써서(`modules_forge/main_entry.py`
+     `on_preset_change`) Defaults Apply 만으로는 남지 않았습니다. 값은 Forge 가 그 덮어쓰기에 쓰는 바로 그 컴포넌트에서 Gradio 가
+     넘기고, 저장 모양도 Forge 와 같습니다(VAE / TE 는 Forge 가 직접 바꿀 때처럼 전체 경로 · 정렬, 스케줄러는 표시 이름). 다른
+     프리셋과 `forge_preset` 은 건드리지 않습니다. 값 하나라도 Forge 의 선택지 · 설정 범위에 맞지 않으면 프리셋 쪽은 아무것도 쓰지
+     않고 그 칸 이름을 알립니다(Defaults Apply 는 그대로 진행). Forge 에 없는 칸(Distilled CFG / Shift 가 없는 프리셋의 세 칸)은
+     건너뜁니다. `--freeze-settings` 면 프리셋 쪽은 거절합니다.
+  프리셋 값은 다음에 페이지를 열 때(또는 프리셋을 바꿀 때) 바로 쓰이고, ui-config 기본값은 Forge 규칙대로 UI 를 다시 띄운 뒤
+  적용됩니다. 프리셋 설정에서 0(= 덮어쓰지 않음 — `on_preset_change` 가 `gr.skip()` 으로 화면 값을 둠)인 스텝 · 크기 · CFG 10칸은
+  0 그대로 둡니다: 그 칸의 화면 값은 같은 클릭의 Defaults Apply 로 ui-config 에 들어가 기본값이 되므로, 화면 값으로 바꿔 쓰면 "덮어쓰지
+  않음"이 "이 값으로 덮어쓰기"로 바뀌기 때문입니다. 이 칸들은 바뀐 항목으로 세지 않고(툴팁에 이름) 설정 범위도 보지 않습니다 — Forge 의
+  프리셋은 처음에 너비 · 높이가 0 입니다. 0 보다 큰 칸은 화면 값으로 바뀝니다.
+  저장하는 동안에는 `저장 중…` 이고 다시 눌러도 한 번만 저장하며, 버튼을 막지(disabled) 않고 `aria-disabled` 로 알려 키보드 포커스가
+  버튼에 그대로 남습니다. 설정 · 켜기 칸은 없고, notebook 레이아웃이 아닌 Forge 기본 화면에는 생기지 않습니다.
+- **빠른 드롭다운을 한 열로 (바뀜 — 표시만)**: 확장이 바꿔 단 빠른 드롭다운(Sampling method · Schedule type · Hires 샘플러/스케줄러 ·
+  Script · XYZ Plot 의 X/Y/Z 유형 등 전부)의 목록이 화면이 넓을 때 여러 열로 펼쳐지던 것을, 항상 **한 열**(트리거 너비, 최소
+  280px, 화면 폭을 넘지 않음)로 보여 주고 다 안 들어가면 스크롤합니다. 목록이 아래에 다 들어가면 아래로, 아니면 위로, 둘 다
+  모자라면 더 넓은 쪽(같으면 아래)을 채워 스크롤하고, 어느 쪽에도 네 줄이 안 들어가는 작은 창에서는 전처럼 화면 위쪽부터 엽니다.
+  검색칸 · ↑↓/Enter · 묶음 단위 추가 표시(끝까지 내리면 다음 묶음 — 묶음이 더 있으면 맨 아래 한 줄이 늘 화면 밖에 남아 스크롤이 생김) ·
+  접근성 속성은 그대로이고, ↑↓ 가 화면에서도 위아래로 움직입니다. XYZ 의 값 드롭다운(여러 개 고르는 `X values` 등)은 Forge 원래
+  드롭다운이라(elem_id 없음) 처음부터 한 열이며 바뀌지 않았습니다.
+- **↑↓ 로 긴 목록을 내려가면 포커스가 사라지던 것 (고침, 0.32.1 에도 있음)**: 빠른 드롭다운에서 ↑↓ 로 묶음(기본 60개)의 끝에 닿으면
+  브라우저가 그 줄을 보이게 스크롤하고, 그때 다음 묶음을 붙이며 목록을 다시 그려 포커스를 가진 항목까지 지워졌습니다 — 포커스가 페이지
+  (`<body>`)로 빠져 ↑↓ 가 더는 듣지 않았습니다. 이제 다시 그린 뒤 같은 항목(목록에서 빠졌으면 같은 자리의 항목)에 포커스를 돌려줍니다
+  (목록 선택지가 새로 고쳐질 때도 같음). 실제 Chromium 에서 163개 목록을 ↑↓ 166번으로 끝까지 내려가 처음으로 돌아오는 것을 확인했습니다.
+
+### 호환
+
+- API `alwayson_scripts["Extra Samplers"]["args"]`: 2 → 5 개(위치 인자, 모두 생략 가능, 남는 값 무시, dict 는 여전히 받지 않음).
+  `ER SDE (Reverse-time)` 은 잡음 구간 인자를 새로 받지만 구간을 켜지 않으면 결과가 전과 같습니다.
+- 새 infotext 키 `ER SDE noise window`, 새 XYZ 축 하나. `ER SDE max stage`/`ER SDE eta` 규칙은 그대로이고 Tunable 에도 적습니다
+  (`Eta` 를 η 로 읽는 붙여 넣기 대체 규칙은 Reverse-time 만).
+- API `alwayson_scripts["Extra Schedulers (sam-extra)"]["args"]`: 5 → 8 개(위치 인자, 새 셋은 맨 뒤, 모두 생략 가능, 남는 값 무시;
+  dict 는 새 키 `flow_cosmos_rho` · `flow_cosmos_sigma_max` · `flow_cosmos_sigma_min` 도 받음). 5개 요청은 전과 같은 결과(Flow Cosmos 는
+  기본값). 새 infotext 키 셋, 새 XYZ 축 셋(`[Extra Schedulers (sam-extra)]` 축 4 → 7 — 기존 넷의 순서는 그대로).
+
+### 문서 · 테스트
+
+- **범위의 물결표가 취소선으로 보이던 것 (고침, README · CHANGELOG 는 0.32.1 에도 있음)**: Gradio 의 Markdown(marked, GFM)과 GitHub 은
+  홑 물결표 한 쌍(`a~b … c~d`)을 취소선으로 그려서, Extra Schedulers 도움말의 `σ̃ 0.002~80 … 0.006~240` 과 Extra Samplers 도움말의
+  잡음 구간 · Restart (flow) 줄이 물결표가 빠진 채 줄 그어진 글자로 보였습니다(실제 Forge 화면에서 확인). 도움말(`gr.Markdown`) 13곳과
+  README 96곳 · CHANGELOG 74곳의 산문 속 물결표를 `\~`(보이는 글자는 그대로 물결표)로 바꿨습니다 — 코드 칸, 그리고 Gradio 의
+  `info` · Forge 설정 라벨처럼 Markdown 으로 그리지 않는 곳은 그대로입니다. Gradio 4.40 이 쓰는 marked 12 로 그려 보면 취소선이
+  도움말 3 · README 30 · CHANGELOG 21 군데에서 0 이 되고 물결표는 모두 보입니다.
+- README(Extra Samplers 18종 표 · ER SDE 세 항목 표 · 잡음 구간 · Restart (flow) 안내 · Extra Schedulers 9종 표(Flow Cosmos Dynamic 행) ·
+  새 절 "샘플러 · 스케줄러 목록 순서 (계열별)" · Flow Cosmos 값 셋 ·
+  API 인자 8개 · 워크플로 5 의 빠른 드롭다운 한 열과 새 절 "기본값 저장 버튼" · txt2img 화면 정리의 한 줄) · THIRD_PARTY_NOTICES
+  (Euler-Smea-Dyn-Sampler 절, ER SDE 절에 40e46c71, 새 절 ComfyUI CFG++ UD10 AB · zju-pi IPNDM/IPNDM_V/DEIS, 재구현 표 5줄, 라이선스 없는
+  저장소에 Restart 공식 코드) · docs/GUIDANCE.md(Dy 보조 평가 문단).
+- 새 테스트: `test_extra_samplers_dpmpp_flow.py`(Forge 함수와 비트 대조, 가우스 데이터 닫힌 해 수렴), `test_extra_samplers_unipc_bh2.py`
+  (Forge `sample_unipc(variant="bh2")` 와 비트 대조), Euler Dy 일반 판의 상류 대조 · Forge `sample_euler` 대조, Forge 경로
+  (`KDiffusionSampler.sample`)에서 새 항목 전부 · "DPM++ 3M (flow ODE)" == "DPM++ 3M SDE"(Eta 0), React DynSF 의 식 · custom 식 ·
+  float32 한계 · 등록. Flow Cosmos rho7: 상류 함수(테스트 안 참조식) · A/B custom 식과 비트 대조(Anima 등 flow 범위), Forge 의 실제
+  예측기(`PredictionDiscreteFlow` · eps · v)와 `ForgeScheduleLinker` 로 Forge `get_sigmas` 를 돌려 flow 목록 / Forge Karras 와 비트 대조,
+  eps/v 분기가 Forge 의 `get_sigmas_karras` 를 실행 중에 부르는지(없으면 `ExtraSchedulerError`),
+  로그 한 번, float32 한계(1,119,764), infotext · 붙여 넣기 · XYZ 선택지, SPEED 통합 테스트에 React DynSF 와 함께 추가. Flow Cosmos
+  값 셋: 기본값 == A/B 식(비트), ρ 6개 × σ̃ 범위 7개 × 스텝 6개 격자에서 같은 숫자를 넣은 custom 식과 비트 대조 · 다른
+  꼴의 float64 식과 허용 오차 대조 · float32 반올림(1 ulp 이내), σ̃ ×k == 시간 shift k, eps/v 에서 Forge Karras(테스트 대역과 Forge 의
+  실제 함수)에 그 ρ, 잘못된 ρ/σ̃ 범위/넘침(eps/v 의 Forge Karras 넘침 포함) → `ExtraSchedulerError`, 마지막 0 앞 float32 최소 정규값
+  규칙(0 · 비정규 수 · NaN — Forge 의 실제 Karras 와 Settings 의 아주 작은 sigma min 포함), 좁은 σ̃ 범위의 평평한 스텝(841 스텝부터)과 그
+  메시지, 스크립트 인자 0/2/3/5/8/9개 · 범위 밖 값 자르기 · 아주 큰 API 정수(그 값만 기본값, Laplace 포함) · infotext 쓰기 · 붙여
+  넣기(키 없음 → 기본값) · Forge 따옴표/정규식 왕복 · XYZ 축 셋(범위 확인) · 슬라이더 순서와 기본값 · 도움말과 README 문구(σ̃ 범위
+  오류는 flow 모델만, 841 스텝), Forge `get_sigmas` 경로, SPEED 통합 테스트 한 줄. `test_extra_samplers_er_sde_eta_origin.py`(ComfyUI 40e46c71 노드와 비트 대조, η 1 == Forge 내장 ER SDE),
+  `test_extra_samplers_er_sde_window.py`(전체 구간 == 구간 없음, 빈 구간 == ODE, 논문 식으로 새로 쓴 float64 풀이와 대조, 구간 안
+  스텝에서만 잡음, 가우스 데이터 주변분포, 콜백-척도 순서 소스 확인), `test_extra_samplers_cfgpp_ud10_ab_origin.py`(두 호스트의 CFG
+  인자로 ComfyUI 와 비트 대조), `test_extra_samplers_ipndm_deis_origin.py`(ComfyUI 와 비트 대조, Forge/ComfyUI DEIS 계수 같음, flow ODE
+  수렴), `test_extra_samplers_restart_flow.py`(창 계획, Forge Heun · Forge Restart(ε) 대조, flow 순방향 잡음의 주변분포 · VE 잡음 음성
+  대조, 스텝 카운터), 등록부 · 스크립트(인자 0/2/3/5/7개, 붙여 넣기 · XYZ) · Forge 경로(Tunable == 내장 ER SDE, Restart (flow) 시드별)
+  확장. Flow Cosmos Dynamic(28개): 다른 꼴의 float64 식(numpy)과 ρ 5개 × σ̃ 범위 7개 × 스텝 7개 격자 대조(허용 오차 + float32 1 ulp),
+  σ̃ 값이 Karras Dynamic 의 값 함수 그대로(Karras Dynamic 을 σ̃ 범위에 돌린 것과 비트 같음), eps/v == Karras Dynamic(비트, 아코디언의 ρ,
+  σ̃ 값 무관), Flow Cosmos rho7 과 같은 스텝은 수식이 말하는 곳뿐(n 1\~160), 기본값 1000 스텝까지 내려감 · 1,277,194 스텝 평평, ρ ≤ 2 ·
+  올라가는 스케줄(ρ 3.8 은 300 스텝 안에서, 3.9 는 없음) → `KarrasDynamicError`(두 모델), σ̃ 범위 · 좁은 범위의 평평한 스텝(841) ·
+  float32 최소 정규값(flow 모델 — eps/v 의 아주 작은 sigma min 은 Karras Dynamic 과 비트 같음) · 모델 없음 · 로그 한 번(rho7 과 따로), Forge 의 실제 예측기와 `ForgeScheduleLinker`,
+  등록 순서(rho7 바로 뒤) · 라벨 · 별칭 없음 · `need_inner_model` · 붙여 넣기 · XYZ 선택지 · Forge `get_sigmas` 경로, infotext 쓰기
+  (본 패스 · Hires · 이름 · 둘 다) · 붙여 넣기 · 왕복 · XYZ 축이 닿음, 도움말 · README 문구, SPEED 통합 테스트 두 줄. 목록 순서
+  (`test_list_order.py` 32개 + 로드 순서 통합 1개): 이 PC 의 실제 목록(Forge 2.29.2 + 이 확장 + RES4LYF + sd_forge_neo_extra_samplers)이
+  표의 순서가 되는지, 규칙(첫 항목 · Hide samplers 의 첫 보이는 항목 유지, `(RES4LYF)` 묶음, 머리말 · 가장 긴 것, 나머지 · custom 맨
+  끝, 없는 항목), Forge 코드를 실행해 XYZ 선택지 · 드롭다운 · Hires 드롭다운 · API 가 새 순서를 따르는지와 조회 결과
+  (`get_sampler_and_scheduler` 1만 개 넘는 조합 · 표 · 기본값) 그대로, 겹치는 키 복원, 두 번 돌려도 같음, Reload UI(Forge 의
+  `set_samplers()` · 다시 등록 · before_ui) 뒤가 새로 시작한 것과 같은지 — Hide samplers 를 바꾼 뒤와 되돌린 뒤 · 아무것도 안 바뀐 때(로그
+  없음) · 겹치는 샘플러 별칭 · 겹치는 스케줄러 이름(로그 없음을 뺀 셋은 고치기 전 코드에서 실패), Forge · 이 확장의 모든 라벨이
+  표에 있는지; 로드 순서 프로브는 불러온 순서와 `before_ui` 뒤 순서(Reload UI 포함)를 따로 봅니다. 테스트 픽스처에 `GaussianModel`(가우스 데이터의 정확한 디노이저), Forge `sd_samplers_extra`/`uni_pc`/`k_diffusion.deis`/
+  `k_prediction` 로더.
+- 기본값 저장: `test_save_defaults.py`(22칸 표가 Forge `forge_main_entry` 의 컴포넌트 순서 · `on_preset_change` 의 키 순서와 같은지
+  AST 로, Forge 의 `presets.register` 키 · 범위, 실제 Forge `on_preset_change` 로 12개 프리셋 모두 왕복, `modules_change` 와 같은 저장
+  모양, 활성 프리셋만 · 바뀐 것만 셈 · 없는/막힌 키 건너뜀 · 정수/실수 · 범위 · 선택지 검사 · 하나라도 틀리면 아무것도 안 씀 ·
+  저장 실패와 값을 받지 않은 설정의 되돌리기 · `--freeze-settings` · 프리셋 값이 Forge 가 건너뛰는 값(0 이하 · NaN)인 스텝 · 크기 · CFG
+  10칸은 쓰지도 세지도 범위를 보지도 않음 — Forge `on_preset_change` 의 AST 에서 `> 0 … else gr.skip()` 칸 10개를 뽑아 같은지, 실제
+  함수를 칸 · 값 · 프리셋마다 돌려 저장 뒤에도 그 칸의 화면 값을 두는지(새 프리셋의 너비 · 높이 0 포함)),
+  `test_save_defaults_gradio.py`(실제 Gradio 4.40 에서 숨은 버튼의
+  입력이 main_entry 의 23개 컴포넌트와 같은 순서 · footer 뒤 demo 안 · `process_api` 클릭으로 저장/거절 JSON · 화면마다 한 번 ·
+  Reload UI 뒤 다시 · 컴포넌트가 없으면 만들지 않고 이름을 남김 · 다 갖춘 화면의 일회용 footer 와 다른 화면의 컴포넌트로는 만들지 않음 ·
+  Forge `create_ui` 순서, `forge_host()` 가 Forge 의 설정 · 프리셋 · 체크포인트 · 모듈 · Low Bits · 샘플러 · 스케줄러 목록과
+  `--freeze-settings` 를 읽는지), `tests/js/notebook_save_defaults.test.mjs`(버튼 자리 · Forge 기본 화면의 탭 줄엔 없음 · 다시 붙이기 ·
+  Apply 다음 프리셋 순서 · 두 번 눌림 막기 · 저장 중에도 키보드 포커스 · 두 파일의 개수를 따로 · 지난 결과 무시 · 시간 초과 · 거절
+  이유 · Settings 탭 없음 · Apply 오류 · 지난 Apply 의 오류가 남은 채 시작 · 같은 `No changes.` 반복 · 연결 실패 안내 · 결과 글 읽기 ·
+  0 으로 둔 칸을 툴팁에 적기 · CSS). 빠른 드롭다운: `tests/js/notebook_dropdown.test.mjs`(넓은 화면 3840/2560 · 묶음 추가 · 큰 화면에서 화면 밖 한 줄 · 짧은 목록 ·
+  위로 열기 · 휴대폰 폭 · 화살표 키 · 작은 창 800×420 의 위쪽 자리 · 양쪽 다 들어갈 때와 같을 때 아래 · 묶음이 붙거나 선택지가 새로
+  고쳐져도 ↑↓ 포커스 유지 — 새 10개 중 화살표 키를 뺀 9개는 0.32.1 코드에서 실패) · `test_notebook_assets.py`(소스 · CSS 고정).
+  돌연변이 확인: 위치 계산 5개(작은 창 · 높이 자르기 · 네 줄 기준 · 아래 우선 · 같을 때 아래) · 포커스 되돌리기 2개 · 저장 버튼 4개 ·
+  Gradio 연결 · `forge_host()` 5개 · 프리셋 0 유지 7개(늘 씀 · `<= 0`(NaN 빠짐) · 칸 하나 빠짐 · dcfg 더함 · 범위 검사 · 바뀐 것으로 셈 ·
+  저장값 대신 기본값) 모두 검출.
+- 물결표: `test_markdown_tildes.py`(8개 — 확장의 모든 `gr.Markdown` 글(소스에서 읽음) · README · CHANGELOG 에 코드 밖의 이스케이프 없는
+  물결표가 없는지(고치기 전 글에서 실패), 코드 칸 · 코드 블록 · 닫히지 않은 백틱 · 백슬래시 짝수/홀수, 일반 글자 칸(`label` · `info` ·
+  `gr.HTML` · 설정 라벨)에는 `\~` 가 없는지).
+- 전체(작업 트리, CPU): 3099 테스트 통과(건너뜀 185 — Forge 확장 폴더 안이나 모델 가중치가 있어야 도는 기존 테스트, 0.32.1 과
+  같음). Extra Samplers · Schedulers 묶음(`test_extra_s*.py`)은 건너뜀 없음. Forge 확장 폴더 안에서만 도는 통합 테스트
+  (`test_integration_*` — 모든 샘플러를 가이던스 묶음·SPEED·로드 순서로 돌림)는 Forge 코드 사본 옆에 확장을 둔 CPU 실행에서 3172 개
+  통과(건너뜀 30 — 하나 늘어난 것은 RES4LYF · sd_forge_neo_extra_samplers 가 설치된 Forge 에서만 도는 목록 순서 스냅숏 대조).
+  JS(`node --test tests/js/*.test.mjs`, Node 24.19): 249 개 중 248 통과(건너뜀 1 — Forge 의 `progressbar.js` 가 옆에 있어야 도는 진행
+  막대 테스트, 0.32.1 과 같음; 0.32.1 의 219 에 빠른 드롭다운 한 열 10 · 기본값 저장 20), `node --check javascript/*.js` 이상 없음. 통합 테스트용 하네스·로드 순서 프로브에 Forge 의 `k_diffusion.deis`·`modules.sd_samplers_extra` 를 넣고, 로드 순서
+  테스트의 샘플러·별칭·스케줄러 목록과 XYZ 축 수(`[Extra Samplers]` 2 → 3, `[Extra Schedulers (sam-extra)]` 4 → 7)를 0.33.0 에
+  맞췄습니다(프로브의 Forge 대역 목록은 Forge 의 순서로, 계열 순서는 `before_ui` 뒤 목록으로 확인).
+- 가이던스 묶음의 "배치 이미지 == 같은 시드 단독" 비교는 기존 항목이 그대로 1e-4 이고, IPNDM_V 만 5e-4 입니다: 가변 간격 계수(shift 3
+  후반 약 3.0 · −5.5 · 5.6 · −2.2, AB4 는 2.29 · −2.46 · 1.54 · −0.38)가 배치 크기에 따른 행렬곱 반올림 차이를 IPNDM 보다 약 5배 키워
+  4096 값 중 하나가 1.34e-4 였습니다. 배치 섞임이 없다는 것은 원소별 모델에서 결정적 항목 전부(IPNDM_V 포함)가 배치 이미지 == 단독을
+  비트 단위로 지키는 테스트(`test_extra_samplers_forge_path`)가 따로 확인합니다.
+
 ## v0.32.1 — Colorcraft 편집기 Type 표시 지연 · 화면 낭독기 접근성 · SPEED custom 스펙트럼 오류
 
 v0.32.0 의 공유 편집기에서 남았던 표시 지연을 고치고, 편집기를 화면 낭독기로 쓸 수 있게 했습니다. 생성 결과 · 스크립트 인자(67개) ·
@@ -95,7 +381,7 @@ v0.31.0 에서 들인 기능을 다듬은 판입니다. Colorcraft 패널을 수
     같습니다.
   - 패널의 67개 인자는 내부 형식입니다(script-info 에 보이지만 바뀔 수 있음). Python 에서 훅에 579개를 그대로 넘기는 호출은 그대로
     읽습니다.
-- **고침**: 패널 소개 글의 "M1~M10 … C1~C5" 가 취소선으로 보이던 것(Gradio 4.40 Markdown 이 `~` 쌍을 취소선으로 그림 — README 의 같은
+- **고침**: 패널 소개 글의 "M1\~M10 … C1\~C5" 가 취소선으로 보이던 것(Gradio 4.40 Markdown 이 `~` 쌍을 취소선으로 그림 — README 의 같은
   줄도 GitHub 에서 그랬음, `–` 로 바꿈), Masking · Debug 아코디언이 안의 체크박스와 같은 elem_id 를 쓰던 것(`…_masking_panel` ·
   `…_debug_panel` 로 바꿔 겹치는 id 4개 → 0).
 - **실제 Forge 대조 (Anima 3.8B, 1024², 50 스텝, ER SDE · Beta57, 시드 11)**: v0.31.0 패널로 만든 기준 4개 — Colorcraft 끔 ·
@@ -104,7 +390,7 @@ v0.31.0 에서 들인 기능을 다듬은 판입니다. Colorcraft 패널을 수
   배열은 UI 와 같은 이미지이고, 감싸지 않은 579개는 Colorcraft 없이(끈 것과 같은 이미지) `not applied: …` 상태를 남깁니다. XYZ
   `[Colorcraft] Exposure` 0 · 0.3 · −0.3 은 칸마다 값대로 따로 생성됐습니다. 실제 페이지 점검 94개 중 92개 통과 — 레이아웃 열 "켜짐"
   표시, 붙여 넣기 16개(↙ · PNG Info, 이 확장 · 원본 · 포크 키), Reload UI, img2img 독립. 나머지 2개는 항목을 바꿀 때 Type 드롭다운
-  글자가 약 0.35~0.49 초 뒤에 바뀌는 표시 지연이고(값 자체는 그보다 먼저 바뀌며 생성은 늘 맞음), 고치지 않았습니다.
+  글자가 약 0.35\~0.49 초 뒤에 바뀌는 표시 지연이고(값 자체는 그보다 먼저 바뀌며 생성은 늘 맞음), 고치지 않았습니다.
 - **한계**: 붙여 넣기는 조합 편집기에 놓이지 않고, 항목을 고른 뒤 약 2 프레임 안의 편집은 로드에 덮입니다(손으로는 닿지 않음). 선택 줄은
   라디오라 v0.31.0 탭의 tablist 역할이 없고 편집기 칸 이름에 항목이 붙지 않습니다(어느 항목인지는 고른 라디오와 `Reset II` 같은 버튼
   이름). 브라우저 전용 갱신 · 숨은 칸 · 라디오 change 같은 Gradio 4.40 동작에 기대므로 Gradio · Forge Neo 를 올리면 다시 확인해야
@@ -131,7 +417,7 @@ v0.31.0 에서 남겨 둔 실제 Forge 확인(설정을 켜고 헤드리스 Chro
   (`rgb(185,28,28)`)와 SAM Extra 테마는 그대로입니다.
 - **첫 스텝 전 미끄러짐**: 기본 방식 Smooth > Accurate 에서 서버 진행률이 0 인 첫 스텝 전(모델 불러오기 등)에도 막대 · 글자가 조금씩
   올라갔습니다(실측 14.3초 동안 7.7% — 막는 값이 없어 약 3분 반이면 99.2%). 이제 그동안 0% 에 머뭅니다. 상류에서 온 미끄러짐은
-  Smooth ~ Accurate 에만 남겼습니다.
+  Smooth \~ Accurate 에만 남겼습니다.
 - **끝과 복원의 글자**: 마지막 패스 뒤 Forge 의 `nextjob` 이 스텝을 0 으로 돌려 디코드 · 저장하는 동안 `0/20 • 99% • ?` 로 보이던
   것을 끝난 패스(`20/20`)로 보입니다. 새로 고친 뒤 Forge 의 Restore progress 로 붙은 작업이 0 에서 출발해 한참 뒤처지던 것(32/80
   스텝에서 `1%`, 실제 56% 일 때 `19%`)은 처음 '돌고 있음' 을 본 응답에서 그 자리로 옮깁니다(`29/80 • 37%`).
@@ -141,7 +427,7 @@ v0.31.0 에서 남겨 둔 실제 Forge 확인(설정을 켜고 헤드리스 Chro
   `In queue: 1/1`), 막대를 끄면 Forge 막대, Settings 의 Apply 로 바로 반영, 설정 변형(부드러움 세 방식 · 글자 형식 · 높이 · 색 · 중단
   표시 · 움직임 줄이기). `GET /sam-extra/progress`: 헤더 없음 403 · `X-SAM3-Notebook: 1` 200 · 257자 `id_task` 400 · POST 405,
   `no-store`, `/openapi.json` 에 없음. Forge Default 밝은 · 어두운 테마는 페이지 안에서 테마를 바꿔 확인했습니다. JS 43개(새 6개 —
-  5개는 고치기 전 코드에서 실패, 1개는 Smooth ~ Accurate 의 미끄러짐을 지킴), Python 62개(새 1개).
+  5개는 고치기 전 코드에서 실패, 1개는 Smooth \~ Accurate 의 미끄러짐을 지킴), Python 62개(새 1개).
 - **한계**: `--gradio-auth` · `--api-auth` 를 켠 실제 Forge(Gradio 4.40 앱 안에서만 확인: 쿠키 없음 401 · 로그인 200, 자격 없음 401 ·
   Basic 200), 배치 2 이상 · Hires, "Don't Interrupt in the middle", 숨은 탭에서 돌아온 뒤 맞추기는 실제 Forge 에서 보지 않았습니다.
   그대로 남은 것: 작업마다 마지막 1초쯤은 ETA 가 `?`(상류와 같음), 작업 시작 뒤 첫 응답까지 약 0.2초 글자가 빔, 페이지를 연 뒤 약
@@ -251,9 +537,9 @@ Sampler 에서 골랐을 때만 쓰이고, MCP 서버는 Forge 밖에서 따로 
   — Optimal Scale 도 이 열에 등록해, v0.30.x 처럼 '도구·실험' 묶음으로 가서 더 보기를 닫으면 숨지 않습니다).
   - 모델: Anima·Qwen-Image·Krea 2·Wan(krea2 벡터), Flux·Chroma·Lumina 2·Z-Image(zimage), Flux 2 Klein·ERNIE-Image(flux2).
     SD 1.5·SDXL 은 Contrast·Color Shift 만 동작하고 이유를 `SAM Extra Colorcraft status` 에 남깁니다.
-  - 수정자 스택 I~X: 탭마다 원본 노드 종류(Advanced·Basic·Luma·Chroma·Chroma Plus·Punch·Shift)와 자기 스케줄(Strength·
-    Start·End·Advanced Schedule), 적용 패스(Base·Hires·Both), 마스크를 고릅니다. Masking 에 축 마스크 M1~M10(clarity·
-    sharpness 디테일 축 포함, Blur·Spread·Normalize·Contrast)과 조합 C1~C5(and·or·subtract·xor), Debug 에 축 투영·마스크
+  - 수정자 스택 I\~X: 탭마다 원본 노드 종류(Advanced·Basic·Luma·Chroma·Chroma Plus·Punch·Shift)와 자기 스케줄(Strength·
+    Start·End·Advanced Schedule), 적용 패스(Base·Hires·Both), 마스크를 고릅니다. Masking 에 축 마스크 M1\~M10(clarity·
+    sharpness 디테일 축 포함, Blur·Spread·Normalize·Contrast)과 조합 C1\~C5(and·or·subtract·xor), Debug 에 축 투영·마스크
     미리보기가 있습니다.
   - 원본 노드와 비트 단위로 같습니다 — krea2·zimage·flux2 에서 20 가지 설정을 스케줄 σ 와 그 사이(2차 샘플러) 마다
     대조(Forge 의 실제 latent format 클래스, CPU). img2img·hires 는 Forge 가 실제로 도는 σ 구간(`sampling_sigmas[offset:]`)
@@ -329,7 +615,7 @@ Sampler 에서 골랐을 때만 쓰이고, MCP 서버는 Forge 밖에서 따로 
   Karras Dynamic · custom** 이 생겼습니다. Cosine 은 처음 내려가는 폭이 작고, CosineExponential blend 는 Cosine 으로 시작해
   Exponential 의 긴 꼬리로 끝나며, Phi 는 (1 − p)^(φ²) 곡선입니다(착상: Extraltodeus 의 Golden Scheduler). Laplace 는 ComfyUI
   `get_sigmas_laplace` 를 그대로 옮겨(arXiv:2407.03297) Forge 처럼 마지막 0 을 붙이고, 노드의 clamp 가 같은 시그마를 되풀이하면
-  (flow 모델은 기본 μ 0 에서 앞쪽 절반이 정확히 1) n 스텝을 같은 곡선 중 sigma min~max 안의 구간에 고르게 다시 놓습니다 — 되풀이가
+  (flow 모델은 기본 μ 0 에서 앞쪽 절반이 정확히 1) n 스텝을 같은 곡선 중 sigma min\~max 안의 구간에 고르게 다시 놓습니다 — 되풀이가
   없으면 노드와 비트 단위로 같고, β 가 0 이거나 곡선 전체가 그 범위 밖이면 μ/β 를 적은 오류로 멈춥니다(Anima 3.8B·28 스텝 실측:
   노드 그대로면 Res Multistep 은 검은 이미지(NaN), Euler 는 정상이지만 14 스텝이 버려짐 — 다시 놓으면 둘 다 정상). Karras Dynamic 은
   Karras 램프에 스텝마다 ρ + 2cos(2πi/n) 지수를 쓰며(ρ 기본 7, Karras 와 같이 쓰는 Settings 의 rho 로 바꿈 — 2 보다 커야 하고,
@@ -338,7 +624,7 @@ Sampler 에서 골랐을 때만 쓰이고, MCP 서버는 Forge 밖에서 따로 
   읽습니다. 기존 스케줄러는 그대로라 결과가 같습니다(결과 같음).
 - **custom 스케줄러**: txt2img·img2img 의 **Extra Schedulers** 아코디언(접힘, txt2img 는 ANIMA 튜닝 열의 Anima 3.8B 아래)에 적은
   식(`m` `M` `n` `s` `x` `phi` `pi` `e`, `+ − * / **`, `sqrt` `exp` `log` 등 함수)을 스텝마다 계산하거나, 시그마 목록(`[1.0, 0.6,
-  0.25, 0.1, 0.0]` — 1.0 으로 시작해 0.0 으로 끝나면 sigma max~min 으로 늘림)을 Forge 의 로그-선형 보간으로 스텝 수에 맞춥니다.
+  0.25, 0.1, 0.0]` — 1.0 으로 시작해 0.0 으로 끝나면 sigma max\~min 으로 늘림)을 Forge 의 로그-선형 보간으로 스텝 수에 맞춥니다.
   식은 파이썬으로 실행하지 않고 AST 화이트리스트 계산기로만 읽습니다 — 속성 접근·`__import__`·람다·컴프리헨션·문자열·64 를 넘는
   지수·500자 초과는 거절하고, 모든 계산은 유한한 float 이어야 합니다. 잘못된 식·목록은 생성을 오류로 멈춥니다(조용히 다른
   스케줄로 바꾸지 않음). 켜기 체크박스는 없고, 생성이 custom 이나 Laplace 를 쓸 때만 아코디언 값이 쓰입니다.
@@ -351,12 +637,12 @@ Sampler 에서 골랐을 때만 쓰이고, MCP 서버는 Forge 밖에서 따로 
   (Laplace 를 쓴 생성만, 둘 다)를 남기고 PNG Info 로 되살립니다. XYZ 축 `[Extra Schedulers (sam-extra)] Laplace mu`·`Laplace beta`·
   `Custom expression`·`Custom sigma list` 가 생겼습니다(쉼표가 든 값은 큰따옴표로, μ/β 가 슬라이더 범위 밖이면 그리드 시작 전에 알림).
   API 키는 `alwayson_scripts["Extra Schedulers (sam-extra)"]` 입니다(같은 이름의 아코디언을 가진 aoleg/Neo_ExtraSchedulers 와 겹치지 않게).
-- **한계**: Cosine · CosineExponential blend · Phi · Karras Dynamic 과 M~m 을 보간하는 custom 식(예: `m + (M - m) * (1 - x) ** 2`)은
+- **한계**: Cosine · CosineExponential blend · Phi · Karras Dynamic 과 M\~m 을 보간하는 custom 식(예: `m + (M - m) * (1 - x) ** 2`)은
   SD·SDXL 계열(eps/v) 모델용입니다. 모델의 시간 shift 없이 시그마 공간을 나눠 구도·대비가 잡히는 σ = 1 근처를 한두 스텝에
   지나가므로, Anima 3.8B(flow)에서는 물 빠진 듯 대비가 낮고 뿌연 이미지가 나옵니다. Forge 자체의 Karras·Exponential 도 같은
   모습이라(평균 밝기 ≈217·표준편차 ≈46, Linear Quadratic 은 ≈182·≈90) 버그가 아닙니다. flow 모델에는 Simple·Beta·Linear Quadratic,
   Laplace(기본 μ 0), 시간 shift 를 넣은 custom 식(예: `m + (M - m) * 3 * (1 - x) / (1 + 2 * (1 - x))` — shift 3 Simple 에 가까움)을
-  쓰세요. flow 모델에서 Laplace 의 μ 를 음수(−1.5·−2)로 두면 곡선이 한두 스텝 만에 1 에서 0.3~0.8 로 떨어져 Anima 에서는 물 빠진
+  쓰세요. flow 모델에서 Laplace 의 μ 를 음수(−1.5·−2)로 두면 곡선이 한두 스텝 만에 1 에서 0.3\~0.8 로 떨어져 Anima 에서는 물 빠진
   이미지가 나왔습니다. Laplace 는 Euler 계열 샘플러로 쓰세요 — Anima 에서는 마지막 스텝이 ≈0.19 에서 sigma min(≈0.003)으로 크게 뛰어, 2차
   multistep 샘플러인 Res Multistep 은 잔 입자가 남습니다(시간 shift custom 식도 Res Multistep 에서는 잔 입자가 조금).
   aoleg/Neo_ExtraSchedulers 로 만든 이미지는 README 에 적힌 이름이면 Schedule type 이 되살아나지만, 그 확장의 식·Laplace 값 infotext
@@ -383,7 +669,7 @@ Sampler 에서 골랐을 때만 쓰이고, MCP 서버는 Forge 밖에서 따로 
   방식으로(half-log-SNR) 옮겨 Anima·Flux 같은 flow 모델에서도 돕니다. 3차까지의 스텝은 Forge 3M SDE 와 비트까지 같습니다.
   옵션·Eta·Sigma noise·스케줄러(Automatic = exponential, 끝에서 두 번째 σ 버림)는 3M SDE 와 같습니다.
 - **Euler (SMEA) Dy CFG++**: Koishi-Star/Euler-Smea-Dyn-Sampler(Apache-2.0)의 Dy(2·3번째 스텝에 반 해상도 보조 스텝)·SMEA
-  (0번째 스텝 ×1.25 보조 스텝)를 Forge 의 CFG++ 갱신으로 바꾼 것입니다. CFG 1~2 를 권장합니다. churn 은 원본의 `max`
+  (0번째 스텝 ×1.25 보조 스텝)를 Forge 의 CFG++ 갱신으로 바꾼 것입니다. CFG 1\~2 를 권장합니다. churn 은 원본의 `max`
   대신 k-diffusion 의 `min` 이라 기본 설정(sigma churn 0)에서는 다시 잡음을 넣지 않습니다(원본과 다른 점). Anima(5차원
   latent)·flow 모델·인페인트 마스크·Anima 레퍼런스 latent 를 지원합니다. 보조 스텝은 Forge 의 스텝 카운터를 늘리지 않아
   프롬프트 편집(`[a:b:N]`)·Skip Early CFG·리파이너 스텝 전환이 밀리지 않습니다(원본은 보조 스텝마다 한 칸씩 밀림).
@@ -419,7 +705,7 @@ Sampler 에서 골랐을 때만 쓰이고, MCP 서버는 Forge 밖에서 따로 
 - **작업 전체 진행률**: 배치·Hires 패스를 합친 Forge 기본 막대와 같은 진행률과, 패스 종류별 스텝 평균·끝난 패스
   시간으로 잡은 작업 전체 ETA. 대기 중에는 Forge 의 대기열 글자.
 - **상류 버그 수정**: 중단 표시 네 가지 중 세 가지만 고를 수 있던 것, 생성이 아닌 클릭 뒤 `0/0` 에 멈추던 것,
-  높이 미제한(이제 10~50px), 보호 없는 localStorage(설정은 Forge 옵션으로), ETA 를 모를 때 Smooth > Accurate 가
+  높이 미제한(이제 10\~50px), 보호 없는 localStorage(설정은 Forge 옵션으로), ETA 를 모를 때 Smooth > Accurate 가
   99% 로 내달리던 것, 스텝 0 을 못 본 새 패스의 준비 시간이 스텝 시간에 섞이던 것.
 - **디자인 규칙**: 테마 색, 그라데이션·빛 번짐 없음, 움직이는 동안 DOM 노드를 넣고 빼지 않음(텍스트 노드
   `.data` 만), prefers-reduced-motion 존중. sd-webui-smooth-progress 가 함께 설치돼 있으면 이 막대는 물러납니다.
@@ -456,7 +742,7 @@ Sampler 에서 골랐을 때만 쓰이고, MCP 서버는 Forge 밖에서 따로 
 ### 구도 · 카메라 — 프롬프트로 시점 잡기 (새 기능, 토글 — 기본 켬, 결과 같음)
 
 - **구도 · 카메라 칸**: txt2img·img2img 스타일 줄 아래(기본 배치에서는 Generate 옆 열, txt2img 는 TIPO 칸 다음)에 접힌 칸이
-  생깁니다. 방향(−180~180°)·높이(−75~75°)·거리·크롭(0~100%)·기울기(−30~30°)·화면 내 인물 위치(−100~100%)를 프리셋 다섯 개·끌 수
+  생깁니다. 방향(−180\~180°)·높이(−75\~75°)·거리·크롭(0\~100%)·기울기(−30\~30°)·화면 내 인물 위치(−100\~100%)를 프리셋 다섯 개·끌 수
   있는 궤도 그림(방향키 5°, Shift 15°, Home 정면)·슬라이더로 정하면 `facing viewer`·`from above`·`cowboy shot`·`dutch angle`·
   `centered composition` 같은 태그·구도 문구를 미리 보여 주고, **메인 태그에 추가** 를 눌렀을 때만 메인 프롬프트 끝에 없는 태그만
   붙입니다. 3D 카메라가 아니라 프롬프트 유도입니다. 사용자 앱 UR_IV 의 `compositionPrompt.ts`·`CompositionControl.vue`(앱
@@ -488,7 +774,7 @@ Sampler 에서 골랐을 때만 쓰이고, MCP 서버는 Forge 밖에서 따로 
   고지 적용 목록에 저작권자를 더했으며 BSD 3-Clause·Apache 2.0 전문을 넣었습니다. Extra Schedulers 의 나머지 스케줄러는 식
   재구현이고, 두 기능이 이름을 맞춘 aoleg/Neo_ExtraSchedulers(라이선스 없음)의 코드는 쓰지 않았습니다(README 만 참고).
   `mcp_server/pyproject.toml` 의 라이선스는 `GPL-3.0-only AND MIT` 입니다. Colorcraft 색 벡터(`sam3ext/colorcraft/data/*.safetensors`,
-  1.4~6.4 KB)는 `.gitignore` 예외로 저장소에 함께 들어갑니다.
+  1.4\~6.4 KB)는 `.gitignore` 예외로 저장소에 함께 들어갑니다.
 - **검증**: Python 2841개 통과(skip 22 — 그중 5개는 MCP SDK 가 있어야 도는 등록 테스트, CPU). 새 테스트는 Colorcraft 139 ·
   Anima SPEED 132 · Extra Schedulers 146 · Extra Samplers 123 · 진행 막대 61 · MCP 312 · 구도·카메라 27 · 기능 조합 44 개입니다.
   JS 177개 통과(진행 막대 37개·Colorcraft 10개·구도·카메라 64개를 더함). 실제 Forge 에서는 위에 적은 Anima 3.8B GPU 실측과
@@ -548,7 +834,7 @@ v0.21.2 이후 쌓인 큰 업데이트입니다. Anima 3.8B(Qwen3.5 / Semantic C
 - NegPiP 가 이 확장에 들어왔습니다. 따로 설치한 `extensions/sd-forge-negpip` 는 지우고(또는 끄고) 재시작하세요 — 남아 있으면 내장 NegPiP 가
   쉬고 경고를 한 번 남깁니다(두 번 적용 방지). 예전 판(`b3673ce`)과 음수 항을 찾는 규칙이 조금 다르고, 새 Forge 에서 emphasis 가
   `None`/`Ignore` 면 Anima NegPiP 는 켜지지 않습니다(**NegPiP 내장** 절).
-- 메모리: 3.8B 는 생성 사이 VRAM 에 최대 약 6~8 GB 를 남기고(`sam3_anima38_keep_resident`), SAM3 'Unload after' 는 모델을 RAM 에 약
+- 메모리: 3.8B 는 생성 사이 VRAM 에 최대 약 6\~8 GB 를 남기고(`sam3_anima38_keep_resident`), SAM3 'Unload after' 는 모델을 RAM 에 약
   3.4 GB 로 보관합니다(`sam3_unload_keep_in_ram`). 3.8B 샘플링 중에는 커넥터 fp32 상주 (`sam3_anima38_connector_fp32`, VRAM 약
   +1.5 GB, 여유가 있을 때만)와 run 캐시(`sam3_anima38_connector_run_cache`, 최대 512 MB)도 씁니다. 넷 다 기본 켬이고 끌 수 있습니다.
 - 업데이트 뒤 첫 시작 때 `ui-config.json` 을 한 번 옮깁니다(Guidance 아코디언 슬라이더, Skimmed CFG `Flip at`, Tile-Repair 네거티브). Forge 는 저장된 슬라이더 값·범위를
@@ -588,9 +874,9 @@ v0.21.2 이후 쌓인 큰 업데이트입니다. Anima 3.8B(Qwen3.5 / Semantic C
   LoRA 패치를 받고 샘플링 직전마다 그 패스의 LoRA 세트에 맞춥니다. LoRA 세트가 바뀌어 Forge 가 UNet 을 새로 복제해도 커넥터가 Forge 메모리 관리 안에서 돕니다.
 - **VRAM 상주 (결과 같음, 토글, 기본 켬)**: 같은 프롬프트 줄이면(시드만 바꾸는 XYZ, batch count, 캐릭터 레퍼런스 후보, ADetailer) 0.6B TE 결과와
   Qwen3.5 인코딩을 줄 캐시에서 꺼내 다시 인코딩하지 않고, batch count 사이에는 설치를 유지합니다. 커넥터(약 1.6 GB)는 생성이 끝나도 VRAM 에 남고, TE(약 1.75
-  GB)·Qwen3.5(약 4.45 GiB)는 다음 샘플링에 쓸 여유가 있을 때만 남깁니다 — 합쳐 최대 약 6~8 GB. Forge 가 자리가 필요하면 퇴출하지만 Forge 밖의 VRAM
+  GB)·Qwen3.5(약 4.45 GiB)는 다음 샘플링에 쓸 여유가 있을 때만 남깁니다 — 합쳐 최대 약 6\~8 GB. Forge 가 자리가 필요하면 퇴출하지만 Forge 밖의 VRAM
   사용(SAM3 검출, 같은 GPU 의 학습)은 모릅니다. 학습과 같이 쓸 때는 Settings → **SAM Extra Anima 3.8B**(`sam3_anima38`) → "Anima 3.8B:
-  TE·Qwen3.5·커넥터를 생성 사이 VRAM 에 남기기 (최대 약 6~8 GB)"(`sam3_anima38_keep_resident`, 기본 켬)를 끄세요. 끄면 TE·Qwen3.5 는 인코딩
+  TE·Qwen3.5·커넥터를 생성 사이 VRAM 에 남기기 (최대 약 6\~8 GB)"(`sam3_anima38_keep_resident`, 기본 켬)를 끄세요. 끄면 TE·Qwen3.5 는 인코딩
   직후, 커넥터는 생성이 끝날 때 내립니다(3.8B 가 설치된 모델의 Forge TE 도 함께 — 줄 캐시로 올리지 않은 TE 까지 내리므로 다음 생성에서 TE 를 다시 올릴 수 있음. 3.8B 를
   설치하지 않은 생성은 영향 없음). 번들에 커넥터 전용 `llm_adapter` 사본이 없는 폴백에서는 결과를 지키려고 늘 내립니다.
 - **메모리 정리**: VRAM 이 모자라 Qwen3.5 가 부분 로드돼도 돕니다(RMSNorm 가중치 장치 불일치 수정). `qwen35_4b` 를 VAE/Text Encoder 목록에 넣어 두어도
@@ -653,7 +939,7 @@ v0.21.2 이후 쌓인 큰 업데이트입니다. Anima 3.8B(Qwen3.5 / Semantic C
 - **가중치 묶음 안의 `BREAK`·75토큰 넘는 음수 항 (결과 변화, 상류와 다름, SD1/SDXL)**: 상류는 `(글:-w)` 를 인코딩하면서 행 수는 맨 글(가중치 1)로
   셉니다. Forge 파서는 가중치가 1 이 아닌 묶음 안의 `BREAK` 를 청크 구분이 아닌 글자 `break` 로 남기므로 `(red eyes BREAK blue hair:-1.5)`·
   `(x BREAK y:-0.5)` 같은 항은 두 글의 청크 배치가 달랐습니다 — 새 Forge 에서는 `IndexError` 가 콘솔에 찍히고 NegPiP 가 조용히 꺼져 음수 항이
-  프롬프트에서 그냥 사라진 채 생성됐고, 옛 Forge·상류에서는 채움 EOS 와 다음 청크 BOS 76~77 행을 뒤집었습니다(`-1` 이면 뒤 단어를 잃음).
+  프롬프트에서 그냥 사라진 채 생성됐고, 옛 Forge·상류에서는 채움 EOS 와 다음 청크 BOS 76\~77 행을 뒤집었습니다(`-1` 이면 뒤 단어를 잃음).
   이제 인코딩한 바로 그 글자로 행을 세고, 옛 엔진도 새 엔진과 같은 행 규칙(엔진의 시작·끝 토큰을 건너뛴 단어 행 + 뒤 EOS)을 써 두 엔진이 같은
   행을 고릅니다 — 75토큰 이하·`BREAK` 없는 항은 예전(상류 자르기)과 한 행도 다르지 않고(Forge 설정 Emphasis 가 `None` 이면 예외:
   괄호·가중치가 글자로 인코딩되므로 이제 그 글자 행 전부를 잡습니다 — 상류는 맨 글 길이만큼 잘라 `(` 같은 앞 글자 행을 잡았습니다), 75토큰 넘는 항은 청크 경계의 채움·BOS 행 대신 단어
@@ -750,8 +1036,8 @@ v0.21.2 이후 쌓인 큰 업데이트입니다. Anima 3.8B(Qwen3.5 / Semantic C
   - **방식**: 순정(Forge/ComfyUI — 원본 가중치의 노름으로 나누고 대부분의 GPU 에서 fp16 이라 같은 파일이 학습 샘플과 다르게 나올 수 있었음)·**LyCORIS**(학습과
     같은 공식, 합친 가중치의 노름으로 나눔, fp32)·**Forge/Comfy 공식 · fp32**·**DoRA 끔**(크기 보정 없이 ΔW 만, 실험용).
   - **끼워 넣은 블록**: 작은 Anima LoRA 를 큰 모델에 얹을 때 복제되는 블록을 **그대로 복제**(순정, 기본)·**덧셈형** (끼워 넣은 블록만 DoRA 크기 보정을 뺌)·**넣지
-    않음**·**약한 복사**(덧셈형 복제본의 ΔW 를 0~1 배로, 범위 어텐션만 / 어텐션+MLP / 전체, 기본 0.12·어텐션만)로 채웁니다. 3.8B 의 끼워 넣은 블록은 출력 가중치가
-    작아 2.9B DoRA 를 그대로 복제하면 출력 투영이 레이어별로 자기 크기의 0.35~10.9배 바뀌지만, 렌더 비교(시드 3개)에서 덧셈형·넣지 않음이 순정보다 일관되게 낫지는 않아 기본은
+    않음**·**약한 복사**(덧셈형 복제본의 ΔW 를 0\~1 배로, 범위 어텐션만 / 어텐션+MLP / 전체, 기본 0.12·어텐션만)로 채웁니다. 3.8B 의 끼워 넣은 블록은 출력 가중치가
+    작아 2.9B DoRA 를 그대로 복제하면 출력 투영이 레이어별로 자기 크기의 0.35\~10.9배 바뀌지만, 렌더 비교(시드 3개)에서 덧셈형·넣지 않음이 순정보다 일관되게 낫지는 않아 기본은
     순정입니다.
   - **적용·기록**: 선택을 바꾸면 다음 생성에서 한 번 다시 합치고, 합친 상태를 모델에 표시해 Reload UI·체크포인트 전환 뒤에도 낡은 가중치를 쓰지 않습니다. infotext `DoRA
     mode`/`DoRA inserted`, 붙여 넣기, XYZ `[DoRA] Inference mode`·`[DoRA] Inserted blocks`·`[DoRA] Weak copy
@@ -785,10 +1071,10 @@ v0.21.2 이후 쌓인 큰 업데이트입니다. Anima 3.8B(Qwen3.5 / Semantic C
 - **Safe PAG 를 원본 노드와 같게 (결과 변화, 토글 없음)**:
   [iljung1106/comfyui-anima-safe-pag@905b0107](https://github.com/iljung1106/comfyui-anima-safe-pag) (MIT)
   기준입니다. PAG 의 Start/End 는 원본처럼 모델 스케줄의 σ 로 바꿔(`percent_to_sigma`, 양 끝 포함) 모델 호출마다 현재 σ 로 판정합니다. 예전에는 한 스텝 늦게
-  오르는 Forge 스텝 비율을 써서, Anima(shift 3)의 기본 구간 0.0~0.7(σ 1.0~0.5625)이 simple 스케줄 20·28·30 스텝에서 원본의 15·20·22 스텝이
+  오르는 Forge 스텝 비율을 써서, Anima(shift 3)의 기본 구간 0.0\~0.7(σ 1.0\~0.5625)이 simple 스케줄 20·28·30 스텝에서 원본의 15·20·22 스텝이
   아니라 14·19·21 스텝에 걸렸습니다. 이제 스텝 수·스케줄러·img2img denoise 가 달라도 원본과 같은 σ 구간이고 2차 샘플러의 중간 평가도 σ 로 판정합니다(predictor 가
   없는 모델만 예전 스텝 비율). SEG·SLG 는 원본 노드에 없는 기능이라 예전처럼 스텝 비율입니다. Attn Scale 상한을 15 → 100 으로 올렸고(슬라이더·API·XYZ),
-  블록·head 번호의 역범위(`20-18`)는 원본처럼 18~20 으로 읽습니다(예전에는 그 부분을 버림, SLG·DAVE 블록 칸도 같음). ControlNet 이 붙은 호출에서
+  블록·head 번호의 역범위(`20-18`)는 원본처럼 18\~20 으로 읽습니다(예전에는 그 부분을 버림, SLG·DAVE 블록 칸도 같음). ControlNet 이 붙은 호출에서
   PAG/SEG/SLG 를 쉬는 것은 원본에 없는 이 확장의 안전장치라, 실제로 막힌 패스의 infotext 에 `Anima Perturbation ControlNet guard` 를 남깁니다.
   `Anima Perturbation Guidance` infotext 에는 PAG σ 창(`pag_sigma_window=`)이 붙습니다.
 - **Skimmed CFG 를 원본 노드와 같게 (결과 변화, 토글 없음)**:
@@ -801,8 +1087,8 @@ v0.21.2 이후 쌓인 큰 업데이트입니다. Anima 3.8B(Qwen3.5 / Semantic C
   `ui-config.json` 에 저장된 예전 step 은 첫 시작 때 한 번 지웁니다.
 - **DCW·CWM·SMC 를 원본 DCW(+a) 와 같게 (결과 변화, 토글 없음)**:
   [namemechan/ComfyUI-DCW@66aaf9dd](https://github.com/namemechan/ComfyUI-DCW) 기준으로 기본값·범위를 맞췄습니다: DCW λ low
-  0.10 → 0.05(−0.5~0.5), λ high 0.02 → 0.01(범위 ±0.5 → ±0.3, step 0.001), CWM α low·high 0.30·0.15 → 0(범위 −1~1 →
-  −1~2, 원본 권장 시작값 low 0.1~0.3·high 0.1~0.2), SMC Custom λ 0.5~30(API·XYZ 값도 이 범위로 맞춤). CWM 은 원본처럼 α 가 0 이 아닐 때만
+  0.10 → 0.05(−0.5\~0.5), λ high 0.02 → 0.01(범위 ±0.5 → ±0.3, step 0.001), CWM α low·high 0.30·0.15 → 0(범위 −1\~1 →
+  −1\~2, 원본 권장 시작값 low 0.1\~0.3·high 0.1\~0.2), SMC Custom λ 0.5\~30(API·XYZ 값도 이 범위로 맞춤). CWM 은 원본처럼 α 가 0 이 아닐 때만
   CFG 를 바꾸므로 새 기본값에서는 켜도 표준 CFG 와 같습니다. SMC/APG/CWM 의 CFG 배율은 원본 cfg 훅처럼 Forge 가 넘기는 `cond_scale`(다른 CFG 함수가 없으면
   Forge 처럼 `edit_strength` 를 곱함)이고, incoming 결과를 최소제곱으로 맞춘 값은 진단(`[VERIFY]` 의 `w_fit`)과 비선형 CFG 경고에만 씁니다.
   RescaleCFG·Dynamic Thresholding 처럼 다른 확장이 `sampler_cfg_function` 을 걸어 두면 원본처럼 SMC·CWM 만 비키고(경고 1회) 그 결과를 둡니다 —
@@ -816,7 +1102,7 @@ v0.21.2 이후 쌓인 큰 업데이트입니다. Anima 3.8B(Qwen3.5 / Semantic C
   band-wise reverse drift compensation 을 Forge post-CFG 경로에 다시 작성했습니다. 원본처럼 따로 켜는 스위치가 없고 **Enable DCW 가 켜져 있고
   tau > 0** 일 때 DCW 의 Haar 변환 안에서 돕니다(DCW λ 를 둘 다 0 으로 두면 RDC 만). 이전 v0.30 개발 빌드의 Enable RDC 체크박스는 화면에서 뺐고, 그
   script argument 자리(58)는 남아 API 가 False 를 보내면 RDC 를 끄며 XYZ `[Anima RDC] Enable` 도 False 일 때만 끕니다.
-  `tau`(0~0.5)·`alpha LL`(기본 0.03)·`alpha HH`(기본 0)를 UI/XYZ/infotext(`Anima RDC`)에 모두 노출하고, 생성마다 EMA 를 초기화하며
+  `tau`(0\~0.5)·`alpha LL`(기본 0.03)·`alpha HH`(기본 0)를 UI/XYZ/infotext(`Anima RDC`)에 모두 노출하고, 생성마다 EMA 를 초기화하며
   해상도가 바뀌면 다시 시작합니다.
 - **DAVE 를 원본 노드와 같게 (결과 변화, 토글 없음)**:
   [sorryhyun/ComfyUI-Anima-DAVE@83143e8d](https://github.com/sorryhyun/ComfyUI-Anima-DAVE) (MIT) 의 초반 스텝 게이트를
@@ -837,14 +1123,14 @@ v0.21.2 이후 쌓인 큰 업데이트입니다. Anima 3.8B(Qwen3.5 / Semantic C
   `color_noise_wavelet` 을 `sam3ext/guidance/cns.py` 에 그대로 편입했습니다(GPL-3.0). Strength 가 1 보다 작으면 흰 노이즈와 `lerp` 로만
   섞고 표준편차를 다시 맞추지 않습니다(원본처럼 조금 낮아짐). 재색칠 기준 `x_t` 는 post-CFG 입력 대신 원본처럼 샘플러 스텝 callback 의 `x`(그 스텝의 시작 상태)를 쓰고,
   callback 을 감쌀 수 없는 샘플러에서만 예전처럼 post-CFG 입력을 씁니다(검증 로그 `x_t=callback|post_cfg`). 기본 Gamma scale 은 3.0 → 2.0,
-  범위도 원본대로입니다(Strength step 0.05, Gamma power 최소 0.1, Gamma scale 0.1~25 · step 0.1 — 원본 README 의 Anima +
+  범위도 원본대로입니다(Strength step 0.05, Gamma power 최소 0.1, Gamma scale 0.1\~25 · step 0.1 — 원본 README 의 Anima +
   euler_ancestral_cfg_pp 권장값 3.0 은 라벨에 적음). 이 스크립트가 붙은 패스의 샘플러가 도는 동안에만 색칠해, ADetailer 내부 img2img 같은 중첩 실행은 흰
   노이즈 그대로입니다.
 - **Detail Daemon 을 ComfyUI-Detail-Daemon 과 같은 값으로 (결과 변화, 토글 없음)**:
   [Jonseed/ComfyUI-Detail-Daemon@3394e44](https://github.com/Jonseed/ComfyUI-Detail-Daemon) 의 값과 σ 조회를 따르고, 노드가
   다루지 않는 Forge 동작은 muerrilla 원본을 따릅니다. 강도는 `σ × max(1e-6, 1 − 스케줄 × 0.1 × CFG)` 이고 CFG 는 hires 패스에서도 늘
   `p.cfg_scale` 입니다. 포크 때 빠졌던 ×0.1 을 되살려 같은 amount 가 노드의 `detail_amount` 와 같은 결과를 냅니다 — **v0.21.2 와 같은 강도는
-  amount × 10** 이고, 이를 위해 Amount 를 −1~1 → −5~5(기본 0.10)로 넓혔습니다. 원본에 없는 프리셋·Multiplier·CFG 결합 토글과 [0.05, 3] 클램프는
+  amount × 10** 이고, 이를 위해 Amount 를 −1\~1 → −5\~5(기본 0.10)로 넓혔습니다. 원본에 없는 프리셋·Multiplier·CFG 결합 토글과 [0.05, 3] 클램프는
   없앴습니다(API 위치 인자 1·10·12 자리는 남기고 읽지 않음). 스케줄 위치는 노드처럼 모델 호출마다 그 σ 를 샘플러가 도는 σ 목록에서 찾아(가장 가까운 칸, 칸 사이는 선형 보간)
   정하므로 Forge 스텝 번호의 한 스텝 지연이 없고, 2차 샘플러의 중간 평가도 노드와 같은 곡선 값을 읽습니다. txt2img 는 σ 목록 전체, img2img·hires 는 Forge 와 같은
   `steps − t_enc − 1` 칸부터 세고(`DDIM` 스케줄이 σ 를 스텝 수 + 2 개 내놓아도 맞음), ADetailer 내부 img2img·img2img-hires-fix 처럼 이
@@ -921,7 +1207,7 @@ v0.21.2 이후 쌓인 큰 업데이트입니다. Anima 3.8B(Qwen3.5 / Semantic C
 - **'Unload after' 가 모델을 CPU RAM 에 보관 (결과 같음, 토글, 기본 켬)**: 검출 뒤 VRAM 에서 내리는 것은 같지만 모델을 RAM 에 약 3.4 GB 로 남겨 다음
   검출은 GPU 로 옮기기만 합니다(재빌드·`sam3.pt` 재읽기 없음). 끄는 설정: Settings → **SAM Extra SAM3**(`sam3_mask`) → "'Unload after'
   뒤 SAM3 모델을 CPU RAM 에 보관 (약 3.4 GB)" (`sam3_unload_keep_in_ram`, 기본 켬). 끄면 VRAM·RAM 에서 모두 해제하고 다음 검출마다 다시 빌드해,
-  RAM 약 3.4 GB 를 아끼는 대신 이미지당 약 2.5~5 초(추정)가 더 듭니다. 끄고 Apply 하면 보관 중인 모델도 곧바로 해제하고, RAM 의 모델은 Reload UI·확장 언로드 때도
+  RAM 약 3.4 GB 를 아끼는 대신 이미지당 약 2.5\~5 초(추정)가 더 듭니다. 끄고 Apply 하면 보관 중인 모델도 곧바로 해제하고, RAM 의 모델은 Reload UI·확장 언로드 때도
   해제됩니다. 로그는 `model moved from VRAM to CPU RAM (moves back on next detection).` / `model released from VRAM and
   RAM (reloads on next detection).`(실패 경로는 `… after the failure …`)입니다. 체크포인트·장치를 바꾸면 옛 모델을 먼저 해제해 두 모델(약 7 GB)이
   GPU 에 함께 있던 순간이 없어지고, 같은 경로의 파일을 교체하면(mtime·크기) 새로 빌드합니다. 내부 API `unload_sam3()` 는 RAM 에 보관했는지(bool)를 돌려주고 선택
@@ -992,15 +1278,15 @@ v0.21.2 이후 쌓인 큰 업데이트입니다. Anima 3.8B(Qwen3.5 / Semantic C
 - **VAE 격자 제거 (새 기능, 기본 끔)**: txt2img·img2img 의 **Anima VAE DeGrid (NAFNet)** 아코디언과 Extras 탭 항목이 생겼습니다.
   [DraconicDragon/NAFNet-VAE-DeGrid](https://huggingface.co/DraconicDragon/NAFNet-VAE-DeGrid)(Apache-2.0, v1.1 권장,
   `models/ESRGAN` 또는 `models/DeGrid`)가 내는 **잔차**를 이미지에 더해 Qwen/Wan VAE 격자 무늬를 지웁니다. 방식은 Full / Dark Pixels
-  Mainly / Bright Pixels Mainly, 강도 0~1.5, 타일 크기(기본 512, 슬라이더 128 단위). 식·타일 위치·feather 가중치는 ComfyUI-NAFNet-Residual
-  의 NAFNet Restoration 노드와 같고(같은 입력 텐서로 비트 단위 대조 — 노드 전체와는 channels-last 입력 때문에 float 로 ~1e-6, 8비트는
+  Mainly / Bright Pixels Mainly, 강도 0\~1.5, 타일 크기(기본 512, 슬라이더 128 단위). 식·타일 위치·feather 가중치는 ComfyUI-NAFNet-Residual
+  의 NAFNet Restoration 노드와 같고(같은 입력 텐서로 비트 단위 대조 — 노드 전체와는 channels-last 입력 때문에 float 로 \~1e-6, 8비트는
   여기서 반올림·ComfyUI SaveImage 는 버림), 마지막 이미지만 [0,1] 로 자릅니다. 16 의 배수가 아닌 크기는 타일마다 반사 패딩해
   (노드·spandrel 은 0 으로 채워 오른쪽·아래 가장자리 잔차가 최대 56/255 까지 커짐) 가장자리도 안쪽과 비슷하고, 표준 Anima 크기는
   모든 타일이 16 의 배수라 노드와 같습니다. 목록에는 state dict 가 NAFNet 인 파일만 나오고(헤더만 읽음, 선언된 버전이 높은 v1.1 이
   기본값), 이미지를 내는 일반 복원 NAFNet 을 고르면 출력이 입력의 무늬(상관)나 밝기(채널별 평균)를 따라가는 것으로 알아채
   적용하지 않습니다(회색 입자 바탕·화면을 채운 스크린톤에서 흐림·median 모델의 상관이 낮아져도 밝기로 거름. 화면을 채운 잔
   스크린톤·1px 체커에서 DeGrid 잔차가 커지는 것은 입력과 반대로 움직이므로 거절하지 않음). 화면을 채운 1px 줄무늬 같은 무늬에서
-  잔차가 극단적으로 폭주하면(|평균| 100/255 초과 — 실측 183~2143/255. 어림 문턱이라 1px 체커·디더링은 그 아래에서도 망가질 수 있음) 그 이미지는 원본 그대로 두고
+  잔차가 극단적으로 폭주하면(|평균| 100/255 초과 — 실측 183\~2143/255. 어림 문턱이라 1px 체커·디더링은 그 아래에서도 망가질 수 있음) 그 이미지는 원본 그대로 두고
   `Anima DeGrid error: output blew up (…)` 을 남깁니다. 모델은 Forge venv 의 spandrel 로 불러옵니다. 모델 파일이 없으면 로그를
   남기고 건너뜁니다.
 - **`.pth` 목록·불러오기 안전**: 목록을 만들 때 `models/ESRGAN` 의 옛 형식 `.pth`(zip 이 아닌 pickle — 예: `4x-UltraSharp.pth`)를
@@ -1009,7 +1295,7 @@ v0.21.2 이후 쌓인 큰 업데이트입니다. Anima 3.8B(Qwen3.5 / Semantic C
   않고 pickle 속 전역도 부르지 않음), 옛 형식은 DeGrid 가 아니므로 열지 않습니다(디버그 로그 한 줄). 고른 모델은 Forge 가 감싸기 전
   로더(`torch.load_origin`·`safetensors.torch.load_file_origin`)에 `Path` 로만 넘깁니다 — Forge 가 감싼 로더는 실패하면 str 인자인
   파일을 `.corrupted` 로 이름을 바꿔 버립니다(이번 오류에서는 `Path` 를 넘겨 이름이 바뀌지 않았음). 목록 만들기는 헤더·`data.pkl` 만
-  읽어 파일 12개(.pth 3개·safetensors 6개)인 `models/ESRGAN` 에서 처음 25~49 ms(실측), 그다음은 캐시(1 ms 미만)입니다.
+  읽어 파일 12개(.pth 3개·safetensors 6개)인 `models/ESRGAN` 에서 처음 25\~49 ms(실측), 그다음은 캐시(1 ms 미만)입니다.
 - **순서**: 이미지마다 모든 always-on 스크립트의 `postprocess_image`(ADetailer·SAM3 인페인트 등)와 색 보정·인페인트 합성이 끝난 뒤,
   저장 직전(`postprocess_image_after_composite`)에 한 번 돕니다 — 설치 순서와 무관합니다. 메인 탭에 켠 Extras Upscale 보다는
   앞이고(`metadata.ini` 콜백 순서), SAM3·ADetailer 내부 패스에서는 돌지 않습니다. Extras 탭에서는 Upscale 보다 먼저 돕니다(항목 이름
@@ -1036,9 +1322,9 @@ v0.21.2 이후 쌓인 큰 업데이트입니다. Anima 3.8B(Qwen3.5 / Semantic C
   v1.1 가중치(CPU): Anima 1216×1856 에서 잔차 |평균| 약 0.5/255, 8비트 값이 바뀐 픽셀 약 44%(대부분 1 단계), CPU 로 약 6.5 초. VAE 를 거친 적 없는 합성 그림을 Qwen-Image VAE 로 왕복한 뒤 돌리면 PSNR
   36.7 → 37.7 dB. GPU(RTX 5090, Forge 생성 탭, 1216×1856 — 그때 기본이던 fp16 autocast): 결과가 같은 이미지에 오프라인으로
   돌린 DeGrid 와 비트 단위로 같고(8 쌍), SAM3 인페인트·ADetailer 가 끝난 이미지에 돌며(SAM3 내부 패스에서는 안 돎), DeGrid 단계는
-  한 장 0.77~0.96 초(모델 올리기·내리기 포함, Forge 를 켜고 처음은 4.1 초), VRAM 약 0.4 GB(가중치 111 MiB + 최대 활성 276~292 MiB).
-  계산만은 fp32 0.27~0.30 초·fp16 autocast 0.34~0.38 초이고, fp16 autocast 와 fp32 는 잔차가 최대 0.32~0.43/255(8비트로 픽셀
-  2~18% 가 1 단계) 다릅니다. ADetailer 복사본 재호출·정밀도 기본값·예전 설정 키 무시는 단위 테스트로 확인했습니다(fp32 기본으로
+  한 장 0.77\~0.96 초(모델 올리기·내리기 포함, Forge 를 켜고 처음은 4.1 초), VRAM 약 0.4 GB(가중치 111 MiB + 최대 활성 276\~292 MiB).
+  계산만은 fp32 0.27\~0.30 초·fp16 autocast 0.34\~0.38 초이고, fp16 autocast 와 fp32 는 잔차가 최대 0.32\~0.43/255(8비트로 픽셀
+  2\~18% 가 1 단계) 다릅니다. ADetailer 복사본 재호출·정밀도 기본값·예전 설정 키 무시는 단위 테스트로 확인했습니다(fp32 기본으로
   Forge 에서 다시 재지는 않음).
 
 ### txt2img 화면 · 도구
@@ -1063,8 +1349,8 @@ v0.21.2 이후 쌓인 큰 업데이트입니다. Anima 3.8B(Qwen3.5 / Semantic C
   슬라이더(기본 1024×1024) 대신 **Short Side**(기본 1024) 하나로 원본 비율을 지키고, 긴 변은 비율을 따라 두 변 모두 32 의 배수로 내립니다(최소 256). 디코드는
   sd-scripts 처럼 `(clamp(−1, 1) + 1) × 127.5` 를 uint8 로 잘라(예전에는 범위를 추정해 반올림) 픽셀 값이 1 씩 다를 수 있습니다. LLLite 목록에는
   safetensors 헤더로 가려낸 3채널(RGB) Anima LLLite 만 나오고(4채널 인페인트 LLLite·다른 ControlNet·`.safetensors` 가 아닌 파일은 빠짐), 기본은
-  가장 새 Tile & Repair 파일(v20)입니다. Multiplier 는 ComfyUI-Anima-LLLite 의 strength 와 같은 −10~10(step 0.01, 기본 1.0)이고
-  라벨이 바뀌어 저장된 예전 0~2 범위는 적용되지 않습니다. 네거티브 기본값은 sd-scripts 처럼 빈 칸이고, `ui-config.json` 에 예전 기본값(`blurry, low
+  가장 새 Tile & Repair 파일(v20)입니다. Multiplier 는 ComfyUI-Anima-LLLite 의 strength 와 같은 −10\~10(step 0.01, 기본 1.0)이고
+  라벨이 바뀌어 저장된 예전 0\~2 범위는 적용되지 않습니다. 네거티브 기본값은 sd-scripts 처럼 빈 칸이고, `ui-config.json` 에 예전 기본값(`blurry, low
   quality`)이 그대로 저장된 기존 설치는 첫 시작 때 한 번 빈 칸으로 옮깁니다(직접 적은 네거티브는 유지).
 - **Tile & Repair HTTP API (새 기능)**: `POST /sam-extra/tile-repair` 가 JSON 하나로 패널의 Tile-Repair 모드와 같은 실행을 합니다.
   `image`(base64 PNG·JPEG·WebP, `data:` 접두어 가능)만 필수이고 나머지 키(`model`, `prompt`, `negative_prompt`, `steps`,
@@ -1110,16 +1396,16 @@ v0.21.2 이후 쌓인 큰 업데이트입니다. Anima 3.8B(Qwen3.5 / Semantic C
 
 - **Anima 3.8B 커넥터 스텝 비용 (결과 같음, 토글 두 개, 기본 켬)**: Settings → **SAM Extra Anima 3.8B** 에 두 설정을 추가했습니다. 끄면 각각 예전
   경로 그대로이고, GPU 에서 둘 다 픽셀 단위로 같았습니다.
-  - "Anima 3.8B: 커넥터를 샘플링 동안 fp32 로 상주 (VRAM 약 +1.5 GB, 장당 약 1~2초 빨라짐)" (`sam3_anima38_connector_fp32`): Forge 가
+  - "Anima 3.8B: 커넥터를 샘플링 동안 fp32 로 상주 (VRAM 약 +1.5 GB, 장당 약 1\~2초 빨라짐)" (`sam3_anima38_connector_fp32`): Forge 가
     다 올린 뒤 커넥터를 fp32 로 한 번 바꿔 두고 스텝마다의 캐스트를 건너뜁니다. Forge 가 남긴 여유 안에서만 바꾸고, 내리거나 다시 패치할 때는 먼저 원래 dtype 으로 되돌립니다.
     바뀌면 콘솔에 `[Anima38] connector fp32 resident: +… MB VRAM` 이 한 번 찍힙니다.
-  - "Anima 3.8B: 커넥터의 timestep 무관 계산을 프롬프트 줄마다 한 번만 (VRAM 줄당 약 15~70 MB)" (`sam3_anima38_connector_run_cache`):
+  - "Anima 3.8B: 커넥터의 timestep 무관 계산을 프롬프트 줄마다 한 번만 (VRAM 줄당 약 15\~70 MB)" (`sam3_anima38_connector_run_cache`):
     의미 특징·source 의 K/V 와 첫 블록을 첫 스텝에 계산해 다시 씁니다(합계 최대 512 MB, 생성이 끝나면 버림). llm_adapter LoRA·번들이 바뀌면 다시 계산하고,
     커넥터가 TE 모듈을 같이 쓰는 폴백에서는 쓰지 않습니다.
   - GPU 시간(사용자 3.8B 설정, 부정 커넥터 켬, 두 번째 렌더): 둘 다 끔 44.3 초 / fp32 만 42.2 초 / 캐시만 43.3 초 / 둘 다 켬 41.7 초(참고: 커넥터
     Bypass 40.2 초).
 - **이 릴리즈의 성능 작업 전체**: 사용자 3.8B 설정 한 장이 47.9 → 41.7 초가 됐고, 기준 이미지(DoRA LyCORIS, 고정 시드)를 다시 렌더하면 픽셀 단위로 같습니다. 커넥터
-  fp32 상주·run 캐시와 VRAM 상주 외에 v2 run 텐서를 첫 스텝에만 올려 재사용하고 forward 당 GPU→CPU 동기화를 5~7회에서 1회로 줄였으며, Qwen3.5 의미 특징
+  fp32 상주·run 캐시와 VRAM 상주 외에 v2 run 텐서를 첫 스텝에만 올려 재사용하고 forward 당 GPU→CPU 동기화를 5\~7회에서 1회로 줄였으며, Qwen3.5 의미 특징
   캐시를 bf16 그대로 저장해 RAM 을 절반으로 줄였습니다.
 - **SAM3**: Detect/Exclude 토큰이 여러 개여도 이미지 백본은 이미지당 한 번만 돕니다. Mask Hull·Mask Outline Px (edge-aware)·작은 반경의 Mask
   Dilation 이 픽셀은 그대로 빨라졌습니다(성분이 많은 1536² Hull 1.1 초 → 약 0.006 초). 인페인트 패스마다 세 번 하던 `synchronize`+`empty_cache` 를
@@ -1189,11 +1475,11 @@ v0.21.0에서 미뤄둔 접근성·테스트 항목을 처리한 릴리즈. 기�
   레이블이 3.98:1, 컨트롤 테두리가 1.36:1이었습니다. tokens.css의 OKLCH 값을 sRGB로 변환해
   계산한 결과로 교체했습니다.
   - `--sam3-color-error-ink` 96% → 99%, 두 팔레트의 `--sam3-color-error` 59% → 58%로
-    취소 버튼 레이블을 **4.50~4.52:1**(WCAG 1.4.3 통과)로 올렸습니다.
+    취소 버튼 레이블을 **4.50\~4.52:1**(WCAG 1.4.3 통과)로 올렸습니다.
   - fast 드롭다운의 오류 표시가 채움용 `--sam3-color-error`를 텍스트 색으로 쓰던 것을
-    팔레트의 오류 텍스트 값 `--sam3-color-error-hover`(5.12~5.58:1)로 바로잡았습니다.
-  - **알려진 미해결**: `--sam3-color-rule`은 표면 대비 1.36~1.58:1로 컨트롤 경계 기준
-    3:1(WCAG 1.4.11)에 미달합니다. 입력 채움이 블록 배경과 1.03~1.07:1이라 테두리가 사실상
+    팔레트의 오류 텍스트 값 `--sam3-color-error-hover`(5.12\~5.58:1)로 바로잡았습니다.
+  - **알려진 미해결**: `--sam3-color-rule`은 표면 대비 1.36\~1.58:1로 컨트롤 경계 기준
+    3:1(WCAG 1.4.11)에 미달합니다. 입력 채움이 블록 배경과 1.03\~1.07:1이라 테두리가 사실상
     유일한 식별 수단이므로 면제도 성립하지 않습니다. 해소에는 밝기 30% → 약 48% 상향이
     필요해 팔레트의 의도적 시각 변경에 해당하므로 이 릴리즈에서는 문서화만 했습니다.
   - 본문·muted·오류 텍스트·취소 레이블 대비를 **테스트에서 직접 계산**해 고정했습니다.
@@ -1392,7 +1678,7 @@ Live 탭 전환 버벅임을 줄인 릴리즈. 코드 중복도 일부 정리.
   시점에 읽음)로 처리.
 - **비-Live 인-페이지 툴바 폐기**: 이전 `?sam3_live=off` 경로의 워크스페이스 툴바(Mode D)를 제거.
   `createToolbar`와 셸의 `기본 UI` 전환 버튼 삭제, `mountToolbar`는 Live 자식 프레임만 처리.
-  이후 호출자가 사라진 툴바 전용 헬퍼 함수 8개(`switchWorkspace`/`createWorkspace` 등, ~180줄)와
+  이후 호출자가 사라진 툴바 전용 헬퍼 함수 8개(`switchWorkspace`/`createWorkspace` 등, \~180줄)와
   `.sam3-workspace-*` 툴바 CSS(복원 상태 클래스 `.sam3-workspace-restoring` 제외)도 제거.
   워크스페이스 전환은 이제 Live 셸에서만 이뤄지며, 저장 로직·`실제 탭으로 열기`(네이티브 탭)는 유지.
 - **탭 전환 부드럽게(버벅임 완화)**:
@@ -1613,7 +1899,7 @@ Forge Neo 기본 파일을 수정하지 않고 한 탭에서 Workspace 1/2/3을 
 전체 코드 감사 후 상시/반복 비용만 안전하게 트림. 모든 기능 유지.
 
 - **매 생성 비용 ↓ (일반 non-Anima 포함)**: `Sam3MaskScript.process`가 SAM3 꺼짐 + XYZ
-  없음이면 ~50필드 payload 조립 + `Sam3Args` pydantic 검증을 **건너뜀**(early-return).
+  없음이면 \~50필드 payload 조립 + `Sam3Args` pydantic 검증을 **건너뜀**(early-return).
 - **매 스텝 비용 ↓**: `_post_cfg`가 합칠 게 없으면(예: Adaptive Guidance만 켜짐) `float()`
   왕복/latent 2회 할당 없이 즉시 반환.
 - **어텐션 콜당 비용 ↓**: 영구 설치되는 SDPA 래퍼가 원본을 `_STATE.get()` 대신 모듈 전역
@@ -1675,7 +1961,7 @@ Neo 코어 파일/기본 동작을 건드리지 않으며, 전 구간 try/except
 | **PAG / SEG / SLG** | 구조·디테일 강화 (perturbation guidance) | 있음(배치 접기) | Anima DiT |
 | **APG** | 높은 CFG 과채도·번짐 억제 | 없음 | 모든 모델 |
 | **Detail Daemon** | 질감·잔디테일↑, 배경 뽀샤시↓ | 없음 | 모든 모델 |
-| **Adaptive Guidance** | 후반 uncond 생략 → 무손실 속도↑ (~−27%) | 음수(생략) | 모든 모델 |
+| **Adaptive Guidance** | 후반 uncond 생략 → 무손실 속도↑ (\~−27%) | 음수(생략) | 모든 모델 |
 
 **Forge Neo 연동 (코어 수정 없음)** — 실제 샘플링이 `sampler_calc_cond_batch_function`을
 호출하지 않음을 소스에서 확인하고, 실제 호출되는 훅만 사용:
@@ -1690,7 +1976,7 @@ CFG couple). 값은 기본 쉽게(메인 슬라이더/프리셋) + 필요 시 �
 Perturbation(attn 택1·SLG 병용) + 크기보정(APG↔rescale) + Detail Daemon + Adaptive
 Guidance가 서로 다른 지점이라 안전하게 병용됩니다.
 
-**검증** — 전 스크립트 py_compile 통과. 수학 독립 검증: PAG `c_out` 복원(~3e-15), APG(eta=1→
+**검증** — 전 스크립트 py_compile 통과. 수학 독립 검증: PAG `c_out` 복원(\~3e-15), APG(eta=1→
 표준 CFG 정확 환원·eta=0 직교·norm clamp), 다중항+auto_decay guidance, Detail Daemon 스케줄,
 Adaptive Guidance 게이팅/재구성.
 

@@ -309,6 +309,22 @@ class NotebookAssetTests(unittest.TestCase):
         self.assertIn("아래로 스크롤하면 더 표시", self.script)
         self.assertNotIn("검색어를 더 입력하세요", self.script)
 
+    def test_fast_dropdown_popover_is_one_column(self):
+        """Decided with the user: one column that scrolls, never side-by-side columns.
+
+        Behaviour (sizes, placement above/below, paging, keys) is pinned in
+        tests/js/notebook_dropdown.test.mjs; this guards the source and the CSS.
+        """
+        start = self.script.index("function positionPopover()")
+        body = self.script[start:self.script.index("function openPopover(", start)]
+        self.assertIn('list.style.gridTemplateColumns = "minmax(0, 1fr)"', body)
+        for gone in ("idealColumns", "maxColumns", "columns = ", "repeat("):
+            self.assertNotIn(gone, body)
+        start = self.css.index(".sam3-fast-dropdown-options {")
+        block = self.css[start:self.css.index("}", start)]
+        self.assertIn("grid-template-columns: minmax(0, 1fr);", block)
+        self.assertIn("overflow-y: auto;", block)
+
     def test_original_forge_extra_network_tabs_are_restored_after_extraction(self):
         gallery_move = self.script.index(
             "galleryTarget.appendChild(gallerySection)"

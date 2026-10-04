@@ -66,9 +66,23 @@ README_LABELS: dict[str, str] = {
     "custom": "custom",
 }
 
+# reForge's label (Panchovix/stable-diffusion-webui-reForge 25a5fb38f), so "Schedule type: React Cosinusoidal
+# DynSF" in reForge images pastes here; the name is the one the desktop app is meant to compile to for ComfyUI
+# once its pack has a handler for it.
+LABEL_REACT_DYNSF = "React Cosinusoidal DynSF"
+# The name "flow_cosmos_rho7" is the schedule option of KeithZ117/Comfyui-anima-sampler (effba3c5), and the name the
+# desktop app is meant to compile to for ComfyUI once its pack has a handler for it. It needs Forge's model
+# (need_inner_model) to tell flow from eps/v.
+LABEL_FLOW_COSMOS_RHO7 = "Flow Cosmos rho7"
+# This extension's own: Karras Dynamic's per-step rho on Flow Cosmos rho7's sigma~ range (flow models), Karras Dynamic
+# itself on eps/v ones — with Flow Cosmos rho7's three accordion values. Needs Forge's model for the same reason.
+LABEL_FLOW_COSMOS_DYNAMIC = "Flow Cosmos Dynamic"
+
 # The labels are the ones specified for infotext compatibility ("Schedule type: <label>") with
 # aoleg/Neo_ExtraSchedulers; that extension has no license and its code was not read, so the match
 # rests on the specification, not on its source. Names are this extension's own (API/lookup keys).
+# React Cosinusoidal DynSF, Flow Cosmos rho7 and Flow Cosmos Dynamic (appended after the six) are not aoleg's: no README
+# alias. Forge shows them in family order anyway (sam3ext/list_order.py).
 SCHEDULER_SPECS: tuple[SchedulerSpec, ...] = (
     SchedulerSpec("cosine", "Cosine", schedulers.cosine, aliases=(README_LABELS["cosine"],)),
     SchedulerSpec("cosine_exponential", "CosineExponential blend", schedulers.cosine_exponential_blend,
@@ -78,11 +92,17 @@ SCHEDULER_SPECS: tuple[SchedulerSpec, ...] = (
     SchedulerSpec("karras_dynamic", "Karras Dynamic", schedulers.karras_dynamic,
                   default_rho=schedulers.KARRAS_DYNAMIC_RHO, aliases=(README_LABELS["karras_dynamic"],)),
     SchedulerSpec("custom", "custom", schedulers.custom, aliases=(README_LABELS["custom"],)),
+    SchedulerSpec("react_cosinusoidal_dynsf", LABEL_REACT_DYNSF, schedulers.react_cosinusoidal_dynsf),
+    SchedulerSpec("flow_cosmos_rho7", LABEL_FLOW_COSMOS_RHO7, schedulers.flow_cosmos_rho7, need_inner_model=True),
+    SchedulerSpec("flow_cosmos_dynamic", LABEL_FLOW_COSMOS_DYNAMIC, schedulers.flow_cosmos_dynamic,
+                  need_inner_model=True),
 )
 
 SCHEDULER_LABELS = tuple(spec.label for spec in SCHEDULER_SPECS)
 LABEL_LAPLACE = "Laplace"
 LABEL_CUSTOM = "custom"
+# The schedulers that read the accordion's Flow Cosmos rho / sigma max / sigma min.
+FLOW_COSMOS_LABELS = (LABEL_FLOW_COSMOS_RHO7, LABEL_FLOW_COSMOS_DYNAMIC)
 
 for _spec in SCHEDULER_SPECS:
     _spec.function._sam_extra_owner = OWNER

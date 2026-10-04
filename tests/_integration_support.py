@@ -456,8 +456,11 @@ class Harness:
     @contextlib.contextmanager
     def forge_environment(self, request):
         """``backend.args``, ``modules.rng`` / ``sd_samplers_common`` and Forge's k-diffusion module
-        with the request's ``TorchHijack`` (``Sampler.initialize``)."""
+        with the request's ``TorchHijack`` (``Sampler.initialize``), plus the two Forge modules extra samplers
+        resolve when they run: ``k_diffusion.deis`` (DEIS) and ``modules.sd_samplers_extra`` (UniPC bh2), both
+        executed read-only from Forge's files."""
         ks = forge_k()
+        deis, samplers_extra = esf.forge_deis(), esf.forge_sd_samplers_extra()
         previous = ks.torch
         ks.torch = FakeTorchHijack(request.rng)
         stub = forge_modules_stub()
@@ -465,7 +468,7 @@ class Harness:
             with fake_backend_args(), esf.installed_k_sampling(ks), _stub_modules({
                 "modules": stub, "modules.sd_samplers_common": stub.sd_samplers_common,
                 "modules.rng": _forge_rng_module(),
-            }):
+            }), esf.installed_k_diffusion_deis(deis), esf.installed_sd_samplers_extra(samplers_extra):
                 yield ks
         finally:
             ks.torch = previous
