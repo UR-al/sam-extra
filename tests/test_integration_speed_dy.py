@@ -28,6 +28,7 @@ import torch
 
 from sam3ext.extra_samplers import euler_dy, registry, substep_guard
 from sam3ext.extra_samplers.registry import LABEL_EULER_DY_CFG_PP, LABEL_EULER_SMEA_DY_CFG_PP
+from sam3ext.speed import forge_host as fh
 from sam3ext.speed import runner
 from tests import _integration_support as I
 
@@ -132,7 +133,7 @@ class SpeedDyTests(unittest.TestCase):
 
 
 class SpeedExtraSamplersTests(unittest.TestCase):
-    """The other three extra samplers under SPEED (Forge's own per-image noise, Brownian for 4M SDE)."""
+    """The non-Dy extra samplers under SPEED (Forge's own per-image noise, Brownian for 4M SDE / 2M SDE Heun)."""
 
     @classmethod
     def setUpClass(cls):
@@ -144,11 +145,15 @@ class SpeedExtraSamplersTests(unittest.TestCase):
         self.scripts.teardown()
 
     def test_er_sde_and_dpmpp_4m_sde(self):
+        """Every non-Dy entry: SPEED runs it in segments, except an entry SPEED refuses by function name
+        (``forge_host.UNSUPPORTED_SAMPLERS`` — UniPC bh2, Forge's UniPC under another name): that one runs
+        unsegmented at full size with the refusal in ``Anima SPEED status``."""
         for spec in registry.SPECS:
             if spec.kind == "dy":
                 continue
             brownian = bool(spec.options.get("brownian_noise"))
             runtime = (lambda s: (lambda request: registry.runtime_kwargs(s, request)))(spec)
+            refused = fh.UNSUPPORTED_SAMPLERS.get(spec.func.__name__)
             for mode in MODES:
                 with self.subTest(sampler=spec.label, mode=mode):
                     outs = {}
@@ -157,9 +162,15 @@ class SpeedExtraSamplersTests(unittest.TestCase):
                                                  hooks={"speed": I.speed_args(mode=mode)},
                                                  sampler_kwargs={"runtime": runtime})
                         self.scripts.teardown()
+                        self.assertTrue(torch.isfinite(result.out).all())
+                        if refused is not None:
+                            self.assertTrue(I.speed_status(result.request).startswith(f"base: skipped - {refused}"),
+                                            I.speed_status(result.request))
+                            self.assertEqual({c.shape[-2:] for c in result.calls}, {(16, 16)})
+                            outs[seeds] = result.out
+                            continue
                         self.assertTrue(I.speed_status(result.request).startswith(f"base: applied ({mode})"))
                         self.assertEqual(result.seen, list(range(10)))
-                        self.assertTrue(torch.isfinite(result.out).all())
                         self.assertEqual({c.shape[-2:] for c in result.calls}, {(8, 8), (16, 16)})
                         outs[seeds] = result.out
                     torch.testing.assert_close(outs[(31, 32)][:1], outs[(31,)], atol=1e-4, rtol=1e-4)

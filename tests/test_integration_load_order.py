@@ -11,6 +11,8 @@ several scripts install hooks when imported. Checked here:
 * ``negpip.py`` is still the extension's last script, Colorcraft loads after every script that
   prepares the UNet or the sampler before it;
 * the extra samplers and schedulers are each registered once, also after a reload;
+* ``scripts/list_order.py`` sorts both lists by family in ``on_before_ui`` (after every script has
+  registered), Forge's first entries stay first, and a reload sorts nothing differently;
 * XYZ axis labels are unique (Forge's built-in ones included) and a reload neither duplicates nor drops
   any — with a reloaded XYZ grid and with one a host kept;
 * settings keys are unique, each section id has one title (and each title one id);
@@ -45,9 +47,36 @@ from sam3ext import layout_lanes  # noqa: E402
 
 NEW_SCRIPTS = ("colorcraft.py", "anima_speed.py", "anima_extra_samplers.py", "anima_extra_schedulers.py",
                "appearance_progress_bar.py", "mcp_settings.py")
-OUR_SAMPLERS = ("ER SDE (Reverse-time)", "ER SDE (ODE)", "DPM++ 4M SDE", "Euler Dy CFG++", "Euler SMEA Dy CFG++")
-OUR_SCHEDULERS = ("Cosine", "CosineExponential blend", "Phi", "Laplace", "Karras Dynamic", "custom")
-NEW_XYZ_PREFIXES = {"[Colorcraft]": 14, "[Anima SPEED]": 6, "[Extra Samplers]": 2, "[Extra Schedulers (sam-extra)]": 4}
+OUR_SAMPLERS = (
+    "ER SDE (Reverse-time)", "ER SDE (ODE)", "DPM++ 4M SDE", "Euler Dy CFG++", "Euler SMEA Dy CFG++",
+    # v0.33.0 (UniPC bh2 and DEIS need Forge's modules.sd_samplers_extra / k_diffusion.deis: the probe has them)
+    "ER SDE (Tunable)", "Euler Dy", "Euler SMEA Dy", "DPM++ 2M SDE Heun", "DPM++ 2M (flow ODE)",
+    "DPM++ 2M Heun (flow ODE)", "DPM++ 3M (flow ODE)", "UniPC bh2", "CFG++ UD10 AB", "IPNDM", "IPNDM_V", "DEIS",
+    "Restart (flow)",
+)
+OUR_SAMPLER_ALIASES = (
+    "er_sde_reverse_time", "er_sde_ode", "dpmpp_4m_sde", "euler_dy_cfg_pp", "euler_smea_dy_cfg_pp",
+    "er_sde_tunable", "euler_dy", "k_euler_dy", "euler_smea_dy", "k_euler_smea_dy", "dpmpp_2m_sde_heun",
+    "k_dpmpp_2m_sde_heun", "dpmpp_2m_flow_ode", "dpmpp_2m_heun_flow_ode", "dpmpp_3m_flow_ode", "uni_pc_bh2",
+    "cfgpp_ud10_ab", "ipndm", "ipndm_v", "deis", "restart_flow",
+)
+OUR_SCHEDULERS = ("Cosine", "CosineExponential blend", "Phi", "Laplace", "Karras Dynamic", "custom",
+                  "React Cosinusoidal DynSF", "Flow Cosmos rho7", "Flow Cosmos Dynamic")
+NEW_XYZ_PREFIXES = {"[Colorcraft]": 14, "[Anima SPEED]": 6, "[Extra Samplers]": 3, "[Extra Schedulers (sam-extra)]": 7}
+# The probe's Forge stand-in (DPM++ 2M, Euler a, Euler, ER SDE / Automatic, Karras, Exponential) plus ours,
+# after scripts/list_order.py (sam3ext/list_order.py: the families of the table, Forge's first entry first).
+FAMILY_ORDER_SAMPLERS = (
+    "DPM++ 2M", "DPM++ 2M SDE Heun", "DPM++ 4M SDE", "DPM++ 2M (flow ODE)", "DPM++ 2M Heun (flow ODE)",
+    "DPM++ 3M (flow ODE)",
+    "Euler", "Euler a", "Euler Dy", "Euler SMEA Dy", "Euler Dy CFG++", "Euler SMEA Dy CFG++", "CFG++ UD10 AB",
+    "ER SDE", "ER SDE (Reverse-time)", "ER SDE (ODE)", "ER SDE (Tunable)",
+    "IPNDM", "IPNDM_V", "DEIS",
+    "UniPC bh2",
+    "Restart (flow)",
+)
+FAMILY_ORDER_SCHEDULERS = ("Automatic", "Karras", "Karras Dynamic", "Flow Cosmos rho7", "Flow Cosmos Dynamic",
+                           "Exponential", "Cosine", "CosineExponential blend", "Phi", "Laplace",
+                           "React Cosinusoidal DynSF", "custom")
 
 
 def _duplicates(items):
@@ -101,21 +130,41 @@ class LoadOrderTests(unittest.TestCase):
 
     def test_samplers_and_schedulers_are_registered_once(self):
         r = self.report
-        for key in ("samplers", "reload_samplers"):
+        for key in ("samplers_at_load", "samplers", "reload_samplers"):
             self.assertEqual(_duplicates(r[key]), [], key)
             for label in OUR_SAMPLERS:
                 self.assertEqual(r[key].count(label), 1, (key, label))
-            self.assertEqual(r[key][:4], ["Euler", "Euler a", "ER SDE", "DPM++ 2M"], "Forge's own stay first")
+        # registered after Forge's own (the order before scripts/list_order.py's before_ui callback)
+        self.assertEqual(r["samplers_at_load"][:4], ["DPM++ 2M", "Euler a", "Euler", "ER SDE"], "Forge's own first")
+        self.assertEqual(sorted(r["samplers_at_load"][4:]), sorted(OUR_SAMPLERS))
         self.assertEqual(r["reload_samplers"], r["samplers"])
-        for alias in ("er_sde_reverse_time", "er_sde_ode", "dpmpp_4m_sde", "euler_dy_cfg_pp", "euler_smea_dy_cfg_pp"):
+        for alias in OUR_SAMPLER_ALIASES:
             self.assertIn(alias, r["reload_samplers_map"])
         for key in ("schedulers", "visible_schedulers", "reload_schedulers", "reload_visible_schedulers"):
             self.assertEqual(_duplicates(r[key]), [], key)
             for label in OUR_SCHEDULERS:
                 self.assertEqual(r[key].count(label), 1, (key, label))
         self.assertEqual(r["reload_schedulers"], r["schedulers"])
-        for name in ("cosine", "karras_dynamic", "laplace", "custom", "karras dynamic"):
+        for name in ("cosine", "karras_dynamic", "laplace", "custom", "karras dynamic", "react_cosinusoidal_dynsf",
+                     "flow_cosmos_rho7", "flow_cosmos_dynamic"):
             self.assertIn(name, r["reload_scheduler_map"])
+
+    def test_before_ui_sorts_the_lists_by_family(self):
+        r = self.report
+        self.assertIn("list_order.py", r["order"])
+        self.assertLess(r["order"].index("list_order.py"), r["order"].index("negpip.py"))
+        for key in ("samplers", "visible_samplers", "reload_samplers"):
+            self.assertEqual(r[key], list(FAMILY_ORDER_SAMPLERS), key)
+        for key in ("schedulers", "visible_schedulers", "reload_schedulers", "reload_visible_schedulers"):
+            self.assertEqual(r[key], list(FAMILY_ORDER_SCHEDULERS), key)
+        self.assertEqual(sorted(r["schedulers_at_load"]), sorted(FAMILY_ORDER_SCHEDULERS))
+        self.assertNotEqual(r["schedulers_at_load"], list(FAMILY_ORDER_SCHEDULERS), "the probe would not see a sort")
+        self.assertNotEqual(r["samplers_at_load"], list(FAMILY_ORDER_SAMPLERS), "the probe would not see a sort")
+        # the maps keep their keys (also after the reload)
+        for key in ("samplers_map", "reload_samplers_map"):
+            self.assertEqual(r[key], r["samplers_map_at_load"], key)
+        for key in ("scheduler_map", "reload_scheduler_map"):
+            self.assertEqual(r[key], r["scheduler_map_at_load"], key)
 
     def test_xyz_axes_are_unique_across_reloads(self):
         r = self.report

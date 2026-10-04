@@ -10,9 +10,10 @@ checkout, ``k_diffusion.sampling`` is Forge's file, the XYZ grid starts with the
 ``scripts/xyz_grid.py``. The probe
 
 1. executes the script files in Forge's order (sorted file names in one extension) and records every
-   ``script_callbacks.on_*`` registration;
+   ``script_callbacks.on_*`` registration and the sampler / scheduler lists as registered;
 2. runs the ``on_ui_settings`` callbacks (option keys, sections), the ``on_before_ui`` callbacks
-   against the XYZ grid (axis labels), the ``on_app_started`` callbacks on a FastAPI app (routes);
+   against the XYZ grid (axis labels) and the sampler / scheduler lists (``scripts/list_order.py`` sorts
+   them by family there), the ``on_app_started`` callbacks on a FastAPI app (routes);
    instantiates every always-visible ``Script`` (title, ``section`` on txt2img);
 3. simulates **Reload UI**: the script files are executed again (new module objects; ``sam3ext`` and
    Forge's modules stay imported), the callbacks registered anew run again — before_ui on a reloaded
@@ -133,13 +134,14 @@ class Options(types.SimpleNamespace):
 
 
 def forge_samplers_module(shared):
-    """``modules.sd_samplers`` with Forge's own ``set_samplers`` / ``add_sampler`` and a few built-ins."""
+    """``modules.sd_samplers`` with Forge's own ``set_samplers`` / ``add_sampler`` and a few built-ins (in the
+    order of Forge's list, whose first entry DPM++ 2M is the default)."""
     common = types.ModuleType("modules.sd_samplers_common")
     common.SamplerData = collections.namedtuple("SamplerData", ["name", "constructor", "aliases", "options"])
     samplers = types.ModuleType("modules.sd_samplers")
     samplers.shared = shared
     samplers.all_samplers = [common.SamplerData(name, None, [alias], {}) for name, alias in (
-        ("Euler", "k_euler"), ("Euler a", "k_euler_a"), ("ER SDE", "er_sde"), ("DPM++ 2M", "k_dpmpp_2m"))]
+        ("DPM++ 2M", "k_dpmpp_2m"), ("Euler a", "k_euler_a"), ("Euler", "k_euler"), ("ER SDE", "er_sde"))]
     samplers.all_samplers_map = {x.name: x for x in samplers.all_samplers}
     samplers.samplers, samplers.samplers_for_img2img, samplers.samplers_map, samplers.samplers_hidden = [], [], {}, {}
     for name in ("set_samplers", "add_sampler"):
@@ -193,6 +195,8 @@ class Webui:
         self.persistent.update({
             "modules.shared": shared, "modules.sd_samplers_common": common, "modules.sd_samplers": samplers,
             "modules.sd_samplers_kdiffusion": kdiffusion, "modules.sd_schedulers": forge_schedulers_module(),
+            # Forge's own modules two extra samplers check at registration (UniPC bh2, DEIS), read-only
+            "modules.sd_samplers_extra": esf.forge_sd_samplers_extra(),
         })
         shared.OptionInfo = OptionInfo
         shared.state = types.SimpleNamespace(sampling_step=0, sampling_steps=0, job="", job_count=0,
@@ -200,6 +204,7 @@ class Webui:
         shared.cmd_opts = types.SimpleNamespace()
         shared.sd_model = None
         self.k_sampling = esf.forge_k_sampling()
+        self.k_deis = esf.forge_deis()
 
     def stubs(self, xyz):
         modules = types.ModuleType("modules")
@@ -243,6 +248,7 @@ class Webui:
         k_package = types.ModuleType("k_diffusion")
         k_package.__path__ = []
         k_package.sampling = self.k_sampling
+        k_package.deis = self.k_deis
         # sam3ext.negpip.anima / .sd patch Forge's text engines on import: stand-ins (tests/test_negpip_script.py)
         negpip_anima = types.ModuleType("sam3ext.negpip.anima")
         negpip_anima.patch_anima_negpip = lambda *a, **k: None
@@ -252,7 +258,7 @@ class Webui:
             "modules": modules, "modules.scripts": scripts, "modules.script_callbacks": callbacks,
             "modules.processing": processing, "modules.scripts_postprocessing": postprocessing,
             "modules.prompt_parser": prompt_parser, "modules.ui_components": ui_components,
-            "k_diffusion": k_package, "k_diffusion.sampling": self.k_sampling,
+            "k_diffusion": k_package, "k_diffusion.sampling": self.k_sampling, "k_diffusion.deis": self.k_deis,
             "sam3ext.negpip.anima": negpip_anima, "sam3ext.negpip.sd": negpip_sd,
             **self.persistent,
         }
@@ -360,6 +366,13 @@ def main():
     report["forge_xyz"] = [option.label for option in xyz.axis_options]
     stubs, scripts_module, callbacks, loaded, failed = load_all(webui, xyz, 1)
     report["load_failed"] = failed
+    samplers = webui.persistent["modules.sd_samplers"]
+    schedulers = webui.persistent["modules.sd_schedulers"]
+    # registration order, before the on_before_ui callbacks (scripts/list_order.py sorts the lists there)
+    report["samplers_at_load"] = [x.name for x in samplers.all_samplers]
+    report["schedulers_at_load"] = [x.label for x in schedulers.all_schedulers]
+    report["samplers_map_at_load"] = sorted(samplers.samplers_map)
+    report["scheduler_map_at_load"] = sorted(schedulers.schedulers_map)
     report["callbacks"] = sorted({name for name, _ in callbacks.registered})
     report["settings_errors"] = run_callbacks(stubs, callbacks, "on_ui_settings")
     report["options"] = list(webui.options)
@@ -368,9 +381,10 @@ def main():
     report["app_errors"] = run_callbacks(stubs, callbacks, "on_app_started", demo, app)
     report["routes"] = routes(app)
     report["scripts"] = scripts_info(stubs, scripts_module, loaded)
-    samplers = webui.persistent["modules.sd_samplers"]
-    schedulers = webui.persistent["modules.sd_schedulers"]
     report["samplers"] = [x.name for x in samplers.all_samplers]
+    report["visible_samplers"] = [x.name for x in samplers.samplers]
+    report["samplers_map"] = sorted(samplers.samplers_map)
+    report["scheduler_map"] = sorted(schedulers.schedulers_map)
     report["schedulers"] = [x.label for x in schedulers.all_schedulers]
     report["visible_schedulers"] = [x.label for x in schedulers.schedulers]
 

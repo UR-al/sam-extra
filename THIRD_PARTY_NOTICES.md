@@ -445,12 +445,46 @@ DWT 의 r ≠ 2 를 미리 거절 · 상태를 클래스가 아닌 요청(p)에 
 `sam3ext/extra_samplers/er_sde.py` 의 `reverse_time_sde_noise_scaler`·`ode_noise_scaler`·`er_sde_kwargs` 는 ComfyUI
 (`comfyanonymous/ComfyUI`, commit `36c0b0a687e5e6d7b55e3e61ab24262ffc0f2508`) `comfy_extras/nodes_custom_sampler.py` 585-633줄
 `SamplerER_SDE` 의 두 잡음 척도(h(λ)=λ^(η+1), h(λ)=λ)와 ODE 규칙(`solver_type == "ODE" or eta == 0` → `s_noise = 0`),
-`sample_er_sde` 에 넘기는 세 인자를 옮긴 것입니다. 풀이 자체는 Forge 내장 `sample_er_sde`(ComfyUI v0.3.75 사본)를 그대로 부릅니다.
-달라진 곳은 η·stage 를 노드 입력 대신 Extra Samplers 아코디언에서 받고 노드 범위(stage 1–3, η 0–10)로 자르는 것과, 노드의
-ER-SDE 선택지는 Forge 내장 ER SDE 이므로 다시 두지 않은 것입니다. `tests/_origin_comfyui_er_sde.py` 는 위 585-633줄과 같은
-커밋 `comfy/k_diffusion/sampling.py` 78-88·152-176·1592-1656줄을 바꾸지 않고 담은 대조 오라클입니다(블록마다 SHA-256 고정,
-첫 블록 앞의 테스트용 대역 코드는 상류 코드가 아님). 원본은 이 확장과 같은 GPL-3.0 입니다. 바탕 논문: Cui et al.,
-"Elucidating the Solution Space of Extended Reverse-Time SDE for Diffusion Models", [arXiv:2309.06169](https://arxiv.org/abs/2309.06169).
+`sample_er_sde` 에 넘기는 세 인자를 옮긴 것입니다. 0.33.0 의 `ER SDE (Tunable)` 이 쓰는 세 번째 척도 `er_sde_noise_scaler`
+(h(λ)=λ·(e^(λ^0.3)+10)^η, 노드의 `ER-SDE` 선택지)는 그 척도를 처음 넣은 commit `40e46c711025947f126cccaa1a692a14937a3096`
+(PR #15428 "Extend ER-SDE noise scaler by scaling h(t)", 2026-08-09)의 같은 줄에서 옮겼습니다(두 커밋의 585-633줄은 바이트 단위로
+같음). 풀이 자체는 Forge 내장 `sample_er_sde`(ComfyUI v0.3.75 사본)를 그대로 부릅니다. 달라진 곳은 η·stage 를 노드 입력 대신
+Extra Samplers 아코디언에서 받고 노드 범위(stage 1–3, η 0–10)로 자르는 것과, 이 확장이 새로 쓴 잡음 구간(아래 참고 출처 표,
+`sam3ext/extra_samplers/er_sde_window.py`)입니다. `tests/_origin_comfyui_er_sde.py` 는 위 585-633줄과 같은 커밋
+`comfy/k_diffusion/sampling.py` 78-88·152-176·1592-1656줄을, `tests/_origin_comfyui_er_sde_eta.py` 는 40e46c71 의 585-633줄을
+바꾸지 않고 담은 대조 오라클입니다(블록마다 SHA-256 고정, 첫 블록 앞의 테스트용 대역 코드는 상류 코드가 아님). 원본은 이 확장과
+같은 GPL-3.0 입니다. 바탕 논문: Cui et al., "Elucidating the Solution Space of Extended Reverse-Time SDE for Diffusion Models",
+[arXiv:2309.06169](https://arxiv.org/abs/2309.06169).
+
+## ComfyUI — CFG++ UD10 AB (GPL-3.0)
+
+`sam3ext/extra_samplers/cfgpp_ud10_ab.py` 의 `sample_cfgpp_history`·`sample_cfgpp_ud10_ab` 은 ComfyUI(`comfyanonymous/ComfyUI`, commit
+`3ac5d7941dfa2504555260512132d1cb5664648d`, PR #15951 "Add cfgpp_ud10_ab sampler.") `comfy/k_diffusion/sampling.py` 419-484줄
+`_sample_cfgpp_history`·`sample_cfgpp_ud10_ab` 을 옮긴 것입니다(387f98aa 까지 바뀌지 않음). 루프·이력·`torch.lerp` 혼합·AB2 계수·
+σ=0 외삽(1·2차)·세 가중치(0.25·1.0·0.1)는 원본 식 그대로입니다. 바꾼 곳(파일 머리 주석에 적음): 모델 샘플링을 Forge 의
+`model.inner_model.predictor` 에서 읽고 `sigma_to_half_log_snr`·`to_d`·`linear_multistep_coeff`·`set_model_options_post_cfg_function`
+은 Forge 의 같은 함수를 부름, CFG 1 에서 무조건 예측을 건너뛴 호출(Forge 는 `uncond` 를 그대로 넘기고 `uncond_denoised` 를 0 으로
+둠)을 Forge 자체의 건너뛰기 조건으로 알아보고 ComfyUI 처럼 조건부 예측을 씀, `@torch.no_grad()`. `tests/_origin_comfyui_cfgpp_history.py`
+는 같은 커밋의 `comfy/k_diffusion/sampling.py` 63-65·152-176·406-416·419-484줄, `comfy/k_diffusion/utils.py` 21-29줄,
+`comfy/model_patcher.py` 114-118줄을 바꾸지 않고 담은 대조 오라클입니다(블록마다 SHA-256 고정, 첫 블록 앞의 테스트용 대역 코드는 상류
+코드가 아님). 원본은 이 확장과 같은 GPL-3.0 입니다. 바탕: CFG++ (Chung et al., [arXiv:2406.08070](https://arxiv.org/abs/2406.08070)).
+
+## zju-pi/diff-sampler — IPNDM · IPNDM_V · DEIS (Apache-2.0)
+
+`sam3ext/extra_samplers/ipndm_deis.py` 의 `sample_ipndm`·`sample_ipndm_v`·`sample_deis` 는 [zju-pi/diff-sampler](https://github.com/zju-pi/diff-sampler)
+(commit `68d5ce427f261962b89ce3b0ee8f6b29f0577328`, 2025-11-25) `diff-solvers-main/solvers.py` 의 `ipndm_sampler`·`ipndm_v_sampler`·
+`deis_sampler`(Apache License 2.0)를, ComfyUI 가 k-diffusion 인터페이스로 옮긴 판(`comfyanonymous/ComfyUI`, commit
+`387f98aa2822f684b8597959a52a467d88cc4806`, `comfy/k_diffusion/sampling.py` 1173-1330줄, 거기에 "#From … under Apache 2 license" 로
+표시됨, GPL-3.0)을 따라 옮긴 것입니다. 계수·이력 버퍼·σ=0 처리는 원본과 같고 결과는 ComfyUI 의 `ipndm`·`ipndm_v`·`deis` 와 비트 단위로
+같습니다. Apache-2.0 4(b) 에 따라 파일 머리에 적은 변경 사항: Forge 의 `trange`·`k_diffusion.deis`, 세 함수 모두 `@torch.no_grad()`,
+콜백에 현재 latent 를 넘김(ComfyUI 는 첫 latent), `max_order` 를 1–4 로 자르고 1 이면 이력을 두지 않음(원본은 빈 목록을 가리켜
+IndexError). DEIS 계수(`gits-main/solver_utils.py`)는 옮기지 않았습니다 — Forge 가 이미 들고 있는
+`modules_forge/packages/k_diffusion/deis.py`(같은 출처, Apache-2.0)를 실행 중에 부릅니다. 이번 판에서는 zju-pi 저장소의 파일을 내려받지
+않았으므로(네트워크 사용 없음) 상류 LICENSE 의 저작권 줄은 옮기지 못했고, ComfyUI 처럼 저장소와 커밋을 적었습니다.
+`tests/_origin_comfyui_ipndm_deis.py` 는 ComfyUI 387f98aa 의 위 1173-1330줄과 `comfy/k_diffusion/deis.py` 전체를 바꾸지 않고 담은 대조
+오라클입니다(블록마다 SHA-256 고정). 바탕 논문: DEIS·iPNDM — Zhang & Chen, [arXiv:2204.13902](https://arxiv.org/abs/2204.13902);
+PNDM — Liu et al., [arXiv:2202.09778](https://arxiv.org/abs/2202.09778). Apache License 2.0 전문은 이 문서 끝에 있습니다. 이 확장의
+GPL-3.0-only 라이선스는 이 코드의 상류 조건을 대체하지 않습니다.
 
 ## ComfyUI-Extra-Samplers — DPM++ 4M SDE (BSD-3-Clause)
 
@@ -469,9 +503,11 @@ DPM-Solver++ (Lu et al., [arXiv:2211.01095](https://arxiv.org/abs/2211.01095)). 
 `sam3ext/extra_samplers/euler_dy.py` 는 [Koishi-Star/Euler-Smea-Dyn-Sampler](https://github.com/Koishi-Star/Euler-Smea-Dyn-Sampler)
 (commit `d98a504c8419be5274068ad91ca6bbf2e13635a8`) `smea_sampling.py` 의 `dy_sampling_step`·`sample_euler_dy`·`smea_sampling_step`·
 `sample_euler_smea_dy`·`_Rescaler`(WebUI 갈래)를 옮겨 바꾼 것입니다(상류 LICENSE 의 저작권 줄 "Copyright 2024 KBlueLeaf",
-NOTICE 파일 없음). 보조 스텝의 위치·해상도·화소 선택·홀수 크기 처리·재잡음 식(`x − eps·sqrt(σ̂²−σ²)`, 매 스텝 잡음 추출)은
-원본과 같습니다. Apache-2.0 4(b) 에 따라 파일 머리에 적은 변경 사항: 모든 Euler 갱신을 Forge 의 CFG++ 갱신으로 바꿈,
-**churn 규칙을 원본의 `max(s_churn/N, √2−1)` 에서 k-diffusion 의 `min` 으로 바꿈**(기본 설정에서 재잡음 없음), flow 모델 churn 을
+NOTICE 파일 없음). 등록하는 샘플러는 넷입니다: `Euler Dy CFG++`·`Euler SMEA Dy CFG++`(CFG++ 갱신)와 0.33.0 에 더한
+`Euler Dy`·`Euler SMEA Dy`(상류와 같은 이름, 같은 코어에 일반 Euler 갱신). 보조 스텝의 위치·해상도·화소 선택·홀수 크기 처리·
+재잡음 식(`x − eps·sqrt(σ̂²−σ²)`, 매 스텝 잡음 추출)은 원본과 같습니다. Apache-2.0 4(b) 에 따라 파일 머리에 적은 변경 사항:
+CFG++ 두 항목의 모든 Euler 갱신을 Forge 의 CFG++ 갱신으로 바꿈, **네 항목 모두 churn 규칙을 원본의 `max(s_churn/N, √2−1)` 에서
+k-diffusion 의 `min` 으로 바꿈**(기본 설정에서 재잡음 없음 — 일반 판도 상류 기본값과 달리 churn 0 이면 재잡음 없음), flow 모델 churn 을
 eps 등가 잡음 수준에서 계산, 5차원 latent, Forge 의 4·5차원 마스크·`image_cond`·Anima 레퍼런스 latent 크기 맞춤, 보조 평가 표시,
 미리보기 latent 복구, 보조 스텝이 Forge 의 스텝 카운터(`CFGDenoiser.step`)를 늘리지 않음(원본은 보조 스텝마다 한 칸씩 밀림),
 보조 스텝 없이 도는 모드(Spectrum Integrated·Wan 2.2 I2V `concat_latent`·PiD `lq_latent`·`extra_concat_condition` 요청).
@@ -499,7 +535,14 @@ Guidance 등)은 README 의 출처 / 크레딧 절과 [docs/GUIDANCE.md](docs/GU
 | Extra Schedulers — Cosine · CosineExponential blend · Phi | `sam3ext/extra_schedulers/schedulers.py` | 공개된 식(README 의 Extra Schedulers 표에 적음; Phi 는 황금비 φ) — 이름만 [aoleg/Neo_ExtraSchedulers](https://github.com/aoleg/Neo_ExtraSchedulers) README 에서. Phi 의 착상(황금비 지수)은 Extraltodeus 의 Golden Scheduler([sigmas_tools_and_the_golden_scheduler](https://github.com/Extraltodeus/sigmas_tools_and_the_golden_scheduler), 위 README 가 출처로 적음) | 상류 라이선스 없음(코드 사용 안 함) · Golden Scheduler 는 크레딧만(코드 열람·사용 안 함) | 식 재구현. CosineExponential 의 지수 부분은 k-diffusion `get_sigmas_exponential` 과 같은 식 |
 | Extra Schedulers — Karras Dynamic | `sam3ext/extra_schedulers/schedulers.py` | Karras et al. [arXiv:2206.00364](https://arxiv.org/abs/2206.00364) 램프 + 스텝마다 ρ + 2cos(2πi/n) — 이 변형의 출처는 미확인(위 README 가 "yoinked-h" 를 적음) | 미확인(코드 사용 안 함) | 식 재구현(오버플로 없는 같은 값의 꼴, 마지막 스텝은 정확히 σmin), ρ 는 Forge 의 rho 설정. 시그마가 도중에 올라가는 ρ(약 4 미만)는 오류로 멈춤 |
 | Extra Schedulers — custom (식 · 시그마 목록) | `sam3ext/extra_schedulers/expression.py` · `sigma_list.py` | 변수 이름(m, M, n, s, x, phi)과 목록 규칙은 위 README 의 설명 | 상류 라이선스 없음(코드 사용 안 함) | 이 확장이 새로 쓴 AST 화이트리스트 계산기(eval/exec 없음). 목록 보간은 Forge 의 `sd_schedulers._loglinear_interp` 를 실행 중에 호출(복사 없음) |
-| Extra Samplers — flow churn·CFG++ 결합 | `sam3ext/extra_samplers/euler_dy.py` | [EDM](https://arxiv.org/abs/2206.00364) Algorithm 2, [CFG++](https://arxiv.org/abs/2406.08070) | — | eps 등가 좌표 churn 과 Dy 보조 스텝의 CFG++ 결합은 이 확장의 식(코드 사본 없음) |
+| Extra Samplers — flow churn·CFG++ 결합 | `sam3ext/extra_samplers/euler_dy.py` | [EDM](https://arxiv.org/abs/2206.00364) Algorithm 2, [CFG++](https://arxiv.org/abs/2406.08070) | — | eps 등가 좌표 churn(Dy 네 항목)과 Dy 보조 스텝의 CFG++ 결합은 이 확장의 식(코드 사본 없음). reForge 의 `Euler Dy` 판(매 스텝 VE churn)은 열어 보지도 쓰지도 않음 |
+| Extra Samplers — DPM++ 2M SDE Heun · DPM++ 2M (flow ODE) · DPM++ 2M Heun (flow ODE) · DPM++ 3M (flow ODE) | `sam3ext/extra_samplers/dpmpp_flow.py` | Forge Neo(97b26fb) `modules_forge/packages/k_diffusion/sampling.py` 523-636줄 `sample_dpmpp_2m_sde`·`sample_dpmpp_3m_sde`(ComfyUI v0.3.75 사본); `solver_type="heun"` 보정은 [crowsonkb/k-diffusion](https://github.com/crowsonkb/k-diffusion) commit `4601bf085320592473f681a62808ed873d17fad5` `sample_dpmpp_2m_sde`; "DPM++ 2M SDE Heun" 항목은 ComfyUI commit `3aad339b63f03e17dc6ebae035b90afc2fefb627`(PR #9542, `dpmpp_2m_sde_heun`)·A1111 과 같은 이름; DPM-Solver++ [arXiv:2211.01095](https://arxiv.org/abs/2211.01095) | GPL-3.0(Forge·ComfyUI) · MIT(k-diffusion) | Forge 함수를 실행 중에 부르는 이 확장의 래퍼(코드 사본 없음): Heun 은 `solver_type="heun"` 고정, flow ODE 셋은 η 0·잡음 샘플러를 부르지 않음. 대조 테스트는 Forge 파일을 읽기 전용으로 실행 |
+| Extra Samplers — UniPC bh2 | `sam3ext/extra_samplers/unipc.py` | Forge Neo `modules/sd_samplers_extra.py` 107-129줄 `sample_unipc` · `modules/uni_pc/uni_pc.py`(ComfyUI v0.3.64 `comfy/extra_samplers/uni_pc.py` 사본); UniPC: Zhao et al. [arXiv:2302.04867](https://arxiv.org/abs/2302.04867) | GPL-3.0 | Forge 의 `sample_unipc` 에 `variant="bh2"` 를 넘기는 짧은 래퍼(코드 사본 없음) |
+| Extra Samplers — ER SDE 잡음 구간 | `sam3ext/extra_samplers/er_sde_window.py` | 착상: [pamparamm/ComfyUI-ppm](https://github.com/pamparamm/ComfyUI-ppm) commit `80f6c431` `er_sde_scheduled`(ER-SDE 잡음을 스케줄 일부에만); 바탕: Cui et al. [arXiv:2309.06169](https://arxiv.org/abs/2309.06169) | AGPL-3.0(코드 미사용) | 코드 미사용 — ppm 파일은 열어 보지도 않았고, Forge 내장 `sample_er_sde` 를 한 번 부르며 콜백으로 스텝 번호를 알아 척도·잡음 함수를 스텝마다 고르는 방식으로 새로 작성(구간은 모델 `percent_to_sigma` 의 진행률). 대조 테스트는 논문 식으로 새로 쓴 float64 풀이 |
+| Extra Samplers — Restart (flow) | `sam3ext/extra_samplers/restart_flow.py` | Xu et al., "Restart Sampling for Improving Generative Processes", [arXiv:2306.14878](https://arxiv.org/abs/2306.14878) Algorithm 1; 참조 저장소 [Newbeeer/diffusion_restart_sampling](https://github.com/Newbeeer/diffusion_restart_sampling) 는 라이선스 없음 — 열어 보지 않음 | 논문(코드 미사용) | 논문 재구현. 창(ε 등가 잡음 수준 0.1~2)과 횟수 규칙은 A1111/Forge `restart_sampler` 와 같게 하되 flow 의 순방향 잡음(α=1−σ)과 스케줄러의 σ 를 그대로 씀. Forge 내장 `restart_sampler`(A1111 코드)는 ε 대조 테스트에서 실행만 함(복사 없음) |
+| Extra Schedulers — React Cosinusoidal DynSF | `sam3ext/extra_schedulers/schedulers.py` `react_cosinusoidal_dynsf` | 식: yoinked-h, [Panchovix/stable-diffusion-webui-reForge](https://github.com/Panchovix/stable-diffusion-webui-reForge) commit `25a5fb38f`(2024-09-27, `ldm_patched/modules/samplers.py` 692-700줄 @ `739b2e1`) | AGPL-3.0(코드 사용 안 함) | 공개된 한 줄 식 재구현, reForge(AGPL-3.0) 코드 미사용 — 라벨과 계수 기본값 2.15 만 맞춤(infotext 호환) |
+| Extra Schedulers — Flow Cosmos rho7 | `sam3ext/extra_schedulers/schedulers.py` `flow_cosmos_rho7` | 이름 `flow_cosmos_rho7` 와 스케줄 착상(Cosmos-Predict2 의 EDM σ 0.002~80 에 Karras ρ 7 을 깔고 t = σ/(1+σ) 로 바꿈 — 이 확장에서는 그 값이 아코디언 ρ · σ̃ max · σ̃ min 의 기본값): [KeithZ117/Comfyui-anima-sampler](https://github.com/KeithZ117/Comfyui-anima-sampler) commit `effba3c5`(`cosmos_schedules.py` `build_flow_cosmos_rho_sigmas`); 식: Karras et al. [arXiv:2206.00364](https://arxiv.org/abs/2206.00364) ρ 램프 + 정류 흐름 시간 변환; 같은 σ 범위: ComfyUI `comfy/supported_models.py` 의 Cosmos 설정 | MIT(코드 사용 안 함) · eps/v 분기: [crowsonkb/k-diffusion](https://github.com/crowsonkb/k-diffusion) MIT(Forge 함수를 부름) | 식에서 새로 작성(코드 사본 없음) — 이름과 착상만 크레딧. eps/v 모델의 Karras 분기는 Forge 의 `k_diffusion.sampling.get_sigmas_karras`(k-diffusion 의 함수, Forge `modules_forge/packages/k_diffusion/sampling.py`)를 실행 중에 아코디언의 ρ(기본 7)로 부르는 것(코드 사본 없음 — Forge 의 Karras 와 같은 함수). 상류 함수의 숫자는 테스트 안의 몇 줄짜리 참조식으로만 대조 |
+| Extra Schedulers — Flow Cosmos Dynamic | `sam3ext/extra_schedulers/schedulers.py` `flow_cosmos_dynamic` | 이 확장의 조합: 위 Karras Dynamic 행의 램프(스텝마다 ρ + 2cos(2πi/n) — 그 변형의 출처는 미확인)를 위 Flow Cosmos rho7 행의 σ̃ 범위와 흐름 시간 변환 t = s/(1 + s) 에 씀; Karras et al. [arXiv:2206.00364](https://arxiv.org/abs/2206.00364) | —(다른 프로젝트의 코드 · 스케줄 없음) | 이 확장의 코드 — Karras Dynamic 과 같은 값 함수(`_karras_dynamic_values`)를 씀. eps/v 모델에서는 이 확장의 Karras Dynamic 그대로(아코디언의 ρ) |
 
 ## 라이선스 없는 저장소 — 이름만 참고 (코드 미사용)
 
@@ -514,6 +557,9 @@ DenOfEquity 저장소는 아무 파일도 열지 않았습니다. README 에서 
 - Extra Samplers: 샘플러 이름(`ER SDE (Reverse-time)`·`ER SDE (ODE)`·`DPM++ 4M SDE`·`Euler Dy CFG++`·`Euler SMEA Dy CFG++`)과
   infotext 키 `ER SDE max stage` 의 규칙, 사용자에게 보이는 동작 설명. 구현은 위 절의 ComfyUI(GPL-3.0)·Clybius(BSD-3-Clause)·
   Koishi-Star(Apache-2.0) 코드와 Forge 의 `sample_er_sde`·CFG++ 갱신을 바탕으로 했습니다.
+
+[Newbeeer/diffusion_restart_sampling](https://github.com/Newbeeer/diffusion_restart_sampling)(Restart 논문의 공식 코드)도 라이선스가 없습니다.
+`Restart (flow)` 는 이 저장소를 열어 보지 않고 논문(arXiv:2306.14878)의 알고리즘만으로 작성했습니다.
 
 ## MIT License 전문
 
@@ -590,7 +636,8 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 `sam3ext/extra_samplers/euler_dy.py` 와 대조 테스트 `tests/_origin_koishi_smea_sampling.py` 의 Euler-Smea-Dyn-Sampler 코드
 (Copyright 2024 KBlueLeaf)에 적용되는 조건입니다. 같은 Apache-2.0 인 Skimmed_CFG 코드, HiFlow 코드, TIPO 모델 코드, Qwen3.5
-토크나이저, ComfyUI-NAFNet-Residual 대조 테스트 사본에도 같은 조건이 적용됩니다(저작권 줄은 각 절의 것). 아래는
+토크나이저, ComfyUI-NAFNet-Residual 대조 테스트 사본, zju-pi/diff-sampler 의 IPNDM·IPNDM_V·DEIS 코드(`sam3ext/extra_samplers/ipndm_deis.py`,
+대조 테스트 `tests/_origin_comfyui_ipndm_deis.py`)에도 같은 조건이 적용됩니다(저작권 줄은 각 절의 것). 아래는
 Euler-Smea-Dyn-Sampler 의 LICENSE 파일 그대로입니다(부록의 저작권 줄 포함). 같은 전문이
 <https://www.apache.org/licenses/LICENSE-2.0> 에도 있습니다.
 

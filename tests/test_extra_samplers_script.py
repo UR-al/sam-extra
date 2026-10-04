@@ -87,12 +87,20 @@ def _load_script(preset=()):
     modules.scripts = types.SimpleNamespace(Script=_Script, AlwaysVisible=_AlwaysVisible, scripts_data=[])
     modules.script_callbacks = types.SimpleNamespace(on_before_ui=before_ui.append)
     modules.sd_samplers, modules.sd_samplers_common, modules.sd_samplers_kdiffusion = sd_samplers, common, kdiffusion
+    # Forge's UniPC module (UniPC bh2 is registered only when sample_unipc takes ``variant``)
+    samplers_extra = types.ModuleType("modules.sd_samplers_extra")
+    samplers_extra.sample_unipc = lambda model, x, sigmas, extra_args=None, callback=None, disable=False, variant="bh1": x
+    modules.sd_samplers_extra = samplers_extra
     k_sampling = types.ModuleType("k_diffusion.sampling")
     for spec in registry.SPECS:
         for name in spec.requires:
             setattr(k_sampling, name, object())
     registry._LOGGED.clear()
-    with fx.stub_modules({"modules": modules}), fx.installed_k_sampling(k_sampling):
+    # Forge's vendored k_diffusion.deis (DEIS is registered only when get_deis_coeff_list exists)
+    deis = types.ModuleType("k_diffusion.deis")
+    deis.get_deis_coeff_list = lambda t_steps, max_order, N=10000, deis_mode="tab": []
+    with fx.stub_modules({"modules": modules, "modules.sd_samplers_extra": samplers_extra}), \
+            fx.installed_k_sampling(k_sampling), fx.installed_k_diffusion_deis(deis):
         spec = importlib.util.spec_from_file_location("_test_extra_samplers_script", SCRIPT)
         module = importlib.util.module_from_spec(spec)
         assert spec.loader is not None
@@ -104,10 +112,28 @@ MOD, SD_SAMPLERS, BEFORE_UI = _load_script()
 
 
 class RegistrationAtImportTests(unittest.TestCase):
-    def test_import_registers_the_five_samplers(self):
+    def test_import_registers_the_eighteen_samplers(self):
         self.assertEqual([x.name for x in SD_SAMPLERS.all_samplers],
-                         ["ER SDE (Reverse-time)", "ER SDE (ODE)", "DPM++ 4M SDE", "Euler Dy CFG++", "Euler SMEA Dy CFG++"])
+                         ["ER SDE (Reverse-time)", "ER SDE (ODE)", "ER SDE (Tunable)", "DPM++ 4M SDE", "Euler Dy CFG++",
+                          "Euler SMEA Dy CFG++", "Euler Dy", "Euler SMEA Dy", "DPM++ 2M SDE Heun", "DPM++ 2M (flow ODE)",
+                          "DPM++ 2M Heun (flow ODE)", "DPM++ 3M (flow ODE)", "UniPC bh2", "CFG++ UD10 AB", "IPNDM",
+                          "IPNDM_V", "DEIS", "Restart (flow)"])
         self.assertEqual(len(BEFORE_UI), 1)
+
+    def test_the_help_names_every_sampler(self):
+        for spec in registry.SPECS:
+            self.assertIn(spec.label, MOD._HELP)
+
+    def test_status_names_a_sampler_this_forge_cannot_run(self):
+        report = registry.RegistrationReport(skipped_missing={"UniPC bh2": ["modules.sd_samplers_extra:sample_unipc(variant)"]})
+        saved = registry._LAST_REPORT
+        registry._LAST_REPORT = report
+        try:
+            status = MOD._status_markdown()
+        finally:
+            registry._LAST_REPORT = saved
+        self.assertIn("`UniPC bh2`", status)
+        self.assertIn("필요한 함수가 없어 건너뜀", status)
 
     def test_status_names_the_labels_another_extension_already_has(self):
         foreign = _SamplerData("ER SDE (Reverse-time)", lambda model: None, [], {})
@@ -147,7 +173,7 @@ class ScriptUiTests(unittest.TestCase):
         self.assertEqual(script.sorting_priority, -32)
 
     def test_the_two_sliders(self):
-        script, (max_stage, eta) = self._ui()
+        script, (max_stage, eta, *window_row) = self._ui()
         self.assertIsInstance(max_stage, gr.Slider)
         self.assertEqual((max_stage.minimum, max_stage.maximum, max_stage.step, max_stage.value), (1, 3, 1, 3))
         self.assertEqual((eta.minimum, eta.maximum, eta.step, eta.value), (0.0, 10.0, 0.01, 1.0))
@@ -155,10 +181,34 @@ class ScriptUiTests(unittest.TestCase):
         self.assertEqual(eta.label, "ER SDE eta")
         self.assertEqual(max_stage.elem_id, "script_txt2img_extra_samplers_er_sde_max_stage")
         self.assertEqual(eta.elem_id, "script_txt2img_extra_samplers_er_sde_eta")
-        _, (img_stage, _img_eta) = self._ui(is_img2img=True)
+        _, (img_stage, _img_eta, *_img_window) = self._ui(is_img2img=True)
         self.assertEqual(img_stage.elem_id, "script_img2img_extra_samplers_er_sde_max_stage")
+        window, start, end = window_row
         self.assertEqual([(c, f) for c, f in script.infotext_fields],
-                         [(max_stage, sampler_params.paste_max_stage), (eta, sampler_params.paste_eta)])
+                         [(max_stage, sampler_params.paste_max_stage), (eta, sampler_params.paste_eta),
+                          (window, sampler_params.paste_noise_window), (start, sampler_params.paste_noise_start),
+                          (end, sampler_params.paste_noise_end)])
+
+    def test_the_noise_window_row(self):
+        """Row 2 (v0.33.0): the checkbox and the two percentage sliders, in the order of ``params.ARG_NAMES``."""
+        _script, controls = self._ui()
+        self.assertEqual(len(controls), len(sampler_params.ARG_NAMES))
+        self.assertEqual(sampler_params.ARG_NAMES, ("max_stage", "eta", "noise_window", "noise_start", "noise_end"))
+        window, start, end = controls[2:]
+        self.assertIsInstance(window, gr.Checkbox)
+        self.assertIs(window.value, False)
+        self.assertEqual(window.label, "ER SDE noise window")
+        for slider, label, value in ((start, "ER SDE noise start", 0.2), (end, "ER SDE noise end", 0.8)):
+            with self.subTest(label=label):
+                self.assertIsInstance(slider, gr.Slider)
+                self.assertEqual((slider.minimum, slider.maximum, slider.step, slider.value), (0.0, 1.0, 0.01, value))
+                self.assertEqual(slider.label, label)
+        self.assertEqual([c.elem_id for c in controls[2:]],
+                         ["script_txt2img_extra_samplers_er_sde_noise_window",
+                          "script_txt2img_extra_samplers_er_sde_noise_start",
+                          "script_txt2img_extra_samplers_er_sde_noise_end"])
+        _, img_controls = self._ui(is_img2img=True)
+        self.assertEqual(img_controls[2].elem_id, "script_img2img_extra_samplers_er_sde_noise_window")
 
     def test_section_follows_the_layout_setting(self):
         script = MOD.ExtraSamplers()
@@ -208,6 +258,66 @@ class ProcessTests(unittest.TestCase):
     def test_xyz_values_override_the_accordion(self):
         self.assertEqual(self._process(3, 1.0, xyz={"max_stage": 1}), sampler_params.ErSdeSettings(1, 1.0))
         self.assertEqual(self._process(3, 1.0, xyz={"eta": "0.25"}), sampler_params.ErSdeSettings(3, 0.25))
+        self.assertEqual(self._process(3, 1.0, False, 0.2, 0.8, xyz={"noise_window": (True, 0.1, 0.9)}),
+                         sampler_params.ErSdeSettings(3, 1.0, True, 0.1, 0.9))
+        self.assertEqual(self._process(3, 1.0, True, 0.3, 0.6, xyz={"noise_window": (False, 0.2, 0.8)}),
+                         sampler_params.ErSdeSettings(3, 1.0, False, 0.2, 0.8))
+
+    def test_argument_lists_of_every_length(self):
+        """API ``args`` of 0, 2 (every v0.31/v0.32 request), 3, 5 and 7 entries: the missing ones default,
+        the window stays off unless asked for, surplus entries are ignored."""
+        S = sampler_params.ErSdeSettings
+        for args, expected in [
+            ((), S(3, 1.0, False, 0.2, 0.8)),
+            ((2, 0.4), S(2, 0.4, False, 0.2, 0.8)),
+            ((2, 0.4, True), S(2, 0.4, True, 0.2, 0.8)),
+            ((2, 0.4, True, 0.1, 0.9), S(2, 0.4, True, 0.1, 0.9)),
+            ((2, 0.4, True, 0.1, 0.9, "extra", 42), S(2, 0.4, True, 0.1, 0.9)),
+        ]:
+            with self.subTest(args=args):
+                self.assertEqual(self._process(*args), expected)
+                self.assertEqual(sampler_params.settings_from_args(list(args)), expected)
+        self.assertEqual(sampler_params.ErSdeSettings(2, 0.4).as_dict(),
+                         {"max_stage": 2, "eta": 0.4, "noise_window": False, "noise_start": 0.2, "noise_end": 0.8})
+
+    def test_noise_window_coercion(self):
+        for value, expected in [
+            (True, True), (1, True), (1.0, True), ("true", True), ("ON", True), (" Yes ", True), ("1", True),
+            (False, False), (0, False), (2, False), (0.5, False), ("false", False), ("off", False), ("", False),
+            (None, False), ([True], False), ("2", False),
+        ]:
+            with self.subTest(value=value):
+                self.assertIs(sampler_params.coerce_noise_window(value), expected)
+
+    def test_the_window_argument_of_a_request_goes_through_that_coercion(self):
+        """An API caller's ``"false"`` / ``"off"`` / ``2`` in the third slot leaves the window off (``bool()``
+        would turn every non-empty text and every non-zero number on); the script and ``settings_from_args``
+        read the slot the same way."""
+        S = sampler_params.ErSdeSettings
+        for value, enabled in [("false", False), ("off", False), (2, False), ("0", False), ("on", True), ("TRUE", True),
+                               (1, True)]:
+            with self.subTest(value=value):
+                expected = S(3, 1.0, enabled, 0.2, 0.8)
+                self.assertEqual(sampler_params.settings_from_args([3, 1.0, value]), expected)
+                self.assertEqual(self._process(3, 1.0, value), expected)
+
+    def test_noise_percent_coercion(self):
+        for value, expected in [
+            (0.3, 0.3), ("0.45", 0.45), (0, 0.0), (1, 1.0), (-0.5, 0.0), (1.7, 1.0),
+            (float("nan"), 0.25), (float("inf"), 0.25), (None, 0.25), ("x", 0.25), (True, 0.25), (False, 0.25),
+        ]:
+            with self.subTest(value=value):
+                self.assertEqual(sampler_params.coerce_noise_percent(value, 0.25), expected)
+        # start >= end is kept as given (an empty window), never swapped
+        self.assertEqual(self._process(3, 1.0, True, 0.9, 0.1), sampler_params.ErSdeSettings(3, 1.0, True, 0.9, 0.1))
+        self.assertEqual(self._process(3, 1.0, "on", "bad", None), sampler_params.ErSdeSettings(3, 1.0, True, 0.2, 0.8))
+
+    def test_an_api_dict_on_the_request_is_read_with_the_same_rules(self):
+        p = types.SimpleNamespace()
+        setattr(p, sampler_params.P_ATTR, {"max_stage": 2, "eta": "0.5", "noise_window": "yes", "noise_start": 0.1})
+        self.assertEqual(sampler_params.resolve(p), sampler_params.ErSdeSettings(2, 0.5, True, 0.1, 0.8))
+        setattr(p, sampler_params.P_ATTR, {"noise_window": 2, "noise_end": 7})
+        self.assertEqual(sampler_params.resolve(p), sampler_params.ErSdeSettings(3, 1.0, False, 0.2, 1.0))
 
 
 class XyzTests(unittest.TestCase):
@@ -215,6 +325,7 @@ class XyzTests(unittest.TestCase):
         class AxisOption:
             def __init__(self, label, type, apply, format_value=None, confirm=None, cost=0.0, choices=None, prepare=None):
                 self.label, self.type, self.apply, self.choices = label, type, apply, choices
+                self.confirm = confirm
 
         module = types.SimpleNamespace(AxisOption=AxisOption, axis_options=[AxisOption("Nothing", str, None)])
         entry = types.SimpleNamespace(script_class=type("Script", (), {"__module__": "xyz_grid.py"}), module=module)
@@ -227,8 +338,9 @@ class XyzTests(unittest.TestCase):
         BEFORE_UI[0]()
         BEFORE_UI[0]()
         labels = [axis.label for axis in module.axis_options]
-        self.assertEqual(labels, ["Nothing", "[Extra Samplers] ER SDE max stage", "[Extra Samplers] ER SDE eta"])
-        stage, eta = module.axis_options[1:]
+        self.assertEqual(labels, ["Nothing", "[Extra Samplers] ER SDE max stage", "[Extra Samplers] ER SDE eta",
+                                  "[Extra Samplers] ER SDE noise window"])
+        stage, eta, _window = module.axis_options[1:]
         self.assertIs(stage.type, int)
         self.assertEqual(stage.choices(), ["1", "2", "3"])
         self.assertIs(eta.type, float)
@@ -240,6 +352,27 @@ class XyzTests(unittest.TestCase):
         self.assertEqual(getattr(p, sampler_params.XYZ_ATTR), {"max_stage": 2, "eta": 0.75})
         MOD.ExtraSamplers().process(p, 3, 1.0)
         self.assertEqual(getattr(p, sampler_params.P_ATTR), sampler_params.ErSdeSettings(2, 0.75))
+
+    def test_the_noise_window_axis(self):
+        module, entry = self._xyz_module()
+        MOD.scripts.scripts_data.append(entry)
+        self.addCleanup(MOD.scripts.scripts_data.remove, entry)
+        BEFORE_UI[0]()
+        axis = module.axis_options[-1]
+        self.assertEqual(axis.label, "[Extra Samplers] ER SDE noise window")
+        self.assertIs(axis.type, str)
+        self.assertIsNone(axis.choices)
+        axis.confirm(None, ["off", "0.1-0.9", " 0.2 - 0.8 ", "0.9-0.1", "0-1", "OFF"])   # all accepted
+        for bad in ("on", "0.1", "0.2-1.5", "-0.1-0.5", "0.2-0.8-0.9", "a-b", ""):
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                axis.confirm(None, ["off", bad])
+        for value, expected in [("0.1-0.9", (True, 0.1, 0.9)), ("off", (False, 0.2, 0.8)), ("0.7-0.3", (True, 0.7, 0.3))]:
+            with self.subTest(value=value):
+                p = types.SimpleNamespace()
+                axis.apply(p, value, [value])
+                self.assertEqual(getattr(p, sampler_params.XYZ_ATTR), {"noise_window": expected})
+                MOD.ExtraSamplers().process(p, 3, 1.0, not expected[0], 0.5, 0.5)
+                self.assertEqual(getattr(p, sampler_params.P_ATTR), sampler_params.ErSdeSettings(3, 1.0, *expected))
 
     def test_no_xyz_script_is_fine(self):
         BEFORE_UI[0]()   # scripts_data has no xyz_grid: nothing to do, nothing raised
@@ -306,6 +439,62 @@ class InfotextTests(unittest.TestCase):
         p = types.SimpleNamespace(extra_generation_params={})
         sampler_params.record_infotext(p, "ER SDE (Reverse-time)", sampler_params.ErSdeSettings(3, 0.1 + 0.2))
         self.assertEqual(p.extra_generation_params, {"ER SDE eta": 0.3})
+
+    def test_tunable_writes_stage_eta_and_window_like_reverse_time(self):
+        S = sampler_params.ErSdeSettings
+        for label, settings, kwargs, expected in [
+            ("ER SDE (Tunable)", S(2, 0.35), {}, {"ER SDE max stage": 2, "ER SDE eta": 0.35}),
+            ("ER SDE (Tunable)", S(), {}, {}),
+            ("ER SDE (Tunable)", S(), {"forge_eta": 0.6}, {"ER SDE eta": 1.0}),
+            ("ER SDE (Tunable)", S(3, 1.0, True, 0.2, 0.8), {}, {"ER SDE noise window": "0.2-0.8"}),
+            ("ER SDE (Reverse-time)", S(3, 2.0, True, 0.1, 0.9), {},
+             {"ER SDE eta": 2.0, "ER SDE noise window": "0.1-0.9"}),
+            ("ER SDE (Reverse-time)", S(3, 1.0, True, 0.9, 0.1), {}, {"ER SDE noise window": "0.9-0.1"}),   # empty
+            ("ER SDE (Tunable)", S(3, 0.0, True, 0.2, 0.8), {}, {"ER SDE eta": 0.0}),   # η 0 = the ODE: no window
+            ("ER SDE (Tunable)", S(3, 1.0, True, 0.2, 0.8), {"window_skipped": True}, {}),
+            ("ER SDE (ODE)", S(1, 2.0, True, 0.2, 0.8), {}, {"ER SDE max stage": 1}),
+            ("Euler Dy", S(1, 2.0, True, 0.2, 0.8), {}, {}),
+        ]:
+            with self.subTest(label=label, settings=settings, kwargs=kwargs):
+                p = types.SimpleNamespace(extra_generation_params={})
+                sampler_params.record_infotext(p, label, settings, **kwargs)
+                self.assertEqual(p.extra_generation_params, expected)
+
+    def test_the_window_pastes_back(self):
+        for start, end in [(0.2, 0.8), (0.1, 0.9), (0.0, 1.0), (0.9, 0.1), (0.123456789, 0.5), (1e-06, 0.75)]:
+            with self.subTest(start=start, end=end):
+                p = types.SimpleNamespace(extra_generation_params={})
+                settings = sampler_params.ErSdeSettings(3, 1.0, True, start, end)
+                sampler_params.record_infotext(p, "ER SDE (Tunable)", settings)
+                pasted = {key: str(value) for key, value in p.extra_generation_params.items()}
+                self.assertIs(sampler_params.paste_noise_window(pasted), True)
+                self.assertEqual(sampler_params.paste_noise_start(pasted), round(start, 6))
+                self.assertEqual(sampler_params.paste_noise_end(pasted), round(end, 6))
+        self.assertEqual(sampler_params.format_noise_window(0.2, 0.8), "0.2-0.8")
+        self.assertEqual(sampler_params.format_noise_window(0.1 + 0.2, 1), "0.3-1")
+
+    def test_window_paste_table(self):
+        for params, expected in [
+            ({}, (False, 0.2, 0.8)),
+            ({"ER SDE noise window": "0.3-0.7"}, (True, 0.3, 0.7)),
+            ({"ER SDE noise window": " 0.3 - 0.7 "}, (True, 0.3, 0.7)),
+            ({"ER SDE noise window": "off"}, (False, 0.2, 0.8)),
+            ({"ER SDE noise window": "0.3-1.7"}, (False, 0.2, 0.8)),
+            ({"ER SDE noise window": "abc"}, (False, 0.2, 0.8)),
+            ({"ER SDE noise window": "0.3"}, (False, 0.2, 0.8)),
+            ({"ER SDE noise window": "1e-06-0.8"}, (True, 1e-06, 0.8)),
+        ]:
+            with self.subTest(params=params):
+                got = (sampler_params.paste_noise_window(params), sampler_params.paste_noise_start(params),
+                       sampler_params.paste_noise_end(params))
+                self.assertEqual(got, expected)
+        self.assertIsNone(sampler_params.parse_noise_window(None))
+        self.assertEqual(sampler_params.parse_noise_window("OFF"), (False, 0.2, 0.8))
+
+    def test_eta_paste_fallback_stays_reverse_time_only(self):
+        """aoleg's infotexts carry Forge's ``Eta`` for Reverse-time; Tunable is this extension's own entry."""
+        self.assertEqual(sampler_params.paste_eta({"Sampler": "ER SDE (Tunable)", "Eta": "0.5"}), 1.0)
+        self.assertEqual(sampler_params.paste_eta({"Sampler": "ER SDE (Tunable)", "ER SDE eta": "0.5"}), 0.5)
 
 
 if __name__ == "__main__":

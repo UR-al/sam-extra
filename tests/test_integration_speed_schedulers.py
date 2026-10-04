@@ -60,6 +60,14 @@ SCHEDULES = (
     # not 1.0 … 0.0, so taken as sigmas as they are (ten values: no interpolation)
     ("custom", {"custom_mode": es_settings.MODE_SIGMAS,
                 "custom_sigmas": "0.95, 0.9, 0.75, 0.7, 0.4, 0.2, 0.1, 0.05, 0.02, 0.01"}),
+    ("React Cosinusoidal DynSF", {}),
+    # the flow list (the model wrap below has a flow predictor): 80/81 … 0.002/1.002
+    ("Flow Cosmos rho7", {}),
+    # its accordion values (D19): ρ 5 on σ̃ 0.006 … 240 (Anima's shift 3 on the default range): 240/241 … 0.006/1.006
+    ("Flow Cosmos rho7", {"flow_cosmos_rho": 5.0, "flow_cosmos_sigma_max": 240.0, "flow_cosmos_sigma_min": 0.006}),
+    # Flow Cosmos Dynamic (D20): Karras Dynamic's per-step ρ on the same σ̃ range, from the same three values
+    ("Flow Cosmos Dynamic", {}),
+    ("Flow Cosmos Dynamic", {"flow_cosmos_rho": 5.0, "flow_cosmos_sigma_max": 240.0, "flow_cosmos_sigma_min": 0.006}),
 )
 
 
@@ -71,7 +79,9 @@ def anima_model_sigmas():
 
 class ForgeSchedules:
     """``KDiffusionSampler.get_sigmas`` from the checkout, over a stub ``sd_schedulers`` holding Forge's
-    three named defaults plus this extension's six (``registry.register_schedulers``)."""
+    three named defaults plus this extension's schedulers (``registry.register_schedulers``). The model wrap
+    carries a flow predictor (``prediction_type`` "const"), which the two Flow Cosmos schedulers read
+    (need_inner_model)."""
 
     def __init__(self):
         self.sd_schedulers = ess.stub_sd_schedulers()
@@ -91,7 +101,9 @@ class ForgeSchedules:
     def __call__(self, label, steps, request, *, options=None, values=None):
         es_settings.set_active(es_settings.coerce(values or {}))
         sampler = types.SimpleNamespace(config=types.SimpleNamespace(options=dict(options or {})),
-                                        model_wrap=types.SimpleNamespace(sigmas=anima_model_sigmas()))
+                                        model_wrap=types.SimpleNamespace(
+                                            sigmas=anima_model_sigmas(),
+                                            predictor=types.SimpleNamespace(prediction_type="const")))
         request.scheduler = label
         request.hr_scheduler = None
         request.sampler_noise_scheduler_override = None

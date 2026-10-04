@@ -6,9 +6,17 @@
   are Forge's own function bodies, taken from those files with ``ast`` — no other Forge code runs.
   Forge is looked for where the extension normally lives (``<forge>/extensions/<this>``), or at
   ``$SAM3_FORGE_ROOT``; without it these tests skip.
+* Forge's ``modules/sd_samplers_extra.py`` (``forge_sd_samplers_extra()``: its ``restart_sampler`` and
+  ``sample_unipc``) on that k-diffusion module and Forge's ``modules/uni_pc/uni_pc.py``, executed
+  read-only from Forge's files; ``installed_sd_samplers_extra`` makes it ``modules.sd_samplers_extra``.
+* Forge's vendored ``modules_forge/packages/k_diffusion/deis.py`` (``forge_deis()``; numpy/torch only;
+  ``installed_k_diffusion_deis`` makes it ``k_diffusion.deis``) and Forge's predictors
+  ``backend/modules/k_prediction.py`` (``forge_k_prediction()``; ``Prediction``/``PredictionDiscreteFlow``
+  with their real ``percent_to_sigma``).
 * The three verbatim origin copies (``tests/_origin_*.py``) with the stand-ins their imports need.
 * Toy models: an elementwise x0 predictor, a CFG denoiser stand-in that runs the post-CFG list and
-  the inpainting blend in Forge's order, deterministic noise sources, predictor stand-ins.
+  the inpainting blend in Forge's order, the exact denoiser of Gaussian data with its closed-form
+  ODE (``GaussianModel``), deterministic noise sources, predictor stand-ins.
 """
 
 from __future__ import annotations
@@ -189,6 +197,132 @@ def installed_k_sampling(module):
         yield module
 
 
+_DEIS = _K_DIR / "deis.py"
+_K_PREDICTION = Path("backend") / "modules" / "k_prediction.py"
+
+
+def forge_deis():
+    """Forge's vendored ``k_diffusion/deis.py`` (zju-pi's DEIS coefficients, Apache-2.0; imports only numpy and
+    torch), executed read-only from its file (cached)."""
+    if "deis" not in _CACHE:
+        _CACHE["deis"] = forge_module_from_source(str(_DEIS), "k_diffusion.deis")
+    return _CACHE["deis"]
+
+
+@contextlib.contextmanager
+def installed_k_diffusion_deis(module):
+    """Make ``module`` the ``k_diffusion.deis`` that ``importlib`` returns (DEIS, the registry's ``forge_requires``
+    check). A ``k_diffusion`` package that is already installed (``installed_k_sampling``) is kept and gets the
+    attribute for the duration — enter this one after it."""
+    parent = sys.modules.get("k_diffusion")
+    stubs = {"k_diffusion.deis": module}
+    if parent is None:
+        parent = types.ModuleType("k_diffusion")
+        parent.__path__ = []
+        stubs["k_diffusion"] = parent
+    missing = object()
+    saved = getattr(parent, "deis", missing)
+    parent.deis = module
+    try:
+        with stub_modules(stubs):
+            yield module
+    finally:
+        if saved is missing:
+            try:
+                delattr(parent, "deis")
+            except AttributeError:
+                pass
+        else:
+            parent.deis = saved
+
+
+def forge_k_prediction():
+    """Forge's ``backend/modules/k_prediction.py`` (imports only math, numpy and torch), executed read-only."""
+    if "k_prediction" not in _CACHE:
+        _CACHE["k_prediction"] = forge_module_from_source(str(_K_PREDICTION), "backend.modules.k_prediction")
+    return _CACHE["k_prediction"]
+
+
+def forge_flow_predictor(shift: float = 3.0):
+    """Forge's ``PredictionDiscreteFlow`` (Anima: shift 3, multiplier 1000) built from its source."""
+    config = types.SimpleNamespace(sampling_settings={"shift": shift, "multiplier": 1000})
+    return forge_k_prediction().PredictionDiscreteFlow(config)
+
+
+def forge_eps_predictor():
+    """Forge's ``Prediction`` with SDXL's ε schedule (scaled-linear β 0.00085-0.012, 1000 steps)."""
+    return forge_k_prediction().Prediction(sigma_data=1.0, prediction_type="epsilon", beta_schedule="linear",
+                                           linear_start=0.00085, linear_end=0.012, timesteps=1000)
+
+
+_UNI_PC = Path("modules") / "uni_pc" / "uni_pc.py"
+_SD_SAMPLERS_EXTRA = Path("modules") / "sd_samplers_extra.py"
+
+
+def forge_uni_pc():
+    """Forge's ``modules/uni_pc/uni_pc.py`` (imports only math, torch and tqdm), executed from its file."""
+    if "uni_pc" not in _CACHE:
+        _CACHE["uni_pc"] = forge_module_from_source(str(_UNI_PC), "modules.uni_pc.uni_pc")
+    return _CACHE["uni_pc"]
+
+
+def forge_sd_samplers_extra():
+    """Forge's ``modules/sd_samplers_extra.py`` (``restart_sampler``, ``sample_unipc``) executed from its
+    file, with its two Forge imports satisfied by Forge's own code: ``k_diffusion.sampling`` is
+    ``forge_k_sampling()`` and ``modules.uni_pc.uni_pc`` is ``forge_uni_pc()`` (cached)."""
+    if "sd_samplers_extra" in _CACHE:
+        return _CACHE["sd_samplers_extra"]
+    path = require_forge() / _SD_SAMPLERS_EXTRA
+    if not path.is_file():
+        raise unittest.SkipTest(f"{_SD_SAMPLERS_EXTRA} is not in this Forge")
+    ks, uni_pc = forge_k_sampling(), forge_uni_pc()
+    k_package = types.ModuleType("k_diffusion")
+    k_package.__path__ = []
+    k_package.sampling = ks
+    modules_pkg = types.ModuleType("modules")
+    modules_pkg.__path__ = []
+    uni_pc_pkg = types.ModuleType("modules.uni_pc")
+    uni_pc_pkg.__path__ = []
+    uni_pc_pkg.uni_pc = uni_pc
+    modules_pkg.uni_pc = uni_pc_pkg
+    module = types.ModuleType("modules.sd_samplers_extra")
+    module.__file__ = str(path)
+    with stub_modules({
+        "k_diffusion": k_package, "k_diffusion.sampling": ks,
+        "modules": modules_pkg, "modules.uni_pc": uni_pc_pkg, "modules.uni_pc.uni_pc": uni_pc,
+    }):
+        exec(compile(path.read_text(encoding="utf-8"), str(path), "exec"), module.__dict__)
+    _CACHE["sd_samplers_extra"] = module
+    return module
+
+
+@contextlib.contextmanager
+def installed_sd_samplers_extra(module):
+    """Make ``module`` the ``modules.sd_samplers_extra`` that ``importlib`` returns (UniPC bh2, the registry's
+    ``forge_requires`` check). A ``modules`` package that is already installed (a test's Forge stand-in) is
+    kept and gets the attribute for the duration."""
+    parent = sys.modules.get("modules")
+    stubs = {"modules.sd_samplers_extra": module}
+    if parent is None:
+        parent = types.ModuleType("modules")
+        parent.__path__ = []
+        stubs["modules"] = parent
+    missing = object()
+    saved = getattr(parent, "sd_samplers_extra", missing)
+    parent.sd_samplers_extra = module
+    try:
+        with stub_modules(stubs):
+            yield module
+    finally:
+        if saved is missing:
+            try:
+                delattr(parent, "sd_samplers_extra")
+            except AttributeError:
+                pass
+        else:
+            parent.sd_samplers_extra = saved
+
+
 # ---------------------------------------------------------------------------
 # Origin copies
 # ---------------------------------------------------------------------------
@@ -226,6 +360,27 @@ def load_comfy_er_sde_origin():
     if "comfy_er_sde" not in _CACHE:
         _CACHE["comfy_er_sde"] = _load("_origin_comfyui_er_sde", ORIGIN_DIR / "_origin_comfyui_er_sde.py")
     return _CACHE["comfy_er_sde"]
+
+
+def load_comfy_er_sde_eta_origin():
+    """ComfyUI's ``SamplerER_SDE`` at 40e46c71 (the η-extended scalers), verbatim."""
+    if "comfy_er_sde_eta" not in _CACHE:
+        _CACHE["comfy_er_sde_eta"] = _load("_origin_comfyui_er_sde_eta", ORIGIN_DIR / "_origin_comfyui_er_sde_eta.py")
+    return _CACHE["comfy_er_sde_eta"]
+
+
+def load_comfy_cfgpp_history_origin():
+    """ComfyUI's ``_sample_cfgpp_history`` / ``sample_cfgpp_ud10_ab`` at 3ac5d794 with their helpers, verbatim."""
+    if "comfy_cfgpp" not in _CACHE:
+        _CACHE["comfy_cfgpp"] = _load("_origin_comfyui_cfgpp_history", ORIGIN_DIR / "_origin_comfyui_cfgpp_history.py")
+    return _CACHE["comfy_cfgpp"]
+
+
+def load_comfy_ipndm_deis_origin():
+    """ComfyUI's ``sample_ipndm`` / ``sample_ipndm_v`` / ``sample_deis`` and ``deis.py`` at 387f98aa, verbatim."""
+    if "comfy_ipndm" not in _CACHE:
+        _CACHE["comfy_ipndm"] = _load("_origin_comfyui_ipndm_deis", ORIGIN_DIR / "_origin_comfyui_ipndm_deis.py")
+    return _CACHE["comfy_ipndm"]
 
 
 def _unused(*args, **kwargs):  # names the origin imports but the tests never call
@@ -418,6 +573,58 @@ class ToyModel:
             image_cond=None if not torch.is_tensor(image_cond) else tuple(image_cond.shape),
             model_options=options,
         ))
+        return denoised
+
+
+class GaussianModel:
+    """The **exact** denoiser of per-element Gaussian data ``x0 ~ N(mu, c²)``, called like ``ToyModel``.
+
+    With ``α = 1 − σ`` on a flow predictor (``prediction_type == "const"``: ``x = (1 − σ)·x0 + σ·n``) and
+    ``α = 1`` otherwise (``x = x0 + σ·n``), ``D(x, σ) = E[x0 | x] = μ + α c² (x − α μ) / (α² c² + σ²)``.
+    Its probability-flow ODE has a closed form: ``z = (x − α μ) / √(α² c² + σ²)`` is constant along a
+    trajectory (``ode_transport``), and the marginal at every σ is ``N(α μ, α² c² + σ²)`` (``marginal``), so a
+    sampler that preserves marginals ends in ``N(μ, c²)``. ``inner_model.predictor`` / ``model_patcher`` as in
+    ``ToyModel``; ``calls`` records every evaluation; ``step`` (None by default) counts the calls like Forge's
+    CFG denoiser when a test sets it to an int."""
+
+    def __init__(self, sampling, mu: float = 0.3, c: float = 0.5):
+        self.inner_model = types.SimpleNamespace(
+            predictor=sampling,
+            model_patcher=types.SimpleNamespace(get_model_object=lambda name: sampling),
+        )
+        self.flow = getattr(sampling, "prediction_type", None) == "const"
+        self.mu = mu
+        self.c = c
+        self.calls: list[Call] = []
+        self.step = None
+
+    def alpha(self, sigma):
+        return 1 - sigma if self.flow else (sigma * 0 + 1)
+
+    def marginal(self, sigma) -> tuple:
+        """Mean and standard deviation of ``x`` at ``sigma``."""
+        alpha = self.alpha(sigma)
+        return alpha * self.mu, (alpha ** 2 * self.c ** 2 + sigma ** 2) ** 0.5
+
+    def ode_transport(self, x, sigma_from, sigma_to):
+        """The exact probability-flow ODE solution: ``x`` at ``sigma_from`` carried to ``sigma_to``."""
+        mean_from, std_from = self.marginal(sigma_from)
+        mean_to, std_to = self.marginal(sigma_to)
+        return mean_to + std_to * (x - mean_from) / std_from
+
+    def __call__(self, x, sigma, **extra_args):
+        s = sigma.reshape(-1, *([1] * (x.ndim - 1))).to(x.dtype)
+        alpha = self.alpha(s)
+        c2 = self.c ** 2
+        denoised = self.mu + alpha * c2 * (x - alpha * self.mu) / (alpha ** 2 * c2 + s ** 2)
+        options = extra_args.get("model_options") or {}
+        self.calls.append(Call(
+            shape=tuple(x.shape), sigma=float(sigma.reshape(-1)[0]),
+            marker=(options.get("transformer_options") or {}).get("sam_extra_substep"),
+            init_latent=None, mask=None, image_cond=None, model_options=options,
+        ))
+        if isinstance(self.step, int) and not isinstance(self.step, bool):
+            self.step += 1
         return denoised
 
 

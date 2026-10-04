@@ -1,16 +1,26 @@
-"""Extra Schedulers — Cosine, CosineExponential blend, Phi, Laplace, Karras Dynamic and a safe custom scheduler.
+"""Extra Schedulers — Cosine, CosineExponential blend, Phi, Laplace, Karras Dynamic, a safe custom scheduler,
+React Cosinusoidal DynSF, Flow Cosmos rho7 and Flow Cosmos Dynamic.
 
 The schedulers live in ``sam3ext/extra_schedulers/`` and are added to Forge's Schedule type list
 when this script is loaded (``registry.register_schedulers`` — before Forge builds the UI, so the
 dropdowns, the XYZ "Schedule type" axis and the API list include them). This always-on script
-holds the accordion with the values two of them need (custom expression / sigma list, Laplace
-μ/β), hands them to the schedulers for each generation (``process``), records them in infotext
-and registers XYZ axes. Arguments, infotext keys and the controls are in
+holds the accordion with the values four of them need (custom expression / sigma list, Laplace
+μ/β, Flow Cosmos ρ / σ̃ max / σ̃ min — shared by the two Flow Cosmos schedulers), hands them to the schedulers
+for each generation (``process``),
+records them in infotext and registers XYZ axes. Arguments, infotext keys and the controls are in
 ``sam3ext/ui_extra_schedulers.py``.
 
-Clean reimplementation: the labels are the ones specified for infotext compatibility with the
+Clean reimplementation: the first six labels are the ones specified for infotext compatibility with the
 unlicensed aoleg/Neo_ExtraSchedulers (fork of the equally unlicensed DenOfEquity/webUI_ExtraSchedulers),
 but no code of either repository was read or used — only their READMEs, for the user-facing names.
+React Cosinusoidal DynSF has reForge's label (its images paste here) and is written from the published
+formula (reForge is AGPL-3.0; none of its code is used). It needs no accordion value (factor 2.15 fixed).
+Flow Cosmos rho7 (a Karras ρ-ramp on a VE-equivalent σ̃ range in flow time on flow models — by default
+Cosmos-Predict2's ρ 7 on 0.002 … 80 — and Forge's Karras with that ρ on eps/v ones) has the name of
+KeithZ117/Comfyui-anima-sampler's schedule option (MIT) and is written from the formula; its ρ, σ̃ max and
+σ̃ min are accordion values (script arguments 6-8, appended in v0.33.0). Flow Cosmos Dynamic is this extension's
+own composition of the two: Karras Dynamic's per-step ρ on the same σ̃ range in flow time on flow models, Karras
+Dynamic itself (with the accordion's ρ) on eps/v ones; it reads the same three values.
 """
 from __future__ import annotations
 
@@ -51,6 +61,9 @@ XYZ_LAPLACE_MU = f"{XYZ_PREFIX} Laplace mu"
 XYZ_LAPLACE_BETA = f"{XYZ_PREFIX} Laplace beta"
 XYZ_CUSTOM_EXPRESSION = f"{XYZ_PREFIX} Custom expression"
 XYZ_CUSTOM_SIGMAS = f"{XYZ_PREFIX} Custom sigma list"
+XYZ_FLOW_COSMOS_RHO = f"{XYZ_PREFIX} Flow Cosmos rho"
+XYZ_FLOW_COSMOS_SIGMA_MAX = f"{XYZ_PREFIX} Flow Cosmos sigma max"
+XYZ_FLOW_COSMOS_SIGMA_MIN = f"{XYZ_PREFIX} Flow Cosmos sigma min"
 
 
 def _xyz_overrides(p) -> dict:
@@ -94,9 +107,9 @@ def _confirm_sigma_lists(p, values):
 
 
 def _confirm_range(label: str, low: float, high: float):
-    """XYZ confirm for a Laplace axis: every value within the accordion slider's range (ComfyUI
-    LaplaceScheduler's), checked before the grid starts — the generation itself would clamp it, and the
-    grid would show the unclamped number."""
+    """XYZ confirm for a number axis (Laplace, Flow Cosmos): every value within the accordion slider's range
+    (for Laplace ComfyUI LaplaceScheduler's), checked before the grid starts — the generation itself would clamp
+    it, and the grid would show the unclamped number."""
 
     def confirm(p, values):
         for value in values:
@@ -127,6 +140,22 @@ def make_xyz_axes(xyz_grid) -> list:
         xyz_grid.AxisOption(
             XYZ_CUSTOM_SIGMAS, str, partial(_xyz_set_custom, mode=es_settings.MODE_SIGMAS),
             confirm=_confirm_sigma_lists,
+        ),
+        # v0.33.0, appended after the four above so their places in the list stay
+        xyz_grid.AxisOption(
+            XYZ_FLOW_COSMOS_RHO, float, partial(_xyz_set_number, field="flow_cosmos_rho"),
+            confirm=_confirm_range(XYZ_FLOW_COSMOS_RHO, es_settings.FLOW_COSMOS_RHO_MIN,
+                                   es_settings.FLOW_COSMOS_RHO_MAX),
+        ),
+        xyz_grid.AxisOption(
+            XYZ_FLOW_COSMOS_SIGMA_MAX, float, partial(_xyz_set_number, field="flow_cosmos_sigma_max"),
+            confirm=_confirm_range(XYZ_FLOW_COSMOS_SIGMA_MAX, es_settings.FLOW_COSMOS_SIGMA_MAX_MIN,
+                                   es_settings.FLOW_COSMOS_SIGMA_MAX_MAX),
+        ),
+        xyz_grid.AxisOption(
+            XYZ_FLOW_COSMOS_SIGMA_MIN, float, partial(_xyz_set_number, field="flow_cosmos_sigma_min"),
+            confirm=_confirm_range(XYZ_FLOW_COSMOS_SIGMA_MIN, es_settings.FLOW_COSMOS_SIGMA_MIN_MIN,
+                                   es_settings.FLOW_COSMOS_SIGMA_MIN_MAX),
         ),
     ]
 

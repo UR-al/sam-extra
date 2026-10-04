@@ -443,6 +443,9 @@ class ScriptHookTests(ScriptTestCase):
             (dict(mode="sideways"), "mode must be one of"),
             (dict(threshold="delta_optimal", delta=1.5), "delta must be in (0, 1)"),
             (dict(preset="sd15"), "unknown spectrum preset"),
+            # v0.33.0: these used to escape coerce_settings (ZeroDivisionError) — the script failed with no status
+            (dict(scales="1/0,1.0"), "division by zero"),
+            (dict(threshold="manual", manual_sigmas="0.7/0"), "division by zero"),
         ):
             with self.subTest(overrides=overrides):
                 fake = RecordingSampler()
@@ -451,6 +454,18 @@ class ScriptHookTests(ScriptTestCase):
                 self.assertIs(p.sampler.func, fake)
                 self.assertIn("invalid settings", status(p))
                 self.assertIn(text, status(p))
+
+    def test_unparseable_text_and_huge_numbers_never_escape_coerce_settings(self):
+        """A "x/0" in the manual-sigma text is parsed even when the threshold is not manual, and an API integer
+        too large for a float raised OverflowError: both escaped as script errors before v0.33.0."""
+        settings = fh.coerce_settings(ui_args(threshold="neo_shift", manual_sigmas="1/0"))   # manual text unused
+        self.assertIsNone(settings.error)
+        self.assertEqual(settings.manual_sigmas, (0.7,))
+        settings = fh.coerce_settings(ui_args(threshold="neo_shift", delta=10 ** 400, sigma_divisor=10 ** 400,
+                                                seed=10 ** 400))
+        self.assertEqual((settings.delta, settings.sigma_divisor, settings.seed), (fh.DEFAULTS["delta"],
+                         fh.DEFAULTS["sigma_divisor"], -1))
+        self.assertIsNone(settings.error)
 
     def test_spectral_seed(self):
         p = make_p(RecordingSampler(), seeds=(42, 43))
@@ -588,6 +603,20 @@ class GuardTests(ScriptTestCase):
         p.sampler = SimpleNamespace(func=RecordingSampler())   # DDIM/PLMS-style sampler class
         run_hooks(p)
         self.assertIn("is not a k-diffusion sampler", status(p))
+
+    def test_extra_samplers_unipc_bh2_is_refused_like_forges_unipc(self):
+        """sam-extra's ``UniPC bh2`` is Forge's ``sample_unipc`` under the name ``sample_unipc_bh2``; the list is
+        keyed by ``__name__``, so without its own entry SPEED would cut UniPC into segments (a one-step segment
+        leaves x unchanged but rescales it by sqrt(1 + σ_end²) / sqrt(1 + σ_start²))."""
+        from sam3ext.extra_samplers import unipc
+
+        self.assertEqual(fh.UNSUPPORTED_SAMPLERS[unipc.sample_unipc_bh2.__name__],
+                         fh.UNSUPPORTED_SAMPLERS["sample_unipc"])
+        p = make_p(unipc.sample_unipc_bh2)
+        run_hooks(p)
+        self.assertIs(p.sampler.func, unipc.sample_unipc_bh2)
+        self.assertIn("skipped", status(p))
+        self.assertIn("UniPC is not segment-safe", status(p))
 
     def test_no_schedule_solvers_pass_through(self):
         calls = []

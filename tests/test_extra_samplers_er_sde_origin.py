@@ -107,8 +107,10 @@ class OriginCopyTests(unittest.TestCase):
         self.assertIs(kwargs["noise_scaler"], er_sde.ode_noise_scaler)
 
     def test_unknown_solver_type_is_refused(self):
-        with self.assertRaises(ValueError):
-            er_sde.er_sde_kwargs("ER-SDE", 3, 1.0, 1.0)
+        # "ER-SDE" became a known type in v0.33.0 (ER SDE (Tunable), test_extra_samplers_er_sde_eta_origin.py)
+        for solver_type in ("SDE", "er-sde", ""):
+            with self.subTest(solver_type=solver_type), self.assertRaises(ValueError):
+                er_sde.er_sde_kwargs(solver_type, 3, 1.0, 1.0)
 
 
 class ForgeSolverParityTests(unittest.TestCase):

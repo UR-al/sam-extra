@@ -71,6 +71,19 @@ class OriginCopyTests(unittest.TestCase):
             source = inspect.getsource(public)
             with self.subTest(sampler=public.__name__):
                 self.assertIn("cfg_pp=True, churn_rule=CHURN_MIN", source)
+        for public in (euler_dy.sample_euler_dy, euler_dy.sample_euler_smea_dy):
+            source = inspect.getsource(public)
+            with self.subTest(sampler=public.__name__):
+                self.assertIn("cfg_pp=False, churn_rule=CHURN_MIN", source)
+
+    def test_the_plain_entries_have_upstreams_names_and_the_cfg_pp_entries_signature(self):
+        for plain, cfg_pp, upstream_name in (
+            (euler_dy.sample_euler_dy, euler_dy.sample_euler_dy_cfg_pp, "def sample_euler_dy("),
+            (euler_dy.sample_euler_smea_dy, euler_dy.sample_euler_smea_dy_cfg_pp, "def sample_euler_smea_dy("),
+        ):
+            with self.subTest(sampler=plain.__name__):
+                self.assertEqual(inspect.signature(plain), inspect.signature(cfg_pp))
+                self.assertIn(upstream_name, fx.origin_body(ORIGIN_FILE, ORIGIN_MARKER))
 
 
 class ChurnRuleTests(unittest.TestCase):
@@ -202,6 +215,85 @@ class KoishiParityTests(_ForgeBase):
                                       s_churn=0.7, noise_sampler=fx.NoiseSequence(x, 9),
                                       smea=smea, cfg_pp=True, churn_rule="min")
                 self.assertTrue(torch.equal(a, b))
+
+    def test_the_registered_plain_samplers_are_the_core_without_cfg_pp_and_min(self):
+        for flow in (True, False):
+            sigmas = fx.flow_sigmas(6)[1:] if flow else fx.eps_sigmas(6)
+            x = fx.seeded((1, 4, 8, 8), 3) * (1.0 if flow else float(sigmas[0]))
+            sampling = fx.FlowSampling if flow else fx.EpsSampling
+            for public, smea in ((euler_dy.sample_euler_dy, False), (euler_dy.sample_euler_smea_dy, True)):
+                with self.subTest(sampler=public.__name__, flow=flow):
+                    a_model, b_model = fx.ToyModel(sampling(), cond_scale=1.8), fx.ToyModel(sampling(), cond_scale=1.8)
+                    a = public(a_model, x.clone(), sigmas, disable=True, s_churn=0.7,
+                               noise_sampler=fx.NoiseSequence(x, 9))
+                    b = euler_dy.euler_dy(b_model, x.clone(), sigmas, disable=True, s_churn=0.7,
+                                          noise_sampler=fx.NoiseSequence(x, 9), smea=smea, cfg_pp=False,
+                                          churn_rule="min")
+                    self.assertTrue(torch.equal(a, b))
+                    # no CFG++ hook: the plain entries leave Forge's CFG-1 optimisation alone
+                    self.assertTrue(all("sampler_post_cfg_function" not in call.model_options
+                                        for call in a_model.calls))
+
+    def test_the_plain_entries_at_their_defaults_are_upstream_without_churn(self):
+        """``Euler Dy`` / ``Euler SMEA Dy`` with their defaults (s_churn 0, the ``min`` rule: no churn) equal the
+        verbatim upstream samplers run with ``s_tmin`` above every σ (upstream's ``max`` rule then gives γ = 0
+        too) — bit for bit, on ε and flow models, even and odd latent sizes; the noise upstream draws on every
+        step is replayed to ours (``fx.ReplayNoise``)."""
+        for flow in (False, True):
+            for shape in SHAPES_4D:
+                sigmas = fx.flow_sigmas(7) if flow else fx.eps_sigmas(7)
+                x = fx.seeded(shape, 40) * (1.0 if flow else float(sigmas[0]))
+                sampling = fx.FlowSampling if flow else fx.EpsSampling
+                for public, upstream_fn in ((euler_dy.sample_euler_dy, self.origin.sample_euler_dy),
+                                            (euler_dy.sample_euler_smea_dy, self.origin.sample_euler_smea_dy)):
+                    with self.subTest(sampler=public.__name__, flow=flow, shape=shape):
+                        drawn = fx.NoiseSequence(x, 41)
+                        origin_model, model = fx.ToyModel(sampling()), fx.ToyModel(sampling())
+                        with fx.origin_torch(self.origin, drawn):
+                            upstream = upstream_fn(origin_model, x.clone(), sigmas, extra_args={}, disable=True,
+                                                   s_tmin=1e9, s_tmax=2e9)
+                        replay = fx.ReplayNoise(drawn.drawn)
+                        ours = public(model, x.clone(), sigmas, extra_args={}, disable=True, noise_sampler=replay)
+                        self.assertTrue(torch.equal(ours, upstream))
+                        self.assertEqual(replay.calls, len(sigmas) - 1)
+                        self.assertEqual([(c.shape, c.sigma) for c in model.calls],
+                                         [(c.shape, c.sigma) for c in origin_model.calls])
+
+    def test_without_substeps_the_plain_entries_are_forges_euler(self):
+        """``substeps=False`` (substep_guard) and no churn: Forge's own ``sample_euler`` bit for bit."""
+        for flow in (False, True):
+            sigmas = fx.flow_sigmas(7) if flow else fx.eps_sigmas(7)
+            x = fx.seeded((2, 4, 6, 5), 42) * (1.0 if flow else float(sigmas[0]))
+            sampling = fx.FlowSampling if flow else fx.EpsSampling
+            for public in (euler_dy.sample_euler_dy, euler_dy.sample_euler_smea_dy):
+                with self.subTest(sampler=public.__name__, flow=flow):
+                    model = fx.ToyModel(sampling(), cond_scale=2.2)
+                    ours = public(model, x.clone(), sigmas, disable=True, noise_sampler=fx.NoiseSequence(x),
+                                  substeps=False)
+                    self.assertEqual(len(model.calls), len(sigmas) - 1)
+                    forge = self.ks.sample_euler(fx.ToyModel(sampling(), cond_scale=2.2), x.clone(), sigmas,
+                                                 disable=True)
+                    self.assertTrue(torch.equal(ours, forge))
+
+    def test_churn_on_the_plain_entries_follows_the_min_rule(self):
+        """ε: γ = min(s_churn/N, √2 − 1) on the first step (Karras); flow: the churned σ̂ stays below 1."""
+        steps = 6
+        for public in (euler_dy.sample_euler_dy, euler_dy.sample_euler_smea_dy):
+            with self.subTest(sampler=public.__name__, model="eps"):
+                sigmas = fx.eps_sigmas(steps)
+                model = fx.ToyModel(fx.EpsSampling())
+                public(model, fx.seeded((1, 4, 8, 8), 43) * float(sigmas[0]), sigmas, disable=True, s_churn=1.5,
+                       noise_sampler=fx.NoiseSequence(torch.zeros(1, 4, 8, 8, dtype=torch.float64)))
+                gamma = min(1.5 / steps, LIMIT)
+                self.assertEqual(model.calls[0].sigma, float(sigmas[0] * (gamma + 1)))
+            with self.subTest(sampler=public.__name__, model="flow"):
+                sigmas = fx.flow_sigmas(steps + 1)[1:]
+                model = fx.ToyModel(fx.FlowSampling())
+                public(model, fx.seeded((1, 4, 8, 8), 44), sigmas, disable=True, s_churn=40.0,
+                       noise_sampler=fx.NoiseSequence(torch.zeros(1, 4, 8, 8, dtype=torch.float64)))
+                main = [call.sigma for call in model.calls if call.marker is None]
+                self.assertTrue(all(0.0 < s < 1.0 for s in main), main)
+                self.assertGreater(main[0], float(sigmas[0]))   # churned (γ = √2 − 1)
 
 
 # ---------------------------------------------------------------------------
@@ -389,7 +481,7 @@ class FiveDimensionalTests(_ForgeBase):
 
 
 class ChurnTests(_ForgeBase):
-    def _first_call(self, sampling, sigmas, x, s_churn, noise):
+    def _first_call(self, sampling, sigmas, x, s_churn, noise, cfg_pp=True):
         seen = {}
 
         class Recording(fx.ToyModel):
@@ -399,26 +491,28 @@ class ChurnTests(_ForgeBase):
                 return super().__call__(xt, sigma, **kw)
 
         euler_dy.euler_dy(Recording(sampling, cond_scale=1.5), x.clone(), sigmas, disable=True,
-                          s_churn=s_churn, noise_sampler=noise)
+                          s_churn=s_churn, noise_sampler=noise, cfg_pp=cfg_pp)
         return seen["x"], seen["sigma"]
 
     def test_flow_churn_uses_the_epsilon_equivalent_noise_level(self):
-        sigmas = fx.flow_sigmas(5)[1:]       # starts below 1
-        x = fx.seeded((1, 4, 6, 6), 11)
-        noise = fx.NoiseSequence(x, 13)
-        s_churn = 3.0                         # min(3/4, √2−1) = √2−1
-        x_hat, sigma_hat = self._first_call(fx.FlowSampling(), sigmas, x, s_churn, noise)
-        gamma = euler_dy.churn_gamma("min", s_churn, len(sigmas) - 1, sigmas[0], 0.0, float("inf"))
-        self.assertEqual(gamma, LIMIT)
-        sigma = sigmas[0]
-        s = sigma / (1 - sigma)
-        s_hat = s * (1 + gamma)
-        expected_sigma = s_hat / (1 + s_hat)
-        expected_x = (1 - expected_sigma) * (x / (1 - sigma) - noise.drawn[0] * (s_hat ** 2 - s ** 2) ** 0.5)
-        torch.testing.assert_close(sigma_hat, expected_sigma.reshape(1), rtol=1e-12, atol=1e-12)
-        torch.testing.assert_close(x_hat, expected_x, rtol=1e-12, atol=1e-12)
-        self.assertLess(float(sigma_hat), 1.0)
-        self.assertGreater(float(sigma_hat), float(sigma))
+        for cfg_pp in (True, False):   # the CFG++ entries and the plain Euler Dy / Euler SMEA Dy
+            with self.subTest(cfg_pp=cfg_pp):
+                sigmas = fx.flow_sigmas(5)[1:]       # starts below 1
+                x = fx.seeded((1, 4, 6, 6), 11)
+                noise = fx.NoiseSequence(x, 13)
+                s_churn = 3.0                         # min(3/4, √2−1) = √2−1
+                x_hat, sigma_hat = self._first_call(fx.FlowSampling(), sigmas, x, s_churn, noise, cfg_pp=cfg_pp)
+                gamma = euler_dy.churn_gamma("min", s_churn, len(sigmas) - 1, sigmas[0], 0.0, float("inf"))
+                self.assertEqual(gamma, LIMIT)
+                sigma = sigmas[0]
+                s = sigma / (1 - sigma)
+                s_hat = s * (1 + gamma)
+                expected_sigma = s_hat / (1 + s_hat)
+                expected_x = (1 - expected_sigma) * (x / (1 - sigma) - noise.drawn[0] * (s_hat ** 2 - s ** 2) ** 0.5)
+                torch.testing.assert_close(sigma_hat, expected_sigma.reshape(1), rtol=1e-12, atol=1e-12)
+                torch.testing.assert_close(x_hat, expected_x, rtol=1e-12, atol=1e-12)
+                self.assertLess(float(sigma_hat), 1.0)
+                self.assertGreater(float(sigma_hat), float(sigma))
 
     def test_flow_at_sigma_one_is_not_churned(self):
         sigmas = fx.flow_sigmas(5)

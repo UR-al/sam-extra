@@ -4555,7 +4555,7 @@ class AnimaSafePAG(scripts.Script):
             gr.Markdown(
                 "#### HiGS — History-Guided Sampling\n"
                 "앞 스텝 예측의 지수평균과의 차이 중 **고주파(DCT 필터)**만 더해 디테일을 살립니다(arXiv 2509.22300, "
-                "ICLR 2026). 첫 스텝은 기록만 합니다. Anima는 CFG 4~5로 논문(2.5)보다 높아 과채도를 막는 η=0을 "
+                "ICLR 2026). 첫 스텝은 기록만 합니다. Anima는 CFG 4\\~5로 논문(2.5)보다 높아 과채도를 막는 η=0을 "
                 "기본으로 했습니다(논문 FID 설정). Momentum과 같은 기록을 써서 함께 켜면 겹칩니다."
             )
             higs_enabled = gr.Checkbox(

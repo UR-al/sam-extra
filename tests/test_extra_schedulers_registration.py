@@ -7,15 +7,18 @@ with their heavy imports stubbed, and Forge's real ``KDiffusionSampler.get_sigma
 """
 from __future__ import annotations
 
+import ast
 import contextlib
 import functools
 import importlib.util
 import io
+import math
 import sys
 import types
 import unittest
 from collections import namedtuple
 from pathlib import Path
+from unittest import mock
 
 import torch
 
@@ -23,6 +26,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "tests"))
 
+import _extra_samplers_fixtures as fixtures  # noqa: E402
 import _extra_schedulers_support as support  # noqa: E402
 from sam3ext.extra_schedulers import registry  # noqa: E402
 from sam3ext.extra_schedulers import schedulers as sch  # noqa: E402
@@ -35,7 +39,12 @@ EXPECTED = [
     ("laplace", "Laplace"),
     ("karras_dynamic", "Karras Dynamic"),
     ("custom", "custom"),
+    ("react_cosinusoidal_dynsf", "React Cosinusoidal DynSF"),
+    ("flow_cosmos_rho7", "Flow Cosmos rho7"),
+    ("flow_cosmos_dynamic", "Flow Cosmos Dynamic"),
 ]
+# The two that ask Forge for its model (flow or eps/v).
+NEED_MODEL = ("Flow Cosmos rho7", "Flow Cosmos Dynamic")
 
 
 def _register(module, **kwargs):
@@ -47,19 +56,21 @@ def _register(module, **kwargs):
 
 
 class StubRegistrationTests(unittest.TestCase):
-    def test_all_six_are_added_in_order_with_forges_fields(self):
+    def test_all_nine_are_added_in_order_with_forges_fields(self):
         module = support.stub_sd_schedulers()
         report, _log = _register(module, hidden_labels=[])
         self.assertEqual(report.added, [label for _name, label in EXPECTED])
         self.assertIsNone(report.error)
-        ours = module.all_schedulers[-6:]
+        self.assertEqual(len(EXPECTED), 9)
+        ours = module.all_schedulers[-9:]
         self.assertEqual([(s.name, s.label) for s in ours], EXPECTED)
-        self.assertEqual(module.schedulers[-6:], ours)
+        self.assertEqual(module.schedulers[-9:], ours)
         for scheduler in ours:
             with self.subTest(label=scheduler.label):
                 self.assertIs(module.schedulers_map[scheduler.name], scheduler)
                 self.assertIs(module.schedulers_map[scheduler.label], scheduler)
-                self.assertFalse(scheduler.need_inner_model)
+                # only the Flow Cosmos schedulers ask Forge for its model (flow or eps/v)
+                self.assertIs(scheduler.need_inner_model, scheduler.label in NEED_MODEL)
                 self.assertTrue(registry.is_ours(scheduler))
         rho = {s.label: s.default_rho for s in ours}
         self.assertEqual(rho.pop("Karras Dynamic"), 7.0)
@@ -107,7 +118,7 @@ class StubRegistrationTests(unittest.TestCase):
         module.schedulers_map.update({"laplace_other": foreign, "Laplace": foreign})
         report, log = _register(module, hidden_labels=[])
         self.assertEqual(report.skipped, ["Laplace"])
-        self.assertEqual(len(report.added), 5)
+        self.assertEqual(len(report.added), 8)
         self.assertIs(module.schedulers_map["Laplace"], foreign)
         self.assertNotIn("laplace", module.schedulers_map)
         self.assertEqual(log.count("'Laplace' is not added"), 1)
@@ -124,7 +135,8 @@ class StubRegistrationTests(unittest.TestCase):
         module.all_schedulers.append(support.StubScheduler("y", "Y", lambda *a, **k: None, aliases=["Karras dynamic"]))
         report, _log = _register(module, hidden_labels=[])
         self.assertEqual(sorted(report.skipped), ["Cosine", "Karras Dynamic", "Phi"])
-        self.assertEqual(sorted(report.added), ["CosineExponential blend", "Laplace", "custom"])
+        self.assertEqual(sorted(report.added), ["CosineExponential blend", "Flow Cosmos Dynamic", "Flow Cosmos rho7",
+                                                "Laplace", "React Cosinusoidal DynSF", "custom"])
 
     def test_forge_lookup_cache_is_cleared_and_the_kdiffusion_map_mirrored(self):
         calls = []
@@ -142,6 +154,9 @@ class StubRegistrationTests(unittest.TestCase):
         self.assertEqual(get_sampler_and_scheduler.cache_info().currsize, 0)
         self.assertIn("karras", kdiffusion.k_diffusion_scheduler)
         self.assertIs(kdiffusion.k_diffusion_scheduler["laplace"], sch.laplace)
+        self.assertIs(kdiffusion.k_diffusion_scheduler["react_cosinusoidal_dynsf"], sch.react_cosinusoidal_dynsf)
+        self.assertIs(kdiffusion.k_diffusion_scheduler["flow_cosmos_rho7"], sch.flow_cosmos_rho7)
+        self.assertIs(kdiffusion.k_diffusion_scheduler["flow_cosmos_dynamic"], sch.flow_cosmos_dynamic)
         self.assertNotIn("phi", kdiffusion.k_diffusion_scheduler)
 
     def test_the_fork_readme_labels_resolve_to_ours(self):
@@ -151,7 +166,8 @@ class StubRegistrationTests(unittest.TestCase):
         # An alias equal to the scheduler's own name or label is left out: it is already a key.
         self.assertEqual({label: s.aliases for label, s in ours.items()}, {
             "Cosine": None, "CosineExponential blend": ["cosine-exponential blend"], "Phi": None, "Laplace": None,
-            "Karras Dynamic": ["karras dynamic"], "custom": None,
+            "Karras Dynamic": ["karras dynamic"], "custom": None, "React Cosinusoidal DynSF": None,
+            "Flow Cosmos rho7": None, "Flow Cosmos Dynamic": None,
         })
         readme = ["cosine", "cosine-exponential blend", "phi", "Laplace", "Karras Dynamic", "custom"]   # as written there
         for written, label in zip(readme, registry.SCHEDULER_LABELS):
@@ -198,6 +214,61 @@ class StubRegistrationTests(unittest.TestCase):
         for spec in registry.SCHEDULER_SPECS:
             self.assertEqual(spec.function._sam_extra_owner, registry.OWNER)
         self.assertEqual(registry.SCHEDULER_LABELS, tuple(label for _name, label in EXPECTED))
+
+    def test_react_dynsf_follows_the_six_without_a_readme_alias(self):
+        self.assertEqual(registry.SCHEDULER_SPECS[5].name, "custom")
+        spec = registry.SCHEDULER_SPECS[6]
+        self.assertEqual((spec.name, spec.label, spec.function), ("react_cosinusoidal_dynsf",
+                                                                  registry.LABEL_REACT_DYNSF,
+                                                                  sch.react_cosinusoidal_dynsf))
+        self.assertEqual(registry.LABEL_REACT_DYNSF, "React Cosinusoidal DynSF")
+        self.assertEqual((spec.aliases, spec.default_rho, spec.need_inner_model), ((), -1.0, False))
+        self.assertNotIn("react_cosinusoidal_dynsf", registry.README_LABELS)
+        # The desktop app pins the label and the factor by AST: module-level literals.
+        for path, name, value in (("sam3ext/extra_schedulers/registry.py", "LABEL_REACT_DYNSF", "React Cosinusoidal DynSF"),
+                                  ("sam3ext/extra_schedulers/schedulers.py", "REACT_DYNSF_FACTOR", 2.15)):
+            tree = ast.parse((ROOT / path).read_text(encoding="utf-8"))
+            literal = next(node.value for node in tree.body if isinstance(node, ast.Assign)
+                           and [getattr(t, "id", None) for t in node.targets] == [name])
+            self.assertIsInstance(literal, ast.Constant)
+            self.assertEqual(literal.value, value)
+
+    def test_flow_cosmos_rho7_follows_react_and_asks_for_the_model(self):
+        """KeithZ117/Comfyui-anima-sampler's option name, Forge-style label, no alias, no rho of its own (Settings →
+        rho does not reach it: Forge passes rho only to a scheduler with a default_rho), and need_inner_model so
+        that Forge passes the model whose predictor tells flow from eps/v."""
+        spec = registry.SCHEDULER_SPECS[7]
+        self.assertEqual(registry.SCHEDULER_SPECS[6].label, registry.LABEL_REACT_DYNSF)
+        self.assertEqual((spec.name, spec.label, spec.function), ("flow_cosmos_rho7", registry.LABEL_FLOW_COSMOS_RHO7,
+                                                                  sch.flow_cosmos_rho7))
+        self.assertEqual(registry.LABEL_FLOW_COSMOS_RHO7, "Flow Cosmos rho7")
+        self.assertEqual((spec.aliases, spec.default_rho, spec.need_inner_model), ((), -1.0, True))
+        self.assertNotIn("flow_cosmos_rho7", registry.README_LABELS)
+        tree = ast.parse((ROOT / "sam3ext/extra_schedulers/registry.py").read_text(encoding="utf-8"))
+        literal = next(node.value for node in tree.body if isinstance(node, ast.Assign)
+                       and [getattr(t, "id", None) for t in node.targets] == ["LABEL_FLOW_COSMOS_RHO7"])
+        self.assertIsInstance(literal, ast.Constant)
+        self.assertEqual(literal.value, "Flow Cosmos rho7")
+
+    def test_flow_cosmos_dynamic_is_appended_last_right_after_flow_cosmos_rho7(self):
+        """D20: this extension's own name and Forge-style label, no alias, no rho of its own (it reads the accordion's
+        Flow Cosmos rho; Settings → rho does not reach it), need_inner_model like Flow Cosmos rho7. The label is a
+        module-level literal (the desktop app pins labels by AST); FLOW_COSMOS_LABELS names the two schedulers that use
+        the three Flow Cosmos values."""
+        spec = registry.SCHEDULER_SPECS[-1]
+        self.assertEqual(registry.SCHEDULER_SPECS[-2].name, "flow_cosmos_rho7")
+        self.assertEqual((spec.name, spec.label, spec.function),
+                         ("flow_cosmos_dynamic", registry.LABEL_FLOW_COSMOS_DYNAMIC, sch.flow_cosmos_dynamic))
+        self.assertEqual(registry.LABEL_FLOW_COSMOS_DYNAMIC, "Flow Cosmos Dynamic")
+        self.assertEqual(sch.FLOW_COSMOS_DYNAMIC, registry.LABEL_FLOW_COSMOS_DYNAMIC, "the name in its messages")
+        self.assertEqual((spec.aliases, spec.default_rho, spec.need_inner_model), ((), -1.0, True))
+        self.assertNotIn("flow_cosmos_dynamic", registry.README_LABELS)
+        self.assertEqual(registry.FLOW_COSMOS_LABELS, ("Flow Cosmos rho7", "Flow Cosmos Dynamic"))
+        tree = ast.parse((ROOT / "sam3ext/extra_schedulers/registry.py").read_text(encoding="utf-8"))
+        literal = next(node.value for node in tree.body if isinstance(node, ast.Assign)
+                       and [getattr(t, "id", None) for t in node.targets] == ["LABEL_FLOW_COSMOS_DYNAMIC"])
+        self.assertIsInstance(literal, ast.Constant)
+        self.assertEqual(literal.value, "Flow Cosmos Dynamic")
 
 
 # ---------------------------------------------------------------------------
@@ -279,7 +350,8 @@ class ForgeRegistryTests(unittest.TestCase):
                          forge_labels + [label for _name, label in EXPECTED])
         visible = [s.label for s in self.sd_schedulers.schedulers]
         self.assertNotIn("Phi", visible)
-        for label in ("Cosine", "CosineExponential blend", "Laplace", "Karras Dynamic", "custom"):
+        for label in ("Cosine", "CosineExponential blend", "Laplace", "Karras Dynamic", "custom", "React Cosinusoidal DynSF",
+                      "Flow Cosmos rho7", "Flow Cosmos Dynamic"):
             self.assertIn(label, visible)
             self.assertIsInstance(self.sd_schedulers.schedulers_map[label], self.sd_schedulers.Scheduler)
         # Forge's own formula for the map gives the same mapping, plus our two fork-README aliases.
@@ -319,7 +391,8 @@ class ForgeRegistryTests(unittest.TestCase):
 
         st.set_active(st.ExtraSchedulerSettings(laplace_mu=0.7, laplace_beta=0.9, custom_expression="m + (M - m) * (1 - x) ** 2"))
         for label, function in (("Cosine", sch.cosine), ("CosineExponential blend", sch.cosine_exponential_blend),
-                                ("Laplace", sch.laplace), ("Karras Dynamic", sch.karras_dynamic), ("custom", sch.custom)):
+                                ("Laplace", sch.laplace), ("Karras Dynamic", sch.karras_dynamic), ("custom", sch.custom),
+                                ("React Cosinusoidal DynSF", sch.react_cosinusoidal_dynsf)):
             with self.subTest(label=label):
                 sigmas, p = run(label)
                 self.assertTrue(torch.equal(sigmas, function(n=12, sigma_min=lo, sigma_max=hi)))
@@ -337,6 +410,182 @@ class ForgeRegistryTests(unittest.TestCase):
         sigmas, _p = run("custom", discard_next_to_last_sigma=True)   # DPM2/3M SDE-style samplers
         full = sch.custom(n=13, sigma_min=lo, sigma_max=hi)
         self.assertTrue(torch.equal(sigmas, torch.cat([full[:-2], full[-1:]])))
+
+    def test_reforge_infotexts_find_react_dynsf(self):
+        """reForge writes "Schedule type: React Cosinusoidal DynSF"; Forge's own lookups find ours by label and name."""
+        self._register()
+        lookup = self.sd_samplers.get_sampler_and_scheduler
+        for written in ("React Cosinusoidal DynSF", "react_cosinusoidal_dynsf"):
+            with self.subTest(written=written):
+                self.assertEqual(lookup("Euler", written), ("Euler", "React Cosinusoidal DynSF"))
+        self.assertEqual(self.sd_samplers.get_scheduler_from_infotext(
+            {"Sampler": "Euler", "Schedule type": "React Cosinusoidal DynSF"}), "React Cosinusoidal DynSF")
+
+    def test_flow_cosmos_rho7_infotext_pastes_back_and_xyz_lists_it(self):
+        """Forge writes "Schedule type: Flow Cosmos rho7"; its infotext parser and the API's lookup find ours by
+        label and by name. The XYZ "Schedule type" axis offers the labels of ``sd_schedulers.schedulers``
+        (scripts/xyz_grid.py) and sets ``p.scheduler`` to one, which get_sigmas looks up (test below)."""
+        self._register()
+        lookup = self.sd_samplers.get_sampler_and_scheduler
+        for written in ("Flow Cosmos rho7", "flow_cosmos_rho7"):
+            with self.subTest(written=written):
+                self.assertEqual(lookup("Euler", written), ("Euler", "Flow Cosmos rho7"))
+                self.assertIs(self.sd_schedulers.schedulers_map[written].function, sch.flow_cosmos_rho7)
+        self.assertEqual(self.sd_samplers.get_scheduler_from_infotext(
+            {"Sampler": "Euler", "Schedule type": "Flow Cosmos rho7"}), "Flow Cosmos rho7")
+        self.assertEqual(self.sd_samplers.get_hr_sampler_and_scheduler(
+            {"Sampler": "Euler", "Schedule type": "Karras", "Hires schedule type": "Flow Cosmos rho7"}),
+            ("Use same sampler", "Flow Cosmos rho7"))
+        self.assertIn("Flow Cosmos rho7", [x.label for x in self.sd_schedulers.schedulers])   # the XYZ axis choices
+
+    def test_flow_cosmos_dynamic_infotext_pastes_back_and_xyz_lists_it(self):
+        """As for Flow Cosmos rho7: "Schedule type: Flow Cosmos Dynamic" (or its name) finds ours through Forge's own
+        lookups, also in the Hires field and in legacy "Sampler: <sampler> <scheduler>" infotext; the XYZ "Schedule
+        type" axis offers it by label."""
+        self._register()
+        lookup = self.sd_samplers.get_sampler_and_scheduler
+        for written in ("Flow Cosmos Dynamic", "flow_cosmos_dynamic"):
+            with self.subTest(written=written):
+                self.assertEqual(lookup("Euler", written), ("Euler", "Flow Cosmos Dynamic"))
+                self.assertIs(self.sd_schedulers.schedulers_map[written].function, sch.flow_cosmos_dynamic)
+        self.assertEqual(lookup("Euler Flow Cosmos Dynamic", None), ("Euler", "Flow Cosmos Dynamic"))
+        self.assertEqual(lookup("Euler Flow Cosmos rho7", None), ("Euler", "Flow Cosmos rho7"))
+        self.assertEqual(self.sd_samplers.get_scheduler_from_infotext(
+            {"Sampler": "Euler", "Schedule type": "Flow Cosmos Dynamic"}), "Flow Cosmos Dynamic")
+        self.assertEqual(self.sd_samplers.get_hr_sampler_and_scheduler(
+            {"Sampler": "Euler", "Schedule type": "Flow Cosmos rho7", "Hires schedule type": "Flow Cosmos Dynamic"}),
+            ("Use same sampler", "Flow Cosmos Dynamic"))
+        labels = [x.label for x in self.sd_schedulers.schedulers]   # the XYZ axis choices
+        self.assertEqual(labels.index("Flow Cosmos Dynamic"), labels.index("Flow Cosmos rho7") + 1)
+
+    def test_forges_get_sigmas_runs_flow_cosmos_dynamic_with_the_models_predictor(self):
+        """Forge's real get_sigmas and model_wrap around Forge's real predictors: the flow list on Anima (shift 3),
+        Karras Dynamic with the accordion's ρ on SDXL eps; Settings → rho never reaches it (no default_rho), Settings →
+        sigma min reaches the eps/v branch only; Forge writes no rho for it."""
+        self._register()
+        get_sigmas, opts = self._forge_get_sigmas()
+        sampling_path = "modules_forge/packages/k_diffusion/sampling.py"
+        append_zero = support.forge_function(sampling_path, "append_zero", {"torch": torch, "math": math})
+        linker = support.forge_function("modules_forge/packages/k_diffusion/external.py", "ForgeScheduleLinker",
+                                        {"torch": torch, "nn": torch.nn,
+                                         "sampling": types.SimpleNamespace(append_zero=append_zero)})
+        flow_wrap = linker(fixtures.forge_flow_predictor(3.0))
+        eps_wrap = linker(fixtures.forge_eps_predictor())
+
+        def run(model_wrap, steps=12):
+            sampler = types.SimpleNamespace(config=types.SimpleNamespace(options={}), model_wrap=model_wrap)
+            p = types.SimpleNamespace(scheduler="Flow Cosmos Dynamic", hr_scheduler=None, is_hr_pass=False,
+                                      extra_generation_params={}, sampler_noise_scheduler_override=None)
+            return get_sigmas(sampler, p, steps), p
+
+        lo, hi = eps_wrap.sigmas[0].item(), eps_wrap.sigmas[-1].item()
+        flow_list = sch._with_final_zero(sch._flow_cosmos_dynamic_times(12)[0], "cpu")
+        stderr = io.StringIO()
+        with mock.patch.object(sch, "_flow_cosmos_dynamic_not_flow_logged", False), contextlib.redirect_stderr(stderr):
+            sigmas, p = run(flow_wrap)
+            self.assertTrue(torch.equal(sigmas, flow_list))
+            self.assertEqual(p.extra_generation_params, {"Schedule type": "Flow Cosmos Dynamic"})
+            self.assertEqual(stderr.getvalue(), "")
+            sigmas, p = run(eps_wrap)
+            self.assertTrue(torch.equal(sigmas, sch.karras_dynamic(12, lo, hi, rho=7.0)))
+            self.assertEqual(p.extra_generation_params, {"Schedule type": "Flow Cosmos Dynamic"})
+            run(eps_wrap)
+            self.assertEqual(stderr.getvalue().count("Flow Cosmos Dynamic: not a flow model"), 1)
+            opts.rho = 4.5   # Settings → rho reaches Karras Dynamic, not Flow Cosmos Dynamic
+            sigmas, p = run(eps_wrap)
+            self.assertTrue(torch.equal(sigmas, sch.karras_dynamic(12, lo, hi, rho=7.0)))
+            self.assertNotIn("Schedule rho", p.extra_generation_params)
+            opts.rho = 0
+            opts.sigma_min = 0.1   # Settings → sigma min override: the eps/v branch's range only
+            sigmas, _p = run(eps_wrap)
+            self.assertTrue(torch.equal(sigmas, sch.karras_dynamic(12, 0.1, hi)))
+            sigmas, _p = run(flow_wrap)
+            self.assertTrue(torch.equal(sigmas, flow_list), "the flow list does not use the model's range")
+            opts.sigma_min = 0
+            st.set_active(st.ExtraSchedulerSettings(flow_cosmos_rho=5.0, flow_cosmos_sigma_max=240.0,
+                                                    flow_cosmos_sigma_min=0.006))
+            sigmas, _p = run(flow_wrap)
+            self.assertTrue(torch.equal(sigmas, sch._with_final_zero(
+                sch._flow_cosmos_dynamic_times(12, 5.0, 0.006, 240.0)[0], "cpu")))
+            sigmas, _p = run(eps_wrap)
+            self.assertTrue(torch.equal(sigmas, sch.karras_dynamic(12, lo, hi, rho=5.0)))
+
+    def test_forges_get_sigmas_runs_flow_cosmos_rho7_with_the_models_predictor(self):
+        """Forge's real get_sigmas with its real model_wrap (``ForgeScheduleLinker``) around Forge's real predictors:
+        the flow list on Anima (shift 3), Forge's Karras on SDXL eps; Settings → rho never reaches it, Settings →
+        sigma min reaches the Karras branch as it reaches Forge's Karras and does not change the flow list."""
+        self._register()
+        get_sigmas, opts = self._forge_get_sigmas()
+        # Forge's k_diffusion.sampling (executed from Forge's file), whose get_sigmas_karras the eps/v branch calls
+        self.enterContext(fixtures.installed_k_sampling(fixtures.forge_k_sampling()))
+        sampling_path = "modules_forge/packages/k_diffusion/sampling.py"
+        namespace = {"torch": torch, "math": math}
+        append_zero = support.forge_function(sampling_path, "append_zero", namespace)
+        karras = support.forge_function(sampling_path, "get_sigmas_karras", namespace)
+        linker = support.forge_function("modules_forge/packages/k_diffusion/external.py", "ForgeScheduleLinker",
+                                        {"torch": torch, "nn": torch.nn,
+                                         "sampling": types.SimpleNamespace(append_zero=append_zero)})
+        flow_wrap = linker(fixtures.forge_flow_predictor(3.0))
+        eps_wrap = linker(fixtures.forge_eps_predictor())
+        real_is_flow_model = sch.is_flow_model
+        seen = []
+
+        def spy(model):
+            seen.append(model)
+            return real_is_flow_model(model)
+
+        def run(model_wrap, steps=12):
+            sampler = types.SimpleNamespace(config=types.SimpleNamespace(options={}), model_wrap=model_wrap)
+            p = types.SimpleNamespace(scheduler="Flow Cosmos rho7", hr_scheduler=None, is_hr_pass=False,
+                                      extra_generation_params={}, sampler_noise_scheduler_override=None)
+            with mock.patch.object(sch, "is_flow_model", side_effect=spy):
+                return get_sigmas(sampler, p, steps), p
+
+        flow_list = sch.flow_cosmos_rho7(12, 0.5, 1.0, inner_model=flow_wrap)
+        lo, hi = eps_wrap.sigmas[0].item(), eps_wrap.sigmas[-1].item()
+        stderr = io.StringIO()
+        with mock.patch.object(sch, "_flow_cosmos_not_flow_logged", False), contextlib.redirect_stderr(stderr):
+            sigmas, p = run(flow_wrap)
+            self.assertIs(seen[-1], flow_wrap, "Forge passes its model_wrap as inner_model")
+            self.assertTrue(torch.equal(sigmas, flow_list))
+            self.assertEqual(p.extra_generation_params, {"Schedule type": "Flow Cosmos rho7"})
+            self.assertEqual(stderr.getvalue(), "")
+
+            sigmas, p = run(eps_wrap)
+            self.assertIs(seen[-1], eps_wrap)
+            self.assertTrue(torch.equal(sigmas, karras(12, lo, hi)))
+            self.assertEqual(p.extra_generation_params, {"Schedule type": "Flow Cosmos rho7"})
+            run(eps_wrap)
+            self.assertEqual(stderr.getvalue().count("not a flow model"), 1)
+
+            opts.rho = 4.5   # Settings → rho: Karras takes it, Flow Cosmos rho7 does not (no default_rho)
+            sigmas, p = run(eps_wrap)
+            self.assertTrue(torch.equal(sigmas, karras(12, lo, hi, rho=7.0)))
+            self.assertNotIn("Schedule rho", p.extra_generation_params)
+            opts.rho = 0
+            opts.sigma_min = 0.1   # Settings → sigma min override
+            sigmas, p = run(eps_wrap)
+            self.assertTrue(torch.equal(sigmas, karras(12, 0.1, hi)))
+            self.assertEqual(p.extra_generation_params["Schedule min sigma"], 0.1)
+            sigmas, _p = run(flow_wrap)
+            self.assertTrue(torch.equal(sigmas, flow_list), "the flow list does not use the model's range")
+            opts.sigma_min = 0
+
+            # D19: the accordion's values (the script's process sets them before sampling) — rho on both, σ̃ on flow
+            st.set_active(st.ExtraSchedulerSettings(flow_cosmos_rho=5.0, flow_cosmos_sigma_max=240.0,
+                                                    flow_cosmos_sigma_min=0.006))
+            sigmas, p = run(flow_wrap)
+            self.assertTrue(torch.equal(sigmas, sch._with_final_zero(sch._flow_cosmos_times(12, 5.0, 0.006, 240.0),
+                                                                     "cpu")))
+            self.assertEqual(p.extra_generation_params, {"Schedule type": "Flow Cosmos rho7"},
+                             "Forge writes no rho for it (the script writes the Flow Cosmos keys)")
+            sigmas, p = run(eps_wrap)
+            self.assertTrue(torch.equal(sigmas, karras(12, lo, hi, rho=5.0)))
+            self.assertNotIn("Schedule rho", p.extra_generation_params)
+            opts.rho = 4.5   # still not Settings → rho
+            sigmas, _p = run(eps_wrap)
+            self.assertTrue(torch.equal(sigmas, karras(12, lo, hi, rho=5.0)))
+            opts.rho = 0
 
     def test_the_fork_readme_labels_resolve_through_forges_own_lookups(self):
         self._register()   # Phi is hidden in setUp

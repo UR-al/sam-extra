@@ -749,6 +749,14 @@
             });
             lastOrderedChoices = ordered;
             var rendered = ordered.slice(0, renderedChoiceLimit);
+            // The list is rebuilt below (paging when the list is scrolled to
+            // its end, a choices refresh). A focused choice would be destroyed
+            // with it and the keyboard focus would fall to <body>, so the same
+            // choice (or the row at the same place) gets the focus back.
+            var active = document.activeElement;
+            var focusedIndex = active && active.parentNode === list
+                ? optionButtons.indexOf(active) : -1;
+            var focusedChoice = focusedIndex !== -1 ? active.textContent : null;
             list.textContent = "";
             optionButtons = [];
             rendered.forEach(function (choice, index) {
@@ -786,6 +794,12 @@
                 optionButtons.push(option);
                 list.appendChild(option);
             });
+            if (focusedIndex !== -1 && optionButtons.length) {
+                var again = optionButtons.find(function (option) {
+                    return option.textContent === focusedChoice;
+                }) || optionButtons[Math.min(focusedIndex, optionButtons.length - 1)];
+                again.focus({ preventScroll: true });
+            }
             if (!matches.length) {
                 empty.textContent = "일치하는 항목이 없습니다";
                 empty.hidden = false;
@@ -813,65 +827,70 @@
             catch (error) { return popover.getAttribute("data-open") === "true"; }
         }
 
+        // Every fast dropdown is ONE column (decided with the user): one choice
+        // per row in list order, so ArrowUp/ArrowDown move visually up/down,
+        // and a list that does not fit scrolls instead of spreading into
+        // side-by-side columns. The panel is as wide as the trigger (at least
+        // 280px, never wider than the viewport).
         function positionPopover() {
             var rect = trigger.getBoundingClientRect();
             var gutter = 8;
-            var baseWidth = Math.max(rect.width, 280);
-            var availableWidth = Math.max(240, window.innerWidth - gutter * 2);
-            var availableHeight = Math.max(240, window.innerHeight - gutter * 2);
+            var gap = 4;
             var optionRowHeight = 44;
             var popoverChromeHeight = 64;
-            var maxRows = Math.max(
-                4,
-                Math.floor(
-                    (availableHeight - popoverChromeHeight) / optionRowHeight
-                )
+            var minRows = 4;
+            var width = Math.min(
+                Math.max(rect.width, 280),
+                Math.max(240, window.innerWidth - gutter * 2)
             );
+            var availableHeight = Math.max(240, window.innerHeight - gutter * 2);
             var itemCount = Math.max(1, optionButtons.length);
-            var idealColumns = Math.max(1, Math.ceil(itemCount / maxRows));
-            var maxColumns = Math.max(
-                1,
-                Math.floor(availableWidth / baseWidth)
-            );
-            var columns = Math.min(idealColumns, maxColumns);
             var hasMore = list.getAttribute("data-has-more") === "true";
-            if (hasMore) {
-                // Keep at least one row below the viewport so a real scrollbar
-                // exists even on a large monitor. Reaching its end appends the
-                // next configured page instead of hiding unknown choices.
-                var maxColumnsWithOverflow = Math.max(
-                    1,
-                    Math.floor((itemCount - 1) / maxRows)
-                );
-                columns = Math.min(columns, maxColumnsWithOverflow);
+            // Keep at least one rendered row below the fold while more pages
+            // exist, so a real scrollbar exists even on a large monitor.
+            // Reaching its end appends the next configured page instead of
+            // hiding unknown choices.
+            var wantedRows = hasMore
+                ? Math.max(minRows, itemCount - 1) : itemCount;
+            var wantedHeight = popoverChromeHeight + wantedRows * optionRowHeight;
+            var below = window.innerHeight - gutter - (rect.bottom + gap);
+            var above = rect.top - gap - gutter;
+            var minHeight = popoverChromeHeight + minRows * optionRowHeight;
+            var placement;
+            var panelHeight;
+            if (below >= wantedHeight) {
+                placement = "below";
+                panelHeight = wantedHeight;
+            } else if (above >= wantedHeight) {
+                placement = "above";
+                panelHeight = wantedHeight;
+            } else if (Math.max(below, above) >= minHeight) {
+                // Too long for either side: fill the roomier side and scroll.
+                placement = below >= above ? "below" : "above";
+                panelHeight = Math.max(below, above);
+            } else {
+                placement = "top";
+                panelHeight = Math.min(availableHeight, wantedHeight);
             }
-            var rows = Math.max(1, Math.ceil(itemCount / columns));
-            var visibleRows = Math.min(rows, maxRows);
-            if (hasMore && rows <= maxRows) {
-                visibleRows = Math.max(4, rows - 1);
-            }
-            var needsScroll = hasMore || rows > maxRows;
-            var width = Math.min(baseWidth * columns, availableWidth);
-            var panelHeight = Math.min(
-                availableHeight,
+            var visibleRows = Math.max(1, Math.min(
+                wantedRows,
+                Math.floor((panelHeight - popoverChromeHeight) / optionRowHeight)
+            ));
+            // Whole rows only: the panel is the search box plus the rows it
+            // shows, so a panel opened above ends right at the trigger.
+            panelHeight = Math.min(
+                panelHeight,
                 popoverChromeHeight + visibleRows * optionRowHeight
             );
-            var below = window.innerHeight - rect.bottom - gutter;
-            var above = rect.top - gutter;
-            var top;
-            if (below >= panelHeight) {
-                top = rect.bottom + 4;
-            } else if (above >= panelHeight) {
-                top = rect.top - panelHeight - 4;
-            } else {
-                top = gutter;
-            }
+            var top = placement === "below" ? rect.bottom + gap
+                : placement === "above" ? rect.top - gap - panelHeight
+                    : gutter;
+            var needsScroll = hasMore || visibleRows < itemCount;
             var left = Math.min(
                 Math.max(gutter, rect.left),
                 Math.max(gutter, window.innerWidth - width - gutter)
             );
-            list.style.gridTemplateColumns = "repeat("
-                + columns + ", minmax(0, 1fr))";
+            list.style.gridTemplateColumns = "minmax(0, 1fr)";
             list.style.maxHeight = Math.round(
                 visibleRows * optionRowHeight
             ) + "px";

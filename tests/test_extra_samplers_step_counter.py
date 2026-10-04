@@ -1,4 +1,4 @@
-"""Forge's CFG denoiser step counter around the Euler (SMEA) Dy CFG++ sub-steps.
+"""Forge's CFG denoiser step counter around the Euler (SMEA) Dy sub-steps (CFG++ and plain entries).
 
 Forge's ``CFGDenoiser.forward`` (modules/sd_samplers_cfg_denoiser.py, executed unchanged from Forge's
 file) counts its calls in ``self.step`` and reads the count for
@@ -148,13 +148,17 @@ class StepCounterTests(unittest.TestCase):
         uncond = [[pp.ScheduledPromptConditioning(STEPS, torch.full((1, 4), -1.0))]]
         return {"cond": cond, "uncond": uncond, "cond_scale": CFG, "s_min_uncond": 0.0, "image_cond": None}
 
-    def _run(self, *, smea: bool, substeps: bool, prompt: str, skip_early_cond: float = 0.0, interrupt_after=None):
+    def _run(self, *, smea: bool, substeps: bool, prompt: str, skip_early_cond: float = 0.0, interrupt_after=None,
+             cfg_pp: bool = True):
         host = _Host(self.prompt_parser, skip_early_cond=skip_early_cond)
         host.interrupt_after = interrupt_after
         p = types.SimpleNamespace(is_hr_pass=False, extra_generation_params={}, scripts=None)
         model = host.denoiser(p)
         x = fx.seeded((1, 4, *FULL), 3, dtype=torch.float32)
-        sampler = euler_dy.sample_euler_smea_dy_cfg_pp if smea else euler_dy.sample_euler_dy_cfg_pp
+        if cfg_pp:
+            sampler = euler_dy.sample_euler_smea_dy_cfg_pp if smea else euler_dy.sample_euler_dy_cfg_pp
+        else:   # Euler Dy / Euler SMEA Dy: the same sub-steps with plain Euler updates
+            sampler = euler_dy.sample_euler_smea_dy if smea else euler_dy.sample_euler_dy
         out = sampler(model, x, fx.flow_sigmas(STEPS, dtype=torch.float32), extra_args=self._extra_args(prompt),
                       disable=True, noise_sampler=fx.NoiseSequence(x), substeps=substeps)
         return out, host, model
@@ -182,9 +186,9 @@ class StepCounterTests(unittest.TestCase):
             self.assertIn(use, forward)
 
     def test_a_substep_counts_as_its_step_and_the_count_does_not_drift(self):
-        for smea in (False, True):
-            with self.subTest(smea=smea):
-                _, host, model = self._run(smea=smea, substeps=True, prompt="a [cat:dog:2] photo")
+        for smea, cfg_pp in ((False, True), (True, True), (False, False), (True, False)):
+            with self.subTest(smea=smea, cfg_pp=cfg_pp):
+                _, host, model = self._run(smea=smea, substeps=True, prompt="a [cat:dog:2] photo", cfg_pp=cfg_pp)
                 # what apply_refiner's switch-by-steps sees: the sub-step has its step's count
                 self.assertEqual([seen for seen, _total in host.refiner_seen], self._step_of_call(smea))
                 self.assertTrue(all(total == STEPS for _seen, total in host.refiner_seen))
@@ -193,10 +197,11 @@ class StepCounterTests(unittest.TestCase):
                 self.assertEqual(sum(1 for marker in markers if marker is not None), 2)
 
     def test_prompt_editing_is_not_shifted(self):
-        for smea, prompt, edge in ((False, "a [cat:dog:2] photo", 2), (True, "a [cat:dog:1] photo", 1)):
-            with self.subTest(smea=smea, prompt=prompt):
-                _, plain, _ = self._run(smea=smea, substeps=False, prompt=prompt)
-                _, host, _ = self._run(smea=smea, substeps=True, prompt=prompt)
+        for (smea, prompt, edge), cfg_pp in ((case, cfg_pp) for cfg_pp in (True, False) for case in (
+                (False, "a [cat:dog:2] photo", 2), (True, "a [cat:dog:1] photo", 1))):
+            with self.subTest(smea=smea, prompt=prompt, cfg_pp=cfg_pp):
+                _, plain, _ = self._run(smea=smea, substeps=False, prompt=prompt, cfg_pp=cfg_pp)
+                _, host, _ = self._run(smea=smea, substeps=True, prompt=prompt, cfg_pp=cfg_pp)
                 per_step = [record[1] for record in plain.records]
                 self.assertEqual(len(per_step), STEPS)
                 # the edit falls between the edge step (which has a sub-step) and the next one
@@ -207,12 +212,13 @@ class StepCounterTests(unittest.TestCase):
 
     def test_skip_early_cfg_is_not_shifted(self):
         # skip_early_cond 0.3 of 8 steps → steps 1-2 run at CFG 1 (0 < step/8 <= 0.3); 0.15 → step 1 only
-        for smea, fraction in ((False, 0.3), (True, 0.15)):
-            with self.subTest(smea=smea):
+        for (smea, fraction), cfg_pp in ((case, cfg_pp) for cfg_pp in (True, False)
+                                         for case in ((False, 0.3), (True, 0.15))):
+            with self.subTest(smea=smea, cfg_pp=cfg_pp):
                 _, plain, _ = self._run(smea=smea, substeps=False, prompt="a [cat:dog:2] photo",
-                                        skip_early_cond=fraction)
+                                        skip_early_cond=fraction, cfg_pp=cfg_pp)
                 _, host, _ = self._run(smea=smea, substeps=True, prompt="a [cat:dog:2] photo",
-                                       skip_early_cond=fraction)
+                                       skip_early_cond=fraction, cfg_pp=cfg_pp)
                 per_step = [record[2] for record in plain.records]
                 self.assertEqual(per_step[:4], [CFG, 1.0, 1.0, CFG] if not smea else [CFG, 1.0, CFG, CFG])
                 self.assertEqual([record[2] for record in self._main(host)], per_step)
@@ -222,16 +228,19 @@ class StepCounterTests(unittest.TestCase):
     def test_an_interrupt_in_a_substep_leaves_the_count_of_the_finished_steps(self):
         # Interrupt pressed during step 2's own evaluation (the third call): Forge's forward raises at the
         # entry of the sub-step that follows, before its own "self.step += 1".
-        host = _Host(self.prompt_parser)
-        host.interrupt_after = 3
-        model = host.denoiser(types.SimpleNamespace(is_hr_pass=False, extra_generation_params={}, scripts=None))
-        x = fx.seeded((1, 4, *FULL), 3, dtype=torch.float32)
-        with self.assertRaises(_Interrupted):
-            euler_dy.sample_euler_dy_cfg_pp(model, x, fx.flow_sigmas(STEPS, dtype=torch.float32),
-                                            extra_args=self._extra_args("a [cat:dog:2] photo"), disable=True,
-                                            noise_sampler=fx.NoiseSequence(x))
-        self.assertEqual(len(host.records), 3)   # steps 0, 1, 2 evaluated; the sub-step never ran
-        self.assertEqual(model.step, 3)
+        for sampler in (euler_dy.sample_euler_dy_cfg_pp, euler_dy.sample_euler_dy):
+            with self.subTest(sampler=sampler.__name__):
+                host = _Host(self.prompt_parser)
+                host.interrupt_after = 3
+                model = host.denoiser(types.SimpleNamespace(is_hr_pass=False, extra_generation_params={},
+                                                            scripts=None))
+                x = fx.seeded((1, 4, *FULL), 3, dtype=torch.float32)
+                with self.assertRaises(_Interrupted):
+                    sampler(model, x, fx.flow_sigmas(STEPS, dtype=torch.float32),
+                            extra_args=self._extra_args("a [cat:dog:2] photo"), disable=True,
+                            noise_sampler=fx.NoiseSequence(x))
+                self.assertEqual(len(host.records), 3)   # steps 0, 1, 2 evaluated; the sub-step never ran
+                self.assertEqual(model.step, 3)
 
 
 if __name__ == "__main__":

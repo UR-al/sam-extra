@@ -703,7 +703,7 @@ D'   = D + w(t)·iDCT(H·DCT(ΔD(η))),   H = sigmoid(50·(R − R_c))   (정규
   않았습니다.
 - hires 스케줄 밖의 σ(2차 sampler 중간점)와 바로 앞과 같은 σ는 방향 정렬만 하고, 가속도 상태는 건드리지 않습니다.
 - ADetailer 내부 img2img처럼 그 요청 안에서 따로 도는 샘플링은 `on_cfg_denoiser`로 가려 기록·정렬하지 않습니다.
-- Euler (SMEA) Dy CFG++(Extra Samplers)의 보조 평가(다른 해상도)는 기록하지도 정렬하지도 않습니다. 기록은 해상도가 바뀌면
+- Euler (SMEA) Dy CFG++ · Euler (SMEA) Dy(Extra Samplers)의 보조 평가(다른 해상도)는 기록하지도 정렬하지도 않습니다. 기록은 해상도가 바뀌면
   처음부터 다시 쌓이므로, 이 표시가 없으면 보조 스텝 때문에 1차 기록이 지워집니다.
 - 1차 기록과 hires latent의 배치·채널이 다르면(예: 다른 계열 hires 체크포인트) 건너뜁니다(콘솔 1회).
 - 붙일 때 콘솔에 `HiFlow=record|align` 또는 꺼진 이유(`no hires fix`, `no base-pass trajectory`)가 나옵니다.
@@ -739,8 +739,8 @@ v0.30.0에서는 MG·HiGS 수가 한 Forge 실행 동안 생성마다 더해졌�
 - CNS는 ancestral/SDE에서만 의미가 있습니다.
 - TeaCache는 이 Suite에 포함하지 않습니다. ADG `keep_every`의 batch 크기 진동 및 stateful guidance와
   캐시가 충돌할 수 있습니다.
-- `Euler Dy CFG++`·`Euler SMEA Dy CFG++`(README의 Extra Samplers)는 한 스텝 안에서 모델을 다른 해상도로 한 번 더 부릅니다(반
-  해상도, ×1.25). 이 보조 평가에도 PAG·CFG base·DCW는 그대로 걸립니다. HiFlow 기록·정렬과 Momentum·HiGS 이력은 보조 평가를
+- `Euler Dy CFG++`·`Euler SMEA Dy CFG++`와 CFG++ 없는 `Euler Dy`·`Euler SMEA Dy`(README의 Extra Samplers)는 한 스텝 안에서
+  모델을 다른 해상도로 한 번 더 부릅니다(반 해상도, ×1.25). 네 항목 모두 같은 표시(`sam_extra_substep`)와 아래 규칙을 따릅니다. 이 보조 평가에도 PAG·CFG base·DCW는 그대로 걸립니다. HiFlow 기록·정렬과 Momentum·HiGS 이력은 보조 평가를
   건너뛰고(`transformer_options["sam_extra_substep"]` 표시), TSR은 적용합니다. SMC의 이전 오차와 APG 모멘텀은 보조 평가에서
   읽기만 하고 저장하거나 지우지 않으며(ADG의 cond-only 초기화도 건너뜀), RDC는 보조 평가에 걸지 않아(DCW만 걸림) 이동 평균이
   그대로 남습니다. 보조 평가는 Forge의 스텝 카운터(`CFGDenoiser.step`)도 늘리지 않아 프롬프트 편집·Skip Early CFG가 밀리지
