@@ -270,13 +270,18 @@ class WiringTests(unittest.TestCase):
         self.assertIn("wrote 18 options, 14 changed, kept 4 at 0 (Forge keeps the screen value)", out.getvalue())
 
     def test_a_refused_save_reaches_the_page_as_json(self):
+        # The refusal must come from the save handler, not from Gradio's own input checks: Gradio 5 (the CI venv)
+        # rejects an out-of-range slider value (e.g. steps 151 > 150) before the handler runs, Gradio 4.40 (Forge)
+        # does not. A sampler the screen offers but this Forge does not list (the live test's 'Beta57 (RES4LYF)'
+        # case) passes Gradio's checks in both and is refused by the handler.
         demo = self.build()
-        host = base.make_host(tmp=self.tmp.name, presets=PRESETS)
+        samplers = [name for name in base.SAMPLERS if name != "ER SDE (Tunable)"]
+        host = base.make_host(tmp=self.tmp.name, presets=PRESETS, samplers=samplers)
         with mock.patch.object(usd, "forge_host", lambda: host), contextlib.redirect_stderr(io.StringIO()) as err:
-            payload = self._click(demo, ["anima", *base.ui_values(t2i_step=151)])
+            payload = self._click(demo, ["anima", *base.ui_values(t2i_sampler="ER SDE (Tunable)")])
         self.assertFalse(payload["ok"])
         self.assertEqual(payload["request"], "req-7")
-        self.assertIn("txt2img Steps", payload["error"])
+        self.assertIn("txt2img Sampler", payload["error"])
         self.assertIn("failed", err.getvalue())
         self.assertEqual(host.opts.data, {})
 
