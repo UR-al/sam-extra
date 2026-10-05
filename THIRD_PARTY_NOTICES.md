@@ -481,7 +481,7 @@ Extra Samplers 아코디언에서 받고 노드 범위(stage 1–3, η 0–10)�
 Apache-2.0 4(b) 에 따라 파일 머리에 적은 변경 사항: Forge 의 `trange`·`k_diffusion.deis`, 세 함수 모두 `@torch.no_grad()`, 콜백에 현재 latent 를 넘김(ComfyUI 는 첫
 latent), `max_order` 를 1–4 로 자르고 1 이면 이력을 두지 않음(원본은 빈 목록을 가리켜 IndexError), IPNDM_V 의 4차 가중치 `coeff4` 끝의
 `h_n_1 / h_n_2` 를 `h_n_2 / h_n_3` 으로 고침(2026-10-05, v0.33.1 — 원본 오타로 가중치 합이 1 이 아니어서 Linear Quadratic 처럼 간격 비율이
-갑자기 바뀌는 목록에서 그림이 깨짐). DEIS 계수(`gits-main/solver_utils.py`)는 옮기지 않았습니다 — Forge 가 이미 들고 있는
+갑자기 바뀌는 목록에서 초록 잡음이 됨. 고친 뒤에도 Linear Quadratic 에서는 가변 간격 4차 외삽의 성질로 그림이 타서 쓸 수 없음 — README). DEIS 계수(`gits-main/solver_utils.py`)는 옮기지 않았습니다 — Forge 가 이미 들고 있는
 `modules_forge/packages/k_diffusion/deis.py`(같은 출처, Apache-2.0)를 실행 중에 부릅니다. 이번 판에서는 zju-pi 저장소의 파일을 내려받지
 않았으므로(네트워크 사용 없음) 상류 LICENSE 의 저작권 줄은 옮기지 못했고, ComfyUI 처럼 저장소와 커밋을 적었습니다.
 `tests/_origin_comfyui_ipndm_deis.py` 는 ComfyUI 387f98aa 의 위 1173-1330줄과 `comfy/k_diffusion/deis.py` 전체를 바꾸지 않고 담은 대조

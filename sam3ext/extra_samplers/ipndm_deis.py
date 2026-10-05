@@ -61,7 +61,11 @@ on 2026-10-05, v0.33.1):
    ``−q·h_{n−1}/h_{n−2}`` makes the four step weights sum to ``1 + q·temp2·(h_{n−2}/h_{n−3} − h_{n−1}/h_{n−2})``
    instead of 1. On Anima's Linear Quadratic 28 list the sum is about −174 at step 15 (0-based; σ 0.968 → 0.952)
    and the image turns into green noise, on Forge and on ComfyUI alike; fixed, the weights sum to 1 on every
-   list. Known upstream inaccuracies kept on purpose, so the weights stay ComfyUI's whenever the step ratios are
+   list. That list stays unusable with IPNDM_V all the same (GPU check 2026-10-05: no green noise, but a burnt,
+   smeared image): after 14 tiny steps its step size jumps x3.71, x2.46, x1.59, and any step-size-aware order-4
+   Adams–Bashforth extrapolates across that jump with huge weights (up to 155 here; the exact variable-step AB4
+   up to 117) — the method on that schedule, not a remaining bug. Use Simple, or IPNDM (fixed weights), there.
+   Known upstream inaccuracies kept on purpose, so the weights stay ComfyUI's whenever the step ratios are
    equal (the result too, bit for bit, when the steps are exact in binary — see above):
    ``temp1`` (order 3's ``temp`` too) closes its parenthesis and ``/ 2`` in the wrong place and ``temp2`` adds the
    ``(1 − h_n/(2(h_n+h_{n−1})))·h_n/(6(h_n+h_{n−1}+h_{n−2}))`` term the integral subtracts. Neither changes the
