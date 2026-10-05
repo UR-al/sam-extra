@@ -3,6 +3,54 @@
 버전 태그는 GitHub Releases에도 발행됩니다. 아래는 요약이며, guidance/속도 기능의
 상세는 [docs/GUIDANCE.md](docs/GUIDANCE.md)를 참고하세요.
 
+## v0.33.1 — IPNDM_V 4차 계수 오타 (Linear Quadratic 에서 그림이 깨지던 것)
+
+IPNDM_V 한 샘플러의 계수 한 곳을 고친 판입니다. 다른 샘플러 · 스케줄러 · 스크립트 인자 · infotext · 설정은 그대로이고(결과 같음),
+IPNDM_V 도 스텝 간격 비율이 일정한 목록(고른 간격 · 등비)에서는 결과가 같습니다. Forge 를 재시작하세요(바뀐 Python 파일).
+
+### Extra Samplers
+
+- **IPNDM_V — Linear Quadratic 에서 초록 잡음 (고침)**: zju-pi/diff-sampler 원본의 `ipndm_v_sampler`(ComfyUI 의 `sample_ipndm_v` 가
+  그대로 옮겼고, 0.33.0 은 그것과 비트 단위로 같았음)는 4차 가중치 `coeff4` 의 끝이 `h_n_2 / h_n_3` 이어야 할 자리에 `h_n_1 / h_n_2`
+  로 적혀 있습니다 — `temp2` 가 곱하는 3차 차분 몫의 마지막 항을 잘못 옮긴 오타입니다. 그래서 네 가중치의 합이 1 이 아니라
+  `1 + q·temp2·(h_n_2/h_n_3 − h_n_1/h_n_2)` 입니다: 스텝 간격 비율이 일정하면 두 비가 같아 1 이지만, 비율이 갑자기 바뀌면 크게
+  어긋납니다. Anima 의 Linear Quadratic 28 스텝 목록(앞 14 스텝이 고르다가 간격이 3.7배 · 2.5배로 뜀)에서는 16번째 스텝(σ 0.968 →
+  0.952)의 합이 약 −174 라 latent 가 그 스텝 길이의 174배를 속도 반대쪽으로 가고, 그림이 초록 잡음이 됐습니다 — Forge 와 ComfyUI 가 같은
+  그림(2026-10-05, GPU 대조와 CPU 재현). 이제 그 토큰 하나만 고쳐 가중치 합이 어느 목록에서나 1 입니다.
+- **바뀌는 결과**: IPNDM_V 를 스텝 간격 비율이 일정하지 않은 목록에서 돌린 결과뿐입니다(5 스텝 이상, 첫 4차 스텝부터). Linear
+  Quadratic 은 깨지던 그림이 정상으로 돌아오고, Simple · Normal · SGM Uniform 처럼 비율이 조금씩 바뀌는 목록은 아주 조금 달라집니다
+  (가우스 데이터 한 예, 28 스텝: 최대 0.0075 — 결과 표준편차 0.49). 그런 목록에서는 같은 시드의 0.33.0 이미지와 비트 단위로 같지
+  않습니다. IPNDM · DEIS 와 다른 샘플러는 그대로입니다.
+- **ComfyUI 와의 관계**: 원본의 다른 부정확한 두 곳(`temp1` 의 괄호 위치, `temp2` 의 한 항 부호 — 가중치 합은 그대로 1 이고, 고른
+  간격의 4차 가중치가 AB4 의 55 · −59 · 37 · −9 대신 57 · −65 · 43 · −11 (/24) 이 됨)은 일부러 그대로 둬, 스텝 간격 비율이 일정한
+  목록에서는 지금도 ComfyUI `ipndm_v` 와 비트 단위로 같습니다. 그 밖의 목록에서는 ComfyUI 의 `sample_ipndm_v` 에서 이 토큰 하나만 고친
+  것과 비트 단위로 같습니다. ComfyUI 자체의 `ipndm_v` 는 원본 그대로라 Linear Quadratic 에서 같은 문제가 남습니다. 고친 뒤 shift 3
+  격자의 정확도는 IPNDM 과 비슷합니다(정확한 가우스 디노이저, 16 · 32 · 64 스텝에서 서로 5% 안). 0.33.0 의 IPNDM_V 가 이 격자에서
+  10–20% 정확했던 것은 오타가 우연히 유리했던 것이라, 도움말 · README 의 "shift 된 스케줄에는 IPNDM_V 가 IPNDM 보다 맞음" 은
+  "정확도가 비슷함" 으로 바꿨습니다.
+- **Linear Quadratic 안내 (새 내용, 도움말 · README)**: UniPC bh2 와 Forge 내장 UniPC 는 Linear Quadratic(스텝 앞 절반이 σ 1 가까이에
+  몰렸다가 간격이 갑자기 커짐)에서 불안정합니다 — Forge 와 ComfyUI 가 같은 결과를 내는 조합의 성질이고 코드 결함이 아니라 고치지
+  않았습니다. Simple · Normal · SGM Uniform 은 CPU 시험(정확한 디노이저)에서 문제가 없었습니다.
+
+### 문서 · 테스트
+
+- `ipndm_deis.py` 머리 주석과 docstring 의 변경 목록에 4번(이 수정, 2026-10-05 — 이유, 남겨 둔 원본의 부정확한 곳)을 적고, "ComfyUI
+  와 비트 단위로 같음" 을 IPNDM · DEIS 와 간격 비율이 일정할 때의 IPNDM_V 로 좁혔습니다. README 의 샘플러 표 · IPNDM 절,
+  THIRD_PARTY_NOTICES.md 의 zju-pi 절(Apache-2.0 4(b) 변경 목록에 이 수정), 패키지 docstring 도 같게 고쳤습니다.
+- `test_extra_samplers_ipndm_deis_origin.py`(8 → 13개): 세 샘플러의 단계 코드(`order = …` 부터 이력 갱신 앞까지)가 원본과 토큰 단위로
+  같고 IPNDM_V 만 `coeff4` 끝의 그 토큰이 다른지(주석 · 공백 무시 — 그 밖에 하나라도 다르면 실패). ComfyUI 비트 대조는 IPNDM · DEIS 는
+  전과 같고, IPNDM_V 는 2 · 3차는 모든 목록에서, 4차는 간격 비율이 일정한 목록(고른 간격 · 반씩 줄어드는 목록 — 비율이 부동소수로도
+  같음을 따로 확인)에서. 모든 목록에서 IPNDM_V == "ComfyUI 함수에서 그 토큰 하나만 고친 것"(비트), 원본과는 고르지 않은 목록의 5 스텝
+  이상에서만 다름. Anima 의 Linear Quadratic 28 목록(값을 그대로 적음)에서 등속도 시험 — 고친 가중치의 합이 모든 스텝에서 1(1e-9 안)이고
+  원본은 16번째 스텝에서 약 −174(수정의 이유로 고정) — 과 정확한 가우스 디노이저 시험 — 오차가 Euler 이하이고 IPNDM 과 5% 안(float64 ·
+  float32), 원본은 Euler 의 10배 넘음. shift 3 격자의 IPNDM_V · IPNDM 비교는 "IPNDM_V ≤ IPNDM" 에서 "서로 5% 안" 으로 바꿨습니다(앞의
+  것은 오타 덕분에 성립하던 것이고, 새 조건은 원본 공식에서 실패). 새 검사는 0.33.0 의 `ipndm_deis.py` 에서 하위 시험 31개가 실패합니다.
+- 가이던스 묶음의 배치 비교(`test_integration_samplers_guidance`, Forge 확장 폴더 안에서만 돎): IPNDM_V 의 "배치 이미지 == 같은 시드
+  단독" 반올림 차이가 CPU 에서 최대 1.42e-4 → 1.89e-4(본 패스 4096 값 중 1e-4 넘는 값 2 → 14개)로 조금 커졌고, 허용치 5e-4 는
+  그대로입니다(IPNDM 2.3e-5). 그 테스트 주석의 가중치 · 측정값을 고쳤습니다.
+- 전체(작업 트리, CPU): 3104 테스트 통과(건너뜀 185, 0.33.0 과 같음). Forge 코드 사본 옆에 확장을 둔 CPU 실행(`test_integration_*`
+  포함): 3177 개 통과(건너뜀 30). JS 가 읽는 글은 바뀌지 않아 JS 테스트는 0.33.0 그대로입니다.
+
 ## v0.33.0 — 샘플러 13종 · React Cosinusoidal DynSF · Flow Cosmos rho7 · Flow Cosmos Dynamic 스케줄러 · ER SDE 잡음 구간 · 목록 계열 순서 · 한 열 드롭다운 · 기본값 저장 버튼
 
 Forge 의 Sampler 목록에 13종(18종이 됨), Schedule type 목록에 3종(9종이 됨)을 더하고, ER SDE 에 η 척도 항목과 잡음 구간을 더하며,

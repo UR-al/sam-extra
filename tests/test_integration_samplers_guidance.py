@@ -15,9 +15,10 @@ Detail Daemon scaling the sigmas:
 
 HiFlow keeps its trajectory in float16; the batch comparison stores it in float32 so the float noise of
 a batched matmul is not rounded into a visible difference (that is storage precision, not coupling).
-IPNDM_V's variable-step weights (about 3.0, -5.5, 5.6, -2.2 late on a shift-3 grid, against AB4's fixed
-2.29, -2.46, 1.54, -0.38) amplify that float noise about 5x more than IPNDM's, so its bound is 5x wider
-(measured 1.34e-4 in 1 of 4096 values). Coupling is ruled out exactly elsewhere: with an elementwise model
+IPNDM_V's variable-step weights (about 3.0, -5.5, 5.6, -2.1 late on a shift-3 grid, against AB4's fixed
+2.29, -2.46, 1.54, -0.38) amplify that float noise about 8x more than IPNDM's, so its bound is 5x wider
+(CPU, v0.33.1: at most 1.89e-4, 14 of 4096 base-pass values above 1e-4; 1.42e-4 and 2 values before the
+coeff4 fix; IPNDM 2.3e-5). Coupling is ruled out exactly elsewhere: with an elementwise model
 every deterministic entry, IPNDM_V included, keeps each batch image bit-exact
 (``test_extra_samplers_forge_path...test_the_deterministic_entries_keep_every_batch_image_bit_exact``).
 """

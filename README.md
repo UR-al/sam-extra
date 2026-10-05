@@ -934,7 +934,7 @@ Forge·reForge 의 이름입니다(ComfyUI 이름 `ipndm`·`ipndm_v`·`deis`·`c
 | DPM++ (λ) | `DPM++ 3M (flow ODE)` | Forge 의 DPM++ 3M SDE 를 η 0 으로(끝에서 두 번째 σ 버림도 같음) — Forge 의 "DPM++ 3M SDE + Eta 0" 과 비트 단위로 같음 | — |
 | 다단계 ODE | `UniPC bh2` | Forge 의 UniPC 를 bh2 변형으로(ComfyUI `uni_pc_bh2`, 나머지는 Forge UniPC 와 같음 — flow 모델에서도 Forge UniPC 그대로) | — |
 | 다단계 ODE | `IPNDM` | zju-pi 의 iPNDM — σ 에서의 4차 Adams–Bashforth(고정 계수), 스텝당 모델 1회. ComfyUI `ipndm` 과 비트 단위로 같음 | — |
-| 다단계 ODE | `IPNDM_V` | iPNDM 의 가변 간격 계수 판 — flow 의 shift 처럼 고르지 않은 스케줄에 맞음. ComfyUI `ipndm_v` 와 같음 | — |
+| 다단계 ODE | `IPNDM_V` | iPNDM 의 가변 간격 계수 판. 원본(zju-pi · ComfyUI)의 4차 계수 오타를 고침(0.33.1) — 스텝 간격 비율이 일정한 목록에서는 ComfyUI `ipndm_v` 와 비트 단위로 같고, 그 밖에서는 그 계수 한 곳만 다름 | — |
 | 다단계 ODE | `DEIS` | DEIS-AB('tab', 3차) — 계수는 Forge 가 이미 가진 `k_diffusion/deis.py`(zju-pi). ComfyUI `deis` 와 같음 | — |
 | CFG++ | `CFG++ UD10 AB` | ComfyUI `cfgpp_ud10_ab` — CFG++ Euler 에 AB2 이력·무조건 미분 외삽·σ=0 외삽(기본 Anima 용으로 조정된 값). CFG 2 권장 | — |
 | Restart | `Restart (flow)` | Restart 논문(Xu et al. 2023)을 flow 에 맞게 새로 작성 — Heun 스텝에 ε 등가 잡음 수준 s=σ/α 0.1\~2 구간을 flow 의 정확한 순방향 잡음(α=1−σ)으로 다시 올렸다가 스케줄 그대로 되짚음. 20 스텝 미만이면 Forge Heun 과 같음 | Sigma noise |
@@ -975,9 +975,22 @@ Forge·reForge 의 이름입니다(ComfyUI 이름 `ipndm`·`ipndm_v`·`deis`·`c
   냅니다(CFG 1·1.5·2·4.5). CFG++ 라 CFG 2 를 넘으면 Forge 의 권장 경고가 남습니다. CFG 1 — Forge 의 Skip Early CFG·NGMS 가 CFG 1 로
   돌리는 스텝 포함 — 이면 ComfyUI 처럼 조건부 예측을 쓰는 이력 섞인 Euler 입니다. 스텝마다 scipy 적분 두 번을 CPU 로 합니다.
 - **IPNDM · IPNDM_V · DEIS**: d=(x−D)/σ 가 flow 모델에서 정확히 속도라 셋 다 flow ODE 를 그대로 풉니다(Anima shift 3 격자에서
-  스텝 수를 두 배로 하면 오차가 약 1/4 — 가우스 데이터 시험). IPNDM 은 고른 간격을 가정하므로 shift 된 flow 스케줄에는 IPNDM_V 가 맞습니다. 차수는
-  ComfyUI KSampler 기본값(4·4·3, DEIS 'tab') 고정입니다. DEIS 계수는 Forge 가 이미 들고 있는 `k_diffusion/deis.py` 를 부릅니다(없는
-  Forge 에서는 DEIS 만 건너뜀).
+  스텝 수를 두 배로 하면 오차가 약 1/4 — 가우스 데이터 시험). IPNDM 은 고른 간격을 가정한 고정 계수, IPNDM_V 는 스텝 간격마다 계수를
+  다시 셉니다. 아래 수정 뒤 shift 3 격자에서는 둘의 오차가 비슷합니다(가우스 시험 16 · 32 · 64 스텝에서 서로 5% 안 — 0.33.0 까지
+  IPNDM_V 가 10–20% 작았던 것은 아래 오타가 이 격자에서 우연히 유리했던 것). 차수는 ComfyUI KSampler 기본값(4·4·3, DEIS 'tab')
+  고정입니다. DEIS 계수는 Forge 가 이미 들고 있는 `k_diffusion/deis.py` 를 부릅니다(없는 Forge 에서는 DEIS 만 건너뜀).
+- **IPNDM_V 4차 계수 수정 (0.33.1)**: zju-pi 원본(ComfyUI 도 그대로 옮김)의 4차 가중치 `coeff4` 는 끝이 `h_n_2 / h_n_3` 이어야 할
+  자리에 `h_n_1 / h_n_2` 로 적혀 있어, 네 가중치의 합이 1 이 아니라 `1 + q·temp2·(h_n_2/h_n_3 − h_n_1/h_n_2)` 가 됩니다. 스텝 간격
+  비율이 일정하면(고른 간격 · 등비) 두 값이 같아 문제가 없지만, Anima 의 Linear Quadratic 28 스텝은 앞 14 스텝이 고르다가 간격이
+  3.7배 · 2.5배로 뛰어 16번째 스텝(σ 0.968 → 0.952)에서 합이 약 −174 가 되고, 그림이 초록 잡음이 됩니다(Forge · ComfyUI 모두,
+  2026-10-05 확인). 0.33.1 은 그 한 곳만 고쳐 합이 어느 목록에서나 1 입니다. 원본의 다른 부정확한 두 곳(`temp1` 의 괄호, `temp2` 의
+  부호 — 가중치 합은 그대로 1, 고른 간격의 4차 가중치가 AB4 의 55 · −59 · 37 · −9 대신 57 · −65 · 43 · −11 (/24))은 ComfyUI 와 같은
+  결과를 지키려고 그대로 둡니다. 그래서 IPNDM_V 는 간격 비율이 일정한 목록에서는 ComfyUI `ipndm_v` 와 비트 단위로 같고, Simple ·
+  Normal 처럼 비율이 조금씩 바뀌는 목록에서는 결과가 조금 달라집니다(가우스 데이터 한 예, 28 스텝: 최대 0.0075 — 결과 표준편차 0.49).
+  ComfyUI 의 `ipndm_v` 는 원본 그대로라 Linear Quadratic 에서 같은 문제가 남아 있습니다.
+- **Linear Quadratic 스케줄과 함께** (2026-10-05 확인): UniPC bh2 와 Forge 내장 UniPC 는 이 스케줄(스텝 앞 절반이 σ 1 가까이에
+  몰렸다가 간격이 갑자기 커짐)에서 불안정합니다 — Forge 와 ComfyUI 가 같은 결과를 내는 조합의 성질이고 코드 결함이 아니라 고치지
+  않았습니다. Simple · Normal · SGM Uniform 은 CPU 시험(정확한 디노이저)에서 문제가 없었습니다.
 - **Restart (flow)**: Restart 논문의 알고리즘을 이 확장이 새로 작성한 것입니다(참조 저장소는 라이선스가 없어 열어 보지 않음).
   Forge 내장 **Restart**(A1111 코드)는 σ 2 까지 VE 잡음을 더하고 Karras 격자를 새로 만들어 flow 모델(σ≤1)에서 순수 잡음을 넘깁니다 —
   flow 모델에서는 Settings → Hide samplers 로 숨기기를 권합니다(이 확장은 그 항목을 바꾸지 않음). 이 판은 창을 ε 등가 잡음 수준
@@ -1032,7 +1045,8 @@ Forge·reForge 의 이름입니다(ComfyUI 이름 `ipndm`·`ipndm_v`·`deis`·`c
   Anima 와 SDE 잡음 주입의 궁합으로 봅니다. SDXL 은 확인하지 않았습니다. 0.33.0 에 더한 열세 항목(Euler Dy·Euler SMEA Dy·
   DPM++ 2M SDE Heun·flow ODE 셋·UniPC bh2·ER SDE (Tunable)·CFG++ UD10 AB·IPNDM·IPNDM_V·DEIS·Restart (flow))과 잡음 구간은 Anima 에서
   화질을 확인하지 않았습니다(CPU 테스트만: Forge·ComfyUI 함수와 비트 단위 비교, 가우스 데이터의 닫힌 해로 flow ODE 수렴 차수와
-  SDE 주변분포 확인).
+  SDE 주변분포 확인). 2026-10-05 에 Linear Quadratic 28 스텝에서 IPNDM_V 가 초록 잡음이 되는 것을 보고 원본 계수 오타를 찾아
+  0.33.1 에서 고쳤습니다(위 IPNDM_V 4차 계수 수정).
 - 출처: ComfyUI(GPL-3.0) `SamplerER_SDE`(Tunable 의 척도는 commit `40e46c71`)·`cfgpp_ud10_ab`(commit `3ac5d794`),
   [Clybius/ComfyUI-Extra-Samplers](https://github.com/Clybius/ComfyUI-Extra-Samplers) (BSD-3-Clause),
   [Koishi-Star/Euler-Smea-Dyn-Sampler](https://github.com/Koishi-Star/Euler-Smea-Dyn-Sampler) (Apache-2.0),

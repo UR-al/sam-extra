@@ -221,7 +221,8 @@ SPECS: tuple = (
         LABEL_CFGPP_UD10_AB, sample_cfgpp_ud10_ab, ("cfgpp_ud10_ab",),
         options={}, extra_params=(), requires=_UD10_REQUIRES, cfg_pp=True,
     ),
-    # zju-pi's multistep ODE samplers as ComfyUI runs them (ipndm_deis); ComfyUI's names as aliases.
+    # zju-pi's multistep ODE samplers as ComfyUI runs them (ipndm_deis; IPNDM_V with the coeff4 typo fixed);
+    # ComfyUI's names as aliases.
     SamplerSpec(LABEL_IPNDM, sample_ipndm, ("ipndm",), options={}, extra_params=(), requires=("trange",)),
     SamplerSpec(LABEL_IPNDM_V, sample_ipndm_v, ("ipndm_v",), options={}, extra_params=(), requires=("trange",)),
     SamplerSpec(

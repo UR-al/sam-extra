@@ -24,8 +24,9 @@ ui-config, logs and the module name by it.
   ``DPM++ 2M Heun (flow ODE)``, ``DPM++ 3M (flow ODE)`` — ``dpmpp_flow``: Forge's own
   ``sample_dpmpp_2m_sde`` / ``sample_dpmpp_3m_sde`` (Heun correction; η = 0 for the ODE entries).
 * **Multistep ODE** — ``UniPC bh2`` — ``unipc.sample_unipc_bh2``: Forge's own UniPC with ``variant="bh2"``.
-  ``IPNDM`` / ``IPNDM_V`` / ``DEIS`` — ``ipndm_deis``: zju-pi/diff-sampler (Apache-2.0) as ComfyUI runs them,
-  DEIS on Forge's vendored ``k_diffusion.deis`` coefficients.
+  ``IPNDM`` / ``IPNDM_V`` / ``DEIS`` — ``ipndm_deis``: zju-pi/diff-sampler (Apache-2.0) as ComfyUI runs them
+  (IPNDM_V with upstream's order-4 ``coeff4`` typo fixed, v0.33.1), DEIS on Forge's vendored ``k_diffusion.deis``
+  coefficients.
 * **CFG++** — ``CFG++ UD10 AB`` — ``cfgpp_ud10_ab.sample_cfgpp_ud10_ab``: ComfyUI's ``cfgpp_ud10_ab`` (GPL-3.0).
 * **Restart** — ``Restart (flow)`` — ``restart_flow.sample_restart_flow``: Restart sampling (Xu et al.,
   arXiv:2306.14878) written from the paper with the flow forward kernel (α = 1 − σ).
