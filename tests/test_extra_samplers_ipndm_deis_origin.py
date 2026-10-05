@@ -10,10 +10,13 @@ every order the samplers run; Forge's DEIS coefficients and ComfyUI's, coefficie
 One documented exception (sam-extra 0.33.1, change 4 of ``ipndm_deis.py``): IPNDM_V's order-4 weight ``coeff4``
 ends in ``h_n_2 / h_n_3`` where upstream has the typo ``h_n_1 / h_n_2``. The step code is upstream's but for that
 one token pair (``test_the_step_code_is_upstreams_but_the_coeff4_token``); IPNDM_V equals ComfyUI's ``ipndm_v``
-bit for bit at orders 2-3 on every list and at order 4 on lists whose consecutive step ratios are equal (equal
-steps, a halving list), and on every list it equals ComfyUI's function with that token fixed. Why: on Anima's
-Linear Quadratic 28 list upstream's weights sum to about −174 at step 15 — not even a constant velocity is
-integrated — while the fixed ones sum to 1 at every step (``LinearQuadraticTests``). Beyond parity: they solve the
+bit for bit at orders 2-3 on every list and at order 4 on constant-ratio lists whose steps are exact in binary
+(equal steps of 1/32 or 1/2, a halving list), and on every list it equals ComfyUI's function with that token
+fixed. On a constant-ratio list that is not exact in binary (a float32/float64 linspace or geometric schedule)
+the fix leaves the weights mathematically unchanged but not bit for bit — the results differ at rounding level,
+so no parity test uses one. Why the fix: on Anima's Linear Quadratic 28 list upstream's weights sum to about −174
+at step 15 (0-based) — not even a constant velocity is integrated — while the fixed ones sum to 1 at every step
+(``LinearQuadraticTests``). Beyond parity: they solve the
 flow ODE (convergence on the exact denoiser of Gaussian data; on Linear Quadratic no worse than Euler) and the
 callback sees the current latent.
 """
@@ -64,14 +67,16 @@ _PAIRS = {
 
 # The one exception to upstream's step code (ipndm_deis.py change 4, 0.33.1): coeff4's last factor. temp2 multiplies
 # the third divided difference, whose last weight is ``-q * h_n_2 / h_n_3`` (coeff3 carries the matching
-# ``q * (1 + h_n_2 / h_n_3)``); upstream wrote ``h_n_1 / h_n_2`` there — the same number only when
-# ``h_n_1 / h_n_2 == h_n_2 / h_n_3``.
+# ``q * (1 + h_n_2 / h_n_3)``); upstream wrote ``h_n_1 / h_n_2`` there — the same value, in exact arithmetic, only
+# when ``h_n_1 / h_n_2 == h_n_2 / h_n_3``.
 COEFF4_UPSTREAM_LINE = "coeff4 = -temp2 * (h_n_1 * (h_n_1 + h_n_2) / (h_n_2 * (h_n_2 + h_n_3))) * h_n_1 / h_n_2"
 COEFF4_UPSTREAM = ("h_n_1", "/", "h_n_2")
 COEFF4_FIXED = ("h_n_2", "/", "h_n_3")
 
-# Lists whose consecutive step ratios are equal in floating point (the coeff4 fix is the identity there):
-# equal steps, and a list whose every step is half the one before (both exact in binary).
+# Lists whose steps are exact in binary, so their consecutive step ratios are equal in floating point and the coeff4
+# fix is the identity there bit for bit: equal steps (of 1/32 or 1/2), and a list whose every step is half the one
+# before. Equal ratios alone are not enough: coeff4 computes ``(… * h_n_2) / h_n_3``, not the ratio, so on a
+# float32/float64 linspace or geometric schedule the fixed and upstream results differ at rounding level.
 CONSTANT_RATIO = ("equal", "halving")
 
 # Anima's Linear Quadratic 28 list, literally: ComfyUI's ``calculate_sigmas(model_sampling, "linear_quadratic",
@@ -141,8 +146,9 @@ def _problem(flow: bool, steps: int, dtype, five_d: bool = False, seed: int = 0,
 
 def _parity_lists(name: str, max_order: int) -> tuple:
     """The lists on which a sampler must equal ComfyUI's verbatim function: the uneven ones for IPNDM and DEIS; for
-    IPNDM_V the constant-ratio ones, and the uneven ones too below order 4 (coeff4 is an order-4 weight) — at order 4
-    there it is ComfyUI's with the coeff4 fix (``test_ipndm_v_is_comfyuis_with_the_coeff4_fix_on_every_list``)."""
+    IPNDM_V the constant-ratio ones (exact in binary), and the uneven ones too below order 4 (coeff4 is an order-4
+    weight) — at order 4 there it is ComfyUI's with the coeff4 fix
+    (``test_ipndm_v_is_comfyuis_with_the_coeff4_fix_on_every_list``)."""
     if name != "ipndm_v":
         return ("uneven",)
     return CONSTANT_RATIO if max_order >= 4 else ("uneven", *CONSTANT_RATIO)
@@ -230,7 +236,9 @@ class OriginParityTests(_Base):
         self.assertEqual(len(model.calls), steps)   # one model call per step
 
     def test_the_constant_ratio_lists_have_bit_equal_step_ratios(self):
-        """Where the coeff4 fix is the identity: ``h_n_1 / h_n_2 == h_n_2 / h_n_3`` in the list's own dtype."""
+        """The constant-ratio lists' step ratios are equal in the list's own dtype (``h_n_1 / h_n_2 == h_n_2 / h_n_3``).
+        Their steps are also exact in binary, which is what makes the coeff4 fix the identity there bit for bit —
+        equal ratios alone would not (``CONSTANT_RATIO``)."""
         for kind in CONSTANT_RATIO:
             for flow in (False, True):
                 for dtype in (torch.float32, torch.float64):
@@ -243,7 +251,8 @@ class OriginParityTests(_Base):
 
     def test_every_sampler_is_comfyuis_bit_for_bit(self):
         """IPNDM and DEIS on the shift-3 flow and Karras ε lists; IPNDM_V there at orders 2-3 (coeff4 is an order-4
-        weight) and at every order on the constant-ratio lists, where it is ComfyUI's ``ipndm_v`` bit for bit."""
+        weight) and at every order on the constant-ratio lists (exact in binary), where it is ComfyUI's ``ipndm_v``
+        bit for bit."""
         for name, (ours, origin) in _PAIRS.items():
             for flow in (False, True):
                 for dtype in (torch.float32, torch.float64):
@@ -257,8 +266,8 @@ class OriginParityTests(_Base):
 
     def test_ipndm_v_is_comfyuis_with_the_coeff4_fix_on_every_list(self):
         """On every list IPNDM_V is ComfyUI's ``sample_ipndm_v`` with coeff4's token fixed, bit for bit. On the
-        uneven lists that differs from upstream from the first order-4 step on (5+ steps) — the only results the
-        fix changes; on the constant-ratio lists it does not."""
+        uneven lists that differs from upstream from the first order-4 step on (5+ steps); on the constant-ratio
+        lists (exact in binary) it changes no bit."""
         ours, origin = _PAIRS["ipndm_v"]
         for flow in (False, True):
             for dtype in (torch.float32, torch.float64):
@@ -371,8 +380,8 @@ class LinearQuadraticTests(_Base):
         self.assertEqual(tuple(sums.shape), (28, 4))
         self.assertLessEqual(float((sums - 1).abs().max()), 1e-9)
         # The reason for the fix: upstream's weights (ComfyUI's verbatim ipndm_v) are right through the 14 equal
-        # steps and wrong from the jump on — about -174 at step 15 (σ 0.968 → 0.952), so the latent moves 174 times
-        # the step, the wrong way; Forge and ComfyUI both drew green noise there.
+        # steps and wrong from the jump on — about -174 at step 15 (0-based; σ 0.968 → 0.952), so the latent moves
+        # 174 times the step, the wrong way; Forge and ComfyUI both drew green noise there.
         upstream = self._weight_sums(ORIGIN.sample_ipndm_v, sigmas)
         per_step = upstream.mean(dim=1)
         self.assertLess(float((upstream - per_step[:, None]).abs().max()), 1e-6)   # every element sees one sum

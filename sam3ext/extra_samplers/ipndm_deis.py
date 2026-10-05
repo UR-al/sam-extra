@@ -37,12 +37,14 @@ derivatives:
   over the Lagrange basis in DEIS' VP time (σ mapped with EDM's constants, ``edm2t``), from Forge's vendored
   ``k_diffusion.deis.get_deis_coeff_list`` (a monotone time variable, so consistent on flow schedules too).
 
-Upstream (zju-pi ``solvers.py``, as adapted by ComfyUI 387f98aa — the result here equals ComfyUI's
-``ipndm`` / ``deis`` bit for bit; IPNDM_V equals ComfyUI's ``ipndm_v`` when consecutive step ratios are equal
-(``h_{n−1}/h_{n−2} = h_{n−2}/h_{n−3}``: equal steps, geometric lists), otherwise it carries the coeff4 fix
-(change 4) — ``tests/test_extra_samplers_ipndm_deis_origin.py``): ``x_next = x + (σ_next − σ)·Σ c_k d_k`` per
+Upstream (zju-pi ``solvers.py``, as adapted by ComfyUI 387f98aa): ``x_next = x + (σ_next − σ)·Σ c_k d_k`` per
 step, a step to σ = 0 returns the x0 prediction (IPNDM, IPNDM_V) or is forced to order 1 (DEIS,
-``t_next <= 0``), a history buffer of ``max_order − 1`` derivatives. Changes (sam-extra, 2026-10-04; change 4
+``t_next <= 0``), a history buffer of ``max_order − 1`` derivatives. IPNDM and DEIS here equal ComfyUI's
+``ipndm`` / ``deis`` bit for bit (``tests/test_extra_samplers_ipndm_deis_origin.py``). IPNDM_V carries the coeff4
+fix (change 4): when consecutive step ratios are equal (``h_{n−1}/h_{n−2} = h_{n−2}/h_{n−3}``: equal steps,
+geometric lists) its weights are mathematically ComfyUI's ``ipndm_v`` ones, and the result is ComfyUI's bit for
+bit only when the steps are exact in binary (power-of-two equal steps, halving or doubling lists); float32/float64
+equal-step (linspace) or geometric schedules differ at rounding level. Changes (sam-extra, 2026-10-04; change 4
 on 2026-10-05, v0.33.1):
 
 1. Host: Forge's ``trange`` (``k_diffusion.sampling``) and Forge's ``k_diffusion.deis``; every function
@@ -57,9 +59,10 @@ on 2026-10-05, v0.33.1):
    difference, whose weights are ``1, −(1 + h_{n−1}/h_{n−2} + q), h_{n−1}/h_{n−2} + q·(1 + h_{n−2}/h_{n−3}),
    −q·h_{n−2}/h_{n−3}`` with ``q = h_{n−1}(h_{n−1}+h_{n−2}) / (h_{n−2}(h_{n−2}+h_{n−3}))``; upstream's last entry
    ``−q·h_{n−1}/h_{n−2}`` makes the four step weights sum to ``1 + q·temp2·(h_{n−2}/h_{n−3} − h_{n−1}/h_{n−2})``
-   instead of 1. On Anima's Linear Quadratic 28 list the sum is about −174 at step 15 (σ 0.968 → 0.952) and the
-   image turns into green noise, on Forge and on ComfyUI alike; fixed, the weights sum to 1 on every list. Known
-   upstream inaccuracies kept on purpose, so the result stays ComfyUI's whenever the step ratios are equal:
+   instead of 1. On Anima's Linear Quadratic 28 list the sum is about −174 at step 15 (0-based; σ 0.968 → 0.952)
+   and the image turns into green noise, on Forge and on ComfyUI alike; fixed, the weights sum to 1 on every
+   list. Known upstream inaccuracies kept on purpose, so the weights stay ComfyUI's whenever the step ratios are
+   equal (the result too, bit for bit, when the steps are exact in binary — see above):
    ``temp1`` (order 3's ``temp`` too) closes its parenthesis and ``/ 2`` in the wrong place and ``temp2`` adds the
    ``(1 − h_n/(2(h_n+h_{n−1})))·h_n/(6(h_n+h_{n−1}+h_{n−2}))`` term the integral subtracts. Neither changes the
    weight sum (still 1); they make the order-3/4 weights differ from the exact variable-step Adams–Bashforth ones —
@@ -204,9 +207,10 @@ def sample_ipndm_v(model, x, sigmas, extra_args=None, callback=None, disable=Non
             # Upstream (zju-pi, copied by ComfyUI) ends this weight in ``* h_n_1 / h_n_2``, a typo: temp2 multiplies the
             # third divided difference, whose last entry is ``-q * h_n_2 / h_n_3`` (q = the bracket; coeff3 has the
             # matching ``q * (1 + h_n_2 / h_n_3)``). With the typo the weights sum to
-            # ``1 + q * temp2 * (h_n_2 / h_n_3 - h_n_1 / h_n_2)``, not 1 — about -174 at step 15 of Anima's Linear Quadratic
-            # 28 list (green noise, on ComfyUI too). Fixed, they sum to 1 on every list, and the result is still upstream's
-            # whenever h_n_1 / h_n_2 == h_n_2 / h_n_3 (equal steps, geometric lists). Change 4 in the docstring.
+            # ``1 + q * temp2 * (h_n_2 / h_n_3 - h_n_1 / h_n_2)``, not 1 — about -174 at step 15 (0-based) of Anima's
+            # Linear Quadratic 28 list (green noise, on ComfyUI too). Fixed, they sum to 1 on every list. Where
+            # h_n_1 / h_n_2 == h_n_2 / h_n_3 (equal steps, geometric lists) the weight is mathematically upstream's — bit
+            # for bit only when the steps are exact in binary (float rounding differs otherwise). Change 4 in the docstring.
             coeff4 = -temp2 * (h_n_1 * (h_n_1 + h_n_2) / (h_n_2 * (h_n_2 + h_n_3))) * h_n_2 / h_n_3
             x_next = x_cur + (t_next - t_cur) * (coeff1 * d_cur + coeff2 * buffer_model[-1] + coeff3 * buffer_model[-2] + coeff4 * buffer_model[-3])
 

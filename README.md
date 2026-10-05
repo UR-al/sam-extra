@@ -934,7 +934,7 @@ Forge·reForge 의 이름입니다(ComfyUI 이름 `ipndm`·`ipndm_v`·`deis`·`c
 | DPM++ (λ) | `DPM++ 3M (flow ODE)` | Forge 의 DPM++ 3M SDE 를 η 0 으로(끝에서 두 번째 σ 버림도 같음) — Forge 의 "DPM++ 3M SDE + Eta 0" 과 비트 단위로 같음 | — |
 | 다단계 ODE | `UniPC bh2` | Forge 의 UniPC 를 bh2 변형으로(ComfyUI `uni_pc_bh2`, 나머지는 Forge UniPC 와 같음 — flow 모델에서도 Forge UniPC 그대로) | — |
 | 다단계 ODE | `IPNDM` | zju-pi 의 iPNDM — σ 에서의 4차 Adams–Bashforth(고정 계수), 스텝당 모델 1회. ComfyUI `ipndm` 과 비트 단위로 같음 | — |
-| 다단계 ODE | `IPNDM_V` | iPNDM 의 가변 간격 계수 판. 원본(zju-pi · ComfyUI)의 4차 계수 오타를 고침(0.33.1) — 스텝 간격 비율이 일정한 목록에서는 ComfyUI `ipndm_v` 와 비트 단위로 같고, 그 밖에서는 그 계수 한 곳만 다름 | — |
+| 다단계 ODE | `IPNDM_V` | iPNDM 의 가변 간격 계수 판. 원본(zju-pi · ComfyUI)의 4차 계수 오타를 고침(0.33.1) — 스텝 간격 비율이 일정한 목록에서는 가중치가 ComfyUI `ipndm_v` 와 수학적으로 같고(결과가 비트 단위로 같은 것은 간격이 이진수로 정확한 목록뿐, 보통의 고른 간격 · 등비 목록은 반올림 수준 차이), 그 밖에서는 그 계수 한 곳만 다름 | — |
 | 다단계 ODE | `DEIS` | DEIS-AB('tab', 3차) — 계수는 Forge 가 이미 가진 `k_diffusion/deis.py`(zju-pi). ComfyUI `deis` 와 같음 | — |
 | CFG++ | `CFG++ UD10 AB` | ComfyUI `cfgpp_ud10_ab` — CFG++ Euler 에 AB2 이력·무조건 미분 외삽·σ=0 외삽(기본 Anima 용으로 조정된 값). CFG 2 권장 | — |
 | Restart | `Restart (flow)` | Restart 논문(Xu et al. 2023)을 flow 에 맞게 새로 작성 — Heun 스텝에 ε 등가 잡음 수준 s=σ/α 0.1\~2 구간을 flow 의 정확한 순방향 잡음(α=1−σ)으로 다시 올렸다가 스케줄 그대로 되짚음. 20 스텝 미만이면 Forge Heun 과 같음 | Sigma noise |
@@ -985,9 +985,11 @@ Forge·reForge 의 이름입니다(ComfyUI 이름 `ipndm`·`ipndm_v`·`deis`·`c
   3.7배 · 2.5배로 뛰어 16번째 스텝(σ 0.968 → 0.952)에서 합이 약 −174 가 되고, 그림이 초록 잡음이 됩니다(Forge · ComfyUI 모두,
   2026-10-05 확인). 0.33.1 은 그 한 곳만 고쳐 합이 어느 목록에서나 1 입니다. 원본의 다른 부정확한 두 곳(`temp1` 의 괄호, `temp2` 의
   부호 — 가중치 합은 그대로 1, 고른 간격의 4차 가중치가 AB4 의 55 · −59 · 37 · −9 대신 57 · −65 · 43 · −11 (/24))은 ComfyUI 와 같은
-  결과를 지키려고 그대로 둡니다. 그래서 IPNDM_V 는 간격 비율이 일정한 목록에서는 ComfyUI `ipndm_v` 와 비트 단위로 같고, Simple ·
-  Normal 처럼 비율이 조금씩 바뀌는 목록에서는 결과가 조금 달라집니다(가우스 데이터 한 예, 28 스텝: 최대 0.0075 — 결과 표준편차 0.49).
-  ComfyUI 의 `ipndm_v` 는 원본 그대로라 Linear Quadratic 에서 같은 문제가 남아 있습니다.
+  결과를 지키려고 그대로 둡니다. 그래서 IPNDM_V 는 간격 비율이 일정한 목록에서는 가중치가 ComfyUI `ipndm_v` 와 수학적으로 같습니다 —
+  결과가 비트 단위로 같은 것은 간격이 이진수로 정확한 목록(예: 2 의 거듭제곱 간격의 고른 목록, 반씩 줄거나 두 배씩 느는 목록)뿐이고,
+  보통의 float32 · float64 고른 간격(linspace) · 등비(지수) 스케줄에서는 반올림 수준으로 다릅니다(CPU 시험 한 예: float32 최대 4.8e-7,
+  float64 최대 4.4e-16). Simple · Normal 처럼 비율이 조금씩 바뀌는 목록에서는 결과가 조금 달라집니다(가우스 데이터 한 예, 28 스텝:
+  최대 0.0075 — 결과 표준편차 0.49). ComfyUI 의 `ipndm_v` 는 원본 그대로라 Linear Quadratic 에서 같은 문제가 남아 있습니다.
 - **Linear Quadratic 스케줄과 함께** (2026-10-05 확인): UniPC bh2 와 Forge 내장 UniPC 는 이 스케줄(스텝 앞 절반이 σ 1 가까이에
   몰렸다가 간격이 갑자기 커짐)에서 불안정합니다 — Forge 와 ComfyUI 가 같은 결과를 내는 조합의 성질이고 코드 결함이 아니라 고치지
   않았습니다. Simple · Normal · SGM Uniform 은 CPU 시험(정확한 디노이저)에서 문제가 없었습니다.
