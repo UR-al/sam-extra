@@ -475,10 +475,13 @@ Extra Samplers 아코디언에서 받고 노드 범위(stage 1–3, η 0–10)�
 (commit `68d5ce427f261962b89ce3b0ee8f6b29f0577328`, 2025-11-25) `diff-solvers-main/solvers.py` 의 `ipndm_sampler`·`ipndm_v_sampler`·
 `deis_sampler`(Apache License 2.0)를, ComfyUI 가 k-diffusion 인터페이스로 옮긴 판(`comfyanonymous/ComfyUI`, commit
 `387f98aa2822f684b8597959a52a467d88cc4806`, `comfy/k_diffusion/sampling.py` 1173-1330줄, 거기에 "#From … under Apache 2 license" 로
-표시됨, GPL-3.0)을 따라 옮긴 것입니다. 계수·이력 버퍼·σ=0 처리는 원본과 같고 결과는 ComfyUI 의 `ipndm`·`ipndm_v`·`deis` 와 비트 단위로
-같습니다. Apache-2.0 4(b) 에 따라 파일 머리에 적은 변경 사항: Forge 의 `trange`·`k_diffusion.deis`, 세 함수 모두 `@torch.no_grad()`,
-콜백에 현재 latent 를 넘김(ComfyUI 는 첫 latent), `max_order` 를 1–4 로 자르고 1 이면 이력을 두지 않음(원본은 빈 목록을 가리켜
-IndexError). DEIS 계수(`gits-main/solver_utils.py`)는 옮기지 않았습니다 — Forge 가 이미 들고 있는
+표시됨, GPL-3.0)을 따라 옮긴 것입니다. 계수·이력 버퍼·σ=0 처리는 원본과 같고(IPNDM_V 의 4차 계수 한 곳만 다름, 아래) 결과는 ComfyUI 의
+`ipndm`·`deis` 와 비트 단위로 같으며, `ipndm_v` 와는 스텝 간격 비율이 일정한 목록에서 가중치가 수학적으로 같습니다(결과가 비트 단위로
+같은 것은 그중 간격이 이진수로 정확한 목록뿐이고, 보통의 float32 · float64 고른 간격 · 등비 목록은 반올림 수준으로 다름).
+Apache-2.0 4(b) 에 따라 파일 머리에 적은 변경 사항: Forge 의 `trange`·`k_diffusion.deis`, 세 함수 모두 `@torch.no_grad()`, 콜백에 현재 latent 를 넘김(ComfyUI 는 첫
+latent), `max_order` 를 1–4 로 자르고 1 이면 이력을 두지 않음(원본은 빈 목록을 가리켜 IndexError), IPNDM_V 의 4차 가중치 `coeff4` 끝의
+`h_n_1 / h_n_2` 를 `h_n_2 / h_n_3` 으로 고침(2026-10-05, v0.33.1 — 원본 오타로 가중치 합이 1 이 아니어서 Linear Quadratic 처럼 간격 비율이
+갑자기 바뀌는 목록에서 그림이 깨짐). DEIS 계수(`gits-main/solver_utils.py`)는 옮기지 않았습니다 — Forge 가 이미 들고 있는
 `modules_forge/packages/k_diffusion/deis.py`(같은 출처, Apache-2.0)를 실행 중에 부릅니다. 이번 판에서는 zju-pi 저장소의 파일을 내려받지
 않았으므로(네트워크 사용 없음) 상류 LICENSE 의 저작권 줄은 옮기지 못했고, ComfyUI 처럼 저장소와 커밋을 적었습니다.
 `tests/_origin_comfyui_ipndm_deis.py` 는 ComfyUI 387f98aa 의 위 1173-1330줄과 `comfy/k_diffusion/deis.py` 전체를 바꾸지 않고 담은 대조
