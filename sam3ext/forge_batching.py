@@ -7,10 +7,11 @@ on by default) and made ``modules.shared.batch_cond_uncond`` a property over it
 * ``can_concat_cond`` — off: cond and uncond never share a UNet call (one call each, cond first);
 * ``sampling_prepare`` — the inference memory Forge reserves for ``(2 if on else 1) * batch`` rows.
 
-Forge 2.29.2 (d70373eb) keeps the old constant ``shared.batch_cond_uncond = True`` and always batches
-(memory for ``2 * batch``). ``getattr(shared, "batch_cond_uncond", True)`` gives the right answer on both;
-anything unreadable (outside Forge, before the settings load, a stub) counts as on — Forge's default and
-the only behaviour 2.29.2 has.
+Forge 2.29.2 (d70373eb) has no such setting: it keeps the old constant ``shared.batch_cond_uncond = True``,
+batches cond and uncond whenever memory allows (low free VRAM still splits them, as with the 2.30 option on)
+and always reserves memory for ``2 * batch``. ``getattr(shared, "batch_cond_uncond", True)`` gives the right
+answer on both (2.30-6, ede60e1a, reads it the same way as 2.30-2); anything unreadable (outside Forge, before
+the settings load, a stub) counts as on — Forge's default and the only behaviour 2.29.2 has.
 """
 
 from __future__ import annotations

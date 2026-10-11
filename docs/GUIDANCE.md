@@ -513,8 +513,10 @@ dpmpp_2s_ancestral·dpmpp_sde의 중간점이나 인페인트의 섞인 latent�
 - 기본 off, `Skip after=0.5`
 - low-VRAM이 cond/uncond를 따로 호출하면 생략할 수 없어 속도 차이가 없습니다.
 - Forge 2.30의 Settings → Optimizations → **Batch Cond/Uncond**를 끄면 cond/uncond가 늘 따로 호출되므로 ADG는 켜져
-  있어도 아무것도 생략하지 않습니다. 이때 infotext에 `Anima Adaptive Guidance status: ADG inactive: Batch Cond/Uncond off`를
-  남기고 콘솔에 한 번 알립니다(동작은 바뀌지 않음). Forge 2.29.2는 늘 한 batch로 호출합니다.
+  있어도 아무것도 생략하지 않고, ADG를 끈 것과 같게 돕니다: 자기 UNet 래퍼를 걸지 않아 다른 확장의 래퍼(Spectrum
+  Integrated 등)가 그대로 돌고 결과도 같습니다(PAG/SEG/SLG가 함께 켜져 있으면 래퍼는 그쪽 몫으로 걸림). 이때 infotext에
+  `Anima Adaptive Guidance status: ADG inactive (Batch Cond/Uncond off)`를 남기고 콘솔에 한 번 알리며, 검증 로그 판정은
+  `NO-SKIP(Batch Cond/Uncond off)`입니다. Forge 2.29.2에는 이 설정이 없어 메모리가 허락하면 늘 한 batch로 호출합니다.
 - 생략 스텝에서는 perturbation과 CFG base(SMC·APG·CWM)도 쉬고 APG momentum만 비웁니다(SMC의 이전 오차는 유지).
   DCW/RDC는 원본 post-CFG 훅처럼 그 스텝에도 적용됩니다.
 - `Keep every N`은 생략 구간에서도 N번째 스텝마다 uncond를 유지합니다.

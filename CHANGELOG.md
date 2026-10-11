@@ -5,21 +5,25 @@
 
 ## 미출시 (Unreleased) — Forge 2.30 호환
 
-Forge Neo 2.30(2.30-2, `45f41b81`)에서 달라진 것에 맞춥니다. 2.29.2(`d70373eb`)와 2.30 둘 다에서 돕니다. **Batch Cond/Uncond
-가 켜진 기본 설정의 결과는 그대로**입니다(같은 경로를 그대로 지남). 바뀐 것은 Batch Cond/Uncond 를 끈 2.30 에서 Anima 3.8B 의 VRAM
-여유 판단과 안내 문구뿐입니다. Forge 를 재시작하세요(바뀐 Python 파일).
+Forge Neo 2.30 에서 달라진 것에 맞춥니다. CPU 테스트 전체가 2.29.2(`d70373eb`), 2.30-2(`45f41b81`), 2.30-6(`ede60e1a`, 2026-10-11
+에 설치된 Forge) 셋에서 통과합니다. 이 판들에서 GPU 생성은 따로 확인하지 않았습니다. **Batch Cond/Uncond 가 켜진 기본 설정의 결과는
+그대로**입니다(같은 경로를 그대로 지남). 바뀐 것은 Batch Cond/Uncond 를 끈 2.30 에서 Anima 3.8B 의 VRAM 여유 판단, Adaptive Guidance
+가 UNet 래퍼를 걸지 않는 것, 안내 문구입니다. Forge 를 재시작하세요(바뀐 Python 파일).
 
 ### Batch Cond/Uncond (Forge 2.30 Settings → Optimizations)
 
 - 2.30 은 cond · uncond 를 한 UNet 호출로 묶을지 고르는 설정을 새로 둡니다(기본 켬). 끄면 `can_concat_cond` 가 늘 거짓이라 cond
-  와 uncond 가 따로(cond 먼저) 돌고, `sampling_prepare` 가 잡는 추론 메모리가 2 × batch 행에서 batch 행으로 줍니다. 2.29.2 는 늘
-  묶습니다. 이 확장은 두 판에서 같은 방법(`shared.batch_cond_uncond`, 읽지 못하면 켬)으로 읽습니다(`sam3ext/forge_batching.py`).
+  와 uncond 가 따로(cond 먼저) 돌고, `sampling_prepare` 가 잡는 추론 메모리가 2 × batch 행에서 batch 행으로 줍니다. 2.29.2 에는 이
+  설정이 없어, 켠 2.30 처럼 메모리가 허락하면 묶고(VRAM 여유가 모자라면 따로 호출) 추론 메모리는 늘 2 × batch 행으로 잡습니다. 이
+  확장은 두 판에서 같은 방법(`shared.batch_cond_uncond`, 읽지 못하면 켬)으로 읽습니다(`sam3ext/forge_batching.py`).
 - **Anima 3.8B**: TE · Qwen3.5 를 VRAM 에 남길지 정할 때 다음 샘플링의 추론 몫을 Forge 와 같은 (켬 2 · 끔 1) × batch 행으로 셉니다.
   예전에는 늘 2 × batch 라, 끈 2.30 에서는 여유를 실제보다 적게 보고 필요 없이 내릴 수 있었습니다. 켬 · 2.29.2 는 예전과 같습니다.
-- **Adaptive Guidance**: 묶음 호출에서만 uncond 행을 빼므로, 끄면 아무것도 생략하지 않습니다(ADG 를 끈 것과 같은 결과 — 테스트로
-  확인). 이제 그럴 때 infotext 에 `Anima Adaptive Guidance status: ADG inactive: Batch Cond/Uncond off` 를 남기고 콘솔에 한 번
-  알리며, 검증 로그 판정은 `NO-SKIP(split calls: Batch Cond/Uncond off)` 입니다. 동작은 바뀌지 않습니다. 패널 안내 · README ·
-  docs/GUIDANCE.md 에 적었습니다.
+- **Adaptive Guidance**: 묶음 호출에서만 uncond 행을 빼므로, 끄면 아무것도 생략할 수 없습니다. 그래서 그때 ADG 는 켜져 있어도 ADG 를
+  끈 것과 같게 돕니다: 자기 UNet 래퍼(`model_function_wrapper`)를 걸지 않아 다른 확장의 래퍼(Spectrum Integrated 등)를 밀어내지
+  않고, 결과도 ADG 를 끈 것과 비트 단위로 같습니다(다른 확장의 래퍼가 있는 경우까지 테스트로 확인). PAG/SEG/SLG 가 함께 켜져
+  있으면 래퍼는 그쪽 몫으로 예전처럼 걸립니다. infotext 에 `Anima Adaptive Guidance status: ADG inactive (Batch Cond/Uncond off)` 를
+  남기고(값에 쌍점 · 쉼표가 없어 Forge 가 따옴표로 감싸지 않고 이 글 그대로 적힘) 콘솔에 한 번 알리며, 검증 로그 판정은 설정을
+  직접 읽어 `NO-SKIP(Batch Cond/Uncond off)` 입니다. 패널 안내 · README · docs/GUIDANCE.md 에 적었습니다.
 - PAG/SEG/SLG 의 가중 · 영역 조건과 내장 NegPiP 의 SD 훅은 끈 배치 모양(조건마다 따로 호출)에서도 같은 결과입니다 — Forge 의 실제
   `sampling_function.py` 로 확인하는 테스트를 더했습니다.
 
@@ -38,6 +42,19 @@ Forge Neo 2.30(2.30-2, `45f41b81`)에서 달라진 것에 맞춥니다. 2.29.2(`
 - 2.30 의 Extras 에는 Forge 자체 **DeGrid**(`scripts/degrid.py`, 픽셀 격자 필터, 기본 켬)가 생겼습니다. Extras 에서 둘 다 켜면 두 번
   적용되고 이 확장의 항목이 먼저 돕니다(둘 다 순서 900, 이름순 — Forge 의 정렬 코드로 확인하는 테스트). Forge 의 DeGrid 를
   Settings → Postprocessing 에서 생성 탭에도 켜면 생성 탭에서도 두 번 적용됩니다. Extras · 생성 탭 안내와 README 에 적었고 동작은 그대로입니다.
+
+### Forge 2.30-6 (`ede60e1a`) — VAE / Text Encoder 드롭다운
+
+- 2.30-6 은 Settings → UI Alternatives 에 'Show filenames without folder in the VAE / Text Encoder dropdown'
+  (`sd_modules_dropdown_use_short`, 기본 켬)을 더했습니다. 끄면 드롭다운이 모델 폴더 아래 경로(`sdxl/clip-l.safetensors`)를 보이고,
+  UI Preset 을 바꿀 때 `on_preset_change` 도 저장된 모듈을 그 경로로 되돌립니다. '기본값 저장' 버튼은 `modules_change` 처럼 파일
+  이름으로 찾아 전체 경로를 저장하므로 어느 쪽이든 그대로 동작합니다(코드는 그대로, 설명만 고침).
+- `on_preset_change` 가 이 설정을 읽게 되면서, Forge 의 실제 함수를 돌리는 `tests/test_save_defaults.py` 가 2.30-6 에서 오류 436 ·
+  실패 1 로 깨졌습니다(가짜 opts 에 없는 설정, 반환 목록 앞의 지역 변수로 옮겨 간 모듈 키). 가짜 opts 는 그 Forge 의
+  `shared_options.py` 기본값을 받고, 계약 테스트는 반환 앞의 지역 변수를 따라가며, 설정을 끈 경우의 왕복 테스트를 더했습니다.
+  `on_preset_change` 가 또 새 설정을 읽으면 오류 수백 개 대신 테스트 하나가 그 이름을 알립니다.
+- 그 밖의 2.30-6 변경(flash attention 의 causal 마스크, VAE 타일 디코드의 출력 채널, Prompts from file 의 결과값)은 이 확장이
+  부르지 않는 부분이라 대응할 것이 없습니다.
 
 ### 테스트
 

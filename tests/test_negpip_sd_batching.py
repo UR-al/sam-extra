@@ -66,7 +66,8 @@ def _forge_stubs(batch_cond_uncond=True):
 
     ``batch_cond_uncond``: Forge 2.30 의 Settings → Optimizations → Batch Cond/Uncond (기본 켬). 2.30 의
     sampling_function 은 ``modules.shared.batch_cond_uncond`` 를 can_concat_cond·sampling_prepare 에서 읽고, 2.29.2 는 읽지
-    않는다(늘 묶음). 클래스마다 새 대역이라 값은 클래스의 것 — 불러 둔 모듈의 값을 바꾸지 않는다."""
+    않는다(메모리가 허락하면 묶음 — 여유 메모리는 대역의 _Memory.free). 클래스마다 새 대역이라 값은 클래스의 것 — 불러 둔
+    모듈의 값을 바꾸지 않는다."""
     names = [n for n in sys.modules if n in ("backend", "modules") or n.startswith(("backend.", "modules."))]
     saved = {n: sys.modules.pop(n) for n in names}
 
@@ -421,7 +422,8 @@ class HookBatchLayoutTests(_Harness, unittest.TestCase):
 
 class NoBatchCondUncondLayoutTests(_Harness, unittest.TestCase):
     """Forge 2.30 의 Batch Cond/Uncond 를 끈 배치 모양: can_concat_cond 가 늘 거짓이라 조각마다 따로, to_run 순서대로(C 먼저,
-    그다음 U) 돈다 — 메모리와 무관하게. 행마다 제 항목·제 쪽 음수 항은 그대로. 2.29.2 는 설정을 읽지 않아 늘 [U, C] 로 묶는다."""
+    그다음 U) 돈다 — 메모리와 무관하게. 행마다 제 항목·제 쪽 음수 항은 그대로. 2.29.2 는 설정을 읽지 않아 메모리가 넉넉하면
+    [U, C] 로 묶는다."""
 
     BATCH_COND_UNCOND = False
     B, STEPS = HookBatchLayoutTests.B, HookBatchLayoutTests.STEPS

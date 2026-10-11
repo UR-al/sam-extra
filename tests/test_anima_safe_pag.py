@@ -58,7 +58,8 @@ def _load_forge_sampler(batch_cond_uncond: bool = True):
 
     Forge 2.30 (45f41b81) reads ``modules.shared.batch_cond_uncond`` — Settings → Optimizations →
     "Batch Cond/Uncond", on by default — in ``can_concat_cond`` and ``sampling_prepare`` (``from
-    modules import shared`` at import); Forge 2.29.2 (d70373eb) has no such read and always batches.
+    modules import shared`` at import); Forge 2.29.2 (d70373eb) has no such read and batches whenever
+    memory allows (the returned ``memory`` stub's free memory does, unless a test lowers it).
     Every call gets its own ``modules``/``modules.shared`` stand-ins with ``batch_cond_uncond``, so a
     loaded sampler keeps the value it was loaded with: load a fresh one for another value, never change
     ``sampler.shared`` of a cached one. ``forge_sampler_honours_batch_flag`` tells the two versions apart.

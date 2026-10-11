@@ -60,8 +60,10 @@ cd <sd-webui-forge-neo>/extensions
 git clone https://github.com/UR-al/sam-extra.git forge_sam3_extension
 ```
 
-**호환 Forge**: Forge Neo **2.29.2**(`d70373eb`)와 **2.30**(2.30-2, `45f41b81`). 2.30 에서 달라진 점(Batch Cond/Uncond 설정,
-Spectrum 예측기, Extras 의 DeGrid)과 이 확장의 대응은 [CHANGELOG](CHANGELOG.md) 의 'Forge 2.30 호환' 절에 있습니다.
+**호환 Forge**: Forge Neo **2.29.2**(`d70373eb`)와 **2.30**(2.30-2 `45f41b81`, 2.30-6 `ede60e1a`) — 세 판 모두 CPU 테스트
+전체로 확인했고, 이 판들에서 GPU 생성은 따로 확인하지 않았습니다. 2.30 에서 달라진 점(Batch Cond/Uncond 설정, Spectrum 예측기,
+Extras 의 DeGrid, 2.30-6 의 VAE / Text Encoder 드롭다운 표기)과 이 확장의 대응은 [CHANGELOG](CHANGELOG.md) 의 'Forge 2.30 호환'
+절에 있습니다.
 
 **폴더명은 반드시 `forge_sam3_extension`** 으로 둡니다. Forge 는 확장 폴더명을 확장 이름으로 쓰는데
 `metadata.ini` 의 콜백 순서 지정(`[callbacks/forge_sam3_extension/…]`)이 이 이름에 묶여 있어, 다른 이름(예: 기본
@@ -1499,7 +1501,7 @@ SAM3 처리와 분리된 opt-in 기능 모음입니다. Forge Neo 코어 파일�
 | **DAVE** | Anima block 출력의 token/spatial DC 성분 감쇠 | 실제 block hit 확인, 다양성/권장 block은 추가 A/B 필요 |
 | **CNS-inspired** | 기존 seeded/Brownian noise를 live x_t 에너지로 재색칠 | Euler a noise call 확인. deterministic sampler에서는 inert |
 | **Anima Modulation Guidance** | 보조 CLIP-L 방향을 공개 어댑터로 block AdaLN에 가산 | 실제 CLIP/어댑터 로드·투영·주입 검증. 이미지 품질 A/B는 추가 필요 |
-| **Adaptive Guidance** | combined batch의 후반 uncond row 생략 | low-VRAM 분리 호출·Forge 2.30 Batch Cond/Uncond 끔에서는 생략/속도 이득 없음(infotext `ADG inactive: Batch Cond/Uncond off`) |
+| **Adaptive Guidance** | combined batch의 후반 uncond row 생략 | low-VRAM 분리 호출·Forge 2.30 Batch Cond/Uncond 끔에서는 생략/속도 이득 없음. 끔이면 ADG를 끈 것과 같게 돌고 UNet 래퍼도 걸지 않음(infotext `ADG inactive (Batch Cond/Uncond off)`) |
 | **Skimmed CFG** | 과포화를 만드는 성분만 낮은 CFG로 되돌림(anti-burn) | 원본 노드와 σ 구간·결과가 비트 단위로 같음(원본 수식 편입). **CFG>1 전용**, pre-CFG가 아닌 post-CFG 맨 앞에서 재구성 |
 | **Detail Daemon** | sigma schedule로 디테일 강도 조절 | 별도 opt-in 기능 |
 
