@@ -95,8 +95,15 @@ class TagIndex:
         return normalize(tag) in self._mapping
 
 
-def default_tag_csv_paths(extensions_dir: Path) -> list[Path]:
-    tags = Path(extensions_dir) / "sd-webui-tagcomplete-neo" / "tags"
+def default_tag_csv_paths(tags_dir: Path | None = None) -> list[Path]:
+    """내장 Tag Autocomplete 의 tags/ 폴더(sam3ext/tagcomplete/paths.py TAGS_DIR) — 둘 다 저장소에 들어 있다.
+
+    예전에는 따로 설치한 sd-webui-tagcomplete-neo 의 tags/ 를 읽었다(그 확장은 이제 sam-extra 에 합쳐졌다)."""
+    if tags_dir is None:
+        from sam3ext.tagcomplete import paths   # stdlib only
+
+        tags_dir = paths.TAGS_DIR
+    tags = Path(tags_dir)
     return [tags / "danbooru_2025.csv", tags / "danbooru.csv"]
 
 

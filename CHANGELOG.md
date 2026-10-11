@@ -336,6 +336,40 @@ Forge 기본 XYZ 에는 `VAE` 축만 있고 텍스트 인코더를 바꿔 가며
   Forge 의 로더 · 엄격 로드와 같은지도 대조합니다. `tests/test_integration_load_order.py` 는 축이 Forge 의 자리에 들어가는지(재로딩 ·
   남은 XYZ 포함) 봅니다.
 
+## 다음 판 (아직 발행 전) — 태그 자동완성 내장 (sd-webui-tagcomplete-neo)
+
+따로 설치하던 [sd-webui-tagcomplete-neo](https://github.com/eduardoabreu81/sd-webui-tagcomplete-neo)(commit `8e0d81f`, MIT)를
+sam-extra 에 넣었습니다(README 의 **Tag Autocomplete (내장 태그 자동완성)** 절). Forge 를 재시작하세요(새 스크립트·JS).
+
+- **설정·동작 그대로**: Settings → **Tag Autocomplete** 의 `tac_*` 57개는 키·이름·섹션이 같아 저장된 값이 이어집니다(기본값은
+  `tac_tagFile` 하나만 다름 — 아래, 테스트가 설치돼 있던 상류 파일과 대조). 전역 JS 이름·`/tacapi/v1/*` 경로 15개·`<forge>/tmp/tagAutocompletePath.txt` 도 같습니다.
+  설정 맨 위에 안내 줄과 스위치 **내장 Tag Autocomplete 사용 (sam-extra)**(`sam3_builtin_tagcomplete_enabled`, 기본 켬, 재시작)가 더해졌습니다.
+- **따로 설치한 사본과 함께 돌지 않음**: 다른 tagcomplete 가 켜져 있으면 내장은 쉬고 콘솔·설정 안내 줄에 이유를 남깁니다(같은 JS 를 두 번
+  실으면 페이지에서 반만 초기화됨). 두 곳 모두 그 폴더를 넣은 옮기기 명령을 알려 줍니다 — Forge 를 끄고 **먼저 옮긴 뒤** 그 확장 폴더를
+  extensions 밖으로 옮기고(지우는 것보다 안전) 재시작하세요. 먼저 지우면 git 에 없는 사용자 목록·사용 횟수가 사라집니다.
+- **사용자 파일 옮기기**: `tools/migrate_tagcomplete.py` — 예전 폴더의 태그 목록·사용 횟수(`tag_frequency.db`)·LoRA 해시 캐시를 이 확장의
+  `tags/` 로(미리보기 기본, 덮어쓰지 않음, SHA-256·DB 확인). 내장이 먼저 한 번 돌며 만든 빈 DB(0 행)·빈 해시 캐시는 옆으로 치우고
+  (`*.empty-<시각>.bak`, 지우지 않음) 옮깁니다. `tac_*` 가 고른 파일이 `tags/` 에 없다는 알림도 이 명령을 함께 알려 줍니다.
+- **페이지가 일찍 열려도 시작**: 로더는 시작 정보를 Forge 설정(`opts`)의 숨은 키 `sam3_tac_builtin_boot` 에서 읽습니다 — 확장들의 시작
+  작업(app_started)이 끝나기 전에 열린 페이지(자동으로 여는 브라우저, Reload UI 뒤 새로 고침)에서도 상류처럼 시작합니다.
+- **태그 목록**: 저장소에 `danbooru_2026-10-01_pt20-ia-dd.csv`·`danbooru.csv`·`danbooru_2025.csv`·`danbooru_e621_merged.csv`·
+  `extra-quality-tags.csv`·`demo-chants.json`(약 19.9 MB)을 넣었습니다. 나머지 상류 목록과 사용자 목록은 git 밖(`.gitignore`)입니다.
+- **기본 태그 목록 — Danbooru 2026-10-01**: `tac_tagFile` 의 기본값이 `danbooru.csv`(상류) 대신 `danbooru_2026-10-01_pt20-ia-dd.csv`
+  입니다 — 2026-10-01 에 만든 Danbooru 목록, 게시물 수 20 이상인 태그 220,510개(별칭 포함). 출처는
+  [DraconicDragon/dbr-e621-lists-archive](https://github.com/DraconicDragon/dbr-e621-lists-archive)(The Unlicense, 파일 그대로 — 테스트가
+  git blob 을 고정)입니다. 키·이름·섹션은 그대로이고, config.json 에 저장된 값이 있으면 그 값이 쓰입니다 — 한국어 설명이 붙은
+  목록(`KR_danbooru_tags_with_description-…csv`)도 Settings 에서 계속 고를 수 있습니다.
+- **저장된 값 바꾸기 (`--set-tagfile`)**: `tools/migrate_tagcomplete.py --set-tagfile <이름> --config <forge>/config.json` — 미리보기가
+  기본이고, `--apply --forge-stopped` 로 `config.json.bak-tagfile-<시각>` 백업을 먼저 쓴 뒤 `tac_tagFile` 값만 바꿉니다(다른 바이트는
+  그대로). Forge 가 떠 있으면(`127.0.0.1` 의 `--forge-port`, 기본 7860 이 응답) 아무것도 쓰지 않습니다.
+- **TIPO**: 캐릭터·작품·메타 구분에 쓰는 danbooru CSV 를 이 확장의 `tags/` 에서 읽습니다(예전: 따로 설치한 tagcomplete 폴더 — 그 폴더를
+  지우면 구분이 비었을 것).
+- **보안 (상류와 다른 점)**: `GET /tacapi/v1/wildcard-contents` 가 와일드카드 폴더 안의 `.txt` 만 돌려줍니다(상류는 아무 파일이나).
+- **고른 파일이 없을 때 알림**: `tac_tagFile` 등이 `tags/` 에 없는 파일을 가리키면 시작할 때 콘솔과 설정 안내 줄에 알립니다(상류는 그 목록을
+  조용히 비움 — 태그 파일이 없으면 extra 파일도). `tac_tagFile` 이면 그동안 기본 목록으로 추천합니다 — 로더가 페이지의 설정 값만
+  바꿔 읽게 하고 config.json·Settings 의 값은 그대로라, 있는 파일을 다시 고르면 그 파일을 씁니다.
+- 의존성: `pyyaml`(상류 `install.py` 가 설치하던 것)을 `requirements.txt` 에 더했습니다(Forge 에 이미 있음).
+
 ## v0.33.1 — IPNDM_V 4차 계수 오타 (Linear Quadratic 에서 그림이 깨지던 것)
 
 **2026-10-05 정정 (GPU 확인 뒤)**: 아래 "Linear Quadratic 은 깨지던 그림이 정상으로 돌아오고" 는 틀렸습니다. 계수 오타 수정은

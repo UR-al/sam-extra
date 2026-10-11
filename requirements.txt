@@ -20,3 +20,6 @@ gradio<6.0,>=4.0
 # loads. Pure Python, so auto-installing it is safe. Same pin as the vendor's own
 # requirements.txt: 2.x reports EXIF-rotated sizes, 1.4.1 does not.
 imagesize==1.4.1
+# Built-in Tag Autocomplete (sam3ext/tagcomplete, from sd-webui-tagcomplete-neo): its helper parses wildcard
+# YAML files. The separate extension's install.py pip-installed it; Forge Neo already ships it.
+pyyaml

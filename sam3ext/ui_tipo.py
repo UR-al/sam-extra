@@ -14,7 +14,6 @@ from __future__ import annotations
 import sys
 import traceback
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Any
 
 from .tipo import prompt as tp
@@ -58,11 +57,10 @@ def _log(message: str) -> None:
 
 
 def _tag_index() -> tp.TagIndex:
-    """tagcomplete 의 danbooru CSV(카테고리 포함) — 처음 누를 때 한 번 읽는다."""
+    """내장 Tag Autocomplete 의 danbooru CSV(카테고리 포함, sam-extra tags/) — 처음 누를 때 한 번 읽는다."""
     global _TAG_INDEX
     if _TAG_INDEX is None:
-        extensions_dir = Path(__file__).resolve().parents[2]
-        _TAG_INDEX = tp.load_tag_index(tp.default_tag_csv_paths(extensions_dir))
+        _TAG_INDEX = tp.load_tag_index(tp.default_tag_csv_paths())
     return _TAG_INDEX
 
 

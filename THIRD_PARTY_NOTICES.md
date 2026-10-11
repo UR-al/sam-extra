@@ -78,6 +78,65 @@ MIT(Copyright (c) 2026 Eduardo Abreu)이며, 각 파일 머리에 저작권·허
 
 MIT 고지 전문은 이 문서 끝에 있습니다. 이 확장의 GPL-3.0-only 라이선스는 이 코드의 상류 조건을 대체하지 않습니다.
 
+## sd-webui-tagcomplete-neo — Tag Autocomplete (MIT)
+
+`sam3ext/tagcomplete/` 의 `tag_autocomplete_helper.py`·`shared_paths.py`·`model_keyword_support.py`·`tag_frequency_db.py` 와
+`javascript/` 15개, 그리고 `tags/` 의 다섯 목록(`danbooru.csv`·`danbooru_2025.csv`·`danbooru_e621_merged.csv`·`extra-quality-tags.csv`·
+`demo-chants.json`)은 [eduardoabreu81/sd-webui-tagcomplete-neo](https://github.com/eduardoabreu81/sd-webui-tagcomplete-neo)
+(commit `8e0d81fd0e25fd2cf98fb4d34d097df9f71a082b`, 2026-05-08)를 편입한 것입니다. 이 저장소는 Eduardo Abreu(eduardoabreu81)가 2026년에
+Forge Neo 용으로 고친 [DominikDoom/a1111-sd-webui-tagcomplete](https://github.com/DominikDoom/a1111-sd-webui-tagcomplete) 의 포크입니다.
+
+- 저작권: **Copyright (c) 2022 Dominik Reh** (상류 `LICENSE` 의 줄 — 원본 저장소의 저자, 여러 기여자 포함)와 포크의 변경
+  (`40d3196` 부터 `8e0d81f` 까지, 2026, **Eduardo Abreu**). 포크는 자기 저작권 줄이나 파일 머리 고지를 더하지 않았고 같은 MIT `LICENSE` 로
+  배포합니다.
+- 라이선스: **MIT**. 전문은 코드 옆 `sam3ext/tagcomplete/LICENSE`(상류 `LICENSE` 무수정 사본, `tests/test_tagcomplete_vendor.py` 가
+  SHA-256 을 고정)와 이 문서 끝에 있습니다. 편입한 파일은 계속 MIT 를 따르고, 이 확장의 GPL-3.0-only 가 대체하지 않습니다.
+- 편입한 Python 파일마다 머리에 상류·저작권·MIT 고지와 수정 고지(`MODIFIED by sam-extra, 2026-10-11`)를 달았습니다. JS 15개·`LICENSE`·
+  태그 목록 다섯 개는 상류와 바이트까지 같습니다(`.gitattributes` 의 `-text` 로 줄끝 변환 없이 저장, 테스트가 SHA-256 고정).
+- `javascript/_caretPosition.js`(입력 칸의 커서 위치 계산)는 다시 다른 MIT 프로젝트
+  [component/textarea-caret-position](https://github.com/component/textarea-caret-position) 의 코드입니다 — 파일 첫 줄
+  `// From https://github.com/component/textarea-caret-position`, 원본 저장소가 `90664d4`(2023-02-26)에서 넣었고 그 라이선스는
+  함께 넣지 않았습니다. 저작권: **Copyright (c) 2015 Jonathan Ong me@jongleberry.com**(그 프로젝트 `LICENSE` 의 줄), 라이선스:
+  **MIT**(전문은 이 문서 끝 — 같은 조건). 이 파일도 바꾸지 않았습니다.
+- 태그 목록 다섯 개의 출처(상류 README 의 "Tag Lists" 표): `danbooru.csv` — Danbooru(danbooru.donmai.us) 태그 상위 10만 개,
+  `danbooru_2025.csv` — 2025년에 갱신한 Danbooru 목록, `danbooru_e621_merged.csv` — Danbooru 와 e621(e621.net) 태그를 합치고 분류를
+  하나로 맞춘 목록(상류 `tagAutocomplete.js` 의 주석이 그 분류의 출처로
+  [DraconicDragon/dbr-e621-lists-archive](https://github.com/DraconicDragon/dbr-e621-lists-archive) 의
+  `tag-lists/danbooru_e621_merged` 를 듭니다), `extra-quality-tags.csv` — 상류가 고른 품질 태그, `demo-chants.json` — 상류의 예시
+  chant. 태그 이름·분류·게시물 수는 Danbooru·e621 사이트의 태그 데이터이고, 파일은 상류 저장소가 위 MIT `LICENSE` 로 배포한 그대로입니다.
+- 여섯째 목록 `tags/danbooru_2026-10-01_pt20-ia-dd.csv`(내장의 `tac_tagFile` 기본값)는 상류 tagcomplete 가 아니라
+  [DraconicDragon/dbr-e621-lists-archive](https://github.com/DraconicDragon/dbr-e621-lists-archive) 의 파일
+  `tag-lists/danbooru/danbooru_2026-10-01_pt20-ia-dd.csv`(git blob `acdc0685c5a52ac743363adfe4d6a9b4298331d0`, 5,602,650 바이트, 그 경로의
+  커밋 `0d3b4e4`, 2026-10-01)를 바이트 그대로 넣은 것입니다 — 2026-10-01 에 만든 Danbooru 태그 목록으로, 게시물 수 20 이상인 태그
+  220,510개(이름·분류·게시물 수·별칭, LF). 라이선스: 그 저장소의 **The Unlicense**(`LICENSE`, 퍼블릭 도메인 헌정 — 조건이 없지만 출처를
+  밝혀 둡니다). 태그 이름·분류·게시물 수는 Danbooru 사이트의 태그 데이터입니다. `tests/test_tagcomplete_vendor.py` 가 git blob·SHA-256 을
+  고정합니다.
+
+이 확장에서 바꾼 부분(MIT 는 수정을 허락합니다 — 바꾼 곳 전부):
+
+- `tag_autocomplete_helper.py`
+  - import: `scripts.model_keyword_support`·`scripts.shared_paths`·`scripts.tag_frequency_db` → `sam3ext.tagcomplete.*`(상류의
+    `tag_frequency_db` sys.path 대체 경로는 뺌). Forge 의 스크립트 로더가 아니라 `sam3ext/tagcomplete/boot.py` 의 `start_helper()`
+    가 불러옵니다(`scripts/builtin_tagcomplete.py` 에서).
+  - `/tacapi/v1/*` 경로를 앱마다 한 번만 붙입니다 — 새 함수 `_api_tac_once` 가 `api_tac` 을 부르고, 같은 앱에 이미 있으면 건너뜁니다.
+  - `GET /tacapi/v1/wildcard-contents`(`api_tac` 안의 `get_wildcard_contents`): 새 함수 `_is_listed_wildcard_file` 로 와일드카드 폴더
+    (`WILDCARD_PATH`, `WILDCARD_EXT_PATHS` — 이 헬퍼가 wc.txt·wce.txt 에 적는 폴더) 안의 `.txt` 만 돌려주고 나머지는 404. 상류는
+    쿼리로 준 아무 파일이나 로그인 없이 돌려줬습니다.
+  - 설정 등록 `on_ui_settings`: `tac_tagFile` 의 기본값만 `danbooru.csv` → `danbooru_2026-10-01_pt20-ia-dd.csv`(위 여섯째 목록).
+    키·이름·섹션·드롭다운과 다른 `tac_*` 56개는 상류와 같습니다(설정 대조 테스트가 이 한 곳만 다름을 확인하고, 이 문자열을 되돌리면 함수가
+    상류와 해시까지 같습니다). config.json 에 저장된 값은 그대로 쓰입니다.
+  - 나머지 함수와 다른 경로 14개는 상류와 글자까지 같습니다(테스트가 함수별 해시를 상류와 대조).
+- `shared_paths.py` — `TAGS_PATH` 가 이 확장의 `tags/`(`sam3ext/tagcomplete/paths.py` 의 `TAGS_DIR`)입니다. 상류는
+  `scripts.basedir()/tags` 로, Forge 가 `scripts/` 의 파일을 실행하는 동안에만 맞는 값입니다. 그래서 `modules.scripts` import 는 뺐습니다.
+- `model_keyword_support.py`·`tag_frequency_db.py` — import 경로만(`scripts.shared_paths` → `sam3ext.tagcomplete.shared_paths`).
+- 상류 `install.py`(`pyyaml` 설치) 대신 `requirements.txt` 에 `pyyaml` 을 적었습니다. 상류의 `README.md`·`.github/`(배너·FUNDING)·
+  `.gitattributes`·`.gitignore` 는 넣지 않았고, 태그 목록 다섯 개 밖의 상류 목록(`e621.csv` 등)도 넣지 않았습니다.
+- 이 확장의 코드(GPL-3.0-only, 상류 코드 아님): `sam3ext/tagcomplete/__init__.py`·`paths.py`·`coexist.py`(따로 설치된 tagcomplete
+  가 켜져 있으면 내장이 쉼, 설정 스위치 `sam3_builtin_tagcomplete_enabled` 와 안내 줄, 로더가 읽는 숨은 설정
+  `sam3_tac_builtin_boot`, 고른 `tac_tagFile` 이 `tags/` 에 없을 때 페이지가 기본 목록을 대신 읽게 하는 정보)·`boot.py`(헬퍼 시작, 그 시작
+  정보), `scripts/builtin_tagcomplete.py`, `javascript/tagcomplete_loader.js`,
+  `tools/migrate_tagcomplete.py`.
+
 ## sd-forge-negpip — NegPiP (AGPL-3.0-or-later)
 
 `sam3ext/negpip/`(`__init__.py`·`anima.py`·`sd.py`·`utils.py`·`mask.py`)와 `scripts/negpip.py` 는
@@ -571,6 +630,8 @@ DenOfEquity 저장소는 아무 파일도 열지 않았습니다. README 에서 
 
 `sam3ext/anima38/`(Copyright (c) 2026 GumGum10 contributors),
 `mcp_server/sam_extra_mcp/forgeneo/`·`server.py`·`service.py` 와 `tests/test_mcp_forgeneo_upstream.py` 의 forgeneo-mcp 코드(Copyright (c) 2026 Eduardo Abreu),
+`sam3ext/tagcomplete/` 의 Tag Autocomplete 코드와 `tags/` 의 태그 목록 다섯 개(Copyright (c) 2022 Dominik Reh; Forge Neo 포크의 변경 2026 Eduardo Abreu — 같은 조건, 전문 사본 `sam3ext/tagcomplete/LICENSE`),
+`sam3ext/tagcomplete/javascript/_caretPosition.js` 의 textarea-caret-position 코드(Copyright (c) 2015 Jonathan Ong me@jongleberry.com),
 `assets/bpe_simple_vocab_16e6.txt.gz`(Copyright (c) 2021 OpenAI),
 `scripts/anima_detail_daemon.py` 의 Detail Daemon 코드(Copyright (c) 2024 Sahand Ahmadian, Copyright (c) 2024 Jonseed),
 `sam3ext/colorcraft/`·`javascript/colorcraft_sliders.js` 와 Colorcraft 대조 테스트 사본의 ComfyUI-Colorcraft 코드(Copyright (c) 2026 Sahand Ahmadian Tehrani (Muerrilla); 포크 aoleg/ComfyUI-Colorcraft — Oleg Afonin),
