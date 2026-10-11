@@ -1865,11 +1865,16 @@ txt2img·img2img 의 스타일 줄 아래에 접힌 칸 **구도 · 카메라** 
 
   첫 줄은 옮길 목록만 보여 줍니다(절대 경로·크기·SHA-256). `--apply` 로 복사하며, 이미 있는 파일은 덮어쓰지 않고(같은 내용이면
   건너뜀, 다르면 충돌로 알리고 그대로 둠) 복사본마다 SHA-256 을, 사용 횟수 DB 는 무결성·스키마·행 수를 확인합니다. 원래 폴더는 바꾸지
-  않습니다.
+  않습니다. 예전 확장을 먼저 끄고 Forge 를 한 번 켜서 내장이 빈 `tag_frequency.db`(0 행)·빈 `temp/known_lora_hashes.txt` 를 만들어
+  두었으면, 그 빈 파일은 지우지 않고 옆으로 치운 뒤(`<이름>.empty-<시각>.bak`) 옮깁니다. 행이 있는 DB 는 그대로 두고 충돌로
+  알리며, 예전 기록을 쓰려면 어떻게 하는지 그 줄에 적습니다. 내용이 다른 LoRA 해시 캐시는 다시 만들어지는 캐시라 그대로 두고 알리기만
+  합니다(충돌 아님).
 - **둘이 함께 돌지 않음**: 다른 tagcomplete 확장(폴더에 상류 파일 `javascript/tagAutocomplete.js` 나 `scripts/tag_autocomplete_helper.py`
   가 있는 것 — 이름은 상관없음)이 켜져 있으면 내장은 쉬고, 콘솔에 `[sam-extra] Tag Autocomplete: built-in copy not started` 를 한 번
-  남기며 설정 안내 줄에도 이유가 나옵니다. 그 확장을 지우거나 Extensions 탭에서 끄고 재시작하면 내장이 돕니다. 페이지에서도
-  `javascript/tagcomplete_loader.js` 가 다른 사본의 전역(`TAC_CFG`·`addAutocompleteToArea`)을 보면 내장 JS 를 붙이지 않습니다.
+  남기며 설정 안내 줄에도 이유가 나옵니다. 두 곳 모두 그 폴더를 넣은 옮기기 명령을 그대로 알려 줍니다 — Forge 를 끄고 **먼저 위
+  도구로 옮긴 뒤** 그 확장 폴더를 extensions 밖으로 옮기거나(지우는 것보다 안전) Extensions 탭에서 끄고 재시작하면 내장이 돕니다.
+  옮기기 전에 지우면 git 에 없는 사용자 목록·사용 횟수가 사라집니다. 페이지에서도 `javascript/tagcomplete_loader.js` 가 다른 사본의
+  전역(`TAC_CFG`·`addAutocompleteToArea`)을 보면 내장 JS 를 붙이지 않습니다.
 - **다른 확장과**: 상류와 같은 전역 이름(`TAC_CFG`·`addAutocompleteToArea`·`hideResults` 등), 요소 클래스(`.autocompleteParent` 등),
   `/tacapi/v1/*` 경로 15개를 그대로 써서 prompt-all-in-one 같은 확장이 예전처럼 붙습니다. 구도 · 카메라 칸이 붙인 글자에는 추천
   목록이 뜨지 않습니다(위 절).
@@ -1877,6 +1882,8 @@ txt2img·img2img 의 스타일 줄 아래에 접힌 칸 **구도 · 카메라** 
   돌려줍니다 — 상류는 쿼리로 준 아무 파일이나 로그인 없이 돌려줘, `--listen` 으로 띄우면 같은 망의 누구나 PC 의 파일을 읽을 수
   있었습니다. 같은 앱에 경로가 두 번 붙지 않고, 의존성 `pyyaml` 은 상류 `install.py` 대신 `requirements.txt` 에 있습니다. 상류의
   JS 15개는 바꾸지 않았고 `sam3ext/tagcomplete/javascript/` 에 있습니다(Forge 가 자동으로 싣지 않는 하위 폴더라 로더가 붙임).
+  로더는 켜졌는지와 파일 목록을 Forge 설정(`opts`)의 숨은 키 `sam3_tac_builtin_boot`(화면에 없고 저장되지 않음)에서 읽어, Forge 가
+  막 떠서 확장들의 시작 작업이 끝나기 전에 열린 페이지(자동으로 여는 브라우저, Reload UI 뒤 새로 고침)에서도 상류처럼 시작합니다.
 - **고른 파일이 없을 때**: `tac_*` 가 고른 파일이 `tags/` 에 없으면(이름이 바뀐 파일 등) 상류는 브라우저 콘솔에 404 만 남기고 그
   목록을 통째로 건너뜁니다 — 태그 파일이 없으면 extra 파일도 읽지 않습니다. 내장은 Forge 를 시작할 때 콘솔
   (`... is not in ... - pick another file`)과 설정 안내 줄에 그 이름을 알려 줍니다. Settings 에서 있는 파일을 다시 고르세요.

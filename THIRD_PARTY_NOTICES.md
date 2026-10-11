@@ -93,6 +93,17 @@ Forge Neo 용으로 고친 [DominikDoom/a1111-sd-webui-tagcomplete](https://gith
   SHA-256 을 고정)와 이 문서 끝에 있습니다. 편입한 파일은 계속 MIT 를 따르고, 이 확장의 GPL-3.0-only 가 대체하지 않습니다.
 - 편입한 Python 파일마다 머리에 상류·저작권·MIT 고지와 수정 고지(`MODIFIED by sam-extra, 2026-10-11`)를 달았습니다. JS 15개·`LICENSE`·
   태그 목록 다섯 개는 상류와 바이트까지 같습니다(`.gitattributes` 의 `-text` 로 줄끝 변환 없이 저장, 테스트가 SHA-256 고정).
+- `javascript/_caretPosition.js`(입력 칸의 커서 위치 계산)는 다시 다른 MIT 프로젝트
+  [component/textarea-caret-position](https://github.com/component/textarea-caret-position) 의 코드입니다 — 파일 첫 줄
+  `// From https://github.com/component/textarea-caret-position`, 원본 저장소가 `90664d4`(2023-02-26)에서 넣었고 그 라이선스는
+  함께 넣지 않았습니다. 저작권: **Copyright (c) 2015 Jonathan Ong me@jongleberry.com**(그 프로젝트 `LICENSE` 의 줄), 라이선스:
+  **MIT**(전문은 이 문서 끝 — 같은 조건). 이 파일도 바꾸지 않았습니다.
+- 태그 목록 다섯 개의 출처(상류 README 의 "Tag Lists" 표): `danbooru.csv` — Danbooru(danbooru.donmai.us) 태그 상위 10만 개,
+  `danbooru_2025.csv` — 2025년에 갱신한 Danbooru 목록, `danbooru_e621_merged.csv` — Danbooru 와 e621(e621.net) 태그를 합치고 분류를
+  하나로 맞춘 목록(상류 `tagAutocomplete.js` 의 주석이 그 분류의 출처로
+  [DraconicDragon/dbr-e621-lists-archive](https://github.com/DraconicDragon/dbr-e621-lists-archive) 의
+  `tag-lists/danbooru_e621_merged` 를 듭니다), `extra-quality-tags.csv` — 상류가 고른 품질 태그, `demo-chants.json` — 상류의 예시
+  chant. 태그 이름·분류·게시물 수는 Danbooru·e621 사이트의 태그 데이터이고, 파일은 상류 저장소가 위 MIT `LICENSE` 로 배포한 그대로입니다.
 
 이 확장에서 바꾼 부분(MIT 는 수정을 허락합니다 — 바꾼 곳 전부):
 
@@ -111,8 +122,9 @@ Forge Neo 용으로 고친 [DominikDoom/a1111-sd-webui-tagcomplete](https://gith
 - 상류 `install.py`(`pyyaml` 설치) 대신 `requirements.txt` 에 `pyyaml` 을 적었습니다. 상류의 `README.md`·`.github/`(배너·FUNDING)·
   `.gitattributes`·`.gitignore` 는 넣지 않았고, 태그 목록 다섯 개 밖의 상류 목록(`e621.csv` 등)도 넣지 않았습니다.
 - 이 확장의 코드(GPL-3.0-only, 상류 코드 아님): `sam3ext/tagcomplete/__init__.py`·`paths.py`·`coexist.py`(따로 설치된 tagcomplete
-  가 켜져 있으면 내장이 쉼, 설정 스위치 `sam3_builtin_tagcomplete_enabled` 와 안내 줄)·`boot.py`(헬퍼 시작, 로더가 묻는
-  `/sam3-tagcomplete/boot`), `scripts/builtin_tagcomplete.py`, `javascript/tagcomplete_loader.js`, `tools/migrate_tagcomplete.py`.
+  가 켜져 있으면 내장이 쉼, 설정 스위치 `sam3_builtin_tagcomplete_enabled` 와 안내 줄, 로더가 읽는 숨은 설정
+  `sam3_tac_builtin_boot`)·`boot.py`(헬퍼 시작, 그 시작 정보), `scripts/builtin_tagcomplete.py`, `javascript/tagcomplete_loader.js`,
+  `tools/migrate_tagcomplete.py`.
 
 ## sd-forge-negpip — NegPiP (AGPL-3.0-or-later)
 
@@ -605,6 +617,7 @@ DenOfEquity 저장소는 아무 파일도 열지 않았습니다. README 에서 
 `sam3ext/anima38/`(Copyright (c) 2026 GumGum10 contributors),
 `mcp_server/sam_extra_mcp/forgeneo/`·`server.py`·`service.py` 와 `tests/test_mcp_forgeneo_upstream.py` 의 forgeneo-mcp 코드(Copyright (c) 2026 Eduardo Abreu),
 `sam3ext/tagcomplete/` 의 Tag Autocomplete 코드와 `tags/` 의 태그 목록 다섯 개(Copyright (c) 2022 Dominik Reh; Forge Neo 포크의 변경 2026 Eduardo Abreu — 같은 조건, 전문 사본 `sam3ext/tagcomplete/LICENSE`),
+`sam3ext/tagcomplete/javascript/_caretPosition.js` 의 textarea-caret-position 코드(Copyright (c) 2015 Jonathan Ong me@jongleberry.com),
 `assets/bpe_simple_vocab_16e6.txt.gz`(Copyright (c) 2021 OpenAI),
 `scripts/anima_detail_daemon.py` 의 Detail Daemon 코드(Copyright (c) 2024 Sahand Ahmadian, Copyright (c) 2024 Jonseed),
 `sam3ext/colorcraft/`·`javascript/colorcraft_sliders.js` 와 Colorcraft 대조 테스트 사본의 ComfyUI-Colorcraft 코드(Copyright (c) 2026 Sahand Ahmadian Tehrani (Muerrilla); 포크 aoleg/ComfyUI-Colorcraft — Oleg Afonin),

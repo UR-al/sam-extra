@@ -4,12 +4,14 @@
 // sam3ext/tagcomplete/javascript/ 에 있다. Forge 는 확장의 javascript/ 맨 위 파일만 <head> 에 넣으므로
 // (modules/extensions.py list_files — 하위 폴더는 읽지 않음) 그 파일들은 자동으로 실리지 않고, 이 로더가 붙인다:
 //
-// 1. 페이지의 <head> 스크립트가 모두 돈 뒤(DOMContentLoaded) 다른 tagcomplete 가 이미 실렸는지 본다 — 상류의 전역
-//    TAC_CFG(var) · addAutocompleteToArea(function). 있으면 한 줄 남기고 멈춘다. 같은 const/class 파일을 두 번 실으면
-//    "Identifier has already been declared" 로 반만 초기화되므로 둘이 같은 페이지에서 돌면 안 된다.
-// 2. GET sam3-tagcomplete/boot(sam3ext/tagcomplete/boot.py)로 켜졌는지와 파일 목록을 받는다. 서버가 막 떠서 경로가 아직
-//    없으면(404·네트워크 오류) 500 ms 간격으로 5번 더 묻는다. 꺼졌으면(설정 스위치, 따로 설치된 사본, 시작 실패) 이유를
-//    한 번 남기고 멈춘다.
+// 1. Forge 의 설정(opts)이 페이지에 올라오기를 기다린다(script.js onOptionsAvailable). 켜졌는지·이유·파일 목록은 숨은 설정
+//    sam3_tac_builtin_boot(sam3ext/tagcomplete/coexist.py — 화면에 없고 저장되지 않음, 값은 이 Forge 프로세스가 스크립트를
+//    불러올 때 정한 것)에 들어 있다. 설정은 페이지와 함께 Gradio 가 보내므로 늦게 붙는 경로(app_started)를 기다리지 않는다 —
+//    상류도 opts 가 차야 초기화를 시작한다(tagAutocomplete.js 의 onUiUpdate). 예전처럼 GET 경로를 물으면 Forge 가 막 떠서
+//    app_started 가 끝나기 전에 열린 페이지(자동으로 여는 브라우저, Reload UI 뒤 새로 고침)에서 내장이 시작되지 않았다.
+// 2. 그때 다른 tagcomplete 가 이미 실렸는지 본다 — 상류의 전역 TAC_CFG(var) · addAutocompleteToArea(function). 있으면 한 줄
+//    남기고 멈춘다. 같은 const/class 파일을 두 번 실으면 "Identifier has already been declared" 로 반만 초기화되므로 둘이 같은
+//    페이지에서 돌면 안 된다. 꺼졌으면(설정 스위치, 따로 설치된 사본, 시작 실패) 이유를 한 번 남기고 멈춘다.
 // 3. 받은 순서(Forge 가 상류 확장 폴더에서 쓰던 이름순 그대로)대로 <script async=false> 를 <head> 에 붙인다 — 붙인
 //    차례대로 실행된다. 하나가 실패해도 나머지는 붙이고 콘솔에 남긴다.
 // 4. 다 실린 뒤 UI 가 이미 다 그려져 있으면(#txt2img_prompt) gradioApp() 에 빈 주석 노드를 넣었다 빼, Forge 의
@@ -19,9 +21,8 @@
 (function () {
     "use strict";
 
-    var BOOT_URL = "sam3-tagcomplete/boot";
-    var RETRIES = 5;
-    var RETRY_MS = 500;
+    var BOOT_OPTION = "sam3_tac_builtin_boot";
+    var POLL_MS = 200;
     var PREFIX = "[sam-extra] Tag Autocomplete: ";
     var root = document.documentElement;
 
@@ -42,37 +43,48 @@
         }
     }
 
-    function sleep(ms) {
-        return new Promise(function (resolve) { setTimeout(resolve, ms); });
+    // Forge's settings (script.js `let opts`, a global lexical binding — not a window property)
+    function currentOptions() {
+        try {
+            return (typeof opts === "object" && opts !== null) ? opts : null;   // eslint-disable-line no-undef
+        } catch (_error) {
+            return null;
+        }
     }
 
-    async function fetchBoot() {
-        for (var attempt = 0; attempt <= RETRIES; attempt++) {
-            if (attempt > 0) await sleep(RETRY_MS);
-            var response;
+    function whenOptionsAvailable(callback) {
+        if (typeof onOptionsAvailable === "function") {   // eslint-disable-line no-undef
+            onOptionsAvailable(callback);                  // eslint-disable-line no-undef
+            return;
+        }
+        (function poll() {   // a webui without onOptionsAvailable: wait for opts to fill
+            var options = currentOptions();
+            if (options && Object.keys(options).length > 0) callback();
+            else setTimeout(poll, POLL_MS);
+        })();
+    }
+
+    // {enabled, reason, upstream, scripts} or null (with a warning)
+    function readBoot() {
+        var options = currentOptions();
+        var raw = options ? options[BOOT_OPTION] : undefined;
+        if (raw === undefined || raw === null || raw === "") {
+            console.warn(PREFIX + "Forge's settings have no " + BOOT_OPTION
+                + " (sam-extra's scripts/builtin_tagcomplete.py did not run - see the server console); built-in copy not started");
+            return null;
+        }
+        if (typeof raw === "string") {
             try {
-                response = await fetch(BOOT_URL, {
-                    cache: "no-store",
-                    credentials: "same-origin",
-                    headers: { "X-SAM3-Notebook": "1" },
-                });
+                raw = JSON.parse(raw);
             } catch (_error) {
-                continue;   // server not reachable yet
-            }
-            if (response.status === 404) continue;   // app_started has not registered the route yet
-            if (!response.ok) {
-                console.warn(PREFIX + "boot request failed (HTTP " + response.status + "); built-in copy not started");
-                return null;
-            }
-            try {
-                return await response.json();
-            } catch (_error) {
-                console.warn(PREFIX + "boot answer is not JSON; built-in copy not started");
-                return null;
+                raw = null;
             }
         }
-        console.warn(PREFIX + "no answer from " + BOOT_URL + "; built-in copy not started");
-        return null;
+        if (!raw || typeof raw !== "object") {
+            console.warn(PREFIX + BOOT_OPTION + " is not a JSON object; built-in copy not started");
+            return null;
+        }
+        return raw;
     }
 
     function nudgeUiUpdate() {
@@ -116,7 +128,7 @@
             console.log(PREFIX + "another tagcomplete is loaded on this page; built-in copy not started");
             return;
         }
-        var boot = await fetchBoot();
+        var boot = readBoot();
         if (!boot) {
             setState("failed");
             return;
@@ -126,27 +138,29 @@
             console.log(PREFIX + "built-in copy not started: " + (boot.reason || "turned off"));
             return;
         }
-        if (anotherCopyLoaded()) {   // loaded while we waited for the server
-            setState("skipped");
-            console.log(PREFIX + "another tagcomplete is loaded on this page; built-in copy not started");
-            return;
-        }
         var urls = Array.isArray(boot.scripts) ? boot.scripts.filter(function (u) { return typeof u === "string"; }) : [];
         var failed = await addScripts(urls);
         setState(failed ? "failed" : "started");
         nudgeUiUpdate();
     }
 
+    var started = false;
     function run() {
+        if (started) return;   // Forge runs onOptionsAvailable callbacks once; this guards the polling fallback too
+        started = true;
         start().catch(function (error) {
             setState("failed");
             console.error(PREFIX + "loader error", error);
         });
     }
 
+    function waitForOptions() {
+        whenOptionsAvailable(run);
+    }
+
     if (document.readyState === "loading") {
-        document.addEventListener("DOMContentLoaded", run, { once: true });
+        document.addEventListener("DOMContentLoaded", waitForOptions, { once: true });
     } else {
-        run();
+        waitForOptions();
     }
 })();

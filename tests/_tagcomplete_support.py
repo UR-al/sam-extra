@@ -251,6 +251,7 @@ def forge_stubs(sandbox_root: Path, opts: Opts | None = None, active=()):
     paths.extensions_dir = str(forge / "extensions")
     extensions = types.ModuleType("modules.extensions")
     extensions.active = lambda: list(active)
+    extensions.extensions = list(active)   # Forge: every extension folder, enabled or not (tests add disabled ones)
     extensions.extensions_builtin_dir = str(forge / "extensions-builtin")
     hashes = types.ModuleType("modules.hashes")
     hashes.sha256_from_cache = lambda *a, **k: None

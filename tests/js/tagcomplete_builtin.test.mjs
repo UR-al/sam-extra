@@ -15,7 +15,7 @@ import { JSDOM, VirtualConsole } from "jsdom";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..");
 const JS_DIR = path.join(ROOT, "sam3ext", "tagcomplete", "javascript");
-// Forge's Extension.list_files order (Python sorted(os.listdir)) — what /sam3-tagcomplete/boot returns
+// Forge's Extension.list_files order (Python sorted(os.listdir)) — the order boot.manifest() gives the loader
 const FILES = readdirSync(JS_DIR).filter((name) => name.endsWith(".js")).sort();
 const SOURCES = FILES.map((name) => [name, readFileSync(path.join(JS_DIR, name), "utf8")]);
 const LOGIC = readFileSync(path.join(ROOT, "javascript", "composition_prompt.js"), "utf8");

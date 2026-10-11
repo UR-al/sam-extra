@@ -23,8 +23,9 @@ several scripts install hooks when imported. Checked here:
   instead of right above Colorcraft, whose sorting priority places it under Optimal Scale;
 * the built-in Tag Autocomplete (``scripts/builtin_tagcomplete.py``) starts its helper with the other
   scripts: its note and switch, then the 57 ``tac_*`` settings in the one "Tag Autocomplete" section,
-  the 15 ``/tacapi/v1/*`` routes and ``/sam3-tagcomplete/boot`` once each (also after Reload UI and a
-  second app start on the same app), and every file it writes in the probe's sandbox.
+  the 15 ``/tacapi/v1/*`` routes once each (also after Reload UI and a second app start on the same app),
+  the loader's start-up information as the one hidden setting ``sam3_tac_builtin_boot`` (no route of its own —
+  nothing the page needs waits for app start), and every file it writes in the probe's sandbox.
 
 The Forge checkout is next to the extension, else ``$SAM3_FORGE_ROOT`` (tests/_extra_schedulers_support.forge_root).
 """
@@ -237,14 +238,16 @@ class LoadOrderTests(unittest.TestCase):
         r = self.report
         self.assertLess(r["order"].index("builtin_tagcomplete.py"), r["order"].index("negpip.py"))
         for key in ("tagcomplete", "reload_tagcomplete"):
-            self.assertEqual(r[key]["state"], {"enabled": True, "code": "ok", "reason": None}, key)
+            self.assertEqual(r[key]["state"], {"enabled": True, "code": "ok", "reason": None, "source": None}, key)
         for key in ("options", "reload_options"):
             in_section = [option[0] for option in r[key] if option[1] == tac.SECTION]
             self.assertEqual(in_section, ["sam3_tac_builtin_note", "sam3_builtin_tagcomplete_enabled", *tac.TAC_KEYS], key)
+            boot = [option for option in r[key] if option[0] == "sam3_tac_builtin_boot"]
+            self.assertEqual([option[1] for option in boot], [[None, "Hidden Options"]], key)
         for key in ("routes", "reload_routes"):
             pairs = [(path, method) for path, methods in r[key] for method in methods]
             self.assertEqual([pair for pair in pairs if pair[0].startswith("/tacapi/")], list(tac.TACAPI_ROUTES), key)
-            self.assertEqual(pairs.count(("/sam3-tagcomplete/boot", "GET")), 1, key)
+            self.assertNotIn(("/sam3-tagcomplete/boot", "GET"), pairs, key)
         # the helper ran (temp files, database) — inside the probe's sandbox, not in tags/ or a Forge install
         for path in ("forge/tmp/tagAutocompletePath.txt", "tags/tag_frequency.db", "tags/temp/wc.txt"):
             self.assertIn(path, r["sandbox_files"])

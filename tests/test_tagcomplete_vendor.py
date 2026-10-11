@@ -258,12 +258,27 @@ class LicenseNoticeTests(unittest.TestCase):
         for needle in ("eduardoabreu81/sd-webui-tagcomplete-neo", "8e0d81f", "Dominik Reh", "Eduardo Abreu",
                        "DominikDoom/a1111-sd-webui-tagcomplete", "sam3ext/tagcomplete/LICENSE", "MIT",
                        "tag_autocomplete_helper.py", "shared_paths.py", "model_keyword_support.py", "tag_frequency_db.py",
-                       "wildcard-contents", "_api_tac_once", "install.py", "tags/"):
+                       "wildcard-contents", "_api_tac_once", "install.py", "tags/",
+                       # _caretPosition.js is a separate MIT project's code (its first line names it; upstream did not
+                       # carry its licence) — its copyright line as in that project's LICENSE
+                       "_caretPosition.js", "component/textarea-caret-position",
+                       "Copyright (c) 2015 Jonathan Ong me@jongleberry.com",
+                       # where the five shipped tag lists come from (upstream README "Tag Lists", tagAutocomplete.js)
+                       "Danbooru", "e621", "DraconicDragon/dbr-e621-lists-archive", "danbooru_e621_merged.csv",
+                       "danbooru_2025.csv", "extra-quality-tags.csv", "demo-chants.json"):
             with self.subTest(needle=needle):
                 self.assertIn(needle, section)
         mit = text[text.index("## MIT License 전문"):]
         self.assertIn("sam3ext/tagcomplete/", mit[:mit.index("```")])
         self.assertIn("Dominik Reh", mit[:mit.index("```")])
+        self.assertIn("_caretPosition.js", mit[:mit.index("```")])
+        self.assertIn("Jonathan Ong", mit[:mit.index("```")])
+
+    def test_the_caret_position_file_still_names_its_origin(self):
+        first = (ROOT / "sam3ext" / "tagcomplete" / "javascript" / "_caretPosition.js").read_text(encoding="utf-8").splitlines()[0]
+        self.assertEqual(first, "// From https://github.com/component/textarea-caret-position")
+        merged = (ROOT / "sam3ext" / "tagcomplete" / "javascript" / "tagAutocomplete.js").read_text(encoding="utf-8-sig")
+        self.assertIn("https://github.com/DraconicDragon/dbr-e621-lists-archive", merged)
 
 
 if __name__ == "__main__":

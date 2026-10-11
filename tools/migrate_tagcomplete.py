@@ -13,11 +13,17 @@ before the old folder is removed. Everything else in temp/ is rebuilt by the hel
 * Never overwrites: a file that already exists in ``--dst`` with the same bytes counts as done; with other bytes it is
   a conflict, left alone and reported (exit code 2). A copy is written under a temporary name, its SHA-256 is checked
   against the source, then it is renamed into place with an operation that fails if the name exists by then.
+* Two exceptions, both placeholders the built-in copy makes when it starts before the copy (e.g. after the old extension
+  was disabled first): an empty tag_frequency.db (0 rows, the old one's schema, no unfinished write next to it) and an
+  empty temp/known_lora_hashes.txt are renamed aside (``<name>.empty-<time>.bak`` next to it, never deleted), then the
+  old file is copied ("replace"). A tag_frequency.db with rows stays a conflict - the message says how to use the old
+  counts instead. A different, non-empty temp/known_lora_hashes.txt is kept and reported ("kept", not a conflict): it is
+  a cache the helper rebuilds.
 * Never changes ``--src`` (read only). Copies keep the source's modification time.
 * tag_frequency.db is copied only when no ``-journal`` / ``-wal`` file sits next to it (an unfinished write — stop Forge
   and run again), and the copy is opened read-only afterwards: integrity check, schema version, row count.
 * ``--progress`` appends one JSON line per finished file; a second run skips those whose copy is still intact.
-* Exit codes: 0 done (or nothing to do), 1 a precondition failed (nothing written), 2 conflicts or failed files.
+* Exit codes: 0 done (or nothing to do), 1 a precondition failed (nothing written), 2 conflicts, blocked or failed files.
 
 Standard library only; run it with the Forge venv's ``python -I``.
 """
@@ -31,6 +37,7 @@ import os
 import shutil
 import sqlite3
 import sys
+import time
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
@@ -54,8 +61,11 @@ class Item:
     dst: Path
     size: int
     sha256: str
-    action: str = ""   # copy · identical · conflict · done · blocked
+    action: str = ""   # copy · replace · identical · done · kept · conflict · blocked (then: copied · replaced · failed)
     note: str = ""
+    dst_size: int | None = None      # replace: the placeholder the plan saw (it must still be that file)
+    dst_sha256: str | None = None
+    aside: Path | None = None        # replaced: where the placeholder went
 
 
 def _print(text: str = "") -> None:
@@ -157,8 +167,48 @@ def append_progress(path: Path | None, item: Item) -> None:
         return
     path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "a", encoding="utf-8") as handle:
-        handle.write(json.dumps({"name": item.name, "sha256": item.sha256, "bytes": item.size, "action": item.action,
-                                 "dst": str(item.dst)}, ensure_ascii=False) + "\n")
+        entry = {"name": item.name, "sha256": item.sha256, "bytes": item.size, "action": item.action, "dst": str(item.dst)}
+        if item.aside is not None:
+            entry["aside"] = str(item.aside)
+        handle.write(json.dumps(entry, ensure_ascii=False) + "\n")
+
+
+def _remember_target(item: Item) -> None:
+    item.dst_size = item.dst.stat().st_size
+    item.dst_sha256 = sha256_of(item.dst)
+
+
+def _plan_database_conflict(item: Item) -> None:
+    """The target already has a different tag_frequency.db: replace it when it is the built-in's empty placeholder."""
+    pending = _journal(item.dst)
+    if pending is not None:   # not even opened: a hot journal would make sqlite try to roll it back
+        item.action = "conflict"
+        item.note = f"the one there has an unfinished write ({pending.name}) - stop Forge and run again"
+        return
+    try:
+        version, rows = database_summary(item.dst)
+    except sqlite3.Error as error:
+        item.action, item.note = "conflict", f"a different file with this name is already there - left as it is ({error})"
+        return
+    try:
+        source_version, source_rows = database_summary(item.src)
+    except sqlite3.Error as error:
+        item.action, item.note = "blocked", f"not a readable tag_frequency.db: {error}"
+        return
+    if rows == 0 and version == source_version:
+        item.action = "replace"
+        item.note = (f"the one there is empty (0 rows, schema {version} - the built-in made it when it first started): "
+                     f"it is renamed aside, then the old one (schema {source_version}, {source_rows} rows) is copied")
+        _remember_target(item)
+        return
+    item.action = "conflict"
+    if rows == 0:
+        item.note = (f"the one there is empty but has schema {version} (the old one: {source_version}) - left as it is; "
+                     f"stop Forge, move {item.dst} aside and run again to use the old one")
+    else:
+        item.note = (f"a different file with this name is already there - left as it is (it has {rows} rows, schema "
+                     f"{version}; the old one is not merged in). To use the old counts ({source_rows} rows) instead: "
+                     f"stop Forge, move {item.dst} aside and run again")
 
 
 def plan(items: list[Item], progress: dict) -> None:
@@ -170,15 +220,19 @@ def plan(items: list[Item], progress: dict) -> None:
             same = item.dst.is_file() and item.dst.stat().st_size == item.size and sha256_of(item.dst) == item.sha256
             if same:
                 item.action = "done" if progress.get(item.name) == item.sha256 else "identical"
+            elif item.name == DATABASE and item.dst.is_file():
+                _plan_database_conflict(item)
+            elif item.name == CACHE and item.dst.is_file() and item.dst.stat().st_size == 0:
+                item.action = "replace"
+                item.note = ("the one there is empty (the built-in made it when it first started): it is renamed aside, "
+                             "then the old one is copied")
+                _remember_target(item)
+            elif item.name == CACHE and item.dst.is_file():
+                item.action = "kept"
+                item.note = "a different hash cache is already there - kept (a cache the helper rebuilds; nothing is lost)"
             else:
                 item.action = "conflict"
                 item.note = "a different file with this name is already there - left as it is"
-                if item.name == DATABASE:
-                    try:
-                        version, rows = database_summary(item.dst)
-                        item.note += f" (it has {rows} rows, schema {version}; the old one is not merged in)"
-                    except sqlite3.Error as error:
-                        item.note += f" ({error})"
             continue
         item.action = "copy"
         if item.name == DATABASE:
@@ -219,6 +273,37 @@ def copy_one(item: Item) -> None:
         item.note = f"schema {version}, {rows} rows"
 
 
+def _aside_path(path: Path) -> Path:
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    candidate = path.with_name(f"{path.name}.empty-{stamp}.bak")
+    if candidate.exists():
+        candidate = path.with_name(f"{path.name}.empty-{stamp}-{uuid.uuid4().hex[:8]}.bak")
+    return candidate
+
+
+def replace_one(item: Item) -> None:
+    """Rename the placeholder the plan saw aside (never deleted, never overwriting), then copy; after a failed copy the
+    placeholder goes back. Raises FileExistsError when the target is no longer that placeholder."""
+    try:
+        unchanged = (item.dst.is_file() and item.dst.stat().st_size == item.dst_size
+                     and sha256_of(item.dst) == item.dst_sha256)
+    except OSError:
+        unchanged = False
+    if not unchanged:
+        raise FileExistsError(f"{item.dst} changed since the plan")
+    if item.name == DATABASE and _journal(item.dst) is not None:
+        raise FileExistsError(f"{item.dst} has an unfinished write next to it - stop Forge and run again")
+    aside = _aside_path(item.dst)
+    _place(item.dst, aside)
+    try:
+        copy_one(item)
+    except BaseException:
+        if not item.dst.exists():
+            _place(aside, item.dst)
+        raise
+    item.aside = aside
+
+
 def _mib(size: int) -> str:
     return f"{size / (1 << 20):.2f} MiB"
 
@@ -250,20 +335,31 @@ def run(src: Path, dst: Path, apply: bool, include_cache: bool, progress_path: P
     failed = []
     if apply:
         for item in items:
-            if item.action != "copy":
+            if item.action not in ("copy", "replace"):
                 continue
+            replacing = item.action == "replace"
+            if replacing:
+                item.note = ""
             try:
-                copy_one(item)
-            except FileExistsError:
-                item.action, item.note = "conflict", "appeared in the target while copying - left as it is"
+                if replacing:
+                    replace_one(item)
+                else:
+                    copy_one(item)
+            except FileExistsError as error:
+                item.action = "conflict"
+                item.note = (f"{error} - left as it is" if replacing
+                             else "appeared in the target while copying - left as it is")
                 _print(f"  conflict  {item.name}: {item.note}")
             except (OSError, sqlite3.Error) as error:
                 item.action, item.note = "failed", str(error)
                 failed.append(item)
             else:
-                item.action = "copied"
+                item.action = "replaced" if replacing else "copied"
                 append_progress(progress_path, item)
-                _print(f"  copied    {item.name} -> {item.dst}  (sha256 verified{', ' + item.note if item.note else ''})")
+                details = "sha256 verified" + (", " + item.note if item.note else "")
+                if replacing:
+                    details += f"; the empty one is now {item.aside}"
+                _print(f"  {item.action:<9} {item.name} -> {item.dst}  ({details})")
         for item in items:
             if item.action == "identical":
                 append_progress(progress_path, item)
@@ -273,7 +369,7 @@ def run(src: Path, dst: Path, apply: bool, include_cache: bool, progress_path: P
     counts = {}
     for item in items:
         counts[item.action] = counts.get(item.action, 0) + 1
-    to_copy = [item for item in items if item.action in ("copy", "copied")]
+    to_copy = [item for item in items if item.action in ("copy", "copied", "replace", "replaced")]
     summary = ", ".join(f"{key} {value}" for key, value in sorted(counts.items()))
     _print(f"[migrate_tagcomplete] {len(items)} files: {summary}; "
            f"{'copied' if apply else 'to copy'} {_mib(sum(i.size for i in to_copy))} into {dst}")

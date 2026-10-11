@@ -8,8 +8,9 @@
 - ``javascript/*.js`` — 상류 ``javascript/`` 15개, 바꾸지 않음. Forge 가 자동으로 싣지 않는 하위 폴더라
   ``javascript/tagcomplete_loader.js``(확장 루트)가 붙인다.
 
-이 확장의 코드: ``paths.py``(경로), ``coexist.py``(따로 설치된 tagcomplete 와 함께 돌지 않기 · 설정 스위치),
-``boot.py``(헬퍼 시작 · 로더가 묻는 ``/sam3-tagcomplete/boot``), ``scripts/builtin_tagcomplete.py``(Forge 진입점).
+이 확장의 코드: ``paths.py``(경로), ``coexist.py``(따로 설치된 tagcomplete 와 함께 돌지 않기 · 설정 스위치 · 옮기기 안내 ·
+로더가 읽는 숨은 설정 ``sam3_tac_builtin_boot``), ``boot.py``(헬퍼 시작 · 그 시작 정보), ``scripts/builtin_tagcomplete.py``
+(Forge 진입점).
 
 이 패키지를 import 해도 아무 일도 일어나지 않는다(파일을 쓰거나 콜백을 거는 것은 ``boot.start_helper()`` 뿐).
 """

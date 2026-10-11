@@ -1,5 +1,5 @@
 # sam-extra 자체 코드(GPL-3.0-only) — 상류 tagcomplete 코드가 아니다.
-"""내장 Tag Autocomplete 시작 — 헬퍼 import 와 로더가 묻는 ``GET /sam3-tagcomplete/boot``.
+"""내장 Tag Autocomplete 시작 — 헬퍼 import 와 로더가 읽는 시작 정보(manifest).
 
 ``start_helper()`` 는 상류 ``scripts/tag_autocomplete_helper.py`` 를 Forge 의 스크립트 로더가 하던 것처럼 스크립트를
 불러올 때마다 새 모듈로 실행한다(Forge 는 불러오기 전에 콜백을 비운다 — Reload UI 에서 두 번 걸리지 않음). 헬퍼는 import
@@ -7,13 +7,16 @@
 ``on_model_loaded``(임베딩)·``on_ui_settings``(tac_* 57개)·``on_app_started``(``/tacapi/v1/*`` 15개)를 건다.
 ``shared_paths``·``model_keyword_support`` 는 상류의 ``scripts.shared_paths`` 처럼 ``sys.modules`` 에 남는다.
 
-``/sam3-tagcomplete/boot`` 는 켜졌는지·이유·JS 파일 목록(Forge 가 확장 JS 에 쓰는 ``file=<경로>?<mtime>`` 꼴, 이름순)을
-돌려준다. 앱마다 한 번 붙고, 다른 sam-extra 경로처럼 로그인 가드(``extension_auth_dependencies``)와 같은 출처 헤더를 받는다.
+``manifest()`` 는 켜졌는지·이유·JS 파일 목록(Forge 가 확장 JS 에 쓰는 ``file=<경로>?<mtime>`` 꼴, 이름순)이다.
+``coexist.register_settings`` 가 그 JSON(``manifest_json()``)을 숨은 설정 ``sam3_tac_builtin_boot`` 의 기본값으로 올려,
+페이지의 ``opts`` 에 실린다 — ``javascript/tagcomplete_loader.js`` 가 거기서 읽는다. HTTP 경로가 아니라서 Forge 가 막 떠
+``app_started`` 가 끝나기 전에 열린 페이지에서도 바로 읽힌다(설정은 Gradio 가 페이지와 함께 보낸다).
 """
 
-# No `from __future__ import annotations` here: FastAPI resolves the route handler's annotations through the module
-# globals, and Request / JSONResponse are imported inside register_route().
+from __future__ import annotations
+
 import importlib
+import json
 import os
 import sys
 import traceback
@@ -21,14 +24,15 @@ import traceback
 from sam3ext.tagcomplete import UPSTREAM_LABEL, paths
 
 HELPER_MODULE = "sam3ext.tagcomplete.tag_autocomplete_helper"
-BOOT_PATH = "/sam3-tagcomplete/boot"
 
 # code: "ok" (running) · "off" (switch) · "standalone" (another copy enabled) · "failed" · "not started"
-STATE: dict = {"enabled": False, "code": "not started", "reason": "not started yet"}
+# source: the folder of another tagcomplete copy — the enabled one when code is "standalone", otherwise a disabled one
+#         (or None); the console line and the settings note name it in the migration command
+STATE: dict = {"enabled": False, "code": "not started", "reason": "not started yet", "source": None}
 
 
-def set_state(code: str, reason: str | None) -> None:
-    STATE.update(enabled=code == "ok", code=code, reason=reason)
+def set_state(code: str, reason: str | None, source: str | None = None) -> None:
+    STATE.update(enabled=code == "ok", code=code, reason=reason, source=source)
 
 
 def _report(message: str) -> None:
@@ -87,21 +91,6 @@ def manifest() -> dict:
     }
 
 
-def register_route(_demo, app) -> bool:
-    """``on_app_started`` — ``GET /sam3-tagcomplete/boot`` 를 앱마다 한 번 붙인다(내장이 쉬어도 붙는다: 로더가 이유를 받는다)."""
-    for route in getattr(app, "routes", ()):
-        if getattr(route, "path", None) == BOOT_PATH:
-            return False
-
-    from fastapi import Request
-    from fastapi.responses import JSONResponse
-
-    from sam3ext.notebook_store import extension_auth_dependencies, require_same_origin_header
-
-    async def tagcomplete_boot(request: Request) -> JSONResponse:
-        require_same_origin_header(request)
-        return JSONResponse(manifest(), headers={"Cache-Control": "no-store, max-age=0", "Pragma": "no-cache"})
-
-    app.add_api_route(BOOT_PATH, tagcomplete_boot, methods=["GET"], include_in_schema=False,
-                      dependencies=extension_auth_dependencies(app))
-    return True
+def manifest_json() -> str:
+    """``manifest()`` 의 JSON 문자열 — 숨은 설정 ``sam3_tac_builtin_boot`` 의 값(로더가 ``JSON.parse`` 한다)."""
+    return json.dumps(manifest(), ensure_ascii=False)

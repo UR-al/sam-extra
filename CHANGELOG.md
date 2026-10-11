@@ -12,9 +12,13 @@ sam-extra 에 넣었습니다(README 의 **Tag Autocomplete (내장 태그 자�
   (테스트가 설치돼 있던 상류 파일과 대조). 전역 JS 이름·`/tacapi/v1/*` 경로 15개·`<forge>/tmp/tagAutocompletePath.txt` 도 같습니다.
   설정 맨 위에 안내 줄과 스위치 **내장 Tag Autocomplete 사용 (sam-extra)**(`sam3_builtin_tagcomplete_enabled`, 기본 켬, 재시작)가 더해졌습니다.
 - **따로 설치한 사본과 함께 돌지 않음**: 다른 tagcomplete 가 켜져 있으면 내장은 쉬고 콘솔·설정 안내 줄에 이유를 남깁니다(같은 JS 를 두 번
-  실으면 페이지에서 반만 초기화됨). 그 확장을 지우고 재시작하세요.
+  실으면 페이지에서 반만 초기화됨). 두 곳 모두 그 폴더를 넣은 옮기기 명령을 알려 줍니다 — Forge 를 끄고 **먼저 옮긴 뒤** 그 확장 폴더를
+  extensions 밖으로 옮기고(지우는 것보다 안전) 재시작하세요. 먼저 지우면 git 에 없는 사용자 목록·사용 횟수가 사라집니다.
 - **사용자 파일 옮기기**: `tools/migrate_tagcomplete.py` — 예전 폴더의 태그 목록·사용 횟수(`tag_frequency.db`)·LoRA 해시 캐시를 이 확장의
-  `tags/` 로(미리보기 기본, 덮어쓰지 않음, SHA-256·DB 확인).
+  `tags/` 로(미리보기 기본, 덮어쓰지 않음, SHA-256·DB 확인). 내장이 먼저 한 번 돌며 만든 빈 DB(0 행)·빈 해시 캐시는 옆으로 치우고
+  (`*.empty-<시각>.bak`, 지우지 않음) 옮깁니다. `tac_*` 가 고른 파일이 `tags/` 에 없다는 알림도 이 명령을 함께 알려 줍니다.
+- **페이지가 일찍 열려도 시작**: 로더는 시작 정보를 Forge 설정(`opts`)의 숨은 키 `sam3_tac_builtin_boot` 에서 읽습니다 — 확장들의 시작
+  작업(app_started)이 끝나기 전에 열린 페이지(자동으로 여는 브라우저, Reload UI 뒤 새로 고침)에서도 상류처럼 시작합니다.
 - **태그 목록**: 저장소에 `danbooru.csv`·`danbooru_2025.csv`·`danbooru_e621_merged.csv`·`extra-quality-tags.csv`·`demo-chants.json`(약 14.3 MB)을
   넣었습니다. 나머지 상류 목록과 사용자 목록은 git 밖(`.gitignore`)입니다.
 - **TIPO**: 캐릭터·작품·메타 구분에 쓰는 danbooru CSV 를 이 확장의 `tags/` 에서 읽습니다(예전: 따로 설치한 tagcomplete 폴더 — 그 폴더를
