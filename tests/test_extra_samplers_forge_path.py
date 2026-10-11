@@ -15,8 +15,9 @@ What this pins down:
   Brownian trees, never through the global RNG;
 * the Dy sub-steps leave Forge's preview/interrupt latent at full resolution;
 * on requests the sub-steps cannot run on (``substep_guard``) — Forge's real Spectrum Integrated
-  forecaster (executed read-only from its file), a Wan 2.2 I2V ``concat_latent``, PiD, an
-  ``extra_concat_condition`` — the crash path is reproduced without the guard, and through Forge's
+  forecaster (executed read-only from its file, and as of 2.29.2 / 2.30 from ``git show``), a Wan 2.2 I2V
+  ``concat_latent``, PiD, an ``extra_concat_condition`` — what happens without the guard is reproduced (the
+  crash; on Forge 2.30's Spectrum, which re-runs a wrong-sized forecast, the lost saving), and through Forge's
   ``initialize`` the samplers run their plain (CFG++) Euler steps with an ``Extra Samplers status`` infotext;
 * the DPM++ entries of ``dpmpp_flow`` next to Forge's own entries: ``DPM++ 3M (flow ODE)`` is Forge's
   ``DPM++ 3M SDE`` at Eta 0 (and the 2M ones Forge's ``DPM++ 2M SDE``), ``DPM++ 2M SDE Heun`` is Forge's 2M SDE
@@ -542,9 +543,9 @@ class SubstepGuardPathTests(_ForgePathBase):
             p.sd_model.forge_objects.unet.model_options, **unet_fields)
         return p
 
-    def _spectrum_request(self, settings=fx.SPECTRUM_DEFAULTS):
+    def _spectrum_request(self, settings=fx.SPECTRUM_DEFAULTS, forecaster=None):
         p = self._plain_request()
-        p.sd_model.forge_objects.unet = self.forecaster.SpectrumNode.patch(
+        p.sd_model.forge_objects.unet = (forecaster or self.forecaster).SpectrumNode.patch(
             p.sd_model.forge_objects.unet, p.steps, *settings)
         return p
 
@@ -570,14 +571,65 @@ class SubstepGuardPathTests(_ForgePathBase):
     def _status(self, p):
         return p.extra_generation_params.get(substep_guard.STATUS_KEY)
 
-    def test_the_spectrum_crash_path_is_real_without_the_guard(self):
+    def _counting_unet_evals(self):
+        """Every real UNet evaluation of ``_RoutedDenoiser`` (a forecast skips it); returns the shape list."""
+        shapes = []
+        toy = fx.toy_x0
+
+        def counted(x, t, k):
+            shapes.append(tuple(x.shape[-2:]))
+            return toy(x, t, k)
+
+        self.enterContext(mock.patch.object(fx, "toy_x0", counted))
+        return shapes
+
+    def test_the_spectrum_crash_path_is_real_without_the_guard_on_forge_2_29_2(self):
+        """Forge 2.29.2's forecaster (d70373eb) hands a sub-step-sized forecast to a full-size step."""
+        forecaster = fx.forge_spectrum_forecaster_at(fx.FORGE_2_29_2)
         for label in _DY_LABELS:
             with self.subTest(label=label):
                 with self.assertRaisesRegex(RuntimeError, "the UNet returned"):
-                    self._direct(label, self._spectrum_request(_SPECTRUM_BREAKS[label]), substeps=True)
+                    self._direct(label, self._spectrum_request(_SPECTRUM_BREAKS[label], forecaster), substeps=True)
                 # the same request without Spectrum runs its sub-steps fine
                 _, model = self._direct(label, self._plain_request(), substeps=True)
                 self.assertEqual(len(model.calls), self.STEPS + 2)
+
+    def test_forge_2_30_spectrum_recomputes_but_the_substeps_cancel_its_saving(self):
+        """Forge 2.30's forecaster (45f41b81) re-runs the model when a forecast has the wrong shape, so the
+        unguarded sub-steps no longer crash — but every sub-step and the step after it are real evaluations
+        and the buffers restart at each size change: no fewer UNet evaluations than the sampler's plain steps
+        without Spectrum at all, while the guard's plain steps keep Spectrum's saving. Hence the guard stays."""
+        forecaster = fx.forge_spectrum_forecaster_at(fx.FORGE_2_30)
+        shapes = self._counting_unet_evals()
+        for label in _DY_LABELS:
+            with self.subTest(label=label):
+                settings = _SPECTRUM_BREAKS[label]
+                del shapes[:]
+                out, model = self._direct(label, self._spectrum_request(settings, forecaster), substeps=True)
+                unguarded = len(shapes)
+                self.assertTrue(torch.isfinite(out).all())
+                self.assertEqual(len(model.calls), self.STEPS + 2)
+                self.assertEqual(sum(1 for size in shapes if size != SHAPE[-2:]), 2, "both sub-steps ran the model")
+                del shapes[:]
+                self._direct(label, self._spectrum_request(settings, forecaster), substeps=False)
+                guarded = len(shapes)
+                self.assertGreaterEqual(unguarded, self.STEPS, "no saving left with the sub-steps")
+                self.assertLess(guarded, self.STEPS, "the guard's plain steps keep Spectrum's saving")
+
+    def test_the_installed_forge_spectrum_is_a_known_version(self):
+        """The Forge this suite runs against behaves like one of the pinned forecasters without the guard:
+        2.29.2 (the crash) or 2.30 (the same outputs, the recompute). A third behaviour fails here first."""
+        for label in _DY_LABELS:
+            with self.subTest(label=label):
+                settings = _SPECTRUM_BREAKS[label]
+                try:
+                    installed, _ = self._direct(label, self._spectrum_request(settings), substeps=True)
+                except RuntimeError as exc:
+                    self.assertIn("the UNet returned", str(exc))   # Forge 2.29.2 behaviour
+                    continue
+                pinned, _ = self._direct(label, self._spectrum_request(
+                    settings, fx.forge_spectrum_forecaster_at(fx.FORGE_2_30)), substeps=True)
+                self.assertTrue(torch.equal(installed, pinned))
 
     def test_spectrum_integrated_gets_the_plain_cfg_pp_steps(self):
         for label in _DY_LABELS:
@@ -600,6 +652,12 @@ class SubstepGuardPathTests(_ForgePathBase):
         self.assertIn(registry.LABEL_EULER_DY_CFG_PP, spectrum[0])
         self.assertIn(substep_guard.STATUS_KEY, spectrum[0])
         self.assertIn("plain CFG++ Euler steps", spectrum[0])
+        # why, on each Forge version (the two pinned tests above): the crash on 2.29.2, the lost saving on 2.30
+        self.assertIn("crash it (Forge 2.29.2)", spectrum[0])
+        self.assertIn("cancel its saving (Forge 2.30 re-runs the model", spectrum[0])
+        p = self._spectrum_request()   # the infotext keeps its short reason
+        self._sample(registry.LABEL_EULER_DY_CFG_PP, p)
+        self.assertEqual(self._status(p), "dy sub-steps skipped (Spectrum)")
 
     def test_the_plain_entries_say_they_run_plain_euler_steps(self):
         for label in (registry.LABEL_EULER_DY, registry.LABEL_EULER_SMEA_DY):

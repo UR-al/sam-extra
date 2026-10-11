@@ -526,6 +526,9 @@ class GuardTests(ScriptTestCase):
         self._run(p)
         self.assertEqual(len(fake.calls), 1)
         self.assertIn("Forge Spectrum Integrated is on", status(p))
+        # why, on each Forge version: 2.29.2 forecasts across the size change, 2.30 re-runs and restarts
+        self.assertIn("coarse-sized tensor on Forge 2.29.2", status(p))
+        self.assertIn("restarts its history on Forge 2.30", status(p))
         # another wrapper (e.g. the Guidance suite's) does not count
         fake2 = RecordingSampler()
         p2 = make_p(fake2, sigmas=self.sigmas)

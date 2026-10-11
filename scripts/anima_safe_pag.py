@@ -75,6 +75,7 @@ import gradio as gr
 from modules import script_callbacks, scripts
 
 from sam3ext import layout_lanes
+from sam3ext.forge_batching import batch_cond_uncond as _forge_batch_cond_uncond
 try:
     from modules import shared
 except ImportError:  # standalone/unit-test loader
@@ -242,6 +243,7 @@ _STATE: dict = {
     "applied_steps": 0,
     "apg_steps": 0,
     "adg_skipped_steps": 0,
+    "adg_batch_off": False,  # ADG on but Forge 2.30's Batch Cond/Uncond off this pass (_adg_batch_off)
     "combined_calls": 0,
     "split_cond_calls": 0,
     "split_uncond_calls": 0,
@@ -308,11 +310,19 @@ INFOTEXT_CONTROLNET_GUARD = "Anima Perturbation ControlNet guard"
 INFOTEXT_CONTROLNET_GUARD_VALUE = (
     "PAG/SEG/SLG skipped while ControlNet is active (Forge guard; the ComfyUI node does not skip)"
 )
+# Forge 2.30 Settings → Optimizations → "Batch Cond/Uncond" 를 끄면 cond·uncond 가 늘 따로 호출돼(can_concat_cond)
+# ADG 가 uncond 행을 뺄 묶음 호출이 없다 — ADG 를 끈 것과 같게 돈다(ADG 만으로는 UNet 래퍼도 걸지 않아 다른 확장의
+# 래퍼가 그대로 돈다), 알림만 남긴다. 2.29.2 에는 이 설정이 없어 메모리가 허락하면 늘 묶는다(sam3ext/forge_batching.py).
+# 설명용, 붙여넣기 때 되돌릴 설정은 없다. 값에 ':' · ',' 를 넣지 않는다 — Forge 의 infotext_utils.quote 가 그런 값을
+# 따옴표로 감싸 적어, 문서·콘솔의 글과 PNG infotext 가 달라진다.
+INFOTEXT_ADG_STATUS = "Anima Adaptive Guidance status"
+INFOTEXT_ADG_BATCH_OFF = "ADG inactive (Batch Cond/Uncond off)"
 
 _EXTRA_GENERATION_PARAM_KEYS = (
     "Anima Perturbation Guidance",
     "Anima APG",
     "Anima Adaptive Guidance",
+    INFOTEXT_ADG_STATUS,
     "Anima CFG Orchestrator",
     "Anima DCW",
     "Anima RDC",
@@ -451,7 +461,35 @@ _ADG: dict = {
     "on": False,
     "start": 0.5,     # skip uncond once this fraction of steps has elapsed
     "interval": 0,    # 0 = skip every step after start; N>0 = still keep uncond every Nth step
+    "batch_off_warned": False,   # console note for Batch Cond/Uncond off, once per session
 }
+
+
+def _adg_batch_off() -> bool:
+    """ADG is on but Forge 2.30's Batch Cond/Uncond is off: there is never a combined cond+uncond call for
+    ADG to drop the uncond rows from, so ADG can do nothing this pass. Always False on Forge 2.29.2 (no such
+    setting: it batches whenever memory allows) and outside Forge."""
+    return bool(_ADG["on"]) and shared is not None and not _forge_batch_cond_uncond(shared)
+
+
+def _adg_batch_off_note(p) -> bool:
+    """When ``_adg_batch_off()``: write the infotext note (every request) and the console line (once per
+    session). ADG stays on but behaves like ADG off: it installs no UNet wrapper of its own, so another
+    extension's wrapper (Spectrum Integrated …) keeps running. False (nothing written) otherwise."""
+    if not _adg_batch_off():
+        return False
+    params = getattr(p, "extra_generation_params", None)
+    if isinstance(params, dict):
+        params[INFOTEXT_ADG_STATUS] = INFOTEXT_ADG_BATCH_OFF
+    if not _ADG["batch_off_warned"]:
+        _ADG["batch_off_warned"] = True
+        _log(
+            f"{INFOTEXT_ADG_BATCH_OFF} - Forge runs cond and uncond as separate UNet calls, so Adaptive "
+            "Guidance has no combined batch to drop the uncond rows from: it skips nothing and runs like ADG "
+            "off (no UNet wrapper of its own; turn Settings → Optimizations → Batch Cond/Uncond back on to use "
+            f"it; infotext '{INFOTEXT_ADG_STATUS}')."
+        )
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -4140,7 +4178,10 @@ class AnimaSafePAG(scripts.Script):
                 "⚠️ 논문의 cosine-similarity 판정이 아닌 **고정 Skip-after 방식**입니다. "
                 "Forge가 cond/uncond를 같은 batch로 호출할 때만 후반 uncond row를 생략합니다. "
                 "low-VRAM 분리 호출에서는 스킵되지 않아 속도 차이가 없으며, 특정 향상률을 "
-                "보장하지 않습니다. 생략된 스텝에서는 perturbation도 함께 쉽니다."
+                "보장하지 않습니다. 생략된 스텝에서는 perturbation도 함께 쉽니다. "
+                "Forge 2.30의 Settings → Optimizations → **Batch Cond/Uncond**를 끄면 늘 분리 호출이라 "
+                "아무것도 생략하지 않고 ADG를 끈 것과 같게 돕니다"
+                "(infotext·콘솔에 `ADG inactive (Batch Cond/Uncond off)`)."
             )
             adg_enabled = gr.Checkbox(
                 label="Enable Adaptive Guidance (combined-batch에서만 후반 uncond 생략)",
@@ -4844,7 +4885,7 @@ class AnimaSafePAG(scripts.Script):
             strength=0.75, rescale_mode="full",
             slg_on=False, slg_targets=set(), active=0,
             wrapper_calls=0, weak_steps=0, applied_steps=0, apg_steps=0,
-            adg_skipped_steps=0, combined_calls=0, split_cond_calls=0,
+            adg_skipped_steps=0, adg_batch_off=False, combined_calls=0, split_cond_calls=0,
             split_uncond_calls=0, control_blocked_calls=0, guard_params=None,
             sigma_hi=None, sigma_lo=None,
             wrapper_fallbacks=0, requested_pert=False, requested_apg=False,
@@ -5749,8 +5790,12 @@ class AnimaSafePAG(scripts.Script):
                 _CNS["scope"] = _install_cns_sampler_scope(p)
             unet = unet.clone()
             # The wrapper is needed for perturbation AND for Adaptive Guidance
-            # (both manipulate the cond/uncond batch before apply_model).
-            if _STATE["on"] or _ADG["on"]:
+            # (both manipulate the cond/uncond batch before apply_model). With
+            # Forge 2.30's Batch Cond/Uncond off there is no combined batch for
+            # ADG to trim, so ADG alone installs nothing: the single wrapper slot
+            # keeps another extension's wrapper (Spectrum Integrated …), like ADG off.
+            _STATE["adg_batch_off"] = _adg_batch_off()
+            if _STATE["on"] or (_ADG["on"] and not _STATE["adg_batch_off"]):
                 _warn_foreign_unet_wrapper(unet)
                 unet.set_model_unet_function_wrapper(_model_wrapper)
             if _STATE["on"]:
@@ -5894,6 +5939,7 @@ class AnimaSafePAG(scripts.Script):
                 p.extra_generation_params["Anima Adaptive Guidance"] = (
                     f"skip_after={_ADG['start']:.2f}, keep_every={_ADG['interval']}"
                 )
+                _adg_batch_off_note(p)
             if _TSR["on"]:
                 p.extra_generation_params["Anima TSR"] = f"k={tsr_k}, sigma={tsr_sigma}"
             if _HIST["mg_on"]:
@@ -6036,6 +6082,9 @@ class AnimaSafePAG(scripts.Script):
                 adg_verdict = "OFF"
             elif _STATE["adg_skipped_steps"] > 0:
                 adg_verdict = f"SKIPPED-UNCOND({_STATE['adg_skipped_steps']} steps)"
+            elif _STATE["adg_batch_off"]:
+                # Read from Forge's setting at attach time: with ADG alone no wrapper counts the calls.
+                adg_verdict = "NO-SKIP(Batch Cond/Uncond off)"
             elif _STATE["split_cond_calls"] or _STATE["split_uncond_calls"]:
                 adg_verdict = "NO-SKIP(split/low-VRAM calls)"
             else:
@@ -6253,6 +6302,7 @@ class AnimaSafePAG(scripts.Script):
         _STATE["applied_steps"] = 0
         _STATE["apg_steps"] = 0
         _STATE["adg_skipped_steps"] = 0
+        _STATE["adg_batch_off"] = False
         _STATE["combined_calls"] = 0
         _STATE["split_cond_calls"] = 0
         _STATE["split_uncond_calls"] = 0

@@ -10,8 +10,11 @@
 저장 형식은 on_preset_change 가 다시 읽어 드롭다운·슬라이더에 넣을 수 있는 그대로다:
 
 * ``forge_checkpoint_{p}`` — 체크포인트 드롭다운 값 그대로(checkpoint_change 처럼).
-* ``forge_additional_modules_{p}`` — modules_change 처럼 파일 이름을 main_entry.module_list 의 전체 경로로 바꿔 정렬한
-  목록(on_preset_change 는 basename 으로 되돌려 드롭다운에 넣는다).
+* ``forge_additional_modules_{p}`` — modules_change 처럼 드롭다운 값의 파일 이름(basename)을 main_entry.module_list 의
+  전체 경로로 바꿔 정렬한 목록. on_preset_change 는 basename 으로 되돌려 드롭다운에 넣는다. Forge 2.30-6(ede60e1a)부터는
+  Settings 의 'Show filenames without folder in the VAE / Text Encoder dropdown'(``sd_modules_dropdown_use_short``, 기본
+  켬)을 끄면 드롭다운이 모델 폴더 아래 경로('sdxl/clip-l.safetensors')를 보이고, on_preset_change 도 그 basename 을
+  main_entry.module_map 으로 그 경로로 되돌린다. 어느 쪽이든 파일 이름으로 찾으므로 저장 모양은 같다.
 * ``forge_unet_storage_dtype_{p}`` — Low Bits 선택지 이름.
 * 샘플러는 이름, 스케줄러는 표시 이름(label) — 설정의 드롭다운 선택지(list_samplers / list_schedulers)가 그렇다.
 * 스텝·크기·배치는 정수, CFG·Distilled CFG(Shift)는 실수. 범위는 그 설정의 슬라이더 범위(presets.register)로 본다.

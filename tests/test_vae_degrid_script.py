@@ -727,6 +727,42 @@ class ExtrasTests(unittest.TestCase):
     def test_runs_before_upscale(self):
         self.assertLess(EXTRAS.ScriptPostprocessingVaeDegrid.order, 1000)
 
+    def test_forge_230_builtin_degrid_runs_after_this_one_in_extras(self):
+        """Forge 2.30 added its own Extras "DeGrid" (scripts/degrid.py — a pixel lattice filter, not NAFNet, on by
+        default). Both on = applied twice; Forge's own ``scripts_in_preferred_order`` (run here from its file) puts
+        this item first: same order 900, then the name. The README / Extras help say so. Forge 2.29.2 has no
+        built-in DeGrid."""
+        degrid = FORGE_ROOT / "scripts" / "degrid.py"
+        runner_file = FORGE_ROOT / "modules" / "scripts_postprocessing.py"
+        if not runner_file.is_file():
+            self.skipTest("Forge checkout not found")
+        if not degrid.is_file():
+            self.skipTest("Forge 2.29.2: no built-in Extras DeGrid")
+        tree = ast.parse(degrid.read_text(encoding="utf-8"))
+        cls = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "ScriptPostprocessingDegrid")
+        fields = {t.id: ast.literal_eval(n.value) for n in cls.body if isinstance(n, ast.Assign) for t in n.targets}
+        accordion = next(n for n in ast.walk(cls) if isinstance(n, ast.Call)
+                         and getattr(n.func, "id", None) == "InputAccordion")
+        self.assertIs(ast.literal_eval(accordion.args[0]), True, "Forge's DeGrid is on by default")
+
+        runner = next(n for n in ast.parse(runner_file.read_text(encoding="utf-8")).body
+                      if isinstance(n, ast.ClassDef) and n.name == "ScriptPostprocessingRunner")
+        method = next(n for n in runner.body if isinstance(n, ast.FunctionDef) and n.name == "scripts_in_preferred_order")
+        opts = types.SimpleNamespace(postprocessing_operation_order=[], postprocessing_disable_in_extras=[])
+        namespace = {"shared": types.SimpleNamespace(opts=opts)}
+        exec(compile(ast.Module(body=[method], type_ignores=[]), str(runner_file), "exec"), namespace)
+
+        def script(name, order):
+            return types.SimpleNamespace(name=name, order=order)
+
+        ours = script(EXTRAS.ScriptPostprocessingVaeDegrid.name, EXTRAS.ScriptPostprocessingVaeDegrid.order)
+        forge = script(fields["name"], fields["order"])
+        upscale = script("Upscale", 1000)
+        for listed in ([upscale, forge, ours], [forge, ours, upscale]):   # load order does not matter
+            with self.subTest(listed=[s.name for s in listed]):
+                ordered = namespace["scripts_in_preferred_order"](types.SimpleNamespace(scripts=listed))
+                self.assertEqual([s.name for s in ordered], [ours.name, "DeGrid", "Upscale"])
+
     def test_name_differs_from_the_generation_script(self):
         # Settings → Postprocessing 에서 메인 탭에도 켜면 Forge 는 ScriptPostprocessingForMainUI(title() = name)로 감싼다
         # (modules/scripts_auto_postprocessing.py). 제목이 같으면 API alwayson_scripts[제목] 이 모호해진다.

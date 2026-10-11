@@ -3,6 +3,68 @@
 버전 태그는 GitHub Releases에도 발행됩니다. 아래는 요약이며, guidance/속도 기능의
 상세는 [docs/GUIDANCE.md](docs/GUIDANCE.md)를 참고하세요.
 
+## 미출시 (Unreleased) — Forge 2.30 호환
+
+Forge Neo 2.30 에서 달라진 것에 맞춥니다. CPU 테스트 전체가 2.29.2(`d70373eb`), 2.30-2(`45f41b81`), 2.30-6(`ede60e1a`, 2026-10-11
+에 설치된 Forge) 셋에서 통과합니다. 이 판들에서 GPU 생성은 따로 확인하지 않았습니다. **Batch Cond/Uncond 가 켜진 기본 설정의 결과는
+그대로**입니다(같은 경로를 그대로 지남). 바뀐 것은 Batch Cond/Uncond 를 끈 2.30 에서 Anima 3.8B 의 VRAM 여유 판단, Adaptive Guidance
+가 UNet 래퍼를 걸지 않는 것, 안내 문구입니다. Forge 를 재시작하세요(바뀐 Python 파일).
+
+### Batch Cond/Uncond (Forge 2.30 Settings → Optimizations)
+
+- 2.30 은 cond · uncond 를 한 UNet 호출로 묶을지 고르는 설정을 새로 둡니다(기본 켬). 끄면 `can_concat_cond` 가 늘 거짓이라 cond
+  와 uncond 가 따로(cond 먼저) 돌고, `sampling_prepare` 가 잡는 추론 메모리가 2 × batch 행에서 batch 행으로 줍니다. 2.29.2 에는 이
+  설정이 없어, 켠 2.30 처럼 메모리가 허락하면 묶고(VRAM 여유가 모자라면 따로 호출) 추론 메모리는 늘 2 × batch 행으로 잡습니다. 이
+  확장은 두 판에서 같은 방법(`shared.batch_cond_uncond`, 읽지 못하면 켬)으로 읽습니다(`sam3ext/forge_batching.py`).
+- **Anima 3.8B**: TE · Qwen3.5 를 VRAM 에 남길지 정할 때 다음 샘플링의 추론 몫을 Forge 와 같은 (켬 2 · 끔 1) × batch 행으로 셉니다.
+  예전에는 늘 2 × batch 라, 끈 2.30 에서는 여유를 실제보다 적게 보고 필요 없이 내릴 수 있었습니다. 켬 · 2.29.2 는 예전과 같습니다.
+- **Adaptive Guidance**: 묶음 호출에서만 uncond 행을 빼므로, 끄면 아무것도 생략할 수 없습니다. 그래서 그때 ADG 는 켜져 있어도 ADG 를
+  끈 것과 같게 돕니다: 자기 UNet 래퍼(`model_function_wrapper`)를 걸지 않아 다른 확장의 래퍼(Spectrum Integrated 등)를 밀어내지
+  않고, 결과도 ADG 를 끈 것과 비트 단위로 같습니다(다른 확장의 래퍼가 있는 경우까지 테스트로 확인). PAG/SEG/SLG 가 함께 켜져
+  있으면 래퍼는 그쪽 몫으로 예전처럼 걸립니다. infotext 에 `Anima Adaptive Guidance status: ADG inactive (Batch Cond/Uncond off)` 를
+  남기고(값에 쌍점 · 쉼표가 없어 Forge 가 따옴표로 감싸지 않고 이 글 그대로 적힘) 콘솔에 한 번 알리며, 검증 로그 판정은 설정을
+  직접 읽어 `NO-SKIP(Batch Cond/Uncond off)` 입니다. 패널 안내 · README · docs/GUIDANCE.md 에 적었습니다.
+- PAG/SEG/SLG 의 가중 · 영역 조건과 내장 NegPiP 의 SD 훅은 끈 배치 모양(조건마다 따로 호출)에서도 같은 결과입니다 — Forge 의 실제
+  `sampling_function.py` 로 확인하는 테스트를 더했습니다.
+
+### Spectrum Integrated 와 Dy 보조 스텝 · SPEED
+
+- 2.30 의 Spectrum 예측기는 예측의 모양이 입력과 다르면 모델을 다시 돌립니다. 그래서 Dy 네 항목의 보조 스텝을 그대로 돌려도 2.29.2
+  처럼 오류로 멈추지는 않지만, 크기가 바뀔 때마다 예측 기록이 새로 시작합니다. CPU 측정(10 스텝, Spectrum 기본값 · SMEA 는 warm-up 4)
+  에서 보조 스텝을 돌리면 실제 UNet 평가가 Euler Dy 11회 · SMEA Dy 10회로, Spectrum 없는 일반 10 스텝보다 적지 않았습니다. 가드가
+  고른 일반 스텝은 8회 · 7회로 절약이 남습니다. 그래서 Spectrum 이 켜져 있으면 보조 스텝을 건너뛰는 가드는 두 판 모두에서 그대로
+  둡니다. 바뀐 것은 콘솔 설명(판마다의 이유)뿐이고 infotext `Extra Samplers status: dy sub-steps skipped (Spectrum)` 는 그대로입니다.
+- SPEED 가 Spectrum 아래에서 물러날 때 `Anima SPEED status` 의 이유도 두 판을 나눠 적습니다(2.29.2 는 저해상도 텐서를 예측할 수
+  있음, 2.30 은 모델을 다시 돌리고 예측 기록을 새로 시작함). 물러나는 동작은 그대로입니다.
+
+### VAE DeGrid
+
+- 2.30 의 Extras 에는 Forge 자체 **DeGrid**(`scripts/degrid.py`, 픽셀 격자 필터, 기본 켬)가 생겼습니다. Extras 에서 둘 다 켜면 두 번
+  적용되고 이 확장의 항목이 먼저 돕니다(둘 다 순서 900, 이름순 — Forge 의 정렬 코드로 확인하는 테스트). Forge 의 DeGrid 를
+  Settings → Postprocessing 에서 생성 탭에도 켜면 생성 탭에서도 두 번 적용됩니다. Extras · 생성 탭 안내와 README 에 적었고 동작은 그대로입니다.
+
+### Forge 2.30-6 (`ede60e1a`) — VAE / Text Encoder 드롭다운
+
+- 2.30-6 은 Settings → UI Alternatives 에 'Show filenames without folder in the VAE / Text Encoder dropdown'
+  (`sd_modules_dropdown_use_short`, 기본 켬)을 더했습니다. 끄면 드롭다운이 모델 폴더 아래 경로(`sdxl/clip-l.safetensors`)를 보이고,
+  UI Preset 을 바꿀 때 `on_preset_change` 도 저장된 모듈을 그 경로로 되돌립니다. '기본값 저장' 버튼은 `modules_change` 처럼 파일
+  이름으로 찾아 전체 경로를 저장하므로 어느 쪽이든 그대로 동작합니다(코드는 그대로, 설명만 고침).
+- `on_preset_change` 가 이 설정을 읽게 되면서, Forge 의 실제 함수를 돌리는 `tests/test_save_defaults.py` 가 2.30-6 에서 오류 436 ·
+  실패 1 로 깨졌습니다(가짜 opts 에 없는 설정, 반환 목록 앞의 지역 변수로 옮겨 간 모듈 키). 가짜 opts 는 그 Forge 의
+  `shared_options.py` 기본값을 받고, 계약 테스트는 반환 앞의 지역 변수를 따라가며, 설정을 끈 경우의 왕복 테스트를 더했습니다.
+  `on_preset_change` 가 또 새 설정을 읽으면 오류 수백 개 대신 테스트 하나가 그 이름을 알립니다.
+- 그 밖의 2.30-6 변경(flash attention 의 causal 마스크, VAE 타일 디코드의 출력 채널, Prompts from file 의 결과값)은 이 확장이
+  부르지 않는 부분이라 대응할 것이 없습니다.
+
+### 테스트
+
+- 2.30 의 `sampling_function.py` 는 `from modules import shared` 를 하므로, 실제 파일을 불러 쓰는 테스트(Safe PAG · DCW · 통합 ·
+  SPEED 스택 · NegPiP SD 배치)의 대역에 `modules.shared`(`batch_cond_uncond=True`)를 넣었습니다(없으면 2.30 에서 오류 47개). 끈 경우는
+  불러 둔 모듈의 값을 바꾸지 않고 새로 불러 확인합니다. 2.29.2 에서는 이 설정을 읽지 않으므로 같은 테스트가 묶음 모양을 확인합니다.
+- Spectrum 테스트는 판마다 나눴습니다: 2.29.2 예측기(`git show d70373eb`)로 충돌, 2.30 예측기(`git show 45f41b81`)로 재계산과
+  사라진 절약, 설치된 Forge 의 예측기가 둘 중 어느 쪽과 같은지. Forge 작업 트리는 건드리지 않고, Forge git 저장소가 없으면(CI)
+  건너뜁니다. 저장소가 다른 곳에 있으면 `SAM3_FORGE_GIT` 로 알려 줍니다.
+
 ## v0.33.1 — IPNDM_V 4차 계수 오타 (Linear Quadratic 에서 그림이 깨지던 것)
 
 **2026-10-05 정정 (GPU 확인 뒤)**: 아래 "Linear Quadratic 은 깨지던 그림이 정상으로 돌아오고" 는 틀렸습니다. 계수 오타 수정은

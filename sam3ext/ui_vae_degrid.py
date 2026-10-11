@@ -172,11 +172,15 @@ HELP_GENERATION = (
     "- **Full** 잔차 전체(어두운·밝은 격자 모두) · **Dark Pixels Mainly** 양의 잔차만(ComfyUI 기본 노드 경로와 같음) · "
     "**Bright Pixels Mainly** 음의 잔차만.\n"
     "- 강도: 잔차에 곱하는 배율(1 = 원본 노드). 타일: 512 = 원본 노드, 0 = 나누지 않음(VRAM 더 씀).\n"
-    "- 장치·fp16/fp32·VRAM 에 남기기는 Settings → **SAM Extra VAE DeGrid**."
+    "- 장치·fp16/fp32·VRAM 에 남기기는 Settings → **SAM Extra VAE DeGrid**.\n"
+    "- Forge 2.30 의 Extras 에 있는 Forge 자체 **DeGrid**(픽셀 격자 필터)를 Settings → Postprocessing 에서 "
+    "txt2img·img2img 에도 켜면 격자 제거가 두 번 적용됩니다."
 )
 HELP_EXTRAS = (
     "이미 만든 이미지(한 장·배치·폴더)에 **VAE DeGrid** 를 적용합니다 — 생성 탭의 같은 기능과 계산이 같습니다. "
-    "Upscale 보다 먼저 돕니다(확대하면 격자 간격이 달라짐). 결과 정보에 `Anima DeGrid …` 가 남습니다."
+    "Upscale 보다 먼저 돕니다(확대하면 격자 간격이 달라짐). 결과 정보에 `Anima DeGrid …` 가 남습니다.\n\n"
+    "Forge 2.30 의 Extras 에는 Forge 자체 **DeGrid**(픽셀 격자 필터, 기본 켬)가 따로 있습니다 — 둘 다 켜면 두 번 "
+    "적용되고 이 항목이 먼저 돕니다(둘 다 순서 900, 이름순)."
 )
 
 

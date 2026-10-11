@@ -60,6 +60,11 @@ cd <sd-webui-forge-neo>/extensions
 git clone https://github.com/UR-al/sam-extra.git forge_sam3_extension
 ```
 
+**호환 Forge**: Forge Neo **2.29.2**(`d70373eb`)와 **2.30**(2.30-2 `45f41b81`, 2.30-6 `ede60e1a`) — 세 판 모두 CPU 테스트
+전체로 확인했고, 이 판들에서 GPU 생성은 따로 확인하지 않았습니다. 2.30 에서 달라진 점(Batch Cond/Uncond 설정, Spectrum 예측기,
+Extras 의 DeGrid, 2.30-6 의 VAE / Text Encoder 드롭다운 표기)과 이 확장의 대응은 [CHANGELOG](CHANGELOG.md) 의 'Forge 2.30 호환'
+절에 있습니다.
+
 **폴더명은 반드시 `forge_sam3_extension`** 으로 둡니다. Forge 는 확장 폴더명을 확장 이름으로 쓰는데
 `metadata.ini` 의 콜백 순서 지정(`[callbacks/forge_sam3_extension/…]`)이 이 이름에 묶여 있어, 다른 이름(예: 기본
 clone 폴더 `sam-extra`)이면 Forge 가 순서 지정을 버립니다. 이 경우 시작 로그에
@@ -721,6 +726,10 @@ Anima(Qwen·Wan VAE)로 만든 이미지에 생기는 **VAE 격자 무늬**를
 - Settings → Postprocessing 에서 Extras 의 Upscale 을 txt2img·img2img 탭에 켰다면 DeGrid 가 그보다 **먼저** 돕니다
   (`metadata.ini` 콜백 순서 — 확대하면 격자 간격이 달라짐). Extras 항목의 이름은 **Anima VAE DeGrid (NAFNet, Extras)** 로
   생성 탭 아코디언과 달라 API 이름이 겹치지 않지만, 그것을 메인 탭에도 켜면 두 번 적용되니 켜지 마세요.
+- Forge 2.30 의 Extras 에는 Forge 자체 **DeGrid**(`scripts/degrid.py`, NAFNet 이 아닌 픽셀 격자 필터, **기본 켬**)가 따로
+  있습니다. Extras 에서 둘 다 켜면 격자 제거가 두 번 적용되고, 이 확장의 항목이 먼저 돕니다(둘 다 순서 900 이라 Forge 가 이름순으로
+  정함). Settings → Postprocessing 에서 Forge 의 DeGrid 를 txt2img·img2img 에도 켜면 생성 탭에서도 두 번 적용됩니다. 한쪽만 쓰려면
+  다른 쪽을 끄세요.
 - img2img 인페인트('Inpaint only masked' 포함)는 합성한 전체 이미지에 적용합니다 — 마스크 밖 원본도 지나가지만, 격자가
   없는 부분은 거의 바뀌지 않습니다.
 - Anima Tile & Repair·캐릭터 레퍼런스 결과는 Forge 생성 파이프라인 밖의 별도 잡이라 이 아코디언이 붙지 않습니다 —
@@ -1011,7 +1020,8 @@ Forge·reForge 의 이름입니다(ComfyUI 이름 `ipndm`·`ipndm_v`·`deis`·`c
   보조 스텝은 자기 스텝으로 세어 Forge 의 스텝 카운터를 늘리지 않으므로 프롬프트 편집·Skip Early CFG·리파이너 스텝 전환이
   Euler (CFG++) 와 같은 스텝에서 일어납니다.
 - **보조 스텝을 쓰지 않는 경우**: Forge 의 **Spectrum Integrated** 가 켜져 있을 때(그 예측기가 해상도 변화를 따라가지 못해,
-  보조 스텝을 그대로 돌리면 기본 설정에서 Euler Dy 가 오류로 멈춤), Wan 2.2 I2V(`concat_latent`)·PiD(`lq_latent`)·다른 확장의
+  보조 스텝을 그대로 돌리면 Forge 2.29.2 는 기본 설정에서 Euler Dy 가 오류로 멈추고, 2.30 은 크기가 바뀐 뒤 모델을 다시 돌려
+  멈추지는 않지만 Spectrum 의 절약이 사라짐 — CPU 측정), Wan 2.2 I2V(`concat_latent`)·PiD(`lq_latent`)·다른 확장의
   `extra_concat_condition` 이 있을 때. 이때 Dy 네 항목은 보조 스텝 없이 일반 스텝(CFG++ 판은 Euler CFG++, 일반 판은 Euler)으로
   돌고, 콘솔에 이유를 한 번 남기며 infotext 에 `Extra Samplers status: dy sub-steps skipped (Spectrum)` 처럼 기록합니다.
 - **가이던스와 함께**: 보조 평가(`transformer_options["sam_extra_substep"]` 표시)는 HiFlow 기록·정렬, Momentum·HiGS 이력, SMC 의
@@ -1141,7 +1151,8 @@ Manual sigma `0.7` · Scales `0.5,1.0` · 샘플러 Euler 입니다. 앱 노드�
 latent(Anima Edit·img2img 참조 — `anima_do_reference` 를 끄면 씀), 다른 모델의 레퍼런스 latent(Flux Kontext·Flux.2 Klein·
 Qwen-Image-Edit·Krea 2 — 원래 크기 그대로 토큰 뒤에 붙어 저해상도 격자와 위치가 맞지 않음), Wan 2.2 I2V 조건 latent(concat_latent),
 PiD 의 저화질 입력 latent(lq_latent), ControlNet(Anima LLLite 포함), flow 가 아닌 모델, Forge 내장
-**Spectrum Integrated**(멈춤 지점이 스텝 수에서 나와 크기가 바뀌는 순간 저해상도 텐서를 예측할 수 있음), Restart·UniPC(Extra
+**Spectrum Integrated**(멈춤 지점이 스텝 수에서 나오고, 크기가 바뀌는 순간 Forge 2.29.2 는 저해상도 텐서를 예측할 수 있으며 2.30 은
+모델을 다시 돌려 예측 기록을 새로 시작함), Restart·UniPC(Extra
 Samplers 의 UniPC bh2 포함)·σ 목록이 없는 샘플러, 저해상도 스텝이 없는 패스(img2img·Hires 가 전환 σ 이하에서 시작 — 원본은 이때 시작 latent 의 고주파를 노이즈로 바꾸고
 σ 를 올렸음), 마지막 전환이 스케줄 안에 없을 때(원본은 작은 latent 를 냄), Hires 패스(체크 꺼짐).
 
@@ -1490,7 +1501,7 @@ SAM3 처리와 분리된 opt-in 기능 모음입니다. Forge Neo 코어 파일�
 | **DAVE** | Anima block 출력의 token/spatial DC 성분 감쇠 | 실제 block hit 확인, 다양성/권장 block은 추가 A/B 필요 |
 | **CNS-inspired** | 기존 seeded/Brownian noise를 live x_t 에너지로 재색칠 | Euler a noise call 확인. deterministic sampler에서는 inert |
 | **Anima Modulation Guidance** | 보조 CLIP-L 방향을 공개 어댑터로 block AdaLN에 가산 | 실제 CLIP/어댑터 로드·투영·주입 검증. 이미지 품질 A/B는 추가 필요 |
-| **Adaptive Guidance** | combined batch의 후반 uncond row 생략 | low-VRAM 분리 호출에서는 생략/속도 이득 없음 |
+| **Adaptive Guidance** | combined batch의 후반 uncond row 생략 | low-VRAM 분리 호출·Forge 2.30 Batch Cond/Uncond 끔에서는 생략/속도 이득 없음. 끔이면 ADG를 끈 것과 같게 돌고 UNet 래퍼도 걸지 않음(infotext `ADG inactive (Batch Cond/Uncond off)`) |
 | **Skimmed CFG** | 과포화를 만드는 성분만 낮은 CFG로 되돌림(anti-burn) | 원본 노드와 σ 구간·결과가 비트 단위로 같음(원본 수식 편입). **CFG>1 전용**, pre-CFG가 아닌 post-CFG 맨 앞에서 재구성 |
 | **Detail Daemon** | sigma schedule로 디테일 강도 조절 | 별도 opt-in 기능 |
 
