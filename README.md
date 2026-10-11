@@ -291,7 +291,7 @@ SAM3 체크포인트는 \~3.5 GB. 한번 로드되면 번들 하나가 캐시에
 2. webui 실행 인자에 `--reserve-vram 2` 추가 — 모델 매니저가 헤드룸 2 GB 확보.
 
 둘 같이 쓰면 가장 안정적. 생성하지 않는 동안 GPU 를 통째로 비우려면 txt2img 탭 줄의 [모델 내리기](#모델-내리기-버튼) 버튼을
-누르세요(Forge 의 모델과 SAM3 를 포함해 sam-extra 가 쥔 모델을 모두 내림).
+누르세요(Forge 의 체크포인트 · 업스케일러 · 얼굴 복원 모델과 SAM3 를 포함해 sam-extra 가 쥔 모델을 모두 내림).
 
 ---
 
@@ -1376,25 +1376,35 @@ txt2img 탭 줄(Generation · 임베딩 · 체크포인트 · 로라 · Manage)�
 
 ### 모델 내리기 버튼
 
-`기본값 저장` 바로 오른쪽의 `모델 내리기` 를 한 번 누르면 확인 없이 메모리에 올라간 모델을 모두 내리고 GPU 캐시를 비운 뒤, 버튼 옆에
-결과를 한 줄로 보여 줍니다(예: `VRAM 사용 19.6 GB → 3.1 GB (Forge 모델 · SAM3 · Anima 3.8B) · 이 프로세스 예약 15.2 → 0.0 GB`).
+`기본값 저장` 바로 오른쪽의 `모델 내리기` 를 한 번 누르면 확인 없이 메모리에 올라간 모델을 모두 내리고 GPU 캐시를 비운 뒤, 버튼
+아래에 결과를 한 줄로 보여 줍니다(예: `VRAM 사용 19.6 GB → 3.1 GB (Forge 모델 · SAM3 · Anima 3.8B) · 이 프로세스 예약 15.2 → 0.0 GB`).
 앞의 숫자는 GPU 전체의 사용량(같은 GPU 를 쓰는 다른 프로그램 — 학습 등 — 의 몫 포함), 뒤의 숫자는 이 Forge 프로세스가 PyTorch 로
-잡아 둔 양입니다(GB 는 1024³ 바이트). 괄호에는 실제로 무언가를 내린 것만 나오고, 결과 글에 마우스를 올리면 쥔 것이 없던 항목과
-실패한 항목(이유와 함께)이 보입니다.
+잡아 둔 양입니다(GB 는 1024³ 바이트). 괄호에는 실제로 무언가를 내린 것만 나오고(`Forge 모델` 은 체크포인트가 올라 있었을 때만),
+결과 글에 마우스를 올리면 쥔 것이 없던 항목과 실패한 항목(이유와 함께)이 보입니다. 결과 줄은 버튼 아래에 따로 나오므로 창이 좁아도
+버튼 자리는 그대로이고, 두 버튼은 늘 붙어 있습니다(줄이 모자라면 둘이 함께 다음 줄로).
 
 1. **Forge 의 모델** — Settings 의 `Unload All Models` 버튼과 같은 Forge 함수(`sd_models.unload_model_weights`)를 그대로 부릅니다.
    고른 체크포인트 · VAE / Text Encoder · Diffusion in Low Bits 는 그대로라 다음 생성 때 Forge 가 같은 설정으로 다시 읽습니다(그 첫
-   생성은 모델을 읽는 만큼 느립니다).
-2. **sam-extra 가 쥔 모델** — SAM3(`Unload after` 가 CPU RAM 에 보관한 사본까지), Anima 3.8B(Qwen3.5 4B · 커넥터 · 특징 캐시),
+   생성은 모델을 읽는 만큼 느립니다). 갤러리 이미지의 ✨(고해상도) 버튼은 Forge 가 모델 다시 읽기를 건너뛰는 길이라, 체크포인트가
+   내려가 있으면 sam-extra 가 그 앞에서 먼저 읽습니다(내리지 않았으면 Forge 의 동작 그대로).
+2. **Forge 가 그 밖에 쥔 모델** — Forge 의 `Unload All Models` 는 Forge 의 메모리 목록에 있는 모델만 내립니다. 그 밖에서 GPU 에 남는
+   업스케일러 모델(hires fix · Extras 의 ESRGAN 계열, 최근 4개까지 캐시), TAESD · VAE Approx 미리보기 디코더, 얼굴 복원(GFPGAN ·
+   CodeFormer — Settings 의 `Move the model to CPU after restoration` 이 꺼져 있으면 GPU 에 남음)도 버립니다. 다음에 쓸 때 Forge 가
+   파일에서 다시 읽습니다.
+3. **sam-extra 가 쥔 모델** — SAM3(`Unload after` 가 CPU RAM 에 보관한 사본까지), Anima 3.8B(Qwen3.5 4B · 커넥터 · 특징 캐시),
    캐릭터 레퍼런스의 IP-Adapter(SigLIP2 인코더 포함), DeGrid(NAFNet), TIPO, Modulation CLIP-L, Colorcraft 벡터 · 앵커, VAE 2x
-   디코더, 샘플링에 쓰는 작은 장치 행렬. VRAM 뿐 아니라 RAM 에서도 놓으며, 다음에 그 기능을 쓸 때 파일에서 다시 읽습니다.
-3. Python 의 쓰레기 수거 뒤 PyTorch 의 CUDA 캐시를 비웁니다(`empty_cache` · `ipc_collect`).
+   디코더, 샘플링에 쓰는 작은 장치 행렬과 예외로 끝난 생성이 남긴 가이던스 텐서. VRAM 뿐 아니라 RAM 에서도 놓으며, 다음에 그 기능을
+   쓸 때 파일에서 다시 읽습니다.
+4. Python 의 쓰레기 수거 뒤 PyTorch 의 CUDA 캐시를 비웁니다(`empty_cache` · `ipc_collect`).
 
-- **생성 중에는 동작하지 않고** `생성 중에는 내릴 수 없습니다` 를 보여 줍니다 — txt2img/img2img · API 생성 · Refine 같은 sam-extra
-  작업이 Forge 의 작업 잠금을 쥐고 있거나 Forge 에 진행 중인 작업이 있을 때. 내리는 동안 누른 Generate 는 끝날 때까지 기다렸다가
-  시작합니다.
+- **생성 중에는 동작하지 않고** `생성 중에는 내릴 수 없습니다` 를 보여 줍니다 — txt2img/img2img · Extras · API 생성 · Refine 같은
+  sam-extra 작업이 Forge 의 작업 잠금을 쥐고 있을 때. 내리는 동안 누른 Generate 는 끝날 때까지 기다렸다가 시작합니다.
+- 잠금은 비었는데 Forge 에 끝나지 않은 작업 기록이 남아 있으면(예: 예외로 끝난 Extras API 호출은 Forge 가 기록을 지우지 않음)
+  `Forge 에 끝나지 않은 작업 기록(extras)이 남아 있습니다 — 생성 중이 아니면 한 번 더 누르세요` 를 보여 줍니다. 생성 중이 아니면 한 번
+  더 누르면 내립니다(그사이 새 작업이 시작됐으면 다시 묻습니다).
 - 한 항목이 실패해도 나머지는 그대로 내리고, 결과 글 끝에 `실패: …` 로 그 이름을 적습니다(이유는 툴팁과 Forge 콘솔).
-- Forge 의 `POST /sdapi/v1/unload-checkpoint` API 는 **Forge 의 모델만** 내립니다. sam-extra 가 쥔 모델까지 내리는 것은 이 버튼입니다.
+- Forge 의 `POST /sdapi/v1/unload-checkpoint` API 는 **Forge 의 체크포인트만** 내립니다. 업스케일러 · 얼굴 복원 모델과 sam-extra 가
+  쥔 모델까지 내리는 것은 이 버튼입니다.
 - CUDA 컨텍스트처럼 프로세스가 살아 있는 동안 남는 몫이 있어 GPU 사용량이 0 이 되지는 않습니다. Forge 의 다른 확장이 따로 쥔
   모델(예: ControlNet 모델 캐시)은 Forge 가 GPU 에서 내리는 데까지만 따릅니다.
 - notebook 레이아웃(txt2img 3열)일 때만 보입니다. 확장을 업데이트한 뒤에는 Forge 를 완전히 다시 시작하세요(Reload UI 만 하면 일부

@@ -103,27 +103,40 @@ function mount(env) {
   return env.hooks.ensureButton();
 }
 
-test("right after '기본값 저장' in the notebook tab row, with the save button's look and its own status", (t) => {
+test("right after '기본값 저장' inside its group, with the save button's look and its result on a row line of its own", (t) => {
   const env = build(t);
   assert.equal(mount(env), true);
   assert.equal(mount(env), true);
   const { wrap, button, status, save } = ui(env);
   const row = env.doc.querySelector("#txt2img_extra_tabs > .tab-nav");
   assert.equal(env.doc.querySelectorAll("#sam3_unload_models").length, 1);
-  assert.equal(wrap.parentElement, row);
-  assert.equal(wrap.previousElementSibling, save, "directly after the save group");
-  assert.equal(row.lastElementChild, wrap);
+  assert.equal(env.doc.querySelectorAll("#sam3_unload_models_status").length, 1);
   const saveButton = save.querySelector("button");
-  // the same classes as the save button (one more each, for its own place in the row)
-  assert.ok(wrap.classList.contains("sam3-save-defaults") && wrap.classList.contains("sam3-unload-models"));
+  // one flex item of the row with the save button: the two wrap together on a narrow window
+  assert.equal(wrap.parentElement, save, "inside the save group");
+  assert.equal(wrap.previousElementSibling, saveButton, "right after the save button (tab order too)");
+  assert.equal(wrap.nextElementSibling, env.doc.querySelector("#sam3_save_defaults_status"),
+    "the save result follows both buttons");
+  assert.equal(save.querySelector("button"), saveButton, "the save script still finds its own button first");
+  // the result is not in the buttons' flex item: a row item that style.css puts on a line of its own
+  assert.equal(status.parentElement, row);
+  assert.equal(status.previousElementSibling, save);
+  assert.equal(row.lastElementChild, status);
+  assert.equal(wrap.contains(status), false);
+  assert.ok(wrap.classList.contains("sam3-unload-models"));
+  assert.ok(!wrap.classList.contains("sam3-save-defaults"), "not a second save group");
+  // the same classes as the save button (one more each)
   for (const name of saveButton.classList) assert.ok(button.classList.contains(name), name);
   assert.ok(button.classList.contains("sam3-unload-models-button"));
   assert.ok(status.classList.contains("sam3-save-defaults-status"));
+  assert.ok(status.classList.contains("sam3-unload-models-status"));
   assert.equal(button.textContent, "모델 내리기");
   assert.equal(button.type, "button");
   assert.match(button.title, /Unload All Models/);
   assert.match(button.title, /SAM3/);
   assert.match(button.title, /생성 중에는 동작하지 않습니다/);
+  assert.match(button.title, /업스케일러 · TAESD · 얼굴 복원/);
+  assert.match(button.title, /✨/);
   assert.equal(button.getAttribute("aria-describedby"), "sam3_unload_models_status");
   assert.equal(status.getAttribute("role"), "status");
   assert.equal(status.getAttribute("aria-live"), "polite");
@@ -131,22 +144,32 @@ test("right after '기본값 저장' in the notebook tab row, with the save butt
   assert.equal(wrap.querySelectorAll("input, select, [type=checkbox]").length, 0, "no extra toggles");
 });
 
-test("mounted before the save button: moved behind it on the next check", (t) => {
+test("mounted before the save button: moved into its group on the next check", (t) => {
   const env = build(t);
   assert.equal(env.hooks.ensureButton(), true);              // the save group is not there yet
   const row = env.doc.querySelector("#txt2img_extra_tabs > .tab-nav");
-  assert.equal(row.lastElementChild, ui(env).wrap);
+  assert.equal(ui(env).wrap.parentElement, row);
+  assert.equal(ui(env).status.previousElementSibling, ui(env).wrap);
+  assert.equal(row.lastElementChild, ui(env).status);
   env.saveHooks.ensureButton();                              // the save script appends its group at the end
   assert.equal(row.lastElementChild, ui(env).save);
   env.hooks.ensureButton();
-  assert.equal(ui(env).wrap.previousElementSibling, ui(env).save);
-  assert.equal(row.lastElementChild, ui(env).wrap);
+  assert.equal(ui(env).wrap.parentElement, ui(env).save);
+  assert.equal(ui(env).wrap.previousElementSibling, ui(env).save.querySelector("button"));
+  assert.equal(ui(env).status.previousElementSibling, ui(env).save);
+  assert.equal(row.lastElementChild, ui(env).status);
+  env.saveHooks.ensureButton();                              // the save script leaves its group (and ours in it) alone
+  assert.equal(ui(env).wrap.parentElement, ui(env).save);
+  assert.equal(env.doc.querySelectorAll("#sam3_unload_models, #sam3_unload_models_status").length, 2);
 });
 
-test("no save script at all: still at the row's end", (t) => {
+test("no save script at all: alone at the row's end, its result after it", (t) => {
   const env = build(t, { save: false });
   assert.equal(env.hooks.ensureButton(), true);
-  assert.equal(env.doc.querySelector("#txt2img_extra_tabs > .tab-nav").lastElementChild, ui(env).wrap);
+  const row = env.doc.querySelector("#txt2img_extra_tabs > .tab-nav");
+  assert.equal(ui(env).wrap.parentElement, row);
+  assert.equal(ui(env).status.previousElementSibling, ui(env).wrap);
+  assert.equal(row.lastElementChild, ui(env).status);
 });
 
 test("Forge's own layout (notebook layout off) gets no button, though its tab row is there", (t) => {
@@ -164,13 +187,19 @@ test("re-attached after the save group when Gradio redraws the row (notebook-mou
   env.doc.querySelector(".gradio-container").appendChild(host.firstElementChild);
   env.window.dispatchEvent(new env.window.CustomEvent("sam3:notebook-mounted"));
   const row = env.doc.querySelector("#txt2img_extra_tabs > .tab-nav");
-  assert.equal(ui(env).wrap.parentElement, row);
-  assert.equal(ui(env).wrap.previousElementSibling, ui(env).save);
+  assert.equal(ui(env).wrap.parentElement, ui(env).save);
+  assert.equal(ui(env).status.parentElement, row);
+  const first = ui(env);
+  first.status.textContent = "내리는 중…";                    // a click in flight while Gradio redraws the row
   const fresh = row.cloneNode(false);
   row.replaceWith(fresh);
   assert.equal(mount(env), true);
-  assert.equal(ui(env).wrap.parentElement, fresh);
-  assert.equal(ui(env).wrap.previousElementSibling, ui(env).save);
+  assert.equal(ui(env).save.parentElement, fresh, "the save script built its group again");
+  assert.equal(ui(env).wrap.parentElement, ui(env).save);
+  assert.equal(ui(env).status.parentElement, fresh);
+  assert.equal(ui(env).wrap, first.wrap, "the same button, put back");
+  assert.equal(ui(env).status, first.status);
+  assert.equal(ui(env).status.textContent, "내리는 중…");
   assert.equal(env.doc.querySelectorAll("#sam3_unload_models").length, 1);
 });
 
@@ -268,19 +297,27 @@ test("no bridge (wiring failed at startup): the failure says where to look", asy
   assert.match(summary.text, /\[sam-extra\] unload models/);
 });
 
-test("the CSS puts it right after the save group in the same look", () => {
+test("the CSS: inside the save group, alone at the row's end only without it, the result on a line of its own", () => {
+  // the rendered layout (rects in a real browser) is tests/js/notebook_unload_models_layout.test.mjs
   const block = (selector) => {
     const start = CSS.indexOf(selector + " {");
     assert.notEqual(start, -1, selector);
     return CSS.slice(start, CSS.indexOf("}", start));
   };
-  const own = block("#sam3_notebook_layout .sam3-notebook-extra-tabs > .tab-nav > .sam3-save-defaults.sam3-unload-models");
-  assert.match(own, /order: 2;/);
-  assert.match(own, /margin-left: 0;/);
+  assert.match(block(".sam3-save-defaults > .sam3-unload-models"), /display: flex;/);
+  const alone = block("#sam3_notebook_layout .sam3-notebook-extra-tabs > .tab-nav > .sam3-unload-models");
+  assert.match(alone, /order: 1;/);
+  assert.match(alone, /margin-left: auto;/);
+  const line = block("#sam3_notebook_layout .sam3-notebook-extra-tabs > .tab-nav > .sam3-unload-models-status");
+  assert.match(line, /order: 2;/);
+  assert.match(line, /flex: 0 0 100%;/);
+  assert.match(line, /max-width: none;/);
+  assert.match(line, /text-align: right;/);
   // the save group keeps the row's right end (order 1, auto margin); the button look is the shared class
   assert.match(block("#sam3_notebook_layout .sam3-notebook-extra-tabs > .tab-nav > .sam3-save-defaults"), /order: 1;/);
   assert.match(block(".sam3-save-defaults-button"), /var\(--button-secondary-background-fill/);
   assert.doesNotMatch(CSS, /\.sam3-unload-models-button\s*\{/, "no separate button style");
+  assert.doesNotMatch(CSS, /\.sam3-save-defaults\.sam3-unload-models/, "no separate row item next to the save group");
 });
 
 async function waitFor(predicate, timeoutMs = 2000) {

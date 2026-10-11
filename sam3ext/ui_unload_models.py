@@ -55,36 +55,39 @@ def _cuda_device(torch):
 
 
 def forge_host() -> unload_models.Host:
-    """버튼을 누를 때의 Forge: queue_lock · shared.state · sd_models · memory_management · torch."""
+    """버튼을 누를 때의 Forge: queue_lock · shared.state · sd_models · Forge 의 모델 캐시(sys.modules) · torch."""
     import gc
 
     import torch
     from modules import sd_models, shared
     from modules.call_queue import queue_lock
 
-    try:
-        from backend import memory_management
-    except Exception:
-        memory_management = None
     device = _cuda_device(torch)
     return unload_models.Host(
         try_lock=lambda: queue_lock.acquire(blocking=False),
         unlock=queue_lock.release,
-        busy=lambda: unload_models.state_busy(shared.state),
-        unload_forge=lambda: unload_models.unload_forge_model(sd_models, memory_management),
+        busy=lambda: unload_models.state_job(shared.state),
+        unload_forge=lambda: unload_models.unload_forge_model(sd_models),
         hooks=unload_registry.hooks,
         collect=lambda: unload_models.collect_garbage(gc, torch),
         memory=lambda: unload_models.measure_cuda(torch, device),
+        forge_caches=lambda: unload_models.forge_cache_hooks(sys.modules.get),
     )
 
 
 def _report(outcome: unload_models.Outcome) -> None:
+    if outcome.stale_job is not None:
+        _log(f"{LOG_PREFIX}: refused once - Forge's queue lock is free but shared.state still shows the job "
+             f"{outcome.stale_job!r} (a failed job left it); the same record on the next click is unloaded")
+        return
     if outcome.refused is not None:
         _log(f"{LOG_PREFIX}: refused - "
              + ("a generation is running" if outcome.refused == unload_models.BUSY_MESSAGE else "already running"))
         return
     released = ", ".join(step.key for step in outcome.released) or "nothing held"
     line = f"{LOG_PREFIX}: released {released}"
+    if outcome.forced_job is not None:
+        line += f" (past the stale job record {outcome.forced_job!r})"
     before, after = outcome.before, outcome.after
     if before is not None and after is not None:
         line += (f"; GPU used {unload_models.gb(before.used)} -> {unload_models.gb(after.used)}, "
