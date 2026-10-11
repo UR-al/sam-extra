@@ -7,6 +7,11 @@ The logic is ``sam3ext/xyz_text_encoder.py`` (values, slots, the cell's list) an
   xyz_grid keeps a chosen axis by its index, see ``scripts/colorcraft.py``). Both tabs. ``confirm`` checks every value
   before the first cell (and that two Text Encoder axes do not pick the same slot), ``apply`` stores the cell's module
   list on the cell's copy of ``p`` - built on the list of an earlier Text Encoder axis of the same cell.
+* ``on_before_ui`` also replaces Forge's own ``VAE`` axis in place (same index, label, choices with "None", cost,
+  labels): a copy whose ``apply`` runs Forge's ``apply_vae`` and marks the cell (``sam3ext/xyz_vae.py``), so the hook
+  can send a VAE Forge cannot swap into the loaded model (a 2D Qwen2D VAE on a model built with a 3D Wan VAE, or the
+  reverse - Forge's strict load fails and xyz_grid leaves the cell black) to the model loader instead, like a Text
+  Encoder cell. Cells Forge can swap keep Forge's swap.
 * ``XyzTextEncoderHook`` (always on, no UI, like ``scripts/negpip.py``) — ``before_process`` hands the cell's list to
   Forge's model loader (the loading parameters, as the stock Checkpoint axis does) and to the ``Module N`` infotext,
   ``process`` / ``postprocess_image`` keep the infotext list the cell's, ``postprocess`` puts both back. Forge's
@@ -16,6 +21,7 @@ The file name sorts before ``negpip.py``, which stays the extension's last scrip
 """
 from __future__ import annotations
 
+import copy
 import os
 import sys
 import traceback
@@ -24,6 +30,7 @@ from modules import script_callbacks, scripts
 
 from sam3ext import xyz_text_encoder as xte
 from sam3ext import xyz_text_encoder_cell as cell_runtime
+from sam3ext import xyz_vae as xvae
 
 TITLE = "XYZ Text Encoder (sam-extra)"
 
@@ -191,6 +198,38 @@ def register_xyz_axes(xyz_grid) -> None:
     xyz_grid.axis_options.append(option)
 
 
+# ---------------------------------------------------------------------------------------------------------------------
+# Forge's VAE axis, replaced in place
+# ---------------------------------------------------------------------------------------------------------------------
+
+# On our copy of Forge's VAE option: the apply of Forge's option it replaced.
+VAE_STOCK_APPLY = "_sam_extra_stock_apply"
+
+
+def make_vae_apply(stock_apply):
+    """Forge's ``apply_vae`` (``p.override_settings["sd_vae"]``) unchanged, then the mark the hook decides the cell by."""
+
+    def apply(p, x, xs):
+        stock_apply(p, x, xs)
+        setattr(p, xvae.CELL_ATTR, {"value": x})
+
+    return apply
+
+
+def replace_vae_axis(xyz_grid) -> None:
+    """Put a copy of Forge's ``VAE`` axis option at its index - the same object otherwise (label, type, choices with
+    "None", cost, labels, confirm, img2img / txt2img class) - whose ``apply`` also marks the cell. Again on a WebUI
+    reload: the copy wraps Forge's apply, never an earlier copy's."""
+    for index, existing in enumerate(xyz_grid.axis_options):
+        if getattr(existing, "label", None) != xvae.AXIS_LABEL:
+            continue
+        stock_apply = getattr(existing, VAE_STOCK_APPLY, None) or existing.apply
+        option = copy.copy(existing)
+        option.apply = make_vae_apply(stock_apply)
+        setattr(option, VAE_STOCK_APPLY, stock_apply)
+        xyz_grid.axis_options[index] = option
+
+
 def _find_xyz_grid():
     for script in scripts.scripts_data:
         if script.script_class.__module__ == "xyz_grid.py":
@@ -201,10 +240,20 @@ def _find_xyz_grid():
 def _on_before_ui() -> None:
     try:
         xyz_grid = _find_xyz_grid()
-        if xyz_grid is not None:
-            register_xyz_axes(xyz_grid)
+    except Exception:
+        _log("finding xyz_grid failed:\n" + traceback.format_exc())
+        return
+    if xyz_grid is None:
+        return
+    try:
+        register_xyz_axes(xyz_grid)
     except Exception:
         _log("xyz_grid axis registration failed:\n" + traceback.format_exc())
+    try:
+        replace_vae_axis(xyz_grid)
+    except Exception:
+        print("[XYZ VAE] replacing Forge's VAE axis failed - Forge's own axis stays:\n" + traceback.format_exc(),
+              file=sys.stderr)
 
 
 script_callbacks.on_before_ui(_on_before_ui)
@@ -228,8 +277,9 @@ class XyzTextEncoderHook(scripts.Script):
         try:
             cell_runtime.before_process(p)
         except Exception:
-            # Forge would only log it (errors.report) and render the cell with the dropdown's encoder; say so plainly.
-            _log("the cell's text encoder was NOT applied:\n" + traceback.format_exc())
+            # Forge would only log it (errors.report) and render the cell with the dropdown's encoder (a VAE Forge
+            # cannot swap then fails in Forge's swap); say so plainly.
+            _log("the cell's text encoder / VAE module list was NOT applied:\n" + traceback.format_exc())
 
     def process(self, p, *args):
         try:

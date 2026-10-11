@@ -356,7 +356,8 @@ Forge 기본 XYZ 에는 VAE 를 바꾸는 `VAE` 축은 있지만 텍스트 인�
   칸을 다시 만들 수 있습니다(기본 `VAE` 축과 함께면 바꾼 VAE 까지). 그리드 이미지의 `Module N` 은 원래 선택입니다(기본 `VAE` 축과
   같음). 칸 라벨은 `Text Encoder: <파일 이름>`, `Use Forge current` 는 `Text Encoder: current (<지금 인코더>)` 입니다.
 - **다른 축과 함께**: `Checkpoint name`(cost 1.0) → 이 축(0.9) → `VAE`(0.7) 순으로 바깥 루프가 됩니다. `VAE` 축과 섞으면 바뀐
-  인코더 모델 위에서 VAE 를 바꿉니다. `Checkpoint name` 축과 섞을 때 계열이 다른 체크포인트(Anima · Krea2)를 비교하려면 두
+  인코더 모델 위에서 VAE 를 바꿉니다(그 모델의 VAE 와 형식이 다른 VAE 는 VAE 까지 바꾼 목록으로 한 번 불러옴 — 아래 `VAE` 절).
+  `Checkpoint name` 축과 섞을 때 계열이 다른 체크포인트(Anima · Krea2)를 비교하려면 두
   계열의 인코더를 모두 VAE / Text Encoder 목록에 넣어 두세요 — 모델마다 자기 자리만 쓰고, 이 축은 고른 파일의 자리만 바꿉니다.
   자리 확인에 쓰는 체크포인트는 Checkpoint 드롭다운의 것(API 면 `override_settings` 의 것)입니다.
 - **축 둘**: 이 축을 X · Y 처럼 두 축에 둘 수 있습니다 — Flux 면 X 에 CLIP-L 파일들, Y 에 T5 파일들. 두 번째 축은 첫 축이 만든
@@ -377,6 +378,35 @@ Forge 기본 XYZ 에는 VAE 를 바꾸는 `VAE` 축은 있지만 텍스트 인�
   NumPy 2 에서 열지 못함).
 - **API**: `override_settings` 에 `forge_additional_modules` 를 주면 그 목록이, `sd_model_checkpoint` 를 주면 그 체크포인트가
   출발점입니다(이 둘은 호출자의 값이라 Forge 가 그 요청 동안 설정에 넣었다 되돌립니다).
+
+### `VAE` (Forge 기본 축) — 형식이 다른 VAE 를 섞어도 검은 칸 없이
+
+Forge 기본 `VAE` 축은 칸마다 VAE 가중치를 **이미 만들어진 모델의 VAE 에 그대로 덮어씁니다**(`sd_vae.reload_vae_weights` → 엄격한
+`load_state_dict`). 그런데 Forge 는 VAE 의 **형식(클래스)** 을 모델을 만들 때 VAE / Text Encoder 드롭다운의 VAE 파일로 정합니다 —
+Anima · Qwen-Image · Wan 계열이면 `post_quant_conv.weight` 가 있는 파일은 2D `Qwen2DVAE`(`qwen_image_vae_2dHDR_fp32`,
+`Qwen2D-Anime-dense…` 같은 Qwen2D 내보내기), 없는 파일은 3D `WanVAE`(`qwen_image_vae`, `qwen_image_vae_HDR_fp32`). 그래서 3D VAE 로
+만든 모델에 2D VAE 를 넣는 칸(또는 그 반대)은 텐서 이름이 맞지 않아 오류가 나고, xyz_grid 는 그 칸을 샘플링 없이 **검은 이미지**로
+채웁니다. 드롭다운에서 고르면 되는 것은 그때 Forge 가 모델을 다시 만들기 때문입니다.
+
+sam-extra 는 이 축을 **같은 자리에서 바꿔 끼웁니다** — 이름 `VAE`, 목록 위치, 값 후보와 `None`, cost 0.7, 칸 라벨 `VAE: <파일>` 은
+그대로라 저장해 둔 XYZ 설정과 infotext 의 `Y Type: VAE` 도 그대로 맞습니다. 칸마다:
+
+- **같은 형식**(파일의 텐서 이름 · 모양이 모델의 VAE 와 똑같음): Forge 의 방식 그대로 — 모델은 그대로 두고 VAE 만 바꿉니다(Forge
+  함수 호출 하나하나까지 기본 축과 같음).
+- **다른 형식**(2D 와 3D, 또는 그 VAE 가 그대로는 받지 못하는 파일): 그 칸만 VAE 를 바꾼 모듈 목록으로 **모델을 다시 불러옵니다** —
+  드롭다운에서 그 파일을 고른 것과 같은 결과입니다. `[Modules] Text Encoder` 축과 같은 방법이라 Forge 설정(config.json · 드롭다운)은
+  건드리지 않고, 칸이 끝나면(오류 · 중단으로 끝나도) 원래 값으로 돌아갑니다. 콘솔에 `[XYZ VAE] <파일> is a 2D Qwen2D VAE (16 ch) and
+  the loaded model's VAE is a 3D Wan / Qwen-Image VAE (16 ch) …` 처럼 이유가 한 줄 남습니다.
+- **판정**: 파일 **헤더만** 읽습니다(가중치는 읽지 않음, 결과는 경로 · 크기 · 수정 시각으로 캐시). 지금 불러온 모델이 그 칸의 모델이면
+  그 VAE 를 직접 보고, 아니면(체크포인트 · 인코더 축이 모델을 바꾸는 칸, 첫 생성 전) 모델이 만들어질 VAE — 선택 목록의 마지막 VAE
+  파일, 없으면 체크포인트에 든 VAE — 의 헤더와 비교합니다. 헤더로 알 수 없을 때(`.pt` 같은 pickle VAE, Forge 가 먼저 형식을 바꾸는
+  diffusers · Flux 2 형식 파일)는 Forge 기본 동작 그대로입니다.
+- **기록**: 각 이미지 infotext 의 `Module N` 은 그 칸에서 실제로 쓴 목록(바꾼 VAE 포함)입니다. 그리드 이미지의 `Module N` 은 원래
+  선택입니다(기본 축과 같음).
+- **다른 축과 함께**: `[Modules] Text Encoder` 축과 X · Y · Z 어디에 두든 칸마다 두 값이 함께 적용됩니다(형식이 다른 VAE 면 인코더를
+  바꾼 목록에서 VAE 까지 바꿔 한 번 불러옴). `Checkpoint name` 축과도 섞을 수 있습니다.
+- **시간**: 형식이 다른 칸은 모델을 다시 불러오므로 체크포인트 축의 칸처럼 시간이 듭니다(같은 VAE 가 이어지는 칸은 다시 불러오지
+  않음). 그리드가 다른 VAE 로 끝났으면 다음 일반 생성이 원래 모델을 한 번 다시 불러옵니다.
 
 ---
 

@@ -3,7 +3,7 @@
 버전 태그는 GitHub Releases에도 발행됩니다. 아래는 요약이며, guidance/속도 기능의
 상세는 [docs/GUIDANCE.md](docs/GUIDANCE.md)를 참고하세요.
 
-## 미출시 (Unreleased) — XYZ `[Modules] Text Encoder` 축
+## 미출시 (Unreleased) — XYZ `[Modules] Text Encoder` 축 · XYZ `VAE` 축 수정
 
 Forge 기본 XYZ 에는 `VAE` 축만 있고 텍스트 인코더를 바꿔 가며 뽑는 축이 없어, **`[Modules] Text Encoder`** 축을 더합니다
 (txt2img · img2img). 칸마다 VAE / Text Encoder 드롭다운에서 그 파일을 고른 것과 같은 모델로 생성하고, Forge 설정(config.json ·
@@ -56,6 +56,35 @@ Forge 기본 XYZ 에는 `VAE` 축만 있고 텍스트 인코더를 바꿔 가며
   `Use Forge current`, 실패한 칸, API 의 모듈 목록 · 체크포인트, 도중의 드롭다운 변경, Hires · Refiner, 칸 안의 패스). 소스 가드가
   `replace_state_dict` 의 탐지 키 · 너비 · 자리 이름 · 계열 표와 `gguf_remapping` 의 이름 표를 지킵니다.
   `tests/test_integration_load_order.py` 에 `[Modules]` 축 하나를 더했습니다.
+
+### XYZ — `VAE` 축: 형식이 다른 VAE 를 섞으면 검은 칸이 나오던 것 (수정)
+
+- **증상**: Anima 에서 VAE / Text Encoder 선택이 3D `qwen_image_vae` 일 때 XYZ `VAE` 축에 2D Qwen2D VAE
+  (`qwen_image_vae_2dHDR_fp32`, `Qwen2D-Anime-dense_epoch_1`, `Qwen2D-Anime-dense-440k_ema_epoch_1`)를 넣으면 그 칸들이 샘플링 없이
+  검은 이미지가 되고, 같은 3D 인 `qwen_image_vae_HDR_fp32` 칸만 그려졌습니다. 선택이 2D 면 반대로 3D 칸이 검었습니다. 드롭다운에서
+  고르면 어느 VAE 든 잘 나옵니다.
+- **원인**(Forge): 기본 `VAE` 축은 `override_settings["sd_vae"]` 로 `process_images` 의 VAE 교체를 부르고, 이 교체는 이미 만들어진 모델의
+  VAE 에 파일을 엄격한 `load_state_dict` 로 덮어씁니다(`modules/sd_vae.py` `_load_vae_dict`). VAE 클래스는 모델을 만들 때 선택의 VAE
+  파일로 정해지므로(`backend/loader.py`: `post_quant_conv.weight` 가 있으면 2D `Qwen2DVAE`, 없으면 3D `WanVAE`) 다른 형식의 파일은
+  키가 하나도 맞지 않아 오류가 나고, xyz_grid 는 오류 난 칸을 빈 이미지로 채웁니다. 드롭다운은 모델을 다시 만들어 문제가 없습니다.
+- **수정**: Forge 의 `VAE` 축을 같은 자리에서 복사본으로 바꿔 끼웁니다(이름 · 위치 · 값 후보와 `None` · cost 0.7 · 칸 라벨 그대로,
+  `apply` 는 Forge 의 `apply_vae` 를 그대로 부른 뒤 칸에 표시만 함 — `scripts/modules_xyz_text_encoder.py`). 늘 켜진 훅이 칸마다 파일
+  헤더로(`sam3ext/xyz_vae.py`, 텍스트 인코더 축의 헤더 읽기 · 캐시를 같이 씀) 모델의 VAE 에 그대로 들어가는지 봅니다 — 지금 불러온
+  모델이 그 칸의 모델이면 그 `first_stage_model` 의 텐서 이름 · 모양과, 아니면 선택 목록의 마지막 VAE 파일(없으면 체크포인트의 VAE)
+  헤더와 비교. 들어가면 Forge 의 교체 그대로(호출까지 기본 축과 같음), 안 들어가면 그 칸만 VAE 를 바꾼 목록으로 모델을 다시 불러옵니다
+  (`sam3ext/xyz_vae_cell.py` → `[Modules] Text Encoder` 축과 같은 `sam3ext/xyz_text_encoder_cell.py`: loading parameters 와
+  `Module N` 에만 넣고 Forge 설정 · config.json 은 쓰지 않으며 칸이 끝나면 되돌림, 그 칸의 `sd_vae` 는 빼서 Forge 의 교체가 다시
+  돌지 않음). 텍스트 인코더 축과는 X · Y · Z 어느 자리 · 순서로 섞어도 칸마다 두 값이 함께 들어갑니다. 헤더로 알 수 없는 VAE(pickle,
+  Forge 가 먼저 형식을 바꾸는 파일)는 Forge 기본 동작 그대로입니다.
+- **테스트**: `tests/test_xyz_vae.py`(형식 · 엄격 로드 비교 · 예측 · 목록), `tests/test_xyz_vae_script.py`(제자리 교체 · Reload UI ·
+  훅), `tests/test_xyz_vae_origin.py` — Forge 의 `modules/sd_vae.py` 전체 · `process_images` · `forge_model_reload` ·
+  `load_torch_file` · `load_state_dict` · `set_config` · `main_entry` 와 xyz_grid 의 `VAE` 축 정의 그대로를 형식마다 텐서 몇 개짜리 진짜
+  VAE 파일로 CPU 에서 돌려, 사용자의 그리드(3D 선택, 3D/2D/3D/2D/2D)가 기본 축으로는 세 칸이 검고 바꾼 축으로는 모두 그려지는 것,
+  다른 순서 · 2D 선택에서의 반대, 같은 형식 칸은 기본 축과 호출 하나까지 같은 것, 실패한 칸 · 불러오지 못한 VAE · 중단 뒤 복원, 라벨 ·
+  `Module N`, 텍스트 인코더 축(여섯 배치) · 체크포인트 축 · API 의 모듈 목록 · 체크포인트 내장 VAE 를 확인합니다. Forge 의 진짜
+  `WanVAE` · `Qwen2DVAE`(작은 설정, 별도 프로세스)와 체크아웃의 `models/VAE` 파일(헤더만, meta 장치)로 형식 판정과 교체 가능 판정이
+  Forge 의 로더 · 엄격 로드와 같은지도 대조합니다. `tests/test_integration_load_order.py` 는 축이 Forge 의 자리에 들어가는지(재로딩 ·
+  남은 XYZ 포함) 봅니다.
 
 ## v0.33.1 — IPNDM_V 4차 계수 오타 (Linear Quadratic 에서 그림이 깨지던 것)
 

@@ -167,6 +167,14 @@ class LoadOrderTests(unittest.TestCase):
         for key in ("scheduler_map", "reload_scheduler_map"):
             self.assertEqual(r[key], r["scheduler_map_at_load"], key)
 
+    def test_forges_vae_axis_is_replaced_in_place(self):
+        """scripts/modules_xyz_text_encoder.py puts its copy of Forge's "VAE" axis at Forge's index - also after a
+        reload and on a kept XYZ grid, always wrapping Forge's apply."""
+        r = self.report
+        index = r["forge_xyz"].index("VAE")
+        for key in ("vae_axis", "reload_vae_axis", "kept_vae_axis"):
+            self.assertEqual(r[key], {"index": index, "wraps_forge": True}, key)
+
     def test_xyz_axes_are_unique_across_reloads(self):
         r = self.report
         labels = r["xyz"]

@@ -1,5 +1,10 @@
-"""One cell of the XYZ ``[Modules] Text Encoder`` axis while Forge renders it — the Forge-facing half (the pure logic is
-``sam3ext/xyz_text_encoder.py``; ``scripts/modules_xyz_text_encoder.py`` calls these from its always-on hook).
+"""One cell of the XYZ ``[Modules] Text Encoder`` axis - or of Forge's ``VAE`` axis when its VAE cannot be swapped in
+place - while Forge renders it: the Forge-facing half (the pure logic is ``sam3ext/xyz_text_encoder.py`` and
+``sam3ext/xyz_vae.py``; ``scripts/modules_xyz_text_encoder.py`` calls these from its always-on hook).
+
+A cell's module list comes from the Text Encoder axis (the selection with an encoder replaced), from the VAE axis
+(``sam3ext/xyz_vae_cell.py``: the selection - or the Text Encoder axis's list - with the VAE replaced, only when Forge's
+own in-place swap would fail), or from both; it is loaded the same way whichever axis made it.
 
 The cell's module list never goes into Forge's settings (``shared.opts``). Forge writes those to config.json whenever a
 page loads (``main_entry.on_preset_change``), the VAE / Text Encoder dropdown changes or Settings are applied - which
@@ -33,6 +38,8 @@ import weakref
 from dataclasses import dataclass
 
 from . import xyz_text_encoder as xte
+from . import xyz_vae as xvae
+from . import xyz_vae_cell
 
 WRAPPER_MARKER = "_sam_extra_xyz_text_encoder_wrapper"
 
@@ -41,10 +48,14 @@ def _log(message: str) -> None:
     print(f"[XYZ Text Encoder] {message}", file=sys.stderr)
 
 
+# The attributes the axes set on a cell's copy of ``p`` (copies of it - passes inside the cell - share them).
+MARK_ATTRS = (xte.CELL_ATTR, xvae.CELL_ATTR)
+
+
 @dataclass
 class Cell:
     p_ref: object               # () -> the cell's p (a weak reference)
-    cell: dict                  # the axis's CELL_ATTR dict (copies of the cell's p share it)
+    marks: tuple                # the axes' attributes on the cell's p (MARK_ATTRS; copies of the cell's p share them)
     task: object                # shared.state.time_start of the task the cell runs in
     modules: list               # the cell's list
     base: list                  # the list it was made from (the settings', or an API caller's)
@@ -95,9 +106,18 @@ def _reference(p):
         return lambda: p
 
 
+def _marks(p) -> tuple:
+    return tuple(mark for mark in (getattr(p, attr, None) for attr in MARK_ATTRS) if mark is not None)
+
+
+def _ours(p, cell: Cell) -> bool:
+    """``p`` is the cell's, or a copy of it (a pass inside the cell)."""
+    return any(mark is own for mark in _marks(p) for own in cell.marks)
+
+
 def _owner(p) -> Cell | None:
     cell = _STATE
-    if cell is not None and getattr(p, xte.CELL_ATTR, None) is cell.cell:
+    if cell is not None and _ours(p, cell):
         return cell
     return None
 
@@ -109,28 +129,44 @@ def _owner(p) -> Cell | None:
 def before_process(p) -> bool:
     """End a cell that is over, start this one; ``True`` when the cell's list was handed to Forge.
 
-    A no-op (one attribute read) for a generation that is not a cell of the axis while no cell runs."""
-    has_attr = hasattr(p, xte.CELL_ATTR)
+    A no-op (a few attribute reads) for a generation that is not a cell of either axis while no cell runs."""
+    has_attr = any(hasattr(p, attr) for attr in MARK_ATTRS)
     cell = getattr(p, xte.CELL_ATTR, None)
+    vae = getattr(p, xvae.CELL_ATTR, None)
     if _STATE is not None:
-        if cell is not None and cell is _STATE.cell:
+        if _ours(p, _STATE):
             return False                  # a copy of the running cell's p: a pass inside the cell
         _, _, shared, _ = _forge()
         if has_attr or _task(shared) != _STATE.task:
             finish()                      # the next cell, or a new task after a cell that failed
-    if not cell:
+    modules = list(cell["modules"]) if cell else None
+    planned = None
+    if isinstance(vae, dict) and not vae.get(xvae.SEEN):
+        vae[xvae.SEEN] = True             # decided once: a pass inside the cell (a copy of p) is not decided again
+        try:
+            planned = xyz_vae_cell.plan(p, modules)
+        except Exception:
+            xyz_vae_cell._log("checking whether Forge can swap the cell's VAE in place failed - Forge's own swap is "
+                              "used:\n" + traceback.format_exc())
+        if planned is not None:
+            modules = planned
+    if modules is None:
         return False
-    return begin(p, cell)
+    handed = begin(p, modules)
+    if handed and planned is not None:
+        xyz_vae_cell.take_over(p)         # only now: if begin failed, Forge's swap still runs (and fails loudly)
+    return handed
 
 
-def begin(p, cell: dict) -> bool:
+def begin(p, modules) -> bool:
+    """Hand ``modules`` (the cell's list) to Forge's model loader and ``Module N`` list for the cell of ``p``."""
     global _STATE
     processing, sd_models, shared, main_entry = _forge()
     install(main_entry)
     module_list = main_entry.module_list
     selection = getattr(shared.opts, xte.MODULES_KEY, None) or []
     base = xte.normalise(xte.effective_base(getattr(p, "override_settings", None), selection), module_list)
-    modules = list(cell["modules"])
+    modules = list(modules)
     if modules == base:
         return False
     data = sd_models.model_data
@@ -145,7 +181,7 @@ def begin(p, cell: dict) -> bool:
     params = dict(current)
     params["additional_modules"] = list(modules)
     overridden = list(modules)
-    _STATE = Cell(p_ref=_reference(p), cell=cell, task=_task(shared), modules=modules, base=base,
+    _STATE = Cell(p_ref=_reference(p), marks=_marks(p), task=_task(shared), modules=modules, base=base,
                   settings_checkpoint=settings_checkpoint, cell_checkpoint=current.get("checkpoint_info"),
                   underlying=current, params=params, overridden=overridden,
                   previous_overridden=getattr(processing, "_overridden_modules", None), installed=[overridden])
@@ -156,12 +192,13 @@ def begin(p, cell: dict) -> bool:
 
 def process(p) -> None:
     """Start of ``process_images_inner``: after Forge's VAE override rebuilt the ``Module N`` list from the settings
-    (the stock VAE axis, or a pass inside the cell with a VAE of its own), put the cell's encoders back into it."""
+    (the VAE axis swapping in place on a Text Encoder cell, or a pass inside the cell with a VAE of its own), put the
+    cell's entries back into it."""
     cell = _STATE
     if cell is None:
         return
     processing, _, shared, main_entry = _forge()
-    owned = getattr(p, xte.CELL_ATTR, None) is cell.cell
+    owned = _ours(p, cell)
     if not owned:
         # a pass inside the cell: only while the settings are the ones the cell was made from (not PiD's own list)
         selection = getattr(shared.opts, xte.MODULES_KEY, None) or []
