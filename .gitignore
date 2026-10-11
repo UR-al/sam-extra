@@ -35,3 +35,13 @@ node_modules/
 # sam-extra MCP server (mcp_server/): `uv run --project mcp_server ...` creates the lock file on
 # its first run (and .venv/, ignored above). Generated per machine, not shipped.
 mcp_server/uv.lock
+
+# Built-in Tag Autocomplete (sam3ext/tagcomplete): only the five tag lists below ship. The other upstream lists,
+# the user's own tag lists, tags/tag_frequency.db (usage counts) and tags/temp/ (rebuilt at every start) stay local
+# (tools/migrate_tagcomplete.py copies them over from an old sd-webui-tagcomplete-neo folder).
+/tags/*
+!/tags/danbooru.csv
+!/tags/danbooru_2025.csv
+!/tags/danbooru_e621_merged.csv
+!/tags/extra-quality-tags.csv
+!/tags/demo-chants.json

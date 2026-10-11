@@ -3,6 +3,27 @@
 버전 태그는 GitHub Releases에도 발행됩니다. 아래는 요약이며, guidance/속도 기능의
 상세는 [docs/GUIDANCE.md](docs/GUIDANCE.md)를 참고하세요.
 
+## 다음 판 (아직 발행 전) — 태그 자동완성 내장 (sd-webui-tagcomplete-neo)
+
+따로 설치하던 [sd-webui-tagcomplete-neo](https://github.com/eduardoabreu81/sd-webui-tagcomplete-neo)(commit `8e0d81f`, MIT)를
+sam-extra 에 넣었습니다(README 의 **Tag Autocomplete (내장 태그 자동완성)** 절). Forge 를 재시작하세요(새 스크립트·JS).
+
+- **설정·동작 그대로**: Settings → **Tag Autocomplete** 의 `tac_*` 57개는 키·기본값·이름·섹션이 같아 저장된 값이 이어집니다
+  (테스트가 설치돼 있던 상류 파일과 대조). 전역 JS 이름·`/tacapi/v1/*` 경로 15개·`<forge>/tmp/tagAutocompletePath.txt` 도 같습니다.
+  설정 맨 위에 안내 줄과 스위치 **내장 Tag Autocomplete 사용 (sam-extra)**(`sam3_builtin_tagcomplete_enabled`, 기본 켬, 재시작)가 더해졌습니다.
+- **따로 설치한 사본과 함께 돌지 않음**: 다른 tagcomplete 가 켜져 있으면 내장은 쉬고 콘솔·설정 안내 줄에 이유를 남깁니다(같은 JS 를 두 번
+  실으면 페이지에서 반만 초기화됨). 그 확장을 지우고 재시작하세요.
+- **사용자 파일 옮기기**: `tools/migrate_tagcomplete.py` — 예전 폴더의 태그 목록·사용 횟수(`tag_frequency.db`)·LoRA 해시 캐시를 이 확장의
+  `tags/` 로(미리보기 기본, 덮어쓰지 않음, SHA-256·DB 확인).
+- **태그 목록**: 저장소에 `danbooru.csv`·`danbooru_2025.csv`·`danbooru_e621_merged.csv`·`extra-quality-tags.csv`·`demo-chants.json`(약 14.3 MB)을
+  넣었습니다. 나머지 상류 목록과 사용자 목록은 git 밖(`.gitignore`)입니다.
+- **TIPO**: 캐릭터·작품·메타 구분에 쓰는 danbooru CSV 를 이 확장의 `tags/` 에서 읽습니다(예전: 따로 설치한 tagcomplete 폴더 — 그 폴더를
+  지우면 구분이 비었을 것).
+- **보안 (상류와 다른 점)**: `GET /tacapi/v1/wildcard-contents` 가 와일드카드 폴더 안의 `.txt` 만 돌려줍니다(상류는 아무 파일이나).
+- **고른 파일이 없을 때 알림**: `tac_tagFile` 등이 `tags/` 에 없는 파일을 가리키면 시작할 때 콘솔과 설정 안내 줄에 알립니다(상류는 그 목록을
+  조용히 비움 — 태그 파일이 없으면 extra 파일도).
+- 의존성: `pyyaml`(상류 `install.py` 가 설치하던 것)을 `requirements.txt` 에 더했습니다(Forge 에 이미 있음).
+
 ## v0.33.1 — IPNDM_V 4차 계수 오타 (Linear Quadratic 에서 그림이 깨지던 것)
 
 **2026-10-05 정정 (GPU 확인 뒤)**: 아래 "Linear Quadratic 은 깨지던 그림이 정상으로 돌아오고" 는 틀렸습니다. 계수 오타 수정은

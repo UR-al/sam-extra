@@ -48,7 +48,8 @@ speckle↓·skin/hair 정리(`scripts/anima_vae_2x.py`). Qwen/Wan VAE latent 공
   [Anima Guidance Suite](#별도-기능-anima-guidance-suite) ·
   [txt2img 화면 정리](#txt2img-화면-정리-) · [진행 막대](#별도-기능-진행-막대-smooth-progress) ·
   [TIPO 프롬프트 확장](#별도-기능-tipo-프롬프트-확장-) · [구도 · 카메라](#별도-기능-구도--카메라-프롬프트로-시점-잡기) ·
-  [NegPiP (내장)](#별도-기능-negpip-내장) · [MCP 서버 (에이전트 연결)](#별도-기능-mcp-서버--에이전트-연결)
+  [NegPiP (내장)](#별도-기능-negpip-내장) · [Tag Autocomplete (내장)](#별도-기능-tag-autocomplete-내장-태그-자동완성) ·
+  [MCP 서버 (에이전트 연결)](#별도-기능-mcp-서버--에이전트-연결)
 - 참고: [출처 / 크레딧](#출처--크레딧-credits)
 
 ---
@@ -359,7 +360,8 @@ Settings에서 선택 후 **Apply settings**를 누르면 현재 페이지에 �
 ## 의존성
 
 `requirements.txt` — Forge launch 시 `install.py` 가 빠진 것만 설치(위 [설치](#설치) 참고, `--sam3-no-auto-install`
-로 끔). SAM3 본체는 `sam3` PyPI 패키지 필요. torch 는 Forge 가 관리하므로 목록에 없습니다.
+로 끔). SAM3 본체는 `sam3` PyPI 패키지 필요. torch 는 Forge 가 관리하므로 목록에 없습니다. 내장 Tag Autocomplete 는 `pyyaml`
+(따로 설치하던 확장의 `install.py` 가 깔던 것 — Forge Neo 에 이미 있음)과 Forge 의 `requests` 를 씁니다.
 
 개발·테스트: `pip install -r requirements-dev.txt`(CPU torch 는 따로:
 `pip install torch --index-url https://download.pytorch.org/whl/cpu`) 뒤 확장 폴더에서
@@ -1754,8 +1756,8 @@ txt2img 도구 줄(붙여넣기·지우기·스타일 적용 버튼)의 **🪄**
 - 문장(쉼표가 들어간 문장 포함)은 TIPO 에 태그로 넘기지 않습니다.
 - 토큰 한도에서 멈춰 끝이 잘렸으면 잘린 태그와 끝나지 않은 문장은 버리고, 상태 줄에 그렇게 알려 줍니다.
 - 적어 둔 품질(`masterpiece` 등)·`year 2025`(→ 시대)·등급(`explicit` → `nsfw, explicit`, 여럿이면 가장 센 것)·`@작가`·캐릭터·
-  작품·메타는 TIPO 에 조건으로 넘깁니다. 캐릭터·작품·메타 구분은 tagcomplete 확장의 danbooru CSV 를 씁니다(없으면 `@작가` 만
-  알아봅니다).
+  작품·메타는 TIPO 에 조건으로 넘깁니다. 캐릭터·작품·메타 구분은 내장 Tag Autocomplete 의 danbooru CSV(`tags/danbooru_2025.csv`,
+  없으면 `tags/danbooru.csv`)를 씁니다(둘 다 없으면 `@작가` 만 알아봅니다).
 - 확장은 Forge 생성 대기열 안에서 돕니다 — 생성 중에 누르면 그 생성이 끝난 뒤 돕니다. 기다리는 동안 프롬프트를 고쳤으면
   결과를 넣지 않고 상태 줄에 알려 줍니다(고친 내용을 덮어쓰지 않게).
 - **모델 받기**는 한 번에 하나만 돕니다 — 받는 중에 다른 창에서 또 누르면 바로 알려 주고 다시 받지 않습니다. 새로 고친 뒤
@@ -1784,7 +1786,8 @@ txt2img·img2img 의 스타일 줄 아래에 접힌 칸 **구도 · 카메라** 
   가리지 않고 알아봅니다(`(From_Above:1.2)` 가 있으면 `from above` 를 붙이지 않음). 붙인 뒤 커서는 프롬프트 끝에 있고 **Ctrl+Z
   한 번**에 되돌아갑니다. 다 들어 있으면 버튼이 **이미 포함된 구도** 로 꺼집니다.
 - **태그 자동완성과 함께**: 붙인 글자를 타이핑으로 알리지 않아(Forge 의 붙여넣기 버튼처럼 `updateInput` 으로 Gradio 에 알림)
-  tagcomplete 의 추천 목록이 뜨지 않습니다 — 목록이 떠 있으면 Enter/Tab 이 방금 붙인 마지막 단어를 추천어로 바꿀 수 있어서입니다.
+  태그 자동완성(내장 Tag Autocomplete, 따로 설치한 tagcomplete 도 같음)의 추천 목록이 뜨지 않습니다 — 목록이 떠 있으면 Enter/Tab 이
+  방금 붙인 마지막 단어를 추천어로 바꿀 수 있어서입니다.
 - **충돌 경고**: 반대 태그(`from below` ↔ `from above`, `facing viewer` ↔ `from behind`, 크롭끼리, 화면 위치끼리)가 이미 있으면
   알려 주고 버튼이 **기존 구도 유지하고 추가** 로 바뀝니다. 기존 태그는 지우지 않습니다. 미리보기와 경고는 프롬프트를 칠 때마다
   바뀝니다.
@@ -1834,6 +1837,49 @@ txt2img·img2img 의 스타일 줄 아래에 접힌 칸 **구도 · 카메라** 
 - Anima 3.8B(워크플로 7)·Safe PAG·캐릭터 레퍼런스 IP-Adapter 와 함께 돕니다. 3.8B 가 NegPiP 보다 위에 설치되는 순서에서는 3.8B 런타임이
   같은 마스크를 대신 적용합니다. 아래에 깔린 것이 따로 설치한 sd-forge-negpip 여도 내장 규칙을 쓰므로, 새 Forge 의 emphasis
   `None`·`Ignore` 에서는 그 판(`0585496`) 단독과 결과가 다릅니다(내장은 뒤집는 행 없음).
+
+## 별도 기능: Tag Autocomplete (내장 태그 자동완성)
+
+프롬프트를 칠 때 danbooru·e621 태그, 와일드카드, LoRA·임베딩, 스타일 이름을 추천합니다.
+[eduardoabreu81/sd-webui-tagcomplete-neo](https://github.com/eduardoabreu81/sd-webui-tagcomplete-neo)(Forge Neo 포크, commit `8e0d81f`;
+원본 [DominikDoom/a1111-sd-webui-tagcomplete](https://github.com/DominikDoom/a1111-sd-webui-tagcomplete), MIT)를 이 확장에 넣은 것이라
+따로 설치할 필요가 없습니다. 추천 규칙·단축키·색·번역·사용 횟수 정렬·CivitAI 트리거 단어 등 사용법은
+[상류 README](https://github.com/eduardoabreu81/sd-webui-tagcomplete-neo/blob/8e0d81fd0e25fd2cf98fb4d34d097df9f71a082b/README.md) 와 같습니다.
+
+- **설정은 그대로**: Settings → **Tag Autocomplete** 의 `tac_*` 설정 57개는 키·기본값·이름·섹션이 따로 설치하던 확장과 같아,
+  config.json 에 남아 있는 값이 그대로 쓰입니다. 맨 위에 안내 줄과 **내장 Tag Autocomplete 사용 (sam-extra)** 스위치(기본 켬,
+  바꾸면 Forge 재시작)가 더해졌습니다. 끄면 `tac_*` 설정은 화면에서만 사라지고 config.json 의 값은 그대로 남습니다.
+- **태그 파일**: `extensions/forge_sam3_extension/tags/` 에서 읽습니다. 저장소에는 다섯 개만 들어 있습니다 — `danbooru.csv`(기본
+  태그 파일), `danbooru_2025.csv`(TIPO 가 먼저 읽는 목록), `danbooru_e621_merged.csv`, `extra-quality-tags.csv`, `demo-chants.json`.
+  상류의 다른 목록(`e621.csv`·`e621_sfw.csv`·`derpibooru.csv`·`EnglishDictionary.csv`·`noob_characters-chants.json`)은
+  [상류 tags 폴더](https://github.com/eduardoabreu81/sd-webui-tagcomplete-neo/tree/8e0d81fd0e25fd2cf98fb4d34d097df9f71a082b/tags) 에서 받아
+  같은 폴더에 두면 목록에 나타납니다. 직접 만든 목록, 사용 횟수(`tags/tag_frequency.db`), 시작할 때마다 다시 만드는 `tags/temp/` 는
+  git 에 들어가지 않습니다.
+- **따로 설치한 확장에서 옮기기**: 예전 `extensions/sd-webui-tagcomplete-neo/tags/` 의 사용자 목록·상류 목록·사용 횟수·LoRA 해시
+  캐시는 `tools/migrate_tagcomplete.py` 로 한 번 옮긴 뒤 그 확장을 지우세요. Forge 를 끈 채로, Forge 폴더에서:
+
+  ```
+  venv\Scripts\python.exe -I extensions\forge_sam3_extension\tools\migrate_tagcomplete.py --src extensions\sd-webui-tagcomplete-neo
+  venv\Scripts\python.exe -I extensions\forge_sam3_extension\tools\migrate_tagcomplete.py --src extensions\sd-webui-tagcomplete-neo --apply
+  ```
+
+  첫 줄은 옮길 목록만 보여 줍니다(절대 경로·크기·SHA-256). `--apply` 로 복사하며, 이미 있는 파일은 덮어쓰지 않고(같은 내용이면
+  건너뜀, 다르면 충돌로 알리고 그대로 둠) 복사본마다 SHA-256 을, 사용 횟수 DB 는 무결성·스키마·행 수를 확인합니다. 원래 폴더는 바꾸지
+  않습니다.
+- **둘이 함께 돌지 않음**: 다른 tagcomplete 확장(폴더에 상류 파일 `javascript/tagAutocomplete.js` 나 `scripts/tag_autocomplete_helper.py`
+  가 있는 것 — 이름은 상관없음)이 켜져 있으면 내장은 쉬고, 콘솔에 `[sam-extra] Tag Autocomplete: built-in copy not started` 를 한 번
+  남기며 설정 안내 줄에도 이유가 나옵니다. 그 확장을 지우거나 Extensions 탭에서 끄고 재시작하면 내장이 돕니다. 페이지에서도
+  `javascript/tagcomplete_loader.js` 가 다른 사본의 전역(`TAC_CFG`·`addAutocompleteToArea`)을 보면 내장 JS 를 붙이지 않습니다.
+- **다른 확장과**: 상류와 같은 전역 이름(`TAC_CFG`·`addAutocompleteToArea`·`hideResults` 등), 요소 클래스(`.autocompleteParent` 등),
+  `/tacapi/v1/*` 경로 15개를 그대로 써서 prompt-all-in-one 같은 확장이 예전처럼 붙습니다. 구도 · 카메라 칸이 붙인 글자에는 추천
+  목록이 뜨지 않습니다(위 절).
+- **상류와 다른 점**: `/tacapi/v1/wildcard-contents` 는 와일드카드 폴더(`scripts/wildcards`, 확장들의 `wildcards/`) 안의 `.txt` 만
+  돌려줍니다 — 상류는 쿼리로 준 아무 파일이나 로그인 없이 돌려줘, `--listen` 으로 띄우면 같은 망의 누구나 PC 의 파일을 읽을 수
+  있었습니다. 같은 앱에 경로가 두 번 붙지 않고, 의존성 `pyyaml` 은 상류 `install.py` 대신 `requirements.txt` 에 있습니다. 상류의
+  JS 15개는 바꾸지 않았고 `sam3ext/tagcomplete/javascript/` 에 있습니다(Forge 가 자동으로 싣지 않는 하위 폴더라 로더가 붙임).
+- **고른 파일이 없을 때**: `tac_*` 가 고른 파일이 `tags/` 에 없으면(이름이 바뀐 파일 등) 상류는 브라우저 콘솔에 404 만 남기고 그
+  목록을 통째로 건너뜁니다 — 태그 파일이 없으면 extra 파일도 읽지 않습니다. 내장은 Forge 를 시작할 때 콘솔
+  (`... is not in ... - pick another file`)과 설정 안내 줄에 그 이름을 알려 줍니다. Settings 에서 있는 파일을 다시 고르세요.
 
 ## 별도 기능: MCP 서버 — 에이전트 연결
 
@@ -1923,6 +1969,7 @@ claude mcp add --scope user -e FORGE_URL=http://127.0.0.1:7861 -e SAM_EXTRA_MCP_
 | **Anima Tile-Repair** (워크플로 3) | [kohya-ss/sd-scripts](https://github.com/kohya-ss/sd-scripts) (`anima_minimal_inference*`) | Apache-2.0 | `anima_vendor/` |
 | **Anima Character Reference / ReStyler** (워크플로 6) | [Anima ReStyler workflow](https://civitai.com/models/2803070/anima-restyler) · [원 아이디어 Reddit 게시물](https://www.reddit.com/r/StableDiffusion/s/0Az0DgoaKj) | 워크플로 페이지 조건 참고 | 동작을 Forge 네이티브 img2img/reference로 재구현 (vendor·코드 복사 없음) |
 | **NegPiP** (별도 기능) | [Haoming02/sd-forge-negpip](https://github.com/Haoming02/sd-forge-negpip) (commit `0585496`, 2026-09-30 보관) · 원작 hako-mikan | AGPL-3.0-or-later | `sam3ext/negpip/`·`scripts/negpip.py` 에 편입 (라이선스 전문 `sam3ext/negpip/LICENSE`, 수정 사항은 `THIRD_PARTY_NOTICES.md`) |
+| **Tag Autocomplete** (별도 기능) | [eduardoabreu81/sd-webui-tagcomplete-neo](https://github.com/eduardoabreu81/sd-webui-tagcomplete-neo) (commit `8e0d81f`, Forge Neo 포크) · 원본 [DominikDoom/a1111-sd-webui-tagcomplete](https://github.com/DominikDoom/a1111-sd-webui-tagcomplete) (Dominik Reh) | MIT | `sam3ext/tagcomplete/`·`tags/` 에 편입 (라이선스 전문 `sam3ext/tagcomplete/LICENSE`, 수정 사항은 `THIRD_PARTY_NOTICES.md`) |
 | **Anima 3.8B (Qwen3.5 / v2)** (워크플로 7) | [GumGum10/forge-anima-3.8B](https://github.com/GumGum10/forge-anima-3.8B) (commit `59c27e5`) | MIT | `sam3ext/anima38/` 에 편입 (저장소에 포함, 수정 사항은 `THIRD_PARTY_NOTICES.md`) |
 | **TIPO 프롬프트 확장** (별도 기능) | [KBlueLeaf/TIPO-v2.1-1B-A200M](https://huggingface.co/KBlueLeaf/TIPO-v2.1-1B-A200M) · 모델 코드 [KohakUwULLM](https://github.com/KohakuBlueleaf/KohakUwULLM) | 가중치 Kohaku License 1.0 · 코드 Apache-2.0 | `sam3ext/tipo/kohaku/` 에 모델 코드만 편입, 가중치는 사용자가 받을 때 HF 에서 |
 | **Anima Safe PAG** (별도 기능) | [iljung1106/comfyui-anima-safe-pag](https://github.com/iljung1106/comfyui-anima-safe-pag) (commit `905b0107`) | MIT | Anima 배치·블록 선택을 이식, σ 적용 구간·번호 파싱 편입(`sam3ext/guidance/sigma_window.py`) |
@@ -1984,7 +2031,8 @@ LoRA Manager(GPL-3.0)는 vendor 그대로 실행하되, `lora_manager_core.py`�
 
 - 저장소에 함께 들어 있는 제3자 코드·자산(`sam3ext/anima38/` 의 MIT 코드, `mcp_server/sam_extra_mcp/forgeneo/` 의
   forgeneo-mcp 코드(MIT), `sam3ext/colorcraft/` 의 Colorcraft 코드·색 벡터(MIT), `sam3ext/speed/` 의 SPEED 코드(MIT),
-  진행 막대의 Smooth Progress 코드(MIT), `sam3ext/extra_samplers/` 의 DPM++ 4M SDE 코드(BSD-3-Clause)·Euler (SMEA) Dy
+  진행 막대의 Smooth Progress 코드(MIT), `sam3ext/tagcomplete/` 의 Tag Autocomplete 코드와 `tags/` 의 태그 목록(MIT),
+  `sam3ext/extra_samplers/` 의 DPM++ 4M SDE 코드(BSD-3-Clause)·Euler (SMEA) Dy
   코드(Apache-2.0), TIPO 모델 코드(Apache-2.0), `assets/` 의 Qwen3.5 토크나이저(Apache-2.0)·CLIP BPE 어휘(MIT))는 원래 고지를
   그대로 유지합니다 — 목록과 조건은 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) 참고.
 - 편입한 NegPiP(`sam3ext/negpip/` 의 `__init__.py`·`anima.py`·`sd.py`·`utils.py`·`mask.py`, `scripts/negpip.py`)는

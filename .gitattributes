@@ -1,0 +1,8 @@
+# Built-in Tag Autocomplete (sam3ext/tagcomplete, from sd-webui-tagcomplete-neo @ 8e0d81f, MIT):
+# the shipped tag lists and the vendored upstream files are stored byte for byte, so they stay
+# hash-equal to upstream (danbooru_e621_merged.csv is CRLF upstream, the rest LF; tagAutocomplete.js
+# keeps its UTF-8 BOM). tests/test_tagcomplete_vendor.py pins their SHA-256.
+/tags/*.csv -text
+/tags/*.json -text
+/sam3ext/tagcomplete/javascript/*.js -text
+/sam3ext/tagcomplete/LICENSE -text
