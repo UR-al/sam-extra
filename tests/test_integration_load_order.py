@@ -62,7 +62,8 @@ OUR_SAMPLER_ALIASES = (
 )
 OUR_SCHEDULERS = ("Cosine", "CosineExponential blend", "Phi", "Laplace", "Karras Dynamic", "custom",
                   "React Cosinusoidal DynSF", "Flow Cosmos rho7", "Flow Cosmos Dynamic")
-NEW_XYZ_PREFIXES = {"[Colorcraft]": 14, "[Anima SPEED]": 6, "[Extra Samplers]": 3, "[Extra Schedulers (sam-extra)]": 7}
+NEW_XYZ_PREFIXES = {"[Colorcraft]": 14, "[Anima SPEED]": 6, "[Extra Samplers]": 3, "[Extra Schedulers (sam-extra)]": 7,
+                    "[Modules]": 1}
 # The probe's Forge stand-in (DPM++ 2M, Euler a, Euler, ER SDE / Automatic, Karras, Exponential) plus ours,
 # after scripts/list_order.py (sam3ext/list_order.py: the families of the table, Forge's first entry first).
 FAMILY_ORDER_SAMPLERS = (
@@ -165,6 +166,14 @@ class LoadOrderTests(unittest.TestCase):
             self.assertEqual(r[key], r["samplers_map_at_load"], key)
         for key in ("scheduler_map", "reload_scheduler_map"):
             self.assertEqual(r[key], r["scheduler_map_at_load"], key)
+
+    def test_forges_vae_axis_is_replaced_in_place(self):
+        """scripts/modules_xyz_text_encoder.py puts its copy of Forge's "VAE" axis at Forge's index - also after a
+        reload and on a kept XYZ grid, always wrapping Forge's apply."""
+        r = self.report
+        index = r["forge_xyz"].index("VAE")
+        for key in ("vae_axis", "reload_vae_axis", "kept_vae_axis"):
+            self.assertEqual(r[key], {"index": index, "wraps_forge": True}, key)
 
     def test_xyz_axes_are_unique_across_reloads(self):
         r = self.report

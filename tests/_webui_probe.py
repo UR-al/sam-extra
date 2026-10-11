@@ -70,12 +70,26 @@ class AxisOption:
         self.choices, self.prepare = choices, prepare
 
 
+def _forge_apply_vae(p, x, xs):
+    """Stands for xyz_grid's ``apply_vae`` (the "VAE" axis sam-extra replaces in place)."""
+    p.override_settings["sd_vae"] = x
+
+
+def vae_axis(xyz) -> dict:
+    """Where the "VAE" axis is, and whether it is sam-extra's copy wrapping Forge's apply (not an earlier copy)."""
+    index = next(i for i, option in enumerate(xyz.axis_options) if option.label == "VAE")
+    option = xyz.axis_options[index]
+    return {"index": index, "wraps_forge": option.apply is not _forge_apply_vae
+            and getattr(option, "_sam_extra_stock_apply", None) is _forge_apply_vae}
+
+
 def new_xyz_grid():
     module = types.ModuleType("xyz_grid.py")
     module.AxisOption = AxisOption
     module.AxisOptionImg2Img = AxisOption
     module.AxisOptionTxt2Img = AxisOption
-    module.axis_options = [AxisOption(label, str, None) for label in forge_xyz_labels()]
+    module.axis_options = [AxisOption(label, str, _forge_apply_vae if label == "VAE" else None)
+                           for label in forge_xyz_labels()]
     return module
 
 
@@ -378,6 +392,7 @@ def main():
     report["options"] = list(webui.options)
     report["before_ui_errors"] = run_callbacks(stubs, callbacks, "on_before_ui")
     report["xyz"] = [option.label for option in xyz.axis_options]
+    report["vae_axis"] = vae_axis(xyz)
     report["app_errors"] = run_callbacks(stubs, callbacks, "on_app_started", demo, app)
     report["routes"] = routes(app)
     report["scripts"] = scripts_info(stubs, scripts_module, loaded)
@@ -397,10 +412,12 @@ def main():
     report["reload_options"] = list(webui.options)
     report["reload_before_ui_errors"] = run_callbacks(stubs, callbacks, "on_before_ui")
     report["reload_xyz"] = [option.label for option in reloaded_xyz.axis_options]
+    report["reload_vae_axis"] = vae_axis(reloaded_xyz)
     # the XYZ module from before the reload, if a host kept it
     stubs_same, _, callbacks_same, _, _ = load_all(webui, xyz, 3)
     run_callbacks(stubs_same, callbacks_same, "on_before_ui")
     report["kept_xyz"] = [option.label for option in xyz.axis_options]
+    report["kept_vae_axis"] = vae_axis(xyz)
     report["reload_app_errors"] = run_callbacks(stubs, callbacks, "on_app_started", demo, app)
     report["reload_routes"] = routes(app)
     report["reload_samplers"] = [x.name for x in samplers.all_samplers]
