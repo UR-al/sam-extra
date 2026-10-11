@@ -332,6 +332,37 @@ Manual Mask 교집합(Refine, 칠했을 때) → Exclude 영역 차감. Mask Blu
 `[SAM3] Checkpoint`·`[SAM3] Device` 축은 값이 바뀔 때마다 SAM3 를 다시 빌드하므로(3\~5 초) cost 를 줘서 바깥 루프로
 돌립니다 — 칸 결과는 같고 격자를 도는 순서만 바뀝니다.
 
+### `[Modules] Text Encoder` — 텍스트 인코더를 바꿔 가며 뽑기
+
+Forge 기본 XYZ 에는 VAE 를 바꾸는 `VAE` 축은 있지만 텍스트 인코더 축은 없습니다. sam-extra 가 `[Modules] Text Encoder` 축을
+더합니다(txt2img · img2img 둘 다). 칸마다 **VAE / Text Encoder 드롭다운에서 그 파일을 고른 것과 똑같이** 생성합니다.
+
+- **값**: `Use Forge current`(지금 드롭다운 선택 그대로), 또는 인코더 파일. 파일은 드롭다운에 보이는 이름 그대로 쓰면 되고,
+  하위 폴더 경로나 확장자를 뺀 이름(`qwen_3_06b_base_full_fp32`)도 됩니다. 인코더가 둘인 모델(Flux 의 CLIP-L + T5)은 텍스트
+  입력에서 `clip_l + t5xxl_fp16` 처럼 `+` 로 이어 씁니다.
+- **드롭다운 후보**: 지금 선택에 든 인코더와 **같은 자리(slot)** 를 채우는 파일만 나옵니다 — Anima 선택이면 Qwen3 0.6B 파일만,
+  Krea2 선택이면 Qwen3-VL 4B 파일만(지금 선택에 인코더가 없으면 알아보는 인코더 전부).
+  자리는 Forge 로더(`backend/loader.py` `replace_state_dict`)와 같은 규칙으로 safetensors **헤더만** 읽어 정합니다(가중치는 읽지 않음).
+- **동작**: 지금 선택에서 그 자리의 인코더만 바꾼 목록으로 칸을 만듭니다(VAE 등 나머지는 그대로). 인코더가 바뀌면 Forge 가 모델을
+  다시 불러오므로 체크포인트 축처럼 칸마다 시간이 듭니다. 칸이 끝나면 — 오류 · 중단으로 끝나도 — 원래 선택으로 돌아가고,
+  config.json 과 드롭다운은 건드리지 않습니다. 그리드가 다른 인코더로 끝났으면 다음 일반 생성이 원래 모델을 한 번 다시
+  불러옵니다(체크포인트 축 뒤와 같음).
+- **기록**: 각 이미지 infotext 의 `Module 1`, `Module 2` … 에 그 칸에서 실제로 쓴 목록이 남아, PNG Info 붙여 넣기(VAE/TE)로 그
+  칸을 다시 만들 수 있습니다. 그리드 이미지의 `Module N` 은 원래 선택입니다(기본 `VAE` 축과 같음). 칸 라벨은
+  `Text Encoder: <파일 이름>`, `Use Forge current` 는 `Text Encoder: current (<지금 인코더>)` 입니다.
+- **다른 축과 함께**: `Checkpoint name`(cost 1.0) → 이 축(0.9) → `VAE`(0.7) 순으로 바깥 루프가 됩니다. `VAE` 축과 섞으면 바뀐
+  인코더 모델 위에서 VAE 를 바꿉니다. `Checkpoint name` 축과 섞을 때 계열이 다른 체크포인트(Anima · Krea2)를 비교하려면 두
+  계열의 인코더를 모두 VAE / Text Encoder 목록에 넣어 두세요 — 모델마다 자기 자리만 쓰고, 이 축은 고른 파일의 자리만 바꿉니다.
+- **Anima 3.8B**: 0.6B 쪽(Qwen3 0.6B) 인코더를 바꿉니다. Qwen3.5 4B 는 3.8B 런타임이 `models/text_encoder` 에서 알아서 찾으므로
+  이 축의 대상이 아닙니다.
+- **그리드를 시작하기 전에 막는 값**(영어 오류): 목록에 없는 파일, VAE, Qwen3.5 파일, Anima 3.8B 어댑터, Forge 가 인코더로
+  읽지 못하는 파일, **지금 선택에 없는 자리의 인코더**(예: Anima 선택에 Qwen3-VL 4B — 불러와도 쓰이지 않으므로), 같은 자리를 채우는
+  두 파일. 지금 선택에 인코더가 하나도 없으면(체크포인트 내장 인코더) 고른 인코더를 더합니다 — 드롭다운에서 고를 때와 같습니다.
+- **GGUF · pickle 인코더**: 헤더로 자리를 읽을 수 없어 드롭다운 후보에는 없고, 텍스트 입력으로 쓰면 지금 선택의 인코더가 **하나**일
+  때 그것을 바꿉니다.
+- **한계 · API**: Hires 의 모듈을 따로 골라 두었으면(`Use same choices` 가 아니면) 2패스는 그 목록을 씁니다. API 로 부를 때
+  `override_settings` 에 `forge_additional_modules` 를 주면 그 목록이 출발점입니다.
+
 ---
 
 ## Settings 저장
