@@ -4,7 +4,8 @@ Registration (the same index, label, type, choices, cost, labels, class; Forge's
 isolated from the Text Encoder axis's registration), the wrapped ``apply`` (Forge's first, then the mark), and the
 always-on hook on a VAE cell: a VAE of the other family goes to the loader (loading parameters, ``Module N``, ``sd_vae``
 taken out, all put back after the cell), anything Forge can swap - or that the headers cannot tell - is left to Forge
-untouched; a failing check or hand-over leaves Forge's swap in place. Forge's own code runs in
+untouched (a picked file in a format Forge's loader converts first goes to the loader, as one Forge cannot swap); a
+failing check or hand-over leaves Forge's swap in place. Forge's own code runs in
 tests/test_xyz_vae_origin.py.
 """
 from __future__ import annotations
@@ -369,6 +370,61 @@ class TwoDimensionalSelectionTests(HookCase):
             self.hook.postprocess(pc, None)
             pc = self.cell(P(), "Qwen2D-Anime-dense_epoch_1.safetensors")
             self.assertIn("sd_vae", pc.override_settings)
+        self.assertIsNone(cell_runtime.state())
+
+
+class ConvertedFormatTests(HookCase):
+    """A VAE file in a format Forge's loader converts first (diffusers here; also Flux 2's ``decoder.post_quant_conv``
+    and ``first_stage_model.`` keys). Picked, it is read like any other file: its names are not the model's VAE's, so
+    Forge's strict swap would fail - the cell loads the model with it, and Forge's loader converts it. As the VAE the
+    model is built with, headers cannot tell what the model gets until it is loaded: the cell is left to Forge."""
+
+    LDM, DIFFUSERS = "sdxl_vae.safetensors", "sdxl_vae_diffusers.safetensors"
+
+    def setUp(self):
+        super().setUp()
+        folder = Path(self.tmp.name) / "models" / "VAE"
+        for name, spec in ((self.LDM, fx.tiny_kl()), (self.DIFFUSERS, fx.tiny_kl(diffusers=True))):
+            self.forge.module_list[name] = STOCK_VAE_DICT[name] = str(fx.write_vae(folder / name, spec, 1.0))
+
+    def select(self, vae):
+        modules = self.forge.paths(vae, TE)
+        self.forge.opts.data["forge_additional_modules"] = modules
+        self.forge.loading["additional_modules"] = list(modules)
+
+    def test_a_picked_file_forge_converts_is_loaded_with_the_model(self):
+        self.select(self.LDM)
+        self.load(fx.tiny_kl())
+        self.assertTrue(xvae.needs_conversion(xvae.file_shapes(self.forge.module_list[self.DIFFUSERS])))
+        stderr = io.StringIO()
+        with self.forge.installed(), contextlib.redirect_stderr(stderr):
+            pc = self.cell(P(), self.DIFFUSERS)
+            self.assertEqual(self.forge.params["additional_modules"], self.forge.paths(self.DIFFUSERS, TE))
+            self.assertEqual(self.forge.processing._overridden_modules, self.forge.paths(self.DIFFUSERS, TE))
+            self.assertNotIn("sd_vae", pc.override_settings, "Forge's in-place swap does not run")
+            self.hook.postprocess(pc, None)
+        self.assertIsNone(cell_runtime.state())
+        self.assertIn(f"[XYZ VAE] {self.DIFFUSERS} is a", stderr.getvalue())
+        self.assertIn("Forge cannot swap it in place", stderr.getvalue())
+
+    def test_a_model_built_with_a_converted_file(self):
+        self.select(self.DIFFUSERS)
+        self.load(fx.tiny_kl())                                   # Forge's loader gave the model the LDM names
+        self.forge.sd_models.model_data.forge_hash = "another model"
+        with self.forge.installed(), contextlib.redirect_stderr(io.StringIO()) as stderr:
+            # not loaded yet: the selection's file cannot tell the model's VAE - Forge's swap, as without sam-extra
+            pc = self.cell(P(), V3HDR)
+            self.assertEqual(pc.override_settings["sd_vae"], STOCK_VAE_DICT[V3HDR])
+            self.assertIsNone(cell_runtime.state())
+            self.assertEqual(stderr.getvalue(), "")
+            # loaded: the model's VAE is read from memory
+            self.load(fx.tiny_kl())
+            pc = self.cell(P(), V3HDR)
+            self.assertEqual(self.forge.params["additional_modules"], self.forge.paths(V3HDR, TE))
+            self.assertNotIn("sd_vae", pc.override_settings)
+            self.hook.postprocess(pc, None)
+            pc = self.cell(P(), self.LDM)
+            self.assertEqual(pc.override_settings["sd_vae"], STOCK_VAE_DICT[self.LDM])
         self.assertIsNone(cell_runtime.state())
 
 

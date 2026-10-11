@@ -401,7 +401,7 @@ class Grid:
         self.opts = fx.FakeOpts(
             {"sd_model_checkpoint": self.ckpt[CKPT_A].title, "forge_additional_modules": list(self.ui_modules),
              "forge_unet_storage_dtype": "Automatic", "CLIP_stop_at_last_layers": 1},
-            {"forge_additional_modules": [], "sd_modules_dropdown_use_short": True})
+            fx.forge_selection_defaults(forge_source("modules/shared_options.py")))
 
         shared = self.shared = types.ModuleType("modules.shared")
         shared.opts = self.opts
@@ -422,8 +422,9 @@ class Grid:
         proc = self.proc = types.ModuleType("modules.processing")
 
         main_entry = self.main_entry = types.ModuleType("modules_forge.main_entry")
-        main_entry.__dict__.update(
-            shared=shared, sd_models=sd_models, module_list=self.module_list, module_map=self.module_map, os=os,
+        main_entry.__dict__.update(   # module_map only where this Forge has it (2.30-6): 2.29.2 / 2.30-2 run without
+            fx.forge_module_lists(forge_source("modules_forge/main_entry.py"), self.module_list, self.module_map),
+            shared=shared, sd_models=sd_models, os=os,
             torch=types.SimpleNamespace(float16="float16", bfloat16="bfloat16"),
             forge_unet_storage_dtype_options={"Automatic": (None, False)}, logger=logging.getLogger("xyz-te-test"),
             print_json=lambda **kwargs: None, dynamic_args=types.SimpleNamespace(online_lora=False), processing=proc)
@@ -626,7 +627,7 @@ class GridCase(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         for rel in ("modules/processing.py", "modules/sysinfo.py", "modules_forge/main_entry.py", "modules/sd_models.py",
-                    "modules/sd_samplers_common.py", "scripts/xyz_grid.py"):
+                    "modules/sd_samplers_common.py", "scripts/xyz_grid.py", "modules/shared_options.py"):
             require_forge_file(rel)
 
     def setUp(self):
@@ -853,6 +854,24 @@ class GridTests(GridCase):
         with self.assertRaisesRegex(ValueError, "is a Qwen3-VL 4B encoder"):
             g.run(self.p, x=(g.te_axis, ["qwen_3_06b_base_full_fp32", "qwen3vl_4b_bf16"]))
         self.assertEqual(g.cells, [])
+        self.assertRestored()
+
+    def test_the_checkouts_main_entry_and_settings(self):
+        """The grid's main_entry and settings are the checkout's shape: ``module_map`` and the dropdown's short-name
+        setting only where Forge has them (2.30-6) - on 2.29.2 / 2.30-2 the dropdown values, a grid and the labels
+        work without them, the values as file names (those versions' dropdown)."""
+        g = self.grid
+        has_map = "module_map" in fx.forge_module_lists(forge_source("modules_forge/main_entry.py"), {}, {})
+        self.assertEqual(hasattr(g.main_entry, "module_map"), has_map)
+        self.assertEqual(fx.DROPDOWN_SHORT_KEY in g.opts.defaults, has_map, "both came with 2.30-6")
+        with mock.patch.dict(sys.modules, g.sys_modules):
+            choices = g.te_axis.choices()
+            label = g.te_axis.format_value(self.p, g.te_axis, TE_FP32)
+        self.assertEqual(choices[0], "Use Forge current")
+        self.assertLessEqual({TE, TE_FP32, TE_FP16}, set(choices))
+        self.assertEqual(label, "Text Encoder: qwen_3_06b_base_full_fp32")
+        g.run(self.p, x=(g.te_axis, [choices[0], TE_FP32]))
+        self.assertEqual(self.models(), [expected(CKPT_A, VAE, TE), expected(CKPT_A, VAE, TE_FP32)])
         self.assertRestored()
 
 

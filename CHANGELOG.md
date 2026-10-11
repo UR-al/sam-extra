@@ -179,8 +179,12 @@ Forge 기본 XYZ 에는 `VAE` 축만 있고 텍스트 인코더를 바꿔 가며
   헤더와 비교. 들어가면 Forge 의 교체 그대로(호출까지 기본 축과 같음), 안 들어가면 그 칸만 VAE 를 바꾼 목록으로 모델을 다시 불러옵니다
   (`sam3ext/xyz_vae_cell.py` → `[Modules] Text Encoder` 축과 같은 `sam3ext/xyz_text_encoder_cell.py`: loading parameters 와
   `Module N` 에만 넣고 Forge 설정 · config.json 은 쓰지 않으며 칸이 끝나면 되돌림, 그 칸의 `sd_vae` 는 빼서 Forge 의 교체가 다시
-  돌지 않음). 텍스트 인코더 축과는 X · Y · Z 어느 자리 · 순서로 섞어도 칸마다 두 값이 함께 들어갑니다. 헤더로 알 수 없는 VAE(pickle,
-  Forge 가 먼저 형식을 바꾸는 파일)는 Forge 기본 동작 그대로입니다.
+  돌지 않음). 텍스트 인코더 축과는 X · Y · Z 어느 자리 · 순서로 섞어도 칸마다 두 값이 함께 들어갑니다. 헤더로 알 수 없을 때 — 고른
+  파일이 pickle 이거나 읽을 수 없을 때, 또는 불러온 모델이 그 칸의 모델이 아니고 모델이 만들어질 VAE(선택 목록의 마지막 VAE 파일,
+  없으면 체크포인트의 VAE)를 헤더로 읽을 수 없을 때(pickle, Forge 가 먼저 형식을 바꾸는 diffusers · Flux 2 · `first_stage_model.`
+  형식) — 는 Forge 기본 동작 그대로입니다. **고른** 파일이 그런 변환 형식이면 텐서 이름이 모델의 VAE 와 달라 Forge 의 교체가
+  실패하므로, 다른 형식의 VAE 처럼 그 칸만 그 파일로 모델을 다시 불러옵니다(Forge 의 로더가 형식을 바꿈, 그 칸은 모델 재로딩만큼
+  시간이 듦).
 
 ### 모델 내리기 버튼 (새 기능)
 
@@ -324,6 +328,15 @@ Forge Neo 2.30 에서 달라진 것에 맞춥니다. CPU 테스트 전체가 2.2
   때만 더해져 그 칸이 Forge 의 로더 오류로 끝남). 코드는 그대로이고, Forge 원본 대조 테스트(`test_xyz_text_encoder_origin.py`)가
   체크아웃의 로더에 8B 자리가 있는지 보아 2.29.2 에서는 Forge 가 거절하는 것과 그 판의 모델 목록에 그 자리가 없는 것을 확인합니다
   (병합 직후 2.29.2 에서 3개 실패). README 의 XYZ 절에 적었습니다.
+- **XYZ `[Modules] Text Encoder` × Forge 2.29.2 · 2.30-2 — `module_map`** (릴리스 전 검토에서 찾음): 축은 Forge 의
+  `main_entry.module_map`(파일 이름 → 하위 폴더 경로)을 그대로 읽었는데, 이 표는 드롭다운의 경로 표기 설정과 함께 2.30-6 에서
+  생겨 2.29.2 · 2.30-2 에는 없습니다. 그 판에서는 XYZ 에서 축을 고르거나 값 채우기를 누를 때(`choices`), 이 축을 쓴 그리드의 첫 칸
+  전(`confirm`)과 칸마다(`apply`) `AttributeError` 로 멈췄습니다. 이제 없으면 빈 표로 읽어 그 판의 드롭다운처럼 파일 이름을
+  후보로 보입니다(`scripts/modules_xyz_text_encoder.py` `_module_list`). 테스트 대역이 판과 상관없이 늘 `module_map` 을 넣어 세 판
+  전체 통과에도 드러나지 않았으므로, 스크립트 테스트의 Forge 대역에 2.30-6 전 모양(`module_map` · 드롭다운 설정 없음)을 더하고,
+  Forge 원본 대조 테스트 두 곳(`test_xyz_text_encoder_origin.py` · `test_xyz_vae_origin.py`)은 체크아웃의 `main_entry.py` 가 정의할
+  때만 `module_map` 을, `shared_options.py` 에 있을 때만 그 설정을 넣습니다. 고치기 전에는 2.29.2 에서 그 테스트들이 33개 오류로
+  실패합니다.
 - **스크립트 순서**: 새 스크립트 셋도 `negpip.py` 앞이고 `negpip.py` 가 이 확장의 마지막 스크립트입니다(통합 시험).
 - **문서**: README · THIRD_PARTY_NOTICES.md 는 다섯 갈래를 그대로 합쳤습니다(재구현 표에 얼굴 검출 · crop 행 뒤로 XYZ 두 행). README 의
   태그 자동완성 옮기기 안내를 콘솔 · 설정 안내 줄과 같게 "옮긴 뒤 그 폴더를 extensions 밖으로"로 맞추고, 모델 내리기 절의 목록에 얼굴
@@ -383,7 +396,8 @@ Forge Neo 2.30 에서 달라진 것에 맞춥니다. CPU 테스트 전체가 2.2
   에서 진짜 클릭 흐름으로 결과 글을 채우기 전과 뒤의 사각형을 잽니다 — 두 버튼이 같은 줄에 붙어 있는지, 결과가 나와도 버튼이 그
   자리인지, 결과가 버튼 아래 오른쪽 정렬인지. 옛 배치에서는 다섯 다 실패합니다.
 - XYZ `[Modules] Text Encoder`: `tests/test_xyz_text_encoder.py`(자리 판정 · GGUF 읽기 · 체크포인트 · 값 · 목록 · 축 둘 · 후보 · 라벨),
-  `tests/test_xyz_text_encoder_script.py`(등록 · Reload UI · 훅 · 축 둘 · 체크포인트), `tests/test_xyz_text_encoder_origin.py` — Forge 의
+  `tests/test_xyz_text_encoder_script.py`(등록 · Reload UI · 훅 · 축 둘 · 체크포인트 · `module_map` 이 없는 2.30-6 전 Forge 와 2.30-6
+  의 하위 폴더 경로 후보), `tests/test_xyz_text_encoder_origin.py`(그리드의 `main_entry` · 설정이 체크아웃 모양) — Forge 의
   `replace_state_dict` · `gguf_remapping` · `preprocess_state_dict` 를 같은 헤더에 돌려 자리 · 내장 인코더를 대조하고(체크아웃의
   `models/text_encoder` 파일 헤더 포함), GGUF 읽기를 Forge 의 gguf-py `GGUFReader` · `get_orig_shape` 와 대조하고, Forge 의
   `process_images` · `set_config` · `modules_change` · `checkpoint_change` · `refresh_model_loading_parameters` · Hires 의 모델 전환
@@ -393,7 +407,8 @@ Forge Neo 2.30 에서 달라진 것에 맞춥니다. CPU 테스트 전체가 2.2
   `replace_state_dict` 의 탐지 키 · 너비 · 자리 이름 · 계열 표와 `gguf_remapping` 의 이름 표를 지킵니다.
   `tests/test_integration_load_order.py` 에 `[Modules]` 축 하나를 더했습니다.
 - XYZ `VAE` 축: `tests/test_xyz_vae.py`(형식 · 엄격 로드 비교 · 예측 · 목록), `tests/test_xyz_vae_script.py`(제자리 교체 · Reload UI ·
-  훅), `tests/test_xyz_vae_origin.py` — Forge 의 `modules/sd_vae.py` 전체 · `process_images` · `forge_model_reload` ·
+  훅 · 고른 diffusers 형식 파일은 모델과 함께 불러옴 · 그런 파일로 만든 모델은 불러오기 전까지 Forge 에 맡김),
+  `tests/test_xyz_vae_origin.py` — Forge 의 `modules/sd_vae.py` 전체 · `process_images` · `forge_model_reload` ·
   `load_torch_file` · `load_state_dict` · `set_config` · `main_entry` 와 xyz_grid 의 `VAE` 축 정의 그대로를 형식마다 텐서 몇 개짜리 진짜
   VAE 파일로 CPU 에서 돌려, 사용자의 그리드(3D 선택, 3D/2D/3D/2D/2D)가 기본 축으로는 세 칸이 검고 바꾼 축으로는 모두 그려지는 것,
   다른 순서 · 2D 선택에서의 반대, 같은 형식 칸은 기본 축과 호출 하나까지 같은 것, 실패한 칸 · 불러오지 못한 VAE · 중단 뒤 복원, 라벨 ·
@@ -416,9 +431,9 @@ Forge Neo 2.30 에서 달라진 것에 맞춥니다. CPU 테스트 전체가 2.2
   `test_integration_load_order.py` 의 XYZ 축 공존(1개). 돌연변이 확인: 페이지 스크립트에 상류와 같은 전역 이름을 하나 두면 JS 넷이
   모두 실패합니다.
 - 전체(CPU, `CUDA_VISIBLE_DEVICES=-1`, 각 Forge 체크아웃의 extensions 에 이 판을 복사해 `SAM3_FORGE_ROOT` 로), 2026-10-12:
-  Forge 2.29.2(`d70373eb`) 3701 테스트 · 건너뜀 32, 2.30-2(`45f41b81`) 3701 · 건너뜀 31, 2.30-6(`ede60e1a`) 3701 · 건너뜀 30 —
+  Forge 2.29.2(`d70373eb`) 3706 테스트 · 건너뜀 32, 2.30-2(`45f41b81`) 3706 · 건너뜀 31, 2.30-6(`ede60e1a`) 3706 · 건너뜀 30 —
   셋 다 실패 0 · 오류 0. 설치된 Forge(2.30-6) 를 `SAM3_FORGE_ROOT` 로 둔 작업 트리(확장 폴더 밖이라 Forge 옆을 찾는 테스트는
-  건너뜀): 3605 · 건너뜀 186 · 실패 0 · 오류 0. JS(`npm test`, node:test + jsdom) 297개 모두 통과(2.30-6 체크아웃 옆 — 작업
+  건너뜀): 3610 · 건너뜀 186 · 실패 0 · 오류 0. JS(`npm test`, node:test + jsdom) 297개 모두 통과(2.30-6 체크아웃 옆 — 작업
   트리에서는 Forge 의 `progressbar.js` 를 쓰는 1개를 건너뜀).
 
 ## v0.33.1 — IPNDM_V 4차 계수 오타 (Linear Quadratic 에서 그림이 깨지던 것)

@@ -187,7 +187,7 @@ class VaeGrid:
         self.opts = tfx.FakeOpts(
             {"sd_model_checkpoint": self.ckpt[CKPT_A].title, "forge_additional_modules": list(self.ui_modules),
              "forge_unet_storage_dtype": "Automatic", "sd_vae": "Automatic"},
-            {"forge_additional_modules": [], "sd_modules_dropdown_use_short": True})
+            tfx.forge_selection_defaults(forge_source("modules/shared_options.py")))
 
         # modules.sd_models: Forge's SdModelData / FakeInitialModel / forge_model_reload / checkpoint lookup
         sd_models = self.sd_models = types.ModuleType("modules.sd_models")
@@ -219,8 +219,9 @@ class VaeGrid:
         sd_models.forge_model_reload = forge_function("modules/sd_models.py", "forge_model_reload", reload_ns)
 
         main_entry = self.main_entry = types.ModuleType("modules_forge.main_entry")
-        main_entry.__dict__.update(
-            shared=shared, sd_models=sd_models, module_list=self.module_list, module_map=self.module_map, os=os,
+        main_entry.__dict__.update(   # module_map only where this Forge has it (2.30-6): 2.29.2 / 2.30-2 run without
+            tfx.forge_module_lists(forge_source("modules_forge/main_entry.py"), self.module_list, self.module_map),
+            shared=shared, sd_models=sd_models, os=os,
             torch=types.SimpleNamespace(float16="float16", bfloat16="bfloat16"),
             forge_unet_storage_dtype_options={"Automatic": (None, False)}, logger=logging.getLogger("xyz-vae-test"),
             print_json=lambda **kwargs: None, dynamic_args=types.SimpleNamespace(online_lora=False), processing=proc)

@@ -17,8 +17,12 @@ the cell has been applied and before ``process_images`` loads the model:
   ``override_settings`` (Forge's swap would raise and leave a black cell), so the cell renders what choosing the file
   in the "VAE / Text Encoder" dropdown renders.
 
-When the headers cannot tell (a pickle VAE, an unreadable file, a format Forge converts first) the cell is left to
-Forge, as before.
+When the headers cannot tell, the cell is left to Forge, as before: the picked file is a pickle or unreadable, or the
+VAE the cell's model is built with cannot be read - that model is not the loaded one, and its VAE file (the module
+list's last) is a pickle, unreadable or in a format Forge's loader converts first (diffusers, Flux 2's
+``decoder.post_quant_conv``, ``first_stage_model.`` keys), or without a VAE file the checkpoint's own VAE cannot be
+read. A PICKED file in such a converted format is read like any other: its tensor names are not the model's VAE's, so
+Forge's strict swap would fail, and the cell loads the model with it (the loader converts it).
 """
 from __future__ import annotations
 

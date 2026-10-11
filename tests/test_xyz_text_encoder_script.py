@@ -3,8 +3,8 @@
 Registration (appended once, replaced in place on Reload UI), the axis (label, type, cost, choices, confirm, labels),
 ``apply`` on xyz_grid's shallow cell copies (also with the axis on two of X/Y/Z), the checkpoint the slot check reads,
 the always-on hook (the cell's list in the loading parameters and the ``Module N`` list, Forge's settings and the
-parent's ``override_settings`` untouched, both put back after the cell) and the empty module list. Forge's own settings
-/ reload / restore code runs in tests/test_xyz_text_encoder_origin.py.
+parent's ``override_settings`` untouched, both put back after the cell), Forge before 2.30-6 (no ``module_map``) and the
+empty module list. Forge's own settings / reload / restore code runs in tests/test_xyz_text_encoder_origin.py.
 """
 from __future__ import annotations
 
@@ -70,13 +70,18 @@ FLUX_MODULES = ("ae.safetensors", "clip_l.safetensors", "t5xxl_fp16.safetensors"
 
 
 class Forge:
-    """The pieces of Forge the script reads when it runs, as ``sys.modules`` entries (``forge.installed()``)."""
+    """The pieces of Forge the script reads when it runs, as ``sys.modules`` entries (``forge.installed()``).
+
+    ``forge_230_6=False``: the shape of Forge 2.29.2 / 2.30-2 - ``main_entry`` has no ``module_map`` and Settings has no
+    'Show filenames without folder in the VAE / Text Encoder dropdown' (``sd_modules_dropdown_use_short``); both came
+    with 2.30-6 (``ede60e1a``)."""
 
     def __init__(self, models_path, *, modules=None, data=None, module_list=None, fill_on_refresh=None,
-                 checkpoint=None):
+                 checkpoint=None, forge_230_6=True):
         self.module_list, self.module_map = ({}, {}) if module_list is not None else fx.write_models(models_path)
         if module_list is not None:
             self.module_list.update(module_list)
+        self.forge_230_6 = forge_230_6
         self.fill_on_refresh = fill_on_refresh
         self.refreshes = 0
         self.ckpt_a = checkpoint or fx.CheckpointInfo("anima.safetensors", "aaaa")
@@ -84,7 +89,10 @@ class Forge:
         if data is None:
             data = {"sd_model_checkpoint": self.ckpt_a.title,
                     "forge_additional_modules": self.paths(*(modules or ANIMA_MODULES))}
-        self.opts = fx.FakeOpts(data, {"forge_additional_modules": [], "sd_modules_dropdown_use_short": True})
+        defaults = {"forge_additional_modules": []}
+        if forge_230_6:
+            defaults["sd_modules_dropdown_use_short"] = True
+        self.opts = fx.FakeOpts(data, defaults)
         self.loading = {"checkpoint_info": self.ckpt_a, "additional_modules": list(data.get("forge_additional_modules",
                                                                                            [])),
                         "unet_storage_dtype": None}
@@ -120,7 +128,9 @@ class Forge:
         modules_forge = types.ModuleType("modules_forge")
         modules_forge.__path__ = []
         main_entry = types.ModuleType("modules_forge.main_entry")
-        main_entry.module_list, main_entry.module_map = self.module_list, self.module_map
+        main_entry.module_list = self.module_list
+        if self.forge_230_6:
+            main_entry.module_map = self.module_map
 
         def refresh_models():
             forge.refreshes += 1
@@ -507,6 +517,45 @@ class CheckpointTests(ScriptCase):
         with forge.installed():
             with self.assertRaisesRegex(ValueError, "the axis cannot read the checkpoint"):
                 self.axis.confirm(P(), ["qwen3vl_4b_bf16"])
+
+
+class ForgeVersionTests(ScriptCase):
+    """``main_entry.module_map`` and the dropdown's short-name setting exist only from Forge 2.30-6; on 2.29.2 / 2.30-2
+    the axis works the same and lists file names, as those versions' dropdown does."""
+
+    FP32 = "qwen_3_06b_base_full_fp32.safetensors"
+
+    def test_without_module_map(self):
+        forge = Forge(self.models, forge_230_6=False)
+        stderr = io.StringIO()
+        with forge.installed(), contextlib.redirect_stderr(stderr):
+            self.assertFalse(hasattr(sys.modules["modules_forge.main_entry"], "module_map"))
+            with self.assertRaises(AttributeError):
+                forge.opts.sd_modules_dropdown_use_short
+            self.assertEqual(self.axis.choices(), [
+                "Use Forge current", "qwen_3_06b_base.safetensors", "qwen_3_06b_base_fp16_uncensored.safetensors",
+                self.FP32])
+            self.axis.confirm(P(), ["Use Forge current", "qwen_3_06b_base_full_fp32", self.FP32, "anima/" + self.FP32])
+            pc = self.cell(forge, P(), "qwen_3_06b_base_full_fp32")
+            self.assertEqual(forge.params["additional_modules"], forge.paths("qwen_image_vae.safetensors", self.FP32))
+            self.assertEqual(forge.processing._overridden_modules,
+                             forge.paths("qwen_image_vae.safetensors", self.FP32))
+            self.assertEqual(self.axis.format_value(pc, self.axis, self.FP32),
+                             "Text Encoder: qwen_3_06b_base_full_fp32")
+            self.hook.postprocess(pc, None)
+        self.assertIsNone(cell_runtime.state())
+        self.assertEqual(stderr.getvalue(), "")
+
+    def test_relative_paths_from_module_map_on_2_30_6(self):
+        forge = Forge(self.models)
+        forge.module_map[self.FP32] = "anima/" + self.FP32
+        forge.opts.data["sd_modules_dropdown_use_short"] = False
+        with forge.installed():
+            choices = self.axis.choices()
+            self.assertIn("anima/" + self.FP32, choices)
+            self.assertNotIn(self.FP32, choices)
+            self.cell(forge, P(), "anima/" + self.FP32)
+        self.assertEqual(forge.params["additional_modules"], forge.paths("qwen_image_vae.safetensors", self.FP32))
 
 
 class EmptyListTests(unittest.TestCase):

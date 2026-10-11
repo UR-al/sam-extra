@@ -57,7 +57,9 @@ def _main_entry():
 
 def _module_list():
     """Forge's ``module_list`` (file name -> full path) and ``module_map`` (file name -> relative path). Forge fills them
-    while it builds the UI and on every page load; when they are empty (an API-only start) they are filled once here."""
+    while it builds the UI and on every page load; when they are empty (an API-only start) they are filled once here.
+    ``module_map`` came with Forge 2.30-6 (with the dropdown's relative-path option); before it - 2.29.2, 2.30-2 - it is
+    ``{}`` here and the dropdown values are file names, as that Forge's dropdown shows them."""
     main_entry = _main_entry()
     if not main_entry.module_list:
         try:
@@ -67,7 +69,7 @@ def _module_list():
     if not main_entry.module_list:
         raise xte.AxisValueError(f"{xte.AXIS_LABEL}: Forge's VAE / Text Encoder list is empty "
                                  "(no file in models/VAE or models/text_encoder)")
-    return main_entry.module_list, main_entry.module_map
+    return main_entry.module_list, getattr(main_entry, "module_map", None) or {}
 
 
 def _text_encoder_roots() -> list:

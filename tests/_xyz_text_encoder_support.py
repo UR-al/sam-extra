@@ -10,10 +10,13 @@
   city96 name them, with the slots Forge's ``gguf_remapping`` + ``replace_state_dict`` give them;
 * ``CHECKPOINTS`` — checkpoint headers (SD1, SDXL, the SDXL refiner, Flux all-in-one / UNet-only, Anima) with the model
   type and the encoder slots they have built in;
-* ``header`` — a header dict from ``{key: shape}``.
+* ``header`` — a header dict from ``{key: shape}``;
+* ``forge_module_lists`` / ``forge_selection_defaults`` — ``main_entry``'s lists and the selection's settings as the
+  Forge checkout has them (``module_map`` and the dropdown's short-name setting only from 2.30-6).
 """
 from __future__ import annotations
 
+import ast
 import json
 import struct
 from pathlib import Path
@@ -306,6 +309,42 @@ def write_models(models_path) -> tuple[dict, dict]:
         module_list[name] = str(path)
         module_map[name] = name
     return module_list, module_map
+
+
+DROPDOWN_SHORT_KEY = "sd_modules_dropdown_use_short"
+
+
+def forge_module_lists(main_entry_source: str, module_list: dict, module_map: dict) -> dict:
+    """``main_entry``'s module-level lists as the Forge whose ``modules_forge/main_entry.py`` is ``main_entry_source``
+    has them: ``module_list`` always, ``module_map`` (file name -> relative path) only where that file defines it - from
+    2.30-6 (``ede60e1a``). 2.29.2 / 2.30-2 have none, and the axis must work there too."""
+    names = set()
+    for node in ast.parse(main_entry_source).body:
+        targets = (node.targets if isinstance(node, ast.Assign) else [node.target] if isinstance(node, ast.AnnAssign)
+                   else [])
+        names.update(target.id for target in targets if isinstance(target, ast.Name))
+    lists = {"module_list": module_list}
+    if "module_map" in names:
+        lists["module_map"] = module_map
+    return lists
+
+
+def forge_selection_defaults(shared_options_source: str) -> dict:
+    """``FakeOpts`` defaults of the VAE / Text Encoder selection: ``forge_additional_modules`` and, where the Forge
+    whose ``modules/shared_options.py`` is ``shared_options_source`` has it (2.30-6), ``sd_modules_dropdown_use_short``
+    with that Forge's default (``OptionInfo(<default>, ...)``)."""
+    defaults = {"forge_additional_modules": []}
+    for node in ast.walk(ast.parse(shared_options_source)):
+        if not isinstance(node, ast.Dict):
+            continue
+        for key, value in zip(node.keys, node.values):
+            if not (isinstance(key, ast.Constant) and key.value == DROPDOWN_SHORT_KEY):
+                continue
+            while isinstance(value, ast.Call) and isinstance(value.func, ast.Attribute):  # .info(...).needs_reload_ui()
+                value = value.func.value
+            if isinstance(value, ast.Call) and getattr(value.func, "id", None) == "OptionInfo" and value.args:
+                defaults[DROPDOWN_SHORT_KEY] = ast.literal_eval(value.args[0])
+    return defaults
 
 
 def write_checkpoint(folder, case: str, name: str | None = None) -> Path:
