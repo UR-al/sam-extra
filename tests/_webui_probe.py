@@ -104,6 +104,11 @@ def new_xyz_grid():
     module.AxisOptionTxt2Img = AxisOption
     module.axis_options = [AxisOption(label, str, _forge_apply_vae if label == "VAE" else None)
                            for label in forge_xyz_labels()]
+    # xyz_grid's format functions (scripts/!sam3.py builds its "[SAM3] …" axes with them in before_ui)
+    module.format_value = lambda p, opt, x: x
+    module.format_value_add_label = lambda p, opt, x: f"{opt.label}: {x}"
+    module.format_remove_path = lambda p, opt, x: os.path.basename(str(x))
+    module.format_nothing = lambda *args, **kwargs: ""
     return module
 
 

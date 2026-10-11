@@ -7,11 +7,14 @@
   ultralytics 는 ADetailer 가 Forge venv 에 깔아 둔 것을 쓴다(없으면 오류 메시지로 알림). 장치는 ADetailer 처럼 비워 두어
   (``""``) ultralytics 가 지금 CUDA 장치를 고르게 하고, SAM3 장치가 cpu 면 ``"cpu"`` — 장치 번호를 주면 ultralytics 가
   ``torch.cuda.set_device`` 로 프로세스 기본 장치를 바꾸기 때문이다.
+* 캐시하지 않는다: 부를 때마다 모델을 읽고 놓는다. '모델 내리기' 버튼(``sam3ext/unload_registry.py``)의 훅
+  ``release_face_detector`` 는 놓은 검출기가 아직 살아 있을 때만(참조 고리 · 예외의 traceback 이 붙듦) 그 안의 모델을 뗀다.
 
 이 모듈은 불러올 때 torch·ultralytics 를 import 하지 않는다(테스트는 ``detect_faces`` 를 가짜로 바꾼다).
 """
 from __future__ import annotations
 
+import weakref
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -22,6 +25,8 @@ MODEL_SUFFIX = ".pt"
 ADETAILER_FOLDER = "adetailer"
 # ADetailer 설정(Settings → ADetailer → Extra paths to scan adetailer models) — 있으면 같은 폴더도 본다.
 OPT_EXTRA_MODEL_DIRS = "ad_extra_models_dir"
+# detect_faces 가 만든 검출기(약한 참조) — 놓은 뒤에도 살아 있는 것만 남는다. release_face_detector 가 본다.
+_DETECTORS: "weakref.WeakSet[Any]" = weakref.WeakSet()
 
 
 class FaceDetectorUnavailable(RuntimeError):
@@ -176,6 +181,7 @@ def detect_faces(image, model_name: str, confidence: float, device: str) -> Face
         ) from exc
     _guard_no_download(path)
     model = YOLO(str(path))
+    _remember(model)
     try:
         pred = model(image, conf=float(confidence), device=ultralytics_device(device), verbose=False)
     finally:
@@ -190,3 +196,26 @@ def detect_faces(image, model_name: str, confidence: float, device: str) -> Face
     if len(scores) != len(xyxy):
         scores = (scores + [float("nan")] * len(xyxy))[: len(xyxy)]
     return FaceDetection(boxes=xyxy, scores=scores, model_path=str(path))
+
+
+def _remember(detector: Any) -> None:
+    try:
+        _DETECTORS.add(detector)
+    except TypeError:   # 약한 참조를 받지 않는 객체(대역) — 놓으면 바로 사라진다
+        pass
+
+
+def release_face_detector() -> bool:
+    """'모델 내리기' 버튼의 훅(sam3ext/unload_registry.py). ``detect_faces`` 는 부를 때마다 모델을 읽고 놓으므로 보통 쥔
+    것이 없다(False). 놓은 검출기가 아직 살아 있으면 — ultralytics 객체의 참조 고리가 gc 를 기다리거나 예외의 traceback 이
+    붙들어 그동안 가중치가 VRAM 에 남음 — 그 안의 모델과 predictor 를 떼어 놓고 True. 버튼은 이 뒤에 gc 와 CUDA 캐시
+    비우기를 한다. 검출기는 다시 쓰지 않으므로(다음 검출은 파일에서 새로 읽음) 떼어도 된다."""
+    alive = list(_DETECTORS)
+    for detector in alive:
+        for attr in ("predictor", "model"):
+            try:
+                setattr(detector, attr, None)
+            except Exception:
+                pass
+    _DETECTORS.clear()
+    return bool(alive)

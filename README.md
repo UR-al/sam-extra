@@ -448,6 +448,9 @@ Forge 기본 XYZ 에는 VAE 를 바꾸는 `VAE` 축은 있지만 텍스트 인�
   선택에 Qwen3-VL 4B, 인코더가 체크포인트에 든 SDXL 에 T5 — 이 축은 모델이 이미 가진 인코더만 바꿈), 체크포인트 계열이 받지 않는
   CLIP(SD1 의 CLIP-G, Anima 같은 계열의 CLIP-L · CLIP-G — Forge 가 버림), 같은 자리를 채우는 두 파일. 목록에도 체크포인트에도
   인코더가 보이지 않으면(체크포인트를 읽을 수 없는 `.ckpt` 등) 고른 인코더를 더합니다 — 드롭다운에서 고를 때와 같습니다.
+- **Forge 2.29.2**: 자리 판정은 2.30 의 로더를 따릅니다. Qwen3-VL 8B 인코더(Qwen-Image 2.1 용 자리)는 2.30 에서 생겨 2.29.2 의
+  Forge 는 읽지 못하는데, 그 판에는 이 자리를 가진 모델 계열이 없어 위의 "모델이 가진 자리가 아닌 인코더" 로 막힙니다(목록에도
+  체크포인트에도 인코더가 보이지 않을 때만 위 규칙대로 더해져, 그 칸은 Forge 의 로더 오류로 끝납니다).
 - **pickle 인코더**(`.pt` · `.bin` 등): 불러오지 않고는 자리를 알 수 없어 드롭다운 후보에는 없고, 텍스트 입력으로 쓰면 지금 선택의
   인코더가 **하나**일 때 그것을 바꿉니다. 선택에 pickle 인코더가 있어 다른 인코더를 고를 수 없을 때는 그 자리의 safetensors · GGUF
   인코더를 목록에 넣으라고 안내합니다. GGUF 는 Forge 가 여는 버전 2 · 3 파일만 읽습니다(바이트 순서가 반대인 파일은 Forge 도
@@ -1552,7 +1555,8 @@ txt2img 탭 줄(Generation · 임베딩 · 체크포인트 · 로라 · Manage)�
    업스케일러 모델(hires fix · Extras 의 ESRGAN 계열, 최근 4개까지 캐시), TAESD · VAE Approx 미리보기 디코더, 얼굴 복원(GFPGAN ·
    CodeFormer — Settings 의 `Move the model to CPU after restoration` 이 꺼져 있으면 GPU 에 남음)도 버립니다. 다음에 쓸 때 Forge 가
    파일에서 다시 읽습니다.
-3. **sam-extra 가 쥔 모델** — SAM3(`Unload after` 가 CPU RAM 에 보관한 사본까지), Anima 3.8B(Qwen3.5 4B · 커넥터 · 특징 캐시),
+3. **sam-extra 가 쥔 모델** — SAM3(`Unload after` 가 CPU RAM 에 보관한 사본까지), 얼굴 안에서만 찾기의 얼굴 검출기(캐시하지 않아
+   보통 없음 — 놓은 뒤에도 메모리에 남은 검출기만), Anima 3.8B(Qwen3.5 4B · 커넥터 · 특징 캐시),
    캐릭터 레퍼런스의 IP-Adapter(SigLIP2 인코더 포함), DeGrid(NAFNet), TIPO, Modulation CLIP-L, Colorcraft 벡터 · 앵커, VAE 2x
    디코더, 샘플링에 쓰는 작은 장치 행렬과 예외로 끝난 생성이 남긴 가이던스 텐서. VRAM 뿐 아니라 RAM 에서도 놓으며, 다음에 그 기능을
    쓸 때 파일에서 다시 읽습니다.
@@ -2072,7 +2076,8 @@ txt2img·img2img 의 스타일 줄 아래에 접힌 칸 **구도 · 카메라** 
   (`127.0.0.1:7860` 이 응답하면 — 다른 포트로 띄우면 `--forge-port <포트>` 를 포트마다) 아무것도 쓰지 않고 멈춥니다. 떠 있는 Forge 는
   설정을 저장할 때 메모리의 값을 config.json 에 다시 쓰기 때문입니다.
 - **따로 설치한 확장에서 옮기기**: 예전 `extensions/sd-webui-tagcomplete-neo/tags/` 의 사용자 목록·상류 목록·사용 횟수·LoRA 해시
-  캐시는 `tools/migrate_tagcomplete.py` 로 한 번 옮긴 뒤 그 확장을 지우세요. Forge 를 끈 채로, Forge 폴더에서:
+  캐시는 `tools/migrate_tagcomplete.py` 로 한 번 옮긴 뒤 그 확장 폴더를 extensions 밖으로 옮기세요(지우는 것보다 안전 — 아래
+  **둘이 함께 돌지 않음**). Forge 를 끈 채로, Forge 폴더에서:
 
   ```
   venv\Scripts\python.exe -I extensions\forge_sam3_extension\tools\migrate_tagcomplete.py --src extensions\sd-webui-tagcomplete-neo

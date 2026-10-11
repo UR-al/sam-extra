@@ -3,166 +3,35 @@
 버전 태그는 GitHub Releases에도 발행됩니다. 아래는 요약이며, guidance/속도 기능의
 상세는 [docs/GUIDANCE.md](docs/GUIDANCE.md)를 참고하세요.
 
-## 미출시 (Unreleased) — Forge 2.30 호환
+## v0.34.0 — 얼굴 안에서만 찾기 · 태그 자동완성 내장 · XYZ Text Encoder 축 · XYZ VAE 축 형식 혼합 수정 · 모델 내리기 버튼 · Forge 2.30 호환
 
-Forge Neo 2.30 에서 달라진 것에 맞춥니다. CPU 테스트 전체가 2.29.2(`d70373eb`), 2.30-2(`45f41b81`), 2.30-6(`ede60e1a`, 2026-10-11
-에 설치된 Forge) 셋에서 통과합니다. 이 판들에서 GPU 생성은 따로 확인하지 않았습니다. **Batch Cond/Uncond 가 켜진 기본 설정의 결과는
-그대로**입니다(같은 경로를 그대로 지남). 바뀐 것은 Batch Cond/Uncond 를 끈 2.30 에서 Anima 3.8B 의 VRAM 여유 판단, Adaptive Guidance
-가 UNet 래퍼를 걸지 않는 것, 안내 문구입니다. Forge 를 재시작하세요(바뀐 Python 파일).
+2026-10-12. 따로 만든 다섯 갈래를 한 판으로 합쳤습니다: SAM3 의 **얼굴 안에서만 찾기**(face_yolov8 얼굴 상자 안에서만 SAM3),
+따로 설치하던 sd-webui-tagcomplete-neo 를 넣은 **태그 자동완성 내장**(기본 태그 목록은 2026-10-01 Danbooru), XYZ 의
+**`[Modules] Text Encoder` 축**과 2D/3D 형식이 다른 VAE 를 섞으면 검은 칸이 나오던 **`VAE` 축 수정**, notebook 탭 줄의 **모델 내리기
+버튼**, **Forge Neo 2.30 호환**(Batch Cond/Uncond · Spectrum · DeGrid · 2.30-6 드롭다운)입니다. 얼굴 crop 은 기본 꺼짐, 새 XYZ 축은 고를
+때만, 버튼은 누를 때만 돌아 쓰지 않으면 결과가 그대로이고, `VAE` 축은 형식이 같은 VAE 끼리면 Forge 의 교체 그대로입니다. Forge 2.30
+대응으로 바뀌는 것은 Batch Cond/Uncond 를 끈 경우뿐입니다. CPU 테스트 전체가 Forge 2.29.2 · 2.30-2 · 2.30-6 에서 실패 없이
+통과합니다(아래 **문서 · 테스트**). 실제 모델로 GPU 생성은 하지 않았습니다.
 
-### Batch Cond/Uncond (Forge 2.30 Settings → Optimizations)
+**업그레이드할 때**
 
-- 2.30 은 cond · uncond 를 한 UNet 호출로 묶을지 고르는 설정을 새로 둡니다(기본 켬). 끄면 `can_concat_cond` 가 늘 거짓이라 cond
-  와 uncond 가 따로(cond 먼저) 돌고, `sampling_prepare` 가 잡는 추론 메모리가 2 × batch 행에서 batch 행으로 줍니다. 2.29.2 에는 이
-  설정이 없어, 켠 2.30 처럼 메모리가 허락하면 묶고(VRAM 여유가 모자라면 따로 호출) 추론 메모리는 늘 2 × batch 행으로 잡습니다. 이
-  확장은 두 판에서 같은 방법(`shared.batch_cond_uncond`, 읽지 못하면 켬)으로 읽습니다(`sam3ext/forge_batching.py`).
-- **Anima 3.8B**: TE · Qwen3.5 를 VRAM 에 남길지 정할 때 다음 샘플링의 추론 몫을 Forge 와 같은 (켬 2 · 끔 1) × batch 행으로 셉니다.
-  예전에는 늘 2 × batch 라, 끈 2.30 에서는 여유를 실제보다 적게 보고 필요 없이 내릴 수 있었습니다. 켬 · 2.29.2 는 예전과 같습니다.
-- **Adaptive Guidance**: 묶음 호출에서만 uncond 행을 빼므로, 끄면 아무것도 생략할 수 없습니다. 그래서 그때 ADG 는 켜져 있어도 ADG 를
-  끈 것과 같게 돕니다: 자기 UNet 래퍼(`model_function_wrapper`)를 걸지 않아 다른 확장의 래퍼(Spectrum Integrated 등)를 밀어내지
-  않고, 결과도 ADG 를 끈 것과 비트 단위로 같습니다(다른 확장의 래퍼가 있는 경우까지 테스트로 확인). PAG/SEG/SLG 가 함께 켜져
-  있으면 래퍼는 그쪽 몫으로 예전처럼 걸립니다. infotext 에 `Anima Adaptive Guidance status: ADG inactive (Batch Cond/Uncond off)` 를
-  남기고(값에 쌍점 · 쉼표가 없어 Forge 가 따옴표로 감싸지 않고 이 글 그대로 적힘) 콘솔에 한 번 알리며, 검증 로그 판정은 설정을
-  직접 읽어 `NO-SKIP(Batch Cond/Uncond off)` 입니다. 패널 안내 · README · docs/GUIDANCE.md 에 적었습니다.
-- PAG/SEG/SLG 의 가중 · 영역 조건과 내장 NegPiP 의 SD 훅은 끈 배치 모양(조건마다 따로 호출)에서도 같은 결과입니다 — Forge 의 실제
-  `sampling_function.py` 로 확인하는 테스트를 더했습니다.
+- Forge 를 **완전히 다시 시작**하고 페이지를 새로 고치세요 — 새 스크립트(`builtin_tagcomplete.py` · `layout_unload_models.py` ·
+  `modules_xyz_text_encoder.py`) · 새 JS(`tagcomplete_loader.js` · `notebook_unload_models.js`)와 바뀐 `sam3ext` 모듈은 Reload UI 로는
+  다 읽히지 않습니다(옛 모듈이 남으면 얼굴 crop 은 나오지 않고, 모델 내리기의 일부 항목은 "Forge 를 다시 시작하세요" 로 실패).
+- **따로 설치한 sd-webui-tagcomplete-neo 가 켜져 있으면** 내장은 쉬고, 콘솔과 Settings → Tag Autocomplete 의 안내 줄에 이유와 옮기기
+  명령을 알립니다. Forge 를 끈 채로 Forge 폴더에서 `tools/migrate_tagcomplete.py --src extensions\sd-webui-tagcomplete-neo`(미리보기)
+  → 같은 명령에 `--apply` 로 사용자 태그 목록 · 사용 횟수(`tag_frequency.db`) · LoRA 해시 캐시를 이 확장의 `tags/` 로 **먼저 옮긴 뒤**,
+  그 폴더를 extensions 밖으로 옮기고(지우지 말고) 시작하세요. config.json 의 `tac_tagFile` 이 `tags/` 에 없는 파일이면 그동안 기본
+  목록으로 추천하고, 저장된 값 자체를 바꾸려면 `--set-tagfile <이름> --config config.json`(미리보기) → `--apply --forge-stopped`
+  입니다 — 명령 전체는 README 의 **Tag Autocomplete** 절.
+- API: SAM3 스크립트 인자(state 키) 3개가 맨 뒤에 붙습니다(`sam3_face_crop` · `sam3_face_crop_model` · `sam3_face_crop_confidence` —
+  키가 없으면 꺼짐으로 전과 같음). Refine 입력은 40 → 43개(캔버스 포함 42 → 45)입니다. 다른 스크립트 인자는 그대로이고, 새 설정은
+  내장 태그 자동완성 스위치(`sam3_builtin_tagcomplete_enabled`, 기본 켬)와 저장되지 않는 숨은 키 `sam3_tac_builtin_boot` 뿐입니다
+  (`tac_*` 57개는 따로 설치하던 확장과 같은 키).
+- 새 의존성 `pyyaml` 은 Forge 에 이미 있습니다(`requirements.txt`). 얼굴 crop 의 `ultralytics` 와 얼굴 모델은 ADetailer 가 둔 것을
+  씁니다(아무것도 받지 않음).
 
-### Spectrum Integrated 와 Dy 보조 스텝 · SPEED
-
-- 2.30 의 Spectrum 예측기는 예측의 모양이 입력과 다르면 모델을 다시 돌립니다. 그래서 Dy 네 항목의 보조 스텝을 그대로 돌려도 2.29.2
-  처럼 오류로 멈추지는 않지만, 크기가 바뀔 때마다 예측 기록이 새로 시작합니다. CPU 측정(10 스텝, Spectrum 기본값 · SMEA 는 warm-up 4)
-  에서 보조 스텝을 돌리면 실제 UNet 평가가 Euler Dy 11회 · SMEA Dy 10회로, Spectrum 없는 일반 10 스텝보다 적지 않았습니다. 가드가
-  고른 일반 스텝은 8회 · 7회로 절약이 남습니다. 그래서 Spectrum 이 켜져 있으면 보조 스텝을 건너뛰는 가드는 두 판 모두에서 그대로
-  둡니다. 바뀐 것은 콘솔 설명(판마다의 이유)뿐이고 infotext `Extra Samplers status: dy sub-steps skipped (Spectrum)` 는 그대로입니다.
-- SPEED 가 Spectrum 아래에서 물러날 때 `Anima SPEED status` 의 이유도 두 판을 나눠 적습니다(2.29.2 는 저해상도 텐서를 예측할 수
-  있음, 2.30 은 모델을 다시 돌리고 예측 기록을 새로 시작함). 물러나는 동작은 그대로입니다.
-
-### VAE DeGrid
-
-- 2.30 의 Extras 에는 Forge 자체 **DeGrid**(`scripts/degrid.py`, 픽셀 격자 필터, 기본 켬)가 생겼습니다. Extras 에서 둘 다 켜면 두 번
-  적용되고 이 확장의 항목이 먼저 돕니다(둘 다 순서 900, 이름순 — Forge 의 정렬 코드로 확인하는 테스트). Forge 의 DeGrid 를
-  Settings → Postprocessing 에서 생성 탭에도 켜면 생성 탭에서도 두 번 적용됩니다. Extras · 생성 탭 안내와 README 에 적었고 동작은 그대로입니다.
-
-### Forge 2.30-6 (`ede60e1a`) — VAE / Text Encoder 드롭다운
-
-- 2.30-6 은 Settings → UI Alternatives 에 'Show filenames without folder in the VAE / Text Encoder dropdown'
-  (`sd_modules_dropdown_use_short`, 기본 켬)을 더했습니다. 끄면 드롭다운이 모델 폴더 아래 경로(`sdxl/clip-l.safetensors`)를 보이고,
-  UI Preset 을 바꿀 때 `on_preset_change` 도 저장된 모듈을 그 경로로 되돌립니다. '기본값 저장' 버튼은 `modules_change` 처럼 파일
-  이름으로 찾아 전체 경로를 저장하므로 어느 쪽이든 그대로 동작합니다(코드는 그대로, 설명만 고침).
-- `on_preset_change` 가 이 설정을 읽게 되면서, Forge 의 실제 함수를 돌리는 `tests/test_save_defaults.py` 가 2.30-6 에서 오류 436 ·
-  실패 1 로 깨졌습니다(가짜 opts 에 없는 설정, 반환 목록 앞의 지역 변수로 옮겨 간 모듈 키). 가짜 opts 는 그 Forge 의
-  `shared_options.py` 기본값을 받고, 계약 테스트는 반환 앞의 지역 변수를 따라가며, 설정을 끈 경우의 왕복 테스트를 더했습니다.
-  `on_preset_change` 가 또 새 설정을 읽으면 오류 수백 개 대신 테스트 하나가 그 이름을 알립니다.
-- 그 밖의 2.30-6 변경(flash attention 의 causal 마스크, VAE 타일 디코드의 출력 채널, Prompts from file 의 결과값)은 이 확장이
-  부르지 않는 부분이라 대응할 것이 없습니다.
-
-### 테스트
-
-- 2.30 의 `sampling_function.py` 는 `from modules import shared` 를 하므로, 실제 파일을 불러 쓰는 테스트(Safe PAG · DCW · 통합 ·
-  SPEED 스택 · NegPiP SD 배치)의 대역에 `modules.shared`(`batch_cond_uncond=True`)를 넣었습니다(없으면 2.30 에서 오류 47개). 끈 경우는
-  불러 둔 모듈의 값을 바꾸지 않고 새로 불러 확인합니다. 2.29.2 에서는 이 설정을 읽지 않으므로 같은 테스트가 묶음 모양을 확인합니다.
-- Spectrum 테스트는 판마다 나눴습니다: 2.29.2 예측기(`git show d70373eb`)로 충돌, 2.30 예측기(`git show 45f41b81`)로 재계산과
-  사라진 절약, 설치된 Forge 의 예측기가 둘 중 어느 쪽과 같은지. Forge 작업 트리는 건드리지 않고, Forge git 저장소가 없으면(CI)
-  건너뜁니다. 저장소가 다른 곳에 있으면 `SAM3_FORGE_GIT` 로 알려 줍니다.
-
-## 미출시 (Unreleased) — 모델 내리기 버튼
-
-notebook 레이아웃 탭 줄의 `기본값 저장` 바로 오른쪽에 **`모델 내리기`** 버튼을 더합니다(같은 모양 · 기본값 저장 묶음 안, 결과는
-버튼 아래 한 줄). 누르면 확인 없이 Forge 의 모델 · Forge 가 그 밖에 쥔 업스케일러 · TAESD · 얼굴 복원 모델 · sam-extra 가 메모리에
-쥔 모델을 모두 내리고 GPU 캐시를 비운 뒤 `VRAM 사용 19.6 GB → 3.1 GB (Forge 모델 · SAM3) · 이 프로세스 예약 15.2 → 0.0 GB` 처럼
-보여 줍니다(README 의 **모델 내리기 버튼** 절). 생성 결과 · 스크립트 인자 · infotext · 설정은 그대로입니다. Forge 를 재시작하세요(새
-스크립트 · JS · 바뀐 Python 파일).
-
-- **거절**: 생성 중이면 아무것도 하지 않고 `생성 중에는 내릴 수 없습니다`. Forge 의 `modules.call_queue.queue_lock` 을 기다리지
-  않고(`acquire(blocking=False)`) 잡아 봅니다 — txt2img/img2img Generate · Extras · API 생성 · sam-extra 의 Refine · Tile-Repair ·
-  캐릭터 레퍼런스가 이 잠금을 쥐고 돕니다. **잠금이 기준**입니다(이 체크아웃에서 `shared.state.begin()` 은 모두 잠금 안). 잠금을
-  잡았는데 `shared.state` 에 작업 기록(`job` 이름 · `job_count` ≠ 0)이 남아 있으면 — 예외로 끝난 Extras API 호출처럼 Forge 가 기록을
-  지우지 못한 경우(modules/postprocessing.py 는 `end()` 를 성공 경로에서만 부르고 API 경로엔 wrap_gradio_call 의 finally 가 없음) —
-  `Forge 에 끝나지 않은 작업 기록(extras)이 남아 있습니다 — 생성 중이 아니면 한 번 더 누르세요` 로 한 번 알리고, **같은 기록**
-  (`job` · `job_count` · `job_timestamp`)에 다시 누르면 내립니다. 그사이 새 작업이 begin 했으면 다시 묻습니다(예전에는 다른 작업이
-  돌아 기록이 지워질 때까지 매번 거절 — 그 작업은 체크포인트를 다시 읽는 생성뿐이었습니다). `interrupted` 만으로는 거절하지
-  않습니다(쉬는 동안 Interrupt 를 누르면 다음 작업 시작까지 True 로 남음). 내리는 동안 잠금을 쥐고 있어 그사이 누른 Generate 는
-  기다렸다가 시작합니다. 두 탭에서 동시에 누르면 하나씩.
-- **Forge 의 모델**: Settings 의 `Unload All Models` 와 `POST /sdapi/v1/unload-checkpoint` 가 부르는
-  `modules.sd_models.unload_model_weights` 를 그대로 한 번 부릅니다(`unload_all_models` → `FakeInitialModel` → `forge_hash` 비움 →
-  `soft_empty_cache` → `gc`). `forge_loading_parameters`(고른 체크포인트 · VAE/TE · Low Bits)는 그대로라 다음 생성의
-  `forge_model_reload` 가 같은 설정으로 다시 읽습니다 — 테스트가 Forge 체크아웃의 두 함수를 AST 로 확인합니다. 결과 글의
-  `Forge 모델` 은 체크포인트가 올라 있었을 때만입니다(체크포인트 없이 Forge 의 메모리 목록에 TIPO · DeGrid 같은 sam-extra 패처만
-  있었으면 그 이름은 각자의 훅이 적습니다 — 예전에는 그때도 `Forge 모델` 이 나왔습니다).
-- **✨(갤러리 이미지 고해상도)**: Forge 의 ✨ 는 `p.txt2img_upscale` 로 process_images 의 `manage_model_and_prompt_cache` 를 건너뛰어,
-  버튼으로 내린 뒤 누르면 process_images_inner 의 `shared.sd_model.is_wan` 에서 `AttributeError: 'FakeInitialModel' object has no
-  attribute 'is_wan'` 이 났습니다(Forge 의 `Unload All Models` 뒤에도 같음). `scripts/layout_unload_models.py` 에 화면에 아무것도 없는
-  AlwaysVisible 스크립트(`UnloadModelsReload`, txt2img 만, `create_group = False`)를 두어, 그 건너뛰기보다 먼저 도는 `before_process`
-  에서 ✨ 이고 체크포인트가 없을 때만 `sd_models.forge_model_reload()` 로 고른 체크포인트를 읽습니다(sam-extra 🎯 와 같은 방법,
-  체크포인트가 있으면 Forge 의 동작 그대로). 테스트가 Forge 체크아웃의 순서(`before_process` → ✨ 건너뛰기 → `is_wan`)를 AST 로 확인합니다.
-- **Forge 가 메모리 목록 밖에 쥔 모델** (`FORGE_CACHE_HOOKS`, Forge 의 내리기 바로 뒤): `unload_all_models` 는 `current_loaded_models`
-  만 내립니다. 그 밖에서 GPU 에 남던 업스케일러(modules/esrgan_model.py `UpscalerESRGAN.load_model` 의 `lru_cache(maxsize=4)` — 이
-  Forge 의 모델 업스케일러는 모두 이 길) · TAESD · VAE Approx 디코더(`sd_vae_taesd_models` · `sd_vae_approx_models`) · 얼굴 복원
-  (`shared.face_restorers` 의 `net` 과 cached `face_helper` — `face_restoration_unload` 기본 끔)을 버립니다. 다시 읽는 길이 있는 것만
-  (`load_net` · cached_property), Forge 모듈은 `sys.modules` 에서 찾습니다(import 하지 않음).
-- **sam-extra 의 해제 훅** (`sam3ext/unload_registry.py`, 이 순서): SAM3 번들(`release_sam3` — `Unload after` 의 RAM 보관 사본까지,
-  이제 버린 번들이 있었는지 돌려줌) · Anima 3.8B(`Anima3BRuntime.unload_models` 새로 — Qwen3.5 4B · 토크나이저 · v1 어댑터 · v2
-  커넥터와 Forge 패처 · run 장치 사본 · 특징/TE 줄 캐시, 예외로 남은 설치는 먼저 restore) · IP-Adapter(`IpaRuntime.unload`) ·
-  DeGrid(`DegridRuntime.unload` — VRAM 과 RAM 의 NAFNet) · TIPO(`TipoRuntime.unload`) · Modulation CLIP-L(`clear_modulation_caches`)
-  · Colorcraft(`release_caches` 새로 — 기저 벡터 · 장치 사본 · 앵커) · 샘플링 캐시(SPEED DCT 기저 · HiFlow 마스크 · MG/HiGS DCT,
-  각 `clear_*` 가 이제 bool) — 그리고 스크립트가 직접 등록하는 VAE 2x 디코더(`scripts/anima_vae_2x.py release_decoders`)와 Safe PAG
-  (`scripts/anima_safe_pag.py release_sampling_caches`, 같은 이름 "샘플링 캐시"): 인덱스 텐서 · 지난 패스 텐서에 더해, 예외로 끝난
-  생성(postprocess 가 돌지 않음)이 남긴 `cond_raw` · `condition_aggregation` · CLIP Modulation 블록 델타(`block_modulations` · `typed`)
-  · DAVE 가 쥔 요청(`offset_p` · `run_p`)과 게이트 캐시 · HiFlow 궤적 · 지난 단계 텐서 · 요청 참조까지. 패키지 모듈은 이름으로
-  적어 누를 때 `sys.modules` 에서 찾습니다 — import 되지 않은 모듈은 건너뛰고(쥔 것이 없음), 업데이트 뒤 재시작하지 않은 옛 모듈은
-  그 항목만 "Forge 를 다시 시작하세요" 로 실패합니다. 공용 런타임이 아직 없으면 만들지 않습니다. 새 기능(예: 얼굴 검출기)은
-  `BUILTIN_HOOKS` 한 줄이나 `register(key, 이름, 함수)` 로 더합니다. LLLite · ControlNet 모델은 Forge 의 ControlNet 이 쥐므로
-  Forge 의 내리기를 따릅니다. MCP 서버는 모델을 쥐지 않습니다.
-- **한 항목의 실패는 나머지를 막지 않습니다**: Forge 의 내리기 · 각 훅(과 훅 목록 읽기) · 캐시 비우기 · VRAM 재기를 따로 감싸, 실패한
-  것은 결과 글 끝에 `실패: TIPO` 처럼 이름을, 툴팁과 Forge 콘솔에 이유(콘솔은 traceback)를 남깁니다.
-- **비우기 · 재기**: `gc.collect()` 뒤 CUDA 가 있으면 `torch.cuda.synchronize` · `empty_cache` · `ipc_collect`. 앞뒤로
-  `torch.cuda.mem_get_info`(GPU 전체 사용 = 전체 − 남은 것, 다른 프로그램 몫 포함)와 `memory_reserved`(이 프로세스)를 잽니다
-  (장치는 Forge 의 `get_torch_device`). CUDA 가 없으면 `모델 내림 (…) · CUDA GPU 가 없어 VRAM 은 재지 않았습니다`.
-- **자리**: 버튼은 기본값 저장 묶음(`#sam3_save_defaults`) 안, 저장 버튼 바로 뒤에 들어가 탭 줄의 flex 항목 하나를 함께 씁니다 —
-  좁은 창에서 줄이 넘어가도 두 버튼이 같이 움직입니다. 결과 글은 그 묶음 밖의 따로 된 줄 항목(`flex-basis: 100%`)이라 버튼 아래
-  오른쪽에 한 줄로 나오고, 길어도 버튼을 밀지 않습니다. 예전에는 결과 글이 버튼 묶음 안에 있어 1280px 로라 탭 · 1024px 에서 결과가
-  나오면 `모델 내리기` 가 다음 줄 왼쪽 끝으로 약 1150px 옮겨 갔다가 15초 뒤 돌아왔고, 1024px 로라 탭에서는 결과 없이도 둘이
-  갈라졌습니다. 이제 로라 · 체크포인트 · 임베딩 탭(검색 · 정렬 칸이 있는 탭)에서 창이 약 1100px 보다 좁으면 두 버튼이 함께 다음 줄
-  왼쪽으로 갑니다(기본값 저장의 v0.33.0 규칙 — 검색 칸이 있으면 `margin-left: 0` — 그대로). 기본값 저장의 결과 글은 이제 두 버튼
-  뒤에 나옵니다. 버튼 · 결과 글은 한 번 만들어 다시 쓰므로 Gradio 가 탭 줄을 다시 그려도 진행 중인 결과 글이 남습니다.
-- **API**: 새 경로는 없습니다 — Forge 의 `POST /sdapi/v1/unload-checkpoint` 는 Forge 의 체크포인트만 내린다고 README 에 적었습니다.
-
-### 파일
-
-- 새로: `sam3ext/unload_models.py`(순서 · 거절 · 결과 글 · Forge 캐시 훅 · ✨ 다시 읽기, Forge · torch 는 Host 로 받는 순수 로직) ·
-  `sam3ext/unload_registry.py` · `sam3ext/ui_unload_models.py`(숨은 Gradio 버튼 — footer 의 on_after_component, 요청 id 입력 → JSON,
-  Gradio 큐 · `concurrency_limit=1`) · `scripts/layout_unload_models.py`(연결 + 화면 없는 ✨ 다시 읽기 스크립트, negpip.py 보다 앞) ·
-  `javascript/notebook_unload_models.js`(기본값 저장 묶음 안에 버튼, 줄 항목으로 결과 글, 줄이 다시 그려지면 같은 것을 다시 붙임 ·
-  버튼은 `aria-disabled` 로만 바쁨을 알려 포커스 유지) · `style.css` 세 규칙(묶음 안의 자리 · 기본값 저장이 없을 때의 자리 · 결과 줄).
-
-### 테스트
-
-- `test_unload_models.py`(56개): 거절(잠금이 잡혀 있으면 잠금 · Forge · 훅을 건드리지 않음, 잠금이 빈 채 남은 작업 기록은 한 번 알리고
-  같은 기록의 두 번째 클릭에 내림 · 새 기록이면 다시 묻고 · 쉬는 동안의 내리기 뒤에도 다시 묻음, `interrupted` 는 거절 아님, 진행 중인
-  두 번째 클릭) · 순서(Forge 한 번 → Forge 캐시 → 훅 → 캐시 → 재기 → 잠금 반환, 훅 목록을 못 읽어도 나머지) · 훅이 던져도 모두 불림 ·
-  결과 글 · 툴팁 · JSON 형식 · 같은 이름은 한 번 · CPU 전용 경로(가짜 torch.cuda 와 진짜 torch) · 재기 실패 · `unload_model_weights`
-  한 번 부름과 체크포인트 유무(sam-extra 패처만 있으면 `Forge 모델` 아님) · Forge 캐시(진짜 `lru_cache` 메서드 · dict · 얼굴 복원의
-  `net` 과 cached_property, 다시 읽는 길이 없는 복원기는 그대로, import 되지 않은 모듈은 건너뜀) · ✨ 다시 읽기(내린 뒤에만, 보통
-  생성은 Forge 에 맡김) · 목록(순서, 모든 항목이 실제 함수 이름인지 AST, import 안 된 모듈은 건너뜀, 옛 모듈 안내, 같은 key 바꿔 끼움)
-  · 기능 훅마다 놓은 뒤 다시 쓰면 파일에서 다시 읽는지(SAM3 · Anima 3.8B · IP-Adapter · DeGrid · TIPO · Modulation · Colorcraft · 세
-  샘플링 행렬 · 두 스크립트의 등록과 해제, Safe PAG 가 예외로 끝난 생성이 남긴 열 가지) · 다른 스레드가 쥔 진짜 잠금에서 기다리지
-  않고 거절.
-- `test_unload_models_gradio.py`(23개, 진짜 Gradio 4.40): 숨은 버튼의 입력 · 출력 · js · 큐 · `concurrency_limit`, footer 뒤 자리,
-  process_api 로 누른 결과 · 거절 · 남은 작업 기록의 두 번 클릭, 처리기가 던지지 않음, 콘솔 기록, 화면마다 한 번 · Reload UI, 일회용
-  footer · `forge_host()` 가 Forge 의 잠금 · state · sd_models · 캐시 모듈 · 장치를 읽는지(체크포인트 없이 TIPO 패처만 있으면
-  `Forge 모델` 아님) · Forge 의 진짜 FIFOLock(실패한 Extras API
-  호출이 남긴 기록 포함) · Forge 체크아웃의 unload/reload 경로 · ✨ 건너뛰기 순서 · 메모리 목록 밖의 모델(AST) · 스크립트 파일(콜백
-  하나 · 화면 없는 AlwaysVisible 스크립트 · 내린 뒤 ✨ 의 before_process).
-- `tests/js/notebook_unload_models.test.mjs`(14개, jsdom): 기본값 저장 묶음 안 저장 버튼 바로 뒤 · 같은 클래스 · 결과 글은 줄 항목,
-  먼저 붙었을 때 묶음 안으로 옮김, 기본값 저장이 없으면 줄 끝, 레이아웃이 없거나 Forge 기본 화면이면 없음, 다시 그린 줄에 같은 것을
-  다시 붙임(진행 중인 결과 글 유지), 요청 id · 결과 한 줄 · 툴팁, 거절 · 일부 실패 · 지난 결과 · 두 번 누름 · 포커스 · 시간 초과 ·
-  연결 없음, CSS.
-- `tests/js/notebook_unload_models_layout.test.mjs`(5개, 새로): headless Chrome(없으면 건너뜀)이 진짜 style.css · tokens.css · 두 페이지
-  스크립트로 탭 줄을 그리고(Forge 체크아웃이 있으면 Forge 의 style.css 도) 1920 · 1280(Generation · 로라) · 1024(Generation · 로라)px
-  에서 진짜 클릭 흐름으로 결과 글을 채우기 전과 뒤의 사각형을 잽니다 — 두 버튼이 같은 줄에 붙어 있는지, 결과가 나와도 버튼이 그
-  자리인지, 결과가 버튼 아래 오른쪽 정렬인지. 옛 배치에서는 다섯 다 실패합니다.
-
-## 미출시 (Unreleased) — SAM3 얼굴 안에서만 찾기 (Face crop)
+### SAM3 — 얼굴 안에서만 찾기 (새 기능)
 
 SAM3 Mask 아코디언과 Refine 패널에 **얼굴 안에서만 찾기**를 더합니다. 켜면 ADetailer 의 `models/adetailer` 얼굴 모델(기본
 `face_yolov8n.pt` · 신뢰도 0.3)로 얼굴 상자를 찾고, 상자마다 넓힌 정사각 crop 에서만 SAM3 를 돌려 마스크를 원래 자리에 붙입니다 —
@@ -174,8 +43,6 @@ SAM3 Mask 아코디언과 Refine 패널에 **얼굴 안에서만 찾기**를 더
 `[SAM3] Face Crop Model` · `[SAM3] Face Crop Confidence` 입니다. Forge 를 재시작하세요(Reload UI 만 하면 옛 모듈이 남아 얼굴 crop 은
 나오지 않고 SAM3 는 예전처럼 돕니다 — 옛 인자 검증기에는 새 키를 넘기지 않고, 기본값 표도 얼굴 키를 따로 가짐). 실제
 얼굴 모델 · SAM3 로 본 화질은 확인하지 않았습니다(GPU 미사용, 가짜 검출기 · 가짜 SAM3 로 CPU 테스트만).
-
-### SAM3 — 얼굴 안에서만 찾기 (새 기능)
 
 - **흐름** (`sam3ext/face_crop.py` 순수 기하 · `sam3ext/face_detect.py` 검출기 · `sam3ext/core.py` `run_sam3_on_pil(face_crop=…)`):
   얼굴 상자를 옆 · 아래 20 %, 위 40 % 넓혀 중심을 지킨 정사각형으로 만들고 이미지 안으로 밉니다(이미지보다 크면 그 축만 이미지
@@ -219,49 +86,47 @@ SAM3 Mask 아코디언과 Refine 패널에 **얼굴 안에서만 찾기**를 더
   셋을 검출기 모듈의 기본값으로 먼저 깔고 Sam3Args 값으로 덮습니다 — 옛 Sam3Args 로만 만들면 process() 가 `KeyError` 로 멈춰(Forge 는
   콘솔에만 알림) 그 생성에서 SAM3 가 조용히 빠졌습니다.
 
-### 문서 · 테스트
+### 태그 자동완성 내장 — sd-webui-tagcomplete-neo (새 기능)
 
-- README: 새 절 [얼굴 안에서만 찾기](README.md#얼굴-안에서만-찾기-face-crop)(흐름 · Individual/Combined · 얼굴 없음 · 받지 않음 ·
-  장치 · 기록 · API 표와 예시), In-flight 목록 · Refine 표 · 마스크 후처리 순서 · XYZ 축 목록 · 의존성. THIRD_PARTY_NOTICES.md 의
-  '코드를 편입하지 않은 재구현' 표에 한 줄(ADetailer 의 호출 방식 — AGPL-3.0, 코드 사본 없음; ultralytics · 얼굴 모델은 포함하지 않음).
-- `test_face_crop.py`(51개 — 넓히기 비율, 가운데 · 네 모서리 · 이미지 밖에 걸친 얼굴의 정사각 crop 과 밀어 넣기, 작은 얼굴 32 px,
-  이미지보다 작은 한 변 · 큰 얼굴의 축 자름, 쓸 수 없는 상자(빈 · 밖 · NaN · inf · 모양 틀림), 뒤집힌 꼭짓점, 무작위 상자 500개에서
-  crop 이 이미지 안 · 얼굴 상자 전체를 담음 · 정사각, 상자 왕복, 무작위 마스크 100개의 비트 단위 붙여 넣기 · 크기 다른 마스크 ·
-  범위 밖 거절, 무게중심, 주인 얼굴(겹침 · crop 밖 얼굴은 후보 아님 · 얼굴 크기 · 같으면 원래 crop · 여러 crop 묶음), 잘린 조각
-  (가장자리 바깥 한 줄 · 이미지 테두리는 자른 변 아님 · 옆 얼굴의 잘린 머리카락은 옆 얼굴로 · 맞닿지 않으면 따로 · 혼자인 조각은
-  예전 규칙 그대로), Exclude 영역 넓히기(0 이면 그대로 · 무작위 crop 500개에서 crop ± px 를 덮음 · 정사각), 같은 얼굴 상자(IoU ·
-  중심 · 점수 높은 쪽 · 점수 없음 · 계획에서 하나로), 왼쪽 → 오른쪽 계획 ·
-  상태 줄 · meta, 키워드 변환(꺼짐이면 `{}`), 모델 폴더 목록 · 추가 폴더 · 이름 찾기, 가짜 ultralytics 로 상자 · 점수 · 호출 인자 ·
-  장치 · 얼굴 없음 · 모델 없음(불러오지 않음) · 폴더 없음 · ultralytics 없음 · 받으려는 이름 거절, 모듈 import 가 torch ·
-  ultralytics 를 올리지 않음).
-- `test_sam3_face_crop.py`(47개 — 프롬프트 색의 연결 성분을 찾는 가짜 SAM3 처리기와 가짜 검출기로 `run_sam3_on_pil`: 꺼짐이면
-  검출기를 부르지 않음, crop 안 결과가 전체 이미지 검출과 비트 단위로 같음 · SAM3 는 crop 만 봄, 상자의 이미지 좌표,
-  Individual = 그룹 × 얼굴(왼쪽 → 오른쪽) · Combined = 합집합, 부위 없는 얼굴, 겹친 얼굴의 주인, 옆 crop 가장자리에 잘린 조각,
-  이 crop 가장자리에 잘려 들어온 옆 얼굴의 머리카락, 한 얼굴의 상자 둘, Exclude 가 crop 마다 · hull 뒤에 · Dilation/Outline 만큼
-  넓힌 영역에서(얼굴 crop 을 끈 결과와 같음), 얼굴 밖 Exclude 무시, Outline · Dilation 이 이미지 좌표(crop 밖으로 번짐),
-  Manual Mask, 얼굴 없음이면 번들을 올리지 않음 · 상태 줄 · Manual Mask 는 그대로(크기 다른 것도), 검출기 오류, 오버레이, meta;
-  인자 기본값 · 맨 뒤 순서 · 강제 변환 · infotext 켬/끔 · Forge 붙여 넣기 변환 왕복 · 실제 Gradio 로 만든 아코디언의 위젯 ·
-  붙여 넣기 칸 · 영어 라벨 · 짧은 예전 값 목록; 스크립트의 process(UI · XYZ · 예전 API · Reload UI 뒤 옛 Sam3Args — 스크립트를 옛
-  클래스가 있는 채로 새로 실행해 기본값 표까지 실제와 같게) · 꺼짐이면 예전 호출 · 얼굴 수 기록 · 🎯 용 얼굴 crop 요약 ·
-  Individual/Combined 패스 · 얼굴 없음 · 배치의 얼굴 수 · XYZ 축; 🎯 의 얼굴 없음 안내(HTML 이스케이프 · 얼굴을 찾았거나 꺼짐이면
-  예전 안내); Refine 의 키 위치 · 위젯 줄맞춤 · 값 변환(짧은 예전 목록은 꺼짐) · `no_faces` 상태 줄 · 얼굴 없음 + Manual Mask 는
-  인페인트 · 꺼짐이면 예전 호출 · PNG 기록 · 검출기 오류의 상태 줄(HTML 이스케이프)). 돌연변이 확인: 주인 정하기를 끄면 2개,
-  붙여 넣기를 한 칸 밀면 9개, 잘린 조각 묶기를 끄면 2개, 상자 중복 제거를 끄면 2개, Exclude 영역 넓히기를 끄면 4개가 실패.
-- `test_ui_refine.py` 의 Refine 입력 개수(42 · 40 → 45 · 43)를 새 위젯에 맞췄습니다.
-- 전체(작업 트리, CPU, `SAM3_FORGE_ROOT` = 이 PC 의 Forge): 3202 테스트(0.33.1 의 3104 + 98), 건너뜀 185. 그중 28개(DCW 원본 대조
-  23 · Safe PAG 1 · Extra Samplers 의 Spectrum 경로 4 — 모두 Forge 코드를 직접 실행하는 테스트)는 이 변경 전 같은 작업 트리에서도 똑같이
-  실패합니다: 이 PC 의 Forge 가 0.33.1 뒤에 바뀐 탓으로 보이고(예: 2026-10-07 `batch_cond_uncond` — `backend/sampling/sampling_function.py`
-  가 이제 `modules.shared` 를 import 해 DCW 대조가 Forge 파일을 불러오지 못함) SAM3 와 무관합니다(실패 목록이 변경 전후 같음).
+따로 설치하던 [sd-webui-tagcomplete-neo](https://github.com/eduardoabreu81/sd-webui-tagcomplete-neo)(commit `8e0d81f`, MIT)를
+sam-extra 에 넣었습니다(README 의 **Tag Autocomplete (내장 태그 자동완성)** 절). Forge 를 재시작하세요(새 스크립트·JS).
 
-## 미출시 (Unreleased) — XYZ `[Modules] Text Encoder` 축 · XYZ `VAE` 축 수정
+- **설정·동작 그대로**: Settings → **Tag Autocomplete** 의 `tac_*` 57개는 키·이름·섹션이 같아 저장된 값이 이어집니다(기본값은
+  `tac_tagFile` 하나만 다름 — 아래, 테스트가 설치돼 있던 상류 파일과 대조). 전역 JS 이름·`/tacapi/v1/*` 경로 15개·`<forge>/tmp/tagAutocompletePath.txt` 도 같습니다.
+  설정 맨 위에 안내 줄과 스위치 **내장 Tag Autocomplete 사용 (sam-extra)**(`sam3_builtin_tagcomplete_enabled`, 기본 켬, 재시작)가 더해졌습니다.
+- **따로 설치한 사본과 함께 돌지 않음**: 다른 tagcomplete 가 켜져 있으면 내장은 쉬고 콘솔·설정 안내 줄에 이유를 남깁니다(같은 JS 를 두 번
+  실으면 페이지에서 반만 초기화됨). 두 곳 모두 그 폴더를 넣은 옮기기 명령을 알려 줍니다 — Forge 를 끄고 **먼저 옮긴 뒤** 그 확장 폴더를
+  extensions 밖으로 옮기고(지우는 것보다 안전) 재시작하세요. 먼저 지우면 git 에 없는 사용자 목록·사용 횟수가 사라집니다.
+- **사용자 파일 옮기기**: `tools/migrate_tagcomplete.py` — 예전 폴더의 태그 목록·사용 횟수(`tag_frequency.db`)·LoRA 해시 캐시를 이 확장의
+  `tags/` 로(미리보기 기본, 덮어쓰지 않음, SHA-256·DB 확인). 내장이 먼저 한 번 돌며 만든 빈 DB(0 행)·빈 해시 캐시는 옆으로 치우고
+  (`*.empty-<시각>.bak`, 지우지 않음) 옮깁니다. `tac_*` 가 고른 파일이 `tags/` 에 없다는 알림도 이 명령을 함께 알려 줍니다.
+- **페이지가 일찍 열려도 시작**: 로더는 시작 정보를 Forge 설정(`opts`)의 숨은 키 `sam3_tac_builtin_boot` 에서 읽습니다 — 확장들의 시작
+  작업(app_started)이 끝나기 전에 열린 페이지(자동으로 여는 브라우저, Reload UI 뒤 새로 고침)에서도 상류처럼 시작합니다.
+- **태그 목록**: 저장소에 `danbooru_2026-10-01_pt20-ia-dd.csv`·`danbooru.csv`·`danbooru_2025.csv`·`danbooru_e621_merged.csv`·
+  `extra-quality-tags.csv`·`demo-chants.json`(약 19.9 MB)을 넣었습니다. 나머지 상류 목록과 사용자 목록은 git 밖(`.gitignore`)입니다.
+- **기본 태그 목록 — Danbooru 2026-10-01**: `tac_tagFile` 의 기본값이 `danbooru.csv`(상류) 대신 `danbooru_2026-10-01_pt20-ia-dd.csv`
+  입니다 — 2026-10-01 에 만든 Danbooru 목록, 게시물 수 20 이상인 태그 220,510개(별칭 포함). 출처는
+  [DraconicDragon/dbr-e621-lists-archive](https://github.com/DraconicDragon/dbr-e621-lists-archive)(The Unlicense, 파일 그대로 — 테스트가
+  git blob 을 고정)입니다. 키·이름·섹션은 그대로이고, config.json 에 저장된 값이 있으면 그 값이 쓰입니다 — 한국어 설명이 붙은
+  목록(`KR_danbooru_tags_with_description-…csv`)도 Settings 에서 계속 고를 수 있습니다.
+- **저장된 값 바꾸기 (`--set-tagfile`)**: `tools/migrate_tagcomplete.py --set-tagfile <이름> --config <forge>/config.json` — 미리보기가
+  기본이고, `--apply --forge-stopped` 로 `config.json.bak-tagfile-<시각>` 백업을 먼저 쓴 뒤 `tac_tagFile` 값만 바꿉니다(다른 바이트는
+  그대로). Forge 가 떠 있으면(`127.0.0.1` 의 `--forge-port`, 기본 7860 이 응답) 아무것도 쓰지 않습니다.
+- **TIPO**: 캐릭터·작품·메타 구분에 쓰는 danbooru CSV 를 이 확장의 `tags/` 에서 읽습니다(예전: 따로 설치한 tagcomplete 폴더 — 그 폴더를
+  지우면 구분이 비었을 것).
+- **보안 (상류와 다른 점)**: `GET /tacapi/v1/wildcard-contents` 가 와일드카드 폴더 안의 `.txt` 만 돌려줍니다(상류는 아무 파일이나).
+- **고른 파일이 없을 때 알림**: `tac_tagFile` 등이 `tags/` 에 없는 파일을 가리키면 시작할 때 콘솔과 설정 안내 줄에 알립니다(상류는 그 목록을
+  조용히 비움 — 태그 파일이 없으면 extra 파일도). `tac_tagFile` 이면 그동안 기본 목록으로 추천합니다 — 로더가 페이지의 설정 값만
+  바꿔 읽게 하고 config.json·Settings 의 값은 그대로라, 있는 파일을 다시 고르면 그 파일을 씁니다.
+- 의존성: `pyyaml`(상류 `install.py` 가 설치하던 것)을 `requirements.txt` 에 더했습니다(Forge 에 이미 있음).
+
+### XYZ — `[Modules] Text Encoder` 축 (새 기능)
 
 Forge 기본 XYZ 에는 `VAE` 축만 있고 텍스트 인코더를 바꿔 가며 뽑는 축이 없어, **`[Modules] Text Encoder`** 축을 더합니다
 (txt2img · img2img). 칸마다 VAE / Text Encoder 드롭다운에서 그 파일을 고른 것과 같은 모델로 생성하고, Forge 설정(config.json ·
 드롭다운)에는 쓰지 않습니다. 새 스크립트 인자 · 설정 · infotext 키는 없습니다(각 이미지의 `Module N` 이 실제 목록을 적음). 다른
 기능의 결과는 그대로입니다. Forge 를 재시작하세요(새 스크립트 파일). 실제 모델로 뽑아 보지는 않았습니다(GPU 미사용 — Forge 의
 설정 · 재로딩 · 복원 · Hires · Refiner 코드를 가짜 로더 위에서 돌린 CPU 테스트만).
-
-### XYZ — `[Modules] Text Encoder` (새 기능)
 
 - **값**: `Use Forge current`(`None` 도 같음), 인코더 파일(드롭다운의 이름 · 하위 폴더 경로 · 확장자 뺀 이름), 텍스트 입력의
   `a + b`(Flux 의 CLIP-L + T5 처럼 인코더가 둘인 모델). `Default` · `Automatic` · `Built-in` 은 `Use Forge current` 를 안내하는
@@ -296,16 +161,6 @@ Forge 기본 XYZ 에는 `VAE` 축만 있고 텍스트 인코더를 바꿔 가며
 - **한계**: 자리 확인은 Checkpoint 드롭다운(API 면 `override_settings`)의 체크포인트로 합니다 — `Checkpoint name` 축의 값은 보지
   않습니다. `.ckpt` 체크포인트는 읽지 않아 내장 인코더를 모릅니다. Hires 의 모듈을 따로 골라 두었으면(`Use same choices` 가 아님)
   2패스는 그 목록을 씁니다. 인코더가 바뀐 칸은 모델을 통째로 다시 불러옵니다(드롭다운에서 바꿀 때와 같음).
-- **테스트**: `tests/test_xyz_text_encoder.py`(자리 판정 · GGUF 읽기 · 체크포인트 · 값 · 목록 · 축 둘 · 후보 · 라벨),
-  `tests/test_xyz_text_encoder_script.py`(등록 · Reload UI · 훅 · 축 둘 · 체크포인트), `tests/test_xyz_text_encoder_origin.py` — Forge 의
-  `replace_state_dict` · `gguf_remapping` · `preprocess_state_dict` 를 같은 헤더에 돌려 자리 · 내장 인코더를 대조하고(체크아웃의
-  `models/text_encoder` 파일 헤더 포함), GGUF 읽기를 Forge 의 gguf-py `GGUFReader` · `get_orig_shape` 와 대조하고, Forge 의
-  `process_images` · `set_config` · `modules_change` · `checkpoint_change` · `refresh_model_loading_parameters` · Hires 의 모델 전환
-  문장 · `apply_refiner` 의 전환 문장과 xyz_grid 의 `apply_checkpoint` · `apply_vae` 로 그리드를 돌려 칸마다 불러온 체크포인트 · 모듈,
-  `Module N`, 칸 도중 페이지가 저장할 설정, 그리드 뒤 원래 값을 확인합니다(체크포인트 축 양쪽 순서, VAE 축, 축 둘, 중간의
-  `Use Forge current`, 실패한 칸, API 의 모듈 목록 · 체크포인트, 도중의 드롭다운 변경, Hires · Refiner, 칸 안의 패스). 소스 가드가
-  `replace_state_dict` 의 탐지 키 · 너비 · 자리 이름 · 계열 표와 `gguf_remapping` 의 이름 표를 지킵니다.
-  `tests/test_integration_load_order.py` 에 `[Modules]` 축 하나를 더했습니다.
 
 ### XYZ — `VAE` 축: 형식이 다른 VAE 를 섞으면 검은 칸이 나오던 것 (수정)
 
@@ -326,7 +181,218 @@ Forge 기본 XYZ 에는 `VAE` 축만 있고 텍스트 인코더를 바꿔 가며
   `Module N` 에만 넣고 Forge 설정 · config.json 은 쓰지 않으며 칸이 끝나면 되돌림, 그 칸의 `sd_vae` 는 빼서 Forge 의 교체가 다시
   돌지 않음). 텍스트 인코더 축과는 X · Y · Z 어느 자리 · 순서로 섞어도 칸마다 두 값이 함께 들어갑니다. 헤더로 알 수 없는 VAE(pickle,
   Forge 가 먼저 형식을 바꾸는 파일)는 Forge 기본 동작 그대로입니다.
-- **테스트**: `tests/test_xyz_vae.py`(형식 · 엄격 로드 비교 · 예측 · 목록), `tests/test_xyz_vae_script.py`(제자리 교체 · Reload UI ·
+
+### 모델 내리기 버튼 (새 기능)
+
+notebook 레이아웃 탭 줄의 `기본값 저장` 바로 오른쪽에 **`모델 내리기`** 버튼을 더합니다(같은 모양 · 기본값 저장 묶음 안, 결과는
+버튼 아래 한 줄). 누르면 확인 없이 Forge 의 모델 · Forge 가 그 밖에 쥔 업스케일러 · TAESD · 얼굴 복원 모델 · sam-extra 가 메모리에
+쥔 모델을 모두 내리고 GPU 캐시를 비운 뒤 `VRAM 사용 19.6 GB → 3.1 GB (Forge 모델 · SAM3) · 이 프로세스 예약 15.2 → 0.0 GB` 처럼
+보여 줍니다(README 의 **모델 내리기 버튼** 절). 생성 결과 · 스크립트 인자 · infotext · 설정은 그대로입니다. Forge 를 재시작하세요(새
+스크립트 · JS · 바뀐 Python 파일).
+
+- **거절**: 생성 중이면 아무것도 하지 않고 `생성 중에는 내릴 수 없습니다`. Forge 의 `modules.call_queue.queue_lock` 을 기다리지
+  않고(`acquire(blocking=False)`) 잡아 봅니다 — txt2img/img2img Generate · Extras · API 생성 · sam-extra 의 Refine · Tile-Repair ·
+  캐릭터 레퍼런스가 이 잠금을 쥐고 돕니다. **잠금이 기준**입니다(이 체크아웃에서 `shared.state.begin()` 은 모두 잠금 안). 잠금을
+  잡았는데 `shared.state` 에 작업 기록(`job` 이름 · `job_count` ≠ 0)이 남아 있으면 — 예외로 끝난 Extras API 호출처럼 Forge 가 기록을
+  지우지 못한 경우(modules/postprocessing.py 는 `end()` 를 성공 경로에서만 부르고 API 경로엔 wrap_gradio_call 의 finally 가 없음) —
+  `Forge 에 끝나지 않은 작업 기록(extras)이 남아 있습니다 — 생성 중이 아니면 한 번 더 누르세요` 로 한 번 알리고, **같은 기록**
+  (`job` · `job_count` · `job_timestamp`)에 다시 누르면 내립니다. 그사이 새 작업이 begin 했으면 다시 묻습니다(예전에는 다른 작업이
+  돌아 기록이 지워질 때까지 매번 거절 — 그 작업은 체크포인트를 다시 읽는 생성뿐이었습니다). `interrupted` 만으로는 거절하지
+  않습니다(쉬는 동안 Interrupt 를 누르면 다음 작업 시작까지 True 로 남음). 내리는 동안 잠금을 쥐고 있어 그사이 누른 Generate 는
+  기다렸다가 시작합니다. 두 탭에서 동시에 누르면 하나씩.
+- **Forge 의 모델**: Settings 의 `Unload All Models` 와 `POST /sdapi/v1/unload-checkpoint` 가 부르는
+  `modules.sd_models.unload_model_weights` 를 그대로 한 번 부릅니다(`unload_all_models` → `FakeInitialModel` → `forge_hash` 비움 →
+  `soft_empty_cache` → `gc`). `forge_loading_parameters`(고른 체크포인트 · VAE/TE · Low Bits)는 그대로라 다음 생성의
+  `forge_model_reload` 가 같은 설정으로 다시 읽습니다 — 테스트가 Forge 체크아웃의 두 함수를 AST 로 확인합니다. 결과 글의
+  `Forge 모델` 은 체크포인트가 올라 있었을 때만입니다(체크포인트 없이 Forge 의 메모리 목록에 TIPO · DeGrid 같은 sam-extra 패처만
+  있었으면 그 이름은 각자의 훅이 적습니다 — 예전에는 그때도 `Forge 모델` 이 나왔습니다).
+- **✨(갤러리 이미지 고해상도)**: Forge 의 ✨ 는 `p.txt2img_upscale` 로 process_images 의 `manage_model_and_prompt_cache` 를 건너뛰어,
+  버튼으로 내린 뒤 누르면 process_images_inner 의 `shared.sd_model.is_wan` 에서 `AttributeError: 'FakeInitialModel' object has no
+  attribute 'is_wan'` 이 났습니다(Forge 의 `Unload All Models` 뒤에도 같음). `scripts/layout_unload_models.py` 에 화면에 아무것도 없는
+  AlwaysVisible 스크립트(`UnloadModelsReload`, txt2img 만, `create_group = False`)를 두어, 그 건너뛰기보다 먼저 도는 `before_process`
+  에서 ✨ 이고 체크포인트가 없을 때만 `sd_models.forge_model_reload()` 로 고른 체크포인트를 읽습니다(sam-extra 🎯 와 같은 방법,
+  체크포인트가 있으면 Forge 의 동작 그대로). 테스트가 Forge 체크아웃의 순서(`before_process` → ✨ 건너뛰기 → `is_wan`)를 AST 로 확인합니다.
+- **Forge 가 메모리 목록 밖에 쥔 모델** (`FORGE_CACHE_HOOKS`, Forge 의 내리기 바로 뒤): `unload_all_models` 는 `current_loaded_models`
+  만 내립니다. 그 밖에서 GPU 에 남던 업스케일러(modules/esrgan_model.py `UpscalerESRGAN.load_model` 의 `lru_cache(maxsize=4)` — 이
+  Forge 의 모델 업스케일러는 모두 이 길) · TAESD · VAE Approx 디코더(`sd_vae_taesd_models` · `sd_vae_approx_models`) · 얼굴 복원
+  (`shared.face_restorers` 의 `net` 과 cached `face_helper` — `face_restoration_unload` 기본 끔)을 버립니다. 다시 읽는 길이 있는 것만
+  (`load_net` · cached_property), Forge 모듈은 `sys.modules` 에서 찾습니다(import 하지 않음).
+- **sam-extra 의 해제 훅** (`sam3ext/unload_registry.py`, 이 순서): SAM3 번들(`release_sam3` — `Unload after` 의 RAM 보관 사본까지,
+  이제 버린 번들이 있었는지 돌려줌) · 얼굴 검출기(`release_face_detector` — 아래 **기능끼리 맞춘 것**) · Anima 3.8B(`Anima3BRuntime.unload_models` 새로 — Qwen3.5 4B · 토크나이저 · v1 어댑터 · v2
+  커넥터와 Forge 패처 · run 장치 사본 · 특징/TE 줄 캐시, 예외로 남은 설치는 먼저 restore) · IP-Adapter(`IpaRuntime.unload`) ·
+  DeGrid(`DegridRuntime.unload` — VRAM 과 RAM 의 NAFNet) · TIPO(`TipoRuntime.unload`) · Modulation CLIP-L(`clear_modulation_caches`)
+  · Colorcraft(`release_caches` 새로 — 기저 벡터 · 장치 사본 · 앵커) · 샘플링 캐시(SPEED DCT 기저 · HiFlow 마스크 · MG/HiGS DCT,
+  각 `clear_*` 가 이제 bool) — 그리고 스크립트가 직접 등록하는 VAE 2x 디코더(`scripts/anima_vae_2x.py release_decoders`)와 Safe PAG
+  (`scripts/anima_safe_pag.py release_sampling_caches`, 같은 이름 "샘플링 캐시"): 인덱스 텐서 · 지난 패스 텐서에 더해, 예외로 끝난
+  생성(postprocess 가 돌지 않음)이 남긴 `cond_raw` · `condition_aggregation` · CLIP Modulation 블록 델타(`block_modulations` · `typed`)
+  · DAVE 가 쥔 요청(`offset_p` · `run_p`)과 게이트 캐시 · HiFlow 궤적 · 지난 단계 텐서 · 요청 참조까지. 패키지 모듈은 이름으로
+  적어 누를 때 `sys.modules` 에서 찾습니다 — import 되지 않은 모듈은 건너뛰고(쥔 것이 없음), 업데이트 뒤 재시작하지 않은 옛 모듈은
+  그 항목만 "Forge 를 다시 시작하세요" 로 실패합니다. 공용 런타임이 아직 없으면 만들지 않습니다. 새 기능은 얼굴 검출기처럼
+  `BUILTIN_HOOKS` 한 줄이나 `register(key, 이름, 함수)` 로 더합니다. LLLite · ControlNet 모델은 Forge 의 ControlNet 이 쥐므로
+  Forge 의 내리기를 따릅니다. MCP 서버는 모델을 쥐지 않습니다.
+- **한 항목의 실패는 나머지를 막지 않습니다**: Forge 의 내리기 · 각 훅(과 훅 목록 읽기) · 캐시 비우기 · VRAM 재기를 따로 감싸, 실패한
+  것은 결과 글 끝에 `실패: TIPO` 처럼 이름을, 툴팁과 Forge 콘솔에 이유(콘솔은 traceback)를 남깁니다.
+- **비우기 · 재기**: `gc.collect()` 뒤 CUDA 가 있으면 `torch.cuda.synchronize` · `empty_cache` · `ipc_collect`. 앞뒤로
+  `torch.cuda.mem_get_info`(GPU 전체 사용 = 전체 − 남은 것, 다른 프로그램 몫 포함)와 `memory_reserved`(이 프로세스)를 잽니다
+  (장치는 Forge 의 `get_torch_device`). CUDA 가 없으면 `모델 내림 (…) · CUDA GPU 가 없어 VRAM 은 재지 않았습니다`.
+- **자리**: 버튼은 기본값 저장 묶음(`#sam3_save_defaults`) 안, 저장 버튼 바로 뒤에 들어가 탭 줄의 flex 항목 하나를 함께 씁니다 —
+  좁은 창에서 줄이 넘어가도 두 버튼이 같이 움직입니다. 결과 글은 그 묶음 밖의 따로 된 줄 항목(`flex-basis: 100%`)이라 버튼 아래
+  오른쪽에 한 줄로 나오고, 길어도 버튼을 밀지 않습니다. 예전에는 결과 글이 버튼 묶음 안에 있어 1280px 로라 탭 · 1024px 에서 결과가
+  나오면 `모델 내리기` 가 다음 줄 왼쪽 끝으로 약 1150px 옮겨 갔다가 15초 뒤 돌아왔고, 1024px 로라 탭에서는 결과 없이도 둘이
+  갈라졌습니다. 이제 로라 · 체크포인트 · 임베딩 탭(검색 · 정렬 칸이 있는 탭)에서 창이 약 1100px 보다 좁으면 두 버튼이 함께 다음 줄
+  왼쪽으로 갑니다(기본값 저장의 v0.33.0 규칙 — 검색 칸이 있으면 `margin-left: 0` — 그대로). 기본값 저장의 결과 글은 이제 두 버튼
+  뒤에 나옵니다. 버튼 · 결과 글은 한 번 만들어 다시 쓰므로 Gradio 가 탭 줄을 다시 그려도 진행 중인 결과 글이 남습니다.
+- **API**: 새 경로는 없습니다 — Forge 의 `POST /sdapi/v1/unload-checkpoint` 는 Forge 의 체크포인트만 내린다고 README 에 적었습니다.
+- **파일**: 새로 `sam3ext/unload_models.py`(순서 · 거절 · 결과 글 · Forge 캐시 훅 · ✨ 다시 읽기, Forge · torch 는 Host 로 받는 순수 로직) ·
+  `sam3ext/unload_registry.py` · `sam3ext/ui_unload_models.py`(숨은 Gradio 버튼 — footer 의 on_after_component, 요청 id 입력 → JSON,
+  Gradio 큐 · `concurrency_limit=1`) · `scripts/layout_unload_models.py`(연결 + 화면 없는 ✨ 다시 읽기 스크립트, negpip.py 보다 앞) ·
+  `javascript/notebook_unload_models.js`(기본값 저장 묶음 안에 버튼, 줄 항목으로 결과 글, 줄이 다시 그려지면 같은 것을 다시 붙임 ·
+  버튼은 `aria-disabled` 로만 바쁨을 알려 포커스 유지) · `style.css` 세 규칙(묶음 안의 자리 · 기본값 저장이 없을 때의 자리 · 결과 줄).
+
+### Forge 2.30 호환
+
+Forge Neo 2.30 에서 달라진 것에 맞춥니다. CPU 테스트 전체가 2.29.2(`d70373eb`), 2.30-2(`45f41b81`), 2.30-6(`ede60e1a`, 2026-10-11
+에 설치된 Forge) 셋에서 통과합니다. 이 판들에서 GPU 생성은 따로 확인하지 않았습니다. **Batch Cond/Uncond 가 켜진 기본 설정의 결과는
+그대로**입니다(같은 경로를 그대로 지남). 바뀐 것은 Batch Cond/Uncond 를 끈 2.30 에서 Anima 3.8B 의 VRAM 여유 판단, Adaptive Guidance
+가 UNet 래퍼를 걸지 않는 것, 안내 문구입니다. Forge 를 재시작하세요(바뀐 Python 파일).
+
+**Batch Cond/Uncond (Forge 2.30 Settings → Optimizations)**
+
+- 2.30 은 cond · uncond 를 한 UNet 호출로 묶을지 고르는 설정을 새로 둡니다(기본 켬). 끄면 `can_concat_cond` 가 늘 거짓이라 cond
+  와 uncond 가 따로(cond 먼저) 돌고, `sampling_prepare` 가 잡는 추론 메모리가 2 × batch 행에서 batch 행으로 줍니다. 2.29.2 에는 이
+  설정이 없어, 켠 2.30 처럼 메모리가 허락하면 묶고(VRAM 여유가 모자라면 따로 호출) 추론 메모리는 늘 2 × batch 행으로 잡습니다. 이
+  확장은 두 판에서 같은 방법(`shared.batch_cond_uncond`, 읽지 못하면 켬)으로 읽습니다(`sam3ext/forge_batching.py`).
+- **Anima 3.8B**: TE · Qwen3.5 를 VRAM 에 남길지 정할 때 다음 샘플링의 추론 몫을 Forge 와 같은 (켬 2 · 끔 1) × batch 행으로 셉니다.
+  예전에는 늘 2 × batch 라, 끈 2.30 에서는 여유를 실제보다 적게 보고 필요 없이 내릴 수 있었습니다. 켬 · 2.29.2 는 예전과 같습니다.
+- **Adaptive Guidance**: 묶음 호출에서만 uncond 행을 빼므로, 끄면 아무것도 생략할 수 없습니다. 그래서 그때 ADG 는 켜져 있어도 ADG 를
+  끈 것과 같게 돕니다: 자기 UNet 래퍼(`model_function_wrapper`)를 걸지 않아 다른 확장의 래퍼(Spectrum Integrated 등)를 밀어내지
+  않고, 결과도 ADG 를 끈 것과 비트 단위로 같습니다(다른 확장의 래퍼가 있는 경우까지 테스트로 확인). PAG/SEG/SLG 가 함께 켜져
+  있으면 래퍼는 그쪽 몫으로 예전처럼 걸립니다. infotext 에 `Anima Adaptive Guidance status: ADG inactive (Batch Cond/Uncond off)` 를
+  남기고(값에 쌍점 · 쉼표가 없어 Forge 가 따옴표로 감싸지 않고 이 글 그대로 적힘) 콘솔에 한 번 알리며, 검증 로그 판정은 설정을
+  직접 읽어 `NO-SKIP(Batch Cond/Uncond off)` 입니다. 패널 안내 · README · docs/GUIDANCE.md 에 적었습니다.
+- PAG/SEG/SLG 의 가중 · 영역 조건과 내장 NegPiP 의 SD 훅은 끈 배치 모양(조건마다 따로 호출)에서도 같은 결과입니다 — Forge 의 실제
+  `sampling_function.py` 로 확인하는 테스트를 더했습니다.
+
+**Spectrum Integrated 와 Dy 보조 스텝 · SPEED**
+
+- 2.30 의 Spectrum 예측기는 예측의 모양이 입력과 다르면 모델을 다시 돌립니다. 그래서 Dy 네 항목의 보조 스텝을 그대로 돌려도 2.29.2
+  처럼 오류로 멈추지는 않지만, 크기가 바뀔 때마다 예측 기록이 새로 시작합니다. CPU 측정(10 스텝, Spectrum 기본값 · SMEA 는 warm-up 4)
+  에서 보조 스텝을 돌리면 실제 UNet 평가가 Euler Dy 11회 · SMEA Dy 10회로, Spectrum 없는 일반 10 스텝보다 적지 않았습니다. 가드가
+  고른 일반 스텝은 8회 · 7회로 절약이 남습니다. 그래서 Spectrum 이 켜져 있으면 보조 스텝을 건너뛰는 가드는 두 판 모두에서 그대로
+  둡니다. 바뀐 것은 콘솔 설명(판마다의 이유)뿐이고 infotext `Extra Samplers status: dy sub-steps skipped (Spectrum)` 는 그대로입니다.
+- SPEED 가 Spectrum 아래에서 물러날 때 `Anima SPEED status` 의 이유도 두 판을 나눠 적습니다(2.29.2 는 저해상도 텐서를 예측할 수
+  있음, 2.30 은 모델을 다시 돌리고 예측 기록을 새로 시작함). 물러나는 동작은 그대로입니다.
+
+**VAE DeGrid**
+
+- 2.30 의 Extras 에는 Forge 자체 **DeGrid**(`scripts/degrid.py`, 픽셀 격자 필터, 기본 켬)가 생겼습니다. Extras 에서 둘 다 켜면 두 번
+  적용되고 이 확장의 항목이 먼저 돕니다(둘 다 순서 900, 이름순 — Forge 의 정렬 코드로 확인하는 테스트). Forge 의 DeGrid 를
+  Settings → Postprocessing 에서 생성 탭에도 켜면 생성 탭에서도 두 번 적용됩니다. Extras · 생성 탭 안내와 README 에 적었고 동작은 그대로입니다.
+
+**Forge 2.30-6 (`ede60e1a`) — VAE / Text Encoder 드롭다운**
+
+- 2.30-6 은 Settings → UI Alternatives 에 'Show filenames without folder in the VAE / Text Encoder dropdown'
+  (`sd_modules_dropdown_use_short`, 기본 켬)을 더했습니다. 끄면 드롭다운이 모델 폴더 아래 경로(`sdxl/clip-l.safetensors`)를 보이고,
+  UI Preset 을 바꿀 때 `on_preset_change` 도 저장된 모듈을 그 경로로 되돌립니다. '기본값 저장' 버튼은 `modules_change` 처럼 파일
+  이름으로 찾아 전체 경로를 저장하므로 어느 쪽이든 그대로 동작합니다(코드는 그대로, 설명만 고침).
+- `on_preset_change` 가 이 설정을 읽게 되면서, Forge 의 실제 함수를 돌리는 `tests/test_save_defaults.py` 가 2.30-6 에서 오류 436 ·
+  실패 1 로 깨졌습니다(가짜 opts 에 없는 설정, 반환 목록 앞의 지역 변수로 옮겨 간 모듈 키). 가짜 opts 는 그 Forge 의
+  `shared_options.py` 기본값을 받고, 계약 테스트는 반환 앞의 지역 변수를 따라가며, 설정을 끈 경우의 왕복 테스트를 더했습니다.
+  `on_preset_change` 가 또 새 설정을 읽으면 오류 수백 개 대신 테스트 하나가 그 이름을 알립니다.
+- 그 밖의 2.30-6 변경(flash attention 의 causal 마스크, VAE 타일 디코드의 출력 채널, Prompts from file 의 결과값)은 이 확장이
+  부르지 않는 부분이라 대응할 것이 없습니다.
+
+### 기능끼리 맞춘 것 (통합)
+
+- **모델 내리기 × 얼굴 안에서만 찾기**: 얼굴 검출기를 해제 훅 목록(`BUILTIN_HOOKS`, SAM3 바로 뒤, 결과 글의 이름 `얼굴 검출기`)에
+  넣었습니다. `detect_faces` 는 부를 때마다 YOLO 를 읽고 놓으므로(캐시 없음) 보통 쥔 것이 없습니다. 놓은 검출기가 아직 살아 있을
+  때만 — ultralytics 객체의 참조 고리가 gc 를 기다리거나 예외의 traceback 이 붙들어 그동안 가중치가 VRAM 에 남음 — 그 안의 모델과
+  predictor 를 떼어 놓고 결과 글에 이름을 남깁니다(`sam3ext/face_detect.py` `release_face_detector`, 검출기는 약한 참조로만 기억).
+  검출 결과와 ultralytics 호출은 그대로입니다.
+- **모델 내리기 × 태그 자동완성**: 둘 다 notebook 화면에 붙지만 자리가 다릅니다 — 버튼은 탭 줄(`#txt2img_extra_tabs > .tab-nav`)의
+  기본값 저장 묶음 안, tagcomplete 는 프롬프트 칸 · Generate 아래 도구 줄(상태 점)과 탭 줄의 extra networks 새로 고침 버튼(클릭
+  리스너). 코드는 바꾸지 않았고, 이 확장의 페이지 스크립트 전부와 상류 15개를 Forge 처럼 한 페이지에 실어 확인하는 테스트를
+  더했습니다: 전역 이름이 겹치지 않고, 서로의 클릭을 받지 않으며(모델 내리기는 태그 목록을 새로 고치지 않고, 새로 고침은 모델 내리기를
+  누르지 않음), Gradio 가 탭 줄을 다시 그려도 tagcomplete 는 한 번만 초기화되고 버튼은 새 줄에 다시 붙으며, 모델 내리기의 결과를
+  기다리는 동안에도 프롬프트에 치면 자동완성 목록이 뜹니다.
+- **XYZ 축**: `[SAM3] …` 40개(얼굴 crop 셋이 맨 뒤)와 `[Modules] Text Encoder`, 제자리에서 바꾼 `VAE` 가 한 번씩 함께 있고 Reload UI ·
+  남아 있던 XYZ 에서도 같습니다. 통합 시험(`tests/_webui_probe.py`)의 xyz_grid 대역에 `format_value` · `format_remove_path` 가 없어
+  `[SAM3]` 축이 지금까지 그 시험에서 빠져 있었습니다(SAM3 는 그 오류를 콘솔에만 알림) — 대역에 넣고 검사를 더했습니다.
+- **XYZ `[Modules] Text Encoder` × Forge 2.29.2**: 자리 판정은 2.30-6 의 로더를 옮긴 것이라 Qwen3-VL 8B 인코더(2.30 에서 생긴
+  Qwen-Image 2.1 의 자리)를 `qwen3vl_8b` 자리로 보는데, 2.29.2 의 Forge 로더는 그 파일을 assert 로 거절합니다. 그 판에는 그 자리를
+  가진 모델 계열이 없어 축은 그 파일을 "모델이 가진 자리가 아닌 인코더" 로 막습니다(목록에도 체크포인트에도 인코더가 보이지 않을
+  때만 더해져 그 칸이 Forge 의 로더 오류로 끝남). 코드는 그대로이고, Forge 원본 대조 테스트(`test_xyz_text_encoder_origin.py`)가
+  체크아웃의 로더에 8B 자리가 있는지 보아 2.29.2 에서는 Forge 가 거절하는 것과 그 판의 모델 목록에 그 자리가 없는 것을 확인합니다
+  (병합 직후 2.29.2 에서 3개 실패). README 의 XYZ 절에 적었습니다.
+- **스크립트 순서**: 새 스크립트 셋도 `negpip.py` 앞이고 `negpip.py` 가 이 확장의 마지막 스크립트입니다(통합 시험).
+- **문서**: README · THIRD_PARTY_NOTICES.md 는 다섯 갈래를 그대로 합쳤습니다(재구현 표에 얼굴 검출 · crop 행 뒤로 XYZ 두 행). README 의
+  태그 자동완성 옮기기 안내를 콘솔 · 설정 안내 줄과 같게 "옮긴 뒤 그 폴더를 extensions 밖으로"로 맞추고, 모델 내리기 절의 목록에 얼굴
+  검출기를 더했습니다.
+
+### 문서 · 테스트
+
+- README: 새 절 [얼굴 안에서만 찾기](README.md#얼굴-안에서만-찾기-face-crop)(흐름 · Individual/Combined · 얼굴 없음 · 받지 않음 ·
+  장치 · 기록 · API 표와 예시), In-flight 목록 · Refine 표 · 마스크 후처리 순서 · XYZ 축 목록 · 의존성. THIRD_PARTY_NOTICES.md 의
+  '코드를 편입하지 않은 재구현' 표에 한 줄(ADetailer 의 호출 방식 — AGPL-3.0, 코드 사본 없음; ultralytics · 얼굴 모델은 포함하지 않음).
+- `test_face_crop.py`(51개 — 넓히기 비율, 가운데 · 네 모서리 · 이미지 밖에 걸친 얼굴의 정사각 crop 과 밀어 넣기, 작은 얼굴 32 px,
+  이미지보다 작은 한 변 · 큰 얼굴의 축 자름, 쓸 수 없는 상자(빈 · 밖 · NaN · inf · 모양 틀림), 뒤집힌 꼭짓점, 무작위 상자 500개에서
+  crop 이 이미지 안 · 얼굴 상자 전체를 담음 · 정사각, 상자 왕복, 무작위 마스크 100개의 비트 단위 붙여 넣기 · 크기 다른 마스크 ·
+  범위 밖 거절, 무게중심, 주인 얼굴(겹침 · crop 밖 얼굴은 후보 아님 · 얼굴 크기 · 같으면 원래 crop · 여러 crop 묶음), 잘린 조각
+  (가장자리 바깥 한 줄 · 이미지 테두리는 자른 변 아님 · 옆 얼굴의 잘린 머리카락은 옆 얼굴로 · 맞닿지 않으면 따로 · 혼자인 조각은
+  예전 규칙 그대로), Exclude 영역 넓히기(0 이면 그대로 · 무작위 crop 500개에서 crop ± px 를 덮음 · 정사각), 같은 얼굴 상자(IoU ·
+  중심 · 점수 높은 쪽 · 점수 없음 · 계획에서 하나로), 왼쪽 → 오른쪽 계획 ·
+  상태 줄 · meta, 키워드 변환(꺼짐이면 `{}`), 모델 폴더 목록 · 추가 폴더 · 이름 찾기, 가짜 ultralytics 로 상자 · 점수 · 호출 인자 ·
+  장치 · 얼굴 없음 · 모델 없음(불러오지 않음) · 폴더 없음 · ultralytics 없음 · 받으려는 이름 거절, 모듈 import 가 torch ·
+  ultralytics 를 올리지 않음).
+- `test_sam3_face_crop.py`(47개 — 프롬프트 색의 연결 성분을 찾는 가짜 SAM3 처리기와 가짜 검출기로 `run_sam3_on_pil`: 꺼짐이면
+  검출기를 부르지 않음, crop 안 결과가 전체 이미지 검출과 비트 단위로 같음 · SAM3 는 crop 만 봄, 상자의 이미지 좌표,
+  Individual = 그룹 × 얼굴(왼쪽 → 오른쪽) · Combined = 합집합, 부위 없는 얼굴, 겹친 얼굴의 주인, 옆 crop 가장자리에 잘린 조각,
+  이 crop 가장자리에 잘려 들어온 옆 얼굴의 머리카락, 한 얼굴의 상자 둘, Exclude 가 crop 마다 · hull 뒤에 · Dilation/Outline 만큼
+  넓힌 영역에서(얼굴 crop 을 끈 결과와 같음), 얼굴 밖 Exclude 무시, Outline · Dilation 이 이미지 좌표(crop 밖으로 번짐),
+  Manual Mask, 얼굴 없음이면 번들을 올리지 않음 · 상태 줄 · Manual Mask 는 그대로(크기 다른 것도), 검출기 오류, 오버레이, meta;
+  인자 기본값 · 맨 뒤 순서 · 강제 변환 · infotext 켬/끔 · Forge 붙여 넣기 변환 왕복 · 실제 Gradio 로 만든 아코디언의 위젯 ·
+  붙여 넣기 칸 · 영어 라벨 · 짧은 예전 값 목록; 스크립트의 process(UI · XYZ · 예전 API · Reload UI 뒤 옛 Sam3Args — 스크립트를 옛
+  클래스가 있는 채로 새로 실행해 기본값 표까지 실제와 같게) · 꺼짐이면 예전 호출 · 얼굴 수 기록 · 🎯 용 얼굴 crop 요약 ·
+  Individual/Combined 패스 · 얼굴 없음 · 배치의 얼굴 수 · XYZ 축; 🎯 의 얼굴 없음 안내(HTML 이스케이프 · 얼굴을 찾았거나 꺼짐이면
+  예전 안내); Refine 의 키 위치 · 위젯 줄맞춤 · 값 변환(짧은 예전 목록은 꺼짐) · `no_faces` 상태 줄 · 얼굴 없음 + Manual Mask 는
+  인페인트 · 꺼짐이면 예전 호출 · PNG 기록 · 검출기 오류의 상태 줄(HTML 이스케이프)). 돌연변이 확인: 주인 정하기를 끄면 2개,
+  붙여 넣기를 한 칸 밀면 9개, 잘린 조각 묶기를 끄면 2개, 상자 중복 제거를 끄면 2개, Exclude 영역 넓히기를 끄면 4개가 실패.
+- `test_ui_refine.py` 의 Refine 입력 개수(42 · 40 → 45 · 43)를 새 위젯에 맞췄습니다.
+- `test_unload_models.py`(59개 — 통합에서 얼굴 검출기 훅 3개를 더함): 거절(잠금이 잡혀 있으면 잠금 · Forge · 훅을 건드리지 않음, 잠금이 빈 채 남은 작업 기록은 한 번 알리고
+  같은 기록의 두 번째 클릭에 내림 · 새 기록이면 다시 묻고 · 쉬는 동안의 내리기 뒤에도 다시 묻음, `interrupted` 는 거절 아님, 진행 중인
+  두 번째 클릭) · 순서(Forge 한 번 → Forge 캐시 → 훅 → 캐시 → 재기 → 잠금 반환, 훅 목록을 못 읽어도 나머지) · 훅이 던져도 모두 불림 ·
+  결과 글 · 툴팁 · JSON 형식 · 같은 이름은 한 번 · CPU 전용 경로(가짜 torch.cuda 와 진짜 torch) · 재기 실패 · `unload_model_weights`
+  한 번 부름과 체크포인트 유무(sam-extra 패처만 있으면 `Forge 모델` 아님) · Forge 캐시(진짜 `lru_cache` 메서드 · dict · 얼굴 복원의
+  `net` 과 cached_property, 다시 읽는 길이 없는 복원기는 그대로, import 되지 않은 모듈은 건너뜀) · ✨ 다시 읽기(내린 뒤에만, 보통
+  생성은 Forge 에 맡김) · 목록(순서, 모든 항목이 실제 함수 이름인지 AST, import 안 된 모듈은 건너뜀, 옛 모듈 안내, 같은 key 바꿔 끼움)
+  · 기능 훅마다 놓은 뒤 다시 쓰면 파일에서 다시 읽는지(SAM3 · Anima 3.8B · IP-Adapter · DeGrid · TIPO · Modulation · Colorcraft · 세
+  샘플링 행렬 · 두 스크립트의 등록과 해제, Safe PAG 가 예외로 끝난 생성이 남긴 열 가지) · 다른 스레드가 쥔 진짜 잠금에서 기다리지
+  않고 거절.
+- `test_unload_models_gradio.py`(23개, 진짜 Gradio 4.40): 숨은 버튼의 입력 · 출력 · js · 큐 · `concurrency_limit`, footer 뒤 자리,
+  process_api 로 누른 결과 · 거절 · 남은 작업 기록의 두 번 클릭, 처리기가 던지지 않음, 콘솔 기록, 화면마다 한 번 · Reload UI, 일회용
+  footer · `forge_host()` 가 Forge 의 잠금 · state · sd_models · 캐시 모듈 · 장치를 읽는지(체크포인트 없이 TIPO 패처만 있으면
+  `Forge 모델` 아님) · Forge 의 진짜 FIFOLock(실패한 Extras API
+  호출이 남긴 기록 포함) · Forge 체크아웃의 unload/reload 경로 · ✨ 건너뛰기 순서 · 메모리 목록 밖의 모델(AST) · 스크립트 파일(콜백
+  하나 · 화면 없는 AlwaysVisible 스크립트 · 내린 뒤 ✨ 의 before_process).
+- `tests/js/notebook_unload_models.test.mjs`(14개, jsdom): 기본값 저장 묶음 안 저장 버튼 바로 뒤 · 같은 클래스 · 결과 글은 줄 항목,
+  먼저 붙었을 때 묶음 안으로 옮김, 기본값 저장이 없으면 줄 끝, 레이아웃이 없거나 Forge 기본 화면이면 없음, 다시 그린 줄에 같은 것을
+  다시 붙임(진행 중인 결과 글 유지), 요청 id · 결과 한 줄 · 툴팁, 거절 · 일부 실패 · 지난 결과 · 두 번 누름 · 포커스 · 시간 초과 ·
+  연결 없음, CSS.
+- `tests/js/notebook_unload_models_layout.test.mjs`(5개, 새로): headless Chrome(없으면 건너뜀)이 진짜 style.css · tokens.css · 두 페이지
+  스크립트로 탭 줄을 그리고(Forge 체크아웃이 있으면 Forge 의 style.css 도) 1920 · 1280(Generation · 로라) · 1024(Generation · 로라)px
+  에서 진짜 클릭 흐름으로 결과 글을 채우기 전과 뒤의 사각형을 잽니다 — 두 버튼이 같은 줄에 붙어 있는지, 결과가 나와도 버튼이 그
+  자리인지, 결과가 버튼 아래 오른쪽 정렬인지. 옛 배치에서는 다섯 다 실패합니다.
+- XYZ `[Modules] Text Encoder`: `tests/test_xyz_text_encoder.py`(자리 판정 · GGUF 읽기 · 체크포인트 · 값 · 목록 · 축 둘 · 후보 · 라벨),
+  `tests/test_xyz_text_encoder_script.py`(등록 · Reload UI · 훅 · 축 둘 · 체크포인트), `tests/test_xyz_text_encoder_origin.py` — Forge 의
+  `replace_state_dict` · `gguf_remapping` · `preprocess_state_dict` 를 같은 헤더에 돌려 자리 · 내장 인코더를 대조하고(체크아웃의
+  `models/text_encoder` 파일 헤더 포함), GGUF 읽기를 Forge 의 gguf-py `GGUFReader` · `get_orig_shape` 와 대조하고, Forge 의
+  `process_images` · `set_config` · `modules_change` · `checkpoint_change` · `refresh_model_loading_parameters` · Hires 의 모델 전환
+  문장 · `apply_refiner` 의 전환 문장과 xyz_grid 의 `apply_checkpoint` · `apply_vae` 로 그리드를 돌려 칸마다 불러온 체크포인트 · 모듈,
+  `Module N`, 칸 도중 페이지가 저장할 설정, 그리드 뒤 원래 값을 확인합니다(체크포인트 축 양쪽 순서, VAE 축, 축 둘, 중간의
+  `Use Forge current`, 실패한 칸, API 의 모듈 목록 · 체크포인트, 도중의 드롭다운 변경, Hires · Refiner, 칸 안의 패스). 소스 가드가
+  `replace_state_dict` 의 탐지 키 · 너비 · 자리 이름 · 계열 표와 `gguf_remapping` 의 이름 표를 지킵니다.
+  `tests/test_integration_load_order.py` 에 `[Modules]` 축 하나를 더했습니다.
+- XYZ `VAE` 축: `tests/test_xyz_vae.py`(형식 · 엄격 로드 비교 · 예측 · 목록), `tests/test_xyz_vae_script.py`(제자리 교체 · Reload UI ·
   훅), `tests/test_xyz_vae_origin.py` — Forge 의 `modules/sd_vae.py` 전체 · `process_images` · `forge_model_reload` ·
   `load_torch_file` · `load_state_dict` · `set_config` · `main_entry` 와 xyz_grid 의 `VAE` 축 정의 그대로를 형식마다 텐서 몇 개짜리 진짜
   VAE 파일로 CPU 에서 돌려, 사용자의 그리드(3D 선택, 3D/2D/3D/2D/2D)가 기본 축으로는 세 칸이 검고 바꾼 축으로는 모두 그려지는 것,
@@ -335,40 +401,25 @@ Forge 기본 XYZ 에는 `VAE` 축만 있고 텍스트 인코더를 바꿔 가며
   `WanVAE` · `Qwen2DVAE`(작은 설정, 별도 프로세스)와 체크아웃의 `models/VAE` 파일(헤더만, meta 장치)로 형식 판정과 교체 가능 판정이
   Forge 의 로더 · 엄격 로드와 같은지도 대조합니다. `tests/test_integration_load_order.py` 는 축이 Forge 의 자리에 들어가는지(재로딩 ·
   남은 XYZ 포함) 봅니다.
-
-## 다음 판 (아직 발행 전) — 태그 자동완성 내장 (sd-webui-tagcomplete-neo)
-
-따로 설치하던 [sd-webui-tagcomplete-neo](https://github.com/eduardoabreu81/sd-webui-tagcomplete-neo)(commit `8e0d81f`, MIT)를
-sam-extra 에 넣었습니다(README 의 **Tag Autocomplete (내장 태그 자동완성)** 절). Forge 를 재시작하세요(새 스크립트·JS).
-
-- **설정·동작 그대로**: Settings → **Tag Autocomplete** 의 `tac_*` 57개는 키·이름·섹션이 같아 저장된 값이 이어집니다(기본값은
-  `tac_tagFile` 하나만 다름 — 아래, 테스트가 설치돼 있던 상류 파일과 대조). 전역 JS 이름·`/tacapi/v1/*` 경로 15개·`<forge>/tmp/tagAutocompletePath.txt` 도 같습니다.
-  설정 맨 위에 안내 줄과 스위치 **내장 Tag Autocomplete 사용 (sam-extra)**(`sam3_builtin_tagcomplete_enabled`, 기본 켬, 재시작)가 더해졌습니다.
-- **따로 설치한 사본과 함께 돌지 않음**: 다른 tagcomplete 가 켜져 있으면 내장은 쉬고 콘솔·설정 안내 줄에 이유를 남깁니다(같은 JS 를 두 번
-  실으면 페이지에서 반만 초기화됨). 두 곳 모두 그 폴더를 넣은 옮기기 명령을 알려 줍니다 — Forge 를 끄고 **먼저 옮긴 뒤** 그 확장 폴더를
-  extensions 밖으로 옮기고(지우는 것보다 안전) 재시작하세요. 먼저 지우면 git 에 없는 사용자 목록·사용 횟수가 사라집니다.
-- **사용자 파일 옮기기**: `tools/migrate_tagcomplete.py` — 예전 폴더의 태그 목록·사용 횟수(`tag_frequency.db`)·LoRA 해시 캐시를 이 확장의
-  `tags/` 로(미리보기 기본, 덮어쓰지 않음, SHA-256·DB 확인). 내장이 먼저 한 번 돌며 만든 빈 DB(0 행)·빈 해시 캐시는 옆으로 치우고
-  (`*.empty-<시각>.bak`, 지우지 않음) 옮깁니다. `tac_*` 가 고른 파일이 `tags/` 에 없다는 알림도 이 명령을 함께 알려 줍니다.
-- **페이지가 일찍 열려도 시작**: 로더는 시작 정보를 Forge 설정(`opts`)의 숨은 키 `sam3_tac_builtin_boot` 에서 읽습니다 — 확장들의 시작
-  작업(app_started)이 끝나기 전에 열린 페이지(자동으로 여는 브라우저, Reload UI 뒤 새로 고침)에서도 상류처럼 시작합니다.
-- **태그 목록**: 저장소에 `danbooru_2026-10-01_pt20-ia-dd.csv`·`danbooru.csv`·`danbooru_2025.csv`·`danbooru_e621_merged.csv`·
-  `extra-quality-tags.csv`·`demo-chants.json`(약 19.9 MB)을 넣었습니다. 나머지 상류 목록과 사용자 목록은 git 밖(`.gitignore`)입니다.
-- **기본 태그 목록 — Danbooru 2026-10-01**: `tac_tagFile` 의 기본값이 `danbooru.csv`(상류) 대신 `danbooru_2026-10-01_pt20-ia-dd.csv`
-  입니다 — 2026-10-01 에 만든 Danbooru 목록, 게시물 수 20 이상인 태그 220,510개(별칭 포함). 출처는
-  [DraconicDragon/dbr-e621-lists-archive](https://github.com/DraconicDragon/dbr-e621-lists-archive)(The Unlicense, 파일 그대로 — 테스트가
-  git blob 을 고정)입니다. 키·이름·섹션은 그대로이고, config.json 에 저장된 값이 있으면 그 값이 쓰입니다 — 한국어 설명이 붙은
-  목록(`KR_danbooru_tags_with_description-…csv`)도 Settings 에서 계속 고를 수 있습니다.
-- **저장된 값 바꾸기 (`--set-tagfile`)**: `tools/migrate_tagcomplete.py --set-tagfile <이름> --config <forge>/config.json` — 미리보기가
-  기본이고, `--apply --forge-stopped` 로 `config.json.bak-tagfile-<시각>` 백업을 먼저 쓴 뒤 `tac_tagFile` 값만 바꿉니다(다른 바이트는
-  그대로). Forge 가 떠 있으면(`127.0.0.1` 의 `--forge-port`, 기본 7860 이 응답) 아무것도 쓰지 않습니다.
-- **TIPO**: 캐릭터·작품·메타 구분에 쓰는 danbooru CSV 를 이 확장의 `tags/` 에서 읽습니다(예전: 따로 설치한 tagcomplete 폴더 — 그 폴더를
-  지우면 구분이 비었을 것).
-- **보안 (상류와 다른 점)**: `GET /tacapi/v1/wildcard-contents` 가 와일드카드 폴더 안의 `.txt` 만 돌려줍니다(상류는 아무 파일이나).
-- **고른 파일이 없을 때 알림**: `tac_tagFile` 등이 `tags/` 에 없는 파일을 가리키면 시작할 때 콘솔과 설정 안내 줄에 알립니다(상류는 그 목록을
-  조용히 비움 — 태그 파일이 없으면 extra 파일도). `tac_tagFile` 이면 그동안 기본 목록으로 추천합니다 — 로더가 페이지의 설정 값만
-  바꿔 읽게 하고 config.json·Settings 의 값은 그대로라, 있는 파일을 다시 고르면 그 파일을 씁니다.
-- 의존성: `pyyaml`(상류 `install.py` 가 설치하던 것)을 `requirements.txt` 에 더했습니다(Forge 에 이미 있음).
+- 2.30 의 `sampling_function.py` 는 `from modules import shared` 를 하므로, 실제 파일을 불러 쓰는 테스트(Safe PAG · DCW · 통합 ·
+  SPEED 스택 · NegPiP SD 배치)의 대역에 `modules.shared`(`batch_cond_uncond=True`)를 넣었습니다(없으면 2.30 에서 오류 47개). 끈 경우는
+  불러 둔 모듈의 값을 바꾸지 않고 새로 불러 확인합니다. 2.29.2 에서는 이 설정을 읽지 않으므로 같은 테스트가 묶음 모양을 확인합니다.
+- Spectrum 테스트는 판마다 나눴습니다: 2.29.2 예측기(`git show d70373eb`)로 충돌, 2.30 예측기(`git show 45f41b81`)로 재계산과
+  사라진 절약, 설치된 Forge 의 예측기가 둘 중 어느 쪽과 같은지. Forge 작업 트리는 건드리지 않고, Forge git 저장소가 없으면(CI)
+  건너뜁니다. 저장소가 다른 곳에 있으면 `SAM3_FORGE_GIT` 로 알려 줍니다.
+- 태그 자동완성: `test_tagcomplete_builtin.py`(21개) · `test_tagcomplete_vendor.py`(19개 — 상류 파일 · 함수 해시) ·
+  `test_tagcomplete_settings_parity.py`(7개 — 설치돼 있던 상류와 설정 대조) · `test_tagcomplete_helper.py`(5개) ·
+  `test_migrate_tagcomplete.py`(29개 — 옮기기 · `--set-tagfile`), JS `tagcomplete_builtin.test.mjs` · `tagcomplete_loader.test.mjs`,
+  통합 시험의 내장 tagcomplete 검사(설정 · 경로 · 시작 정보, 쓰는 파일은 시험의 임시 폴더 안).
+- 통합: `tests/js/tagcomplete_notebook_buttons.test.mjs`(4개, 새로 — 위 **모델 내리기 × 태그 자동완성**), `test_unload_models.py` 의
+  `FaceDetectHookTests`(3개 — 놓은 검출기는 쥔 것 없음, 참조 고리로 남은 검출기는 gc 없이 가중치가 풀림, 버튼이 목록으로 찾음),
+  `test_integration_load_order.py` 의 XYZ 축 공존(1개). 돌연변이 확인: 페이지 스크립트에 상류와 같은 전역 이름을 하나 두면 JS 넷이
+  모두 실패합니다.
+- 전체(CPU, `CUDA_VISIBLE_DEVICES=-1`, 각 Forge 체크아웃의 extensions 에 이 판을 복사해 `SAM3_FORGE_ROOT` 로), 2026-10-12:
+  Forge 2.29.2(`d70373eb`) 3701 테스트 · 건너뜀 32, 2.30-2(`45f41b81`) 3701 · 건너뜀 31, 2.30-6(`ede60e1a`) 3701 · 건너뜀 30 —
+  셋 다 실패 0 · 오류 0. 설치된 Forge(2.30-6) 를 `SAM3_FORGE_ROOT` 로 둔 작업 트리(확장 폴더 밖이라 Forge 옆을 찾는 테스트는
+  건너뜀): 3605 · 건너뜀 186 · 실패 0 · 오류 0. JS(`npm test`, node:test + jsdom) 297개 모두 통과(2.30-6 체크아웃 옆 — 작업
+  트리에서는 Forge 의 `progressbar.js` 를 쓰는 1개를 건너뜀).
 
 ## v0.33.1 — IPNDM_V 4차 계수 오타 (Linear Quadratic 에서 그림이 깨지던 것)
 

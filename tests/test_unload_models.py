@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import ast
 import contextlib
+import gc
 import importlib.util
 import json
 import sys
@@ -15,6 +16,7 @@ import tempfile
 import threading
 import types
 import unittest
+import weakref
 from pathlib import Path
 from unittest import mock
 
@@ -589,7 +591,7 @@ def fake_sd_models(current, calls):
 class RegistryTests(unittest.TestCase):
     def test_builtin_hooks_in_order(self):
         self.assertEqual([row[0] for row in ur.BUILTIN_HOOKS], [
-            "sam3", "anima38", "anima_ipa", "vae_degrid", "tipo", "modulation", "colorcraft",
+            "sam3", "face_detect", "anima38", "anima_ipa", "vae_degrid", "tipo", "modulation", "colorcraft",
             "speed_dct", "hiflow_mask", "history_dct"])
         registry = ur.UnloadRegistry(ur.BUILTIN_HOOKS)
         self.assertEqual([(h.key, h.label) for h in registry.hooks()], [(row[0], row[1]) for row in ur.BUILTIN_HOOKS])
@@ -673,6 +675,84 @@ class Sam3HookTests(unittest.TestCase):
             self.assertIsNone(core._BUNDLE)
             self.assertIsNone(core._BUNDLE_OFFLOADED, "the copy 'Unload after' keeps in RAM goes too")
             self.assertIs(core.release_sam3(), False)
+
+
+class FaceDetectHookTests(unittest.TestCase):
+    """SAM3 '얼굴 안에서만 찾기'의 YOLO 검출기(sam3ext/face_detect.py) — 부를 때마다 읽고 놓으므로 보통 쥔 것이 없고,
+    놓은 뒤에도 살아 있는 검출기(참조 고리가 gc 를 기다림)만 모델 · predictor 를 떼어 놓는다. ultralytics 는 가짜."""
+
+    def setUp(self):
+        from sam3ext import face_detect as fd
+
+        self.fd = fd
+        fd.release_face_detector()                               # whatever an earlier test left
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        models = Path(tmp.name) / "models"
+        (models / "adetailer").mkdir(parents=True)
+        (models / "adetailer" / "face_yolov8n.pt").write_bytes(b"x")
+        patcher = mock.patch.object(fd, "_models_root", lambda: models)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    @staticmethod
+    def _ultralytics(made: list, cycle: bool) -> dict:
+        module = types.ModuleType("ultralytics")
+
+        class YOLO:
+            def __init__(self, path):
+                self.model = torch.nn.Linear(2, 2)
+                self.predictor = types.SimpleNamespace(model=self.model)
+                if cycle:
+                    self.predictor.owner = self                  # only gc frees a cycle
+                made.append(weakref.ref(self))
+
+            def __call__(self, image, **kwargs):
+                return [types.SimpleNamespace(boxes=types.SimpleNamespace(xyxy=[[1.0, 2.0, 3.0, 4.0]], conf=[0.9]))]
+
+        module.YOLO = YOLO
+        utils = types.ModuleType("ultralytics.utils")
+        checks = types.ModuleType("ultralytics.utils.checks")
+        checks.check_yolov5u_filename = lambda file, verbose=True: file
+        utils.checks = checks
+        module.utils = utils
+        return {"ultralytics": module, "ultralytics.utils": utils, "ultralytics.utils.checks": checks}
+
+    def _detect(self, made: list, cycle: bool):
+        from PIL import Image
+
+        with mock.patch.dict(sys.modules, self._ultralytics(made, cycle)):
+            return self.fd.detect_faces(Image.new("RGB", (32, 32)), "face_yolov8n.pt", 0.3, "cpu")
+
+    def test_a_detector_that_was_let_go_holds_nothing(self):
+        made: list = []
+        found = self._detect(made, cycle=False)
+        self.assertEqual(found.boxes, [[1.0, 2.0, 3.0, 4.0]])
+        self.assertIsNone(made[0](), "detect_faces keeps no detector")
+        self.assertIs(self.fd.release_face_detector(), False)
+
+    def test_a_detector_a_cycle_keeps_alive_loses_its_model_and_predictor(self):
+        made: list = []
+        gc.disable()
+        try:
+            self._detect(made, cycle=True)
+            detector = made[0]()
+            self.assertIsNotNone(detector, "the cycle keeps it until gc")
+            weights = weakref.ref(detector.model)
+            del detector
+            self.assertIs(self.fd.release_face_detector(), True)
+            self.assertIsNone(weights(), "the weights go at once, without waiting for gc")
+            self.assertIsNone(made[0](), "with its predictor dropped the cycle is broken: the detector goes too")
+            self.assertIs(self.fd.release_face_detector(), False, "nothing twice")
+        finally:
+            gc.enable()
+
+    def test_the_button_reaches_it_through_the_builtin_list(self):
+        hooks = {hook.key: hook for hook in ur.UnloadRegistry(ur.BUILTIN_HOOKS).hooks()}
+        self.assertEqual(hooks["face_detect"].label, "얼굴 검출기")
+        with mock.patch.object(self.fd, "release_face_detector", return_value=True) as release:
+            self.assertIs(hooks["face_detect"].release(), True)
+        release.assert_called_once_with()
 
 
 class RuntimeHookTests(unittest.TestCase):

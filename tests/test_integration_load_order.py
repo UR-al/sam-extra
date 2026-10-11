@@ -14,7 +14,8 @@ several scripts install hooks when imported. Checked here:
 * ``scripts/list_order.py`` sorts both lists by family in ``on_before_ui`` (after every script has
   registered), Forge's first entries stay first, and a reload sorts nothing differently;
 * XYZ axis labels are unique (Forge's built-in ones included) and a reload neither duplicates nor drops
-  any — with a reloaded XYZ grid and with one a host kept;
+  any — with a reloaded XYZ grid and with one a host kept; the SAM3 axes (face crop included) and the
+  ``[Modules] Text Encoder`` / replaced ``VAE`` axes are there together;
 * settings keys are unique, each section id has one title (and each title one id);
 * the HTTP routes are registered once, also when app start fires again on the same app;
 * every always-on script that puts itself in the ANIMA section has an ``anima`` lane in
@@ -205,6 +206,19 @@ class LoadOrderTests(unittest.TestCase):
             for b in prefixes:
                 if a != b:
                     self.assertFalse(b.startswith(a), (a, b))   # no prefix guard swallows another
+
+    def test_face_crop_and_text_encoder_axes_coexist(self):
+        """v0.34.0: the "[SAM3] …" axes scripts/!sam3.py adds in before_ui (with the three face crop axes last) and the
+        "[Modules] Text Encoder" axis and replaced "VAE" axis of scripts/modules_xyz_text_encoder.py are each there once
+        — also after Reload UI and on a kept XYZ grid."""
+        for key in ("xyz", "reload_xyz", "kept_xyz"):
+            labels = self.report[key]
+            sam3 = [label for label in labels if label.startswith("[SAM3] ")]
+            self.assertEqual(len(sam3), 40, key)
+            self.assertEqual(sam3[-3:], ["[SAM3] Face Crop", "[SAM3] Face Crop Model", "[SAM3] Face Crop Confidence"], key)
+            for label in ("[Modules] Text Encoder", "VAE", *sam3):
+                self.assertEqual(labels.count(label), 1, (key, label))
+            self.assertEqual(labels.index("VAE"), self.report["forge_xyz"].index("VAE"), key)
 
     def test_settings_keys_and_sections_are_unique(self):
         r = self.report

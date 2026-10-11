@@ -13,7 +13,7 @@
 * ``register(key, label, release)`` — 그 밖의 곳(``scripts/*.py`` 처럼 import 이름이 없는 스크립트 모듈, 다른 확장 기능).
   같은 ``key`` 로 다시 등록하면 바꿔 끼운다(Reload UI 가 스크립트를 다시 실행할 때).
 
-새 기능이 모델을 쥐면(예: 얼굴 검출기) 그 모듈에 ``release`` 함수를 두고 ``BUILTIN_HOOKS`` 에 한 줄을 더하거나 ``register``
+새 기능이 모델을 쥐면 그 모듈에 ``release`` 함수를 두고 ``BUILTIN_HOOKS`` 에 한 줄을 더하거나(얼굴 검출기처럼) ``register``
 로 등록한다. 같은 ``label`` 을 여러 훅이 써도 된다 — 결과 글에는 한 번만 나온다.
 """
 from __future__ import annotations
@@ -27,6 +27,8 @@ from typing import Any, Callable
 BUILTIN_HOOKS: tuple[tuple[str, str, str, str], ...] = (
     # SAM3 번들(약 3.5 GB) — 'Unload after' 가 CPU RAM 에 보관한 사본까지 버린다(다음 검출은 파일에서 다시 빌드).
     ("sam3", "SAM3", "sam3ext.core", "release_sam3"),
+    # SAM3 '얼굴 안에서만 찾기'의 YOLO 얼굴 검출기 — 캐시하지 않으므로 보통 없음, 놓은 뒤에도 살아 있는 검출기만 뗀다.
+    ("face_detect", "얼굴 검출기", "sam3ext.face_detect", "release_face_detector"),
     # Anima 3.8B: Qwen3.5 4B · v1 어댑터 · v2 커넥터와 그 Forge 패처 · run 의 장치 사본 · 특징/TE 줄 캐시.
     ("anima38", "Anima 3.8B", "sam3ext.anima38.runtime", "unload_shared_runtime"),
     # 캐릭터 레퍼런스의 IP-Adapter 가중치와 SigLIP2 인코더(쉴 때 CPU RAM).

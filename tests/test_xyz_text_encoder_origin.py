@@ -1,5 +1,8 @@
 """XYZ ``[Modules] Text Encoder`` against Forge's own code (Forge Neo 2.30; skipped without a Forge checkout).
 
+On Forge 2.29.2 (no Qwen3-VL 8B encoder yet — ``_forge_reads_qwen3vl_8b``) Forge rejects an 8B file that te_slots,
+written for 2.30, puts in the ``qwen3vl_8b`` slot; the tests expect that rejection there instead of the slot.
+
 1. **Slots** — Forge's real ``backend/loader.py`` ``replace_state_dict`` runs on the same headers as
    ``sam3ext.xyz_text_encoder.te_slots`` (tensors are stand-ins with a ``shape``): the ``text_encoders.<slot>.`` keys it
    writes are the slots te_slots gives, for every branch, the files Forge rejects, and the safetensors files in the
@@ -108,6 +111,14 @@ def _gguf_modules():
     return {"backend": backend, "backend.loader_gguf": module}
 
 
+def _forge_reads_qwen3vl_8b() -> bool:
+    """Forge Neo 2.30 added the Qwen3-VL 8B text encoder (Qwen-Image 2.1, slot ``qwen3vl_8b``); 2.29.2's
+    replace_state_dict asserts that every Qwen3-VL file is the 4B one. te_slots follows 2.30 and names an 8B file's
+    slot. On 2.29.2 no model family has that slot (test_slot_names checks it), so the axis refuses such a file as an
+    encoder the model does not have, as it does on 2.30 for a model without that slot."""
+    return "qwen3vl_8b" in forge_source("backend/loader.py")
+
+
 class SlotOriginTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -143,6 +154,11 @@ class SlotOriginTests(unittest.TestCase):
                         self.forge_slots(shapes)
                     with self.assertRaises(xte.ForgeLoadError):
                         xte.te_slots(header)
+                    continue
+                if set(expected) == {"qwen3vl_8b"} and not _forge_reads_qwen3vl_8b():
+                    with self.assertRaises(AssertionError):     # Forge 2.29.2: only the 4B one
+                        self.forge_slots(shapes)
+                    self.assertEqual(set(xte.te_slots(header)), set(expected))
                     continue
                 forge = self.forge_slots(shapes, CLIP_CONTEXT.get(name))
                 self.assertEqual(forge, set(xte.te_slots(header)))
@@ -192,6 +208,10 @@ class SlotOriginTests(unittest.TestCase):
                     continue
                 # CLIP weights go nowhere without a CLIP checkpoint (model type "-"): compared by name above
                 expected = set(xte.te_slots(header)) - {"clip_l", "clip_g"}
+                if expected == {"qwen3vl_8b"} and not _forge_reads_qwen3vl_8b():
+                    with self.assertRaises(AssertionError):     # Forge 2.29.2: only the 4B one
+                        self.forge_slots(shapes, path=str(path))
+                    continue
                 self.assertEqual(self.forge_slots(shapes, path=str(path)), expected)
                 if kind.kind in ("qwen35", "adapter"):
                     self.assertEqual(expected, set(), "Forge would use it as an encoder")
@@ -1142,7 +1162,11 @@ class LoaderGuardTests(unittest.TestCase):
                     choices.append([str(value) for value in _branch_values(latest[1])])
             for combo in itertools.product(*choices):
                 slots.add("".join(combo).split(".", 1)[0])
-        self.assertEqual(slots, set(xte.SLOT_NAMES) - {"clip_l", "clip_g"})
+        expected = set(xte.SLOT_NAMES) - {"clip_l", "clip_g"}
+        if not _forge_reads_qwen3vl_8b():   # Forge 2.29.2: no Qwen3-VL 8B slot, and no model family that reads one
+            expected.discard("qwen3vl_8b")
+            self.assertNotIn("qwen3vl_8b", forge_source("modules_forge/packages/huggingface_guess/model_list.py"))
+        self.assertEqual(slots, expected)
 
     def test_model_type_tables(self):
         self.assertEqual(ast.literal_eval(_dict_literal(self.fn, "prefix_L")), xte.PREFIX_L)
