@@ -3,6 +3,7 @@ inpaint (optionally with a ControlNet unit) against the currently selected
 gallery image, appending the result back into the same gallery."""
 from __future__ import annotations
 
+import html
 import io
 import json
 import os
@@ -19,12 +20,19 @@ import numpy as np
 from PIL import Image
 
 from .coerce import as_float, as_int
+from .face_detect import DEFAULT_CONFIDENCE as FACE_CROP_DEFAULT_CONFIDENCE
+from .face_detect import DEFAULT_MODEL as FACE_CROP_DEFAULT_MODEL
+from .face_detect import FaceDetectorUnavailable, find_face_models
 from .forge_exclusive import run_exclusive, stop_if_job
 from .ui import (
     _controlnet_model_choices,
     _controlnet_module_choices,
     _default_cn_module,
+    default_face_model,
 )
+
+# Refine 의 '얼굴 안에서만 찾기' — 이웃 라벨처럼 'SAM3 Refine' 접두어(ui_loadsave 경로가 겹치지 않게) + 한국어 이름.
+REFINE_FACE_CROP_LABEL = "SAM3 Refine Face Crop (얼굴 안에서만 찾기) — SAM3 runs on each face_yolov8 face crop"
 
 # Job name the Refine click runs under (shared.state.begin) and the prefixes
 # the per-pass names in inpaint_core.run_sam3_refine start with. The Stop
@@ -115,6 +123,10 @@ class RefinePanel:
     # Regional style-swap preset — one click sets the guide-tuned values on the
     # existing widgets (no new script args). See docs/REGIONAL_STYLE_SWAP.md.
     regional_preset_button: gr.Button
+    # 얼굴 안에서만 찾기 — face_yolov8 얼굴 crop 안에서만 SAM3 (sam3ext/face_crop.py).
+    face_crop: gr.Checkbox
+    face_crop_model: gr.Dropdown
+    face_crop_confidence: gr.Slider
     # Manual-mask canvas slots (None when ForgeCanvas isn't importable).
     # canvas_bg / canvas_fg are LogicalImage Textbox slots backing the
     # background image and the user's drawn scribble layer respectively.
@@ -170,6 +182,10 @@ class RefinePanel:
             self.cn_threshold_a,
             self.cn_threshold_b,
             self.insert_mode,
+            # 얼굴 안에서만 찾기 — 캔버스 칸(있을 때만 붙음) 앞, 다른 값 뒤에 붙여 앞의 순서를 그대로 둔다.
+            self.face_crop,
+            self.face_crop_model,
+            self.face_crop_confidence,
         ]
         # Append canvas slots when the component is available so the user's
         # drawn mask + (optionally) overridden source image reach the click
@@ -221,6 +237,9 @@ REFINE_ARG_KEYS = (
     "cn_threshold_a",
     "cn_threshold_b",
     "insert_mode",
+    "face_crop",
+    "face_crop_model",
+    "face_crop_confidence",
     # Canvas slots — only appended when ForgeCanvas is available (see
     # ``RefinePanel.all_widgets``). Keep them last so the rest of the keys
     # are positionally stable when the canvas is absent.
@@ -407,6 +426,29 @@ def build_refine_panel(
                 label="Unload SAM3 from VRAM after detection",
                 value=False,
                 elem_id="sam3_refine_unload_after",
+            )
+
+        with gr.Row():
+            face_crop = gr.Checkbox(
+                label=REFINE_FACE_CROP_LABEL,
+                value=False,
+                elem_id="sam3_refine_face_crop",
+            )
+            face_models = find_face_models()
+            face_crop_model = gr.Dropdown(
+                label="SAM3 Refine Face Detector (models/adetailer)",
+                choices=face_models,
+                value=default_face_model(face_models),
+                type="value",
+                elem_id="sam3_refine_face_crop_model",
+            )
+            face_crop_confidence = gr.Slider(
+                label="SAM3 Refine Face Detector Confidence",
+                minimum=0.0,
+                maximum=1.0,
+                step=0.01,
+                value=FACE_CROP_DEFAULT_CONFIDENCE,
+                elem_id="sam3_refine_face_crop_confidence",
             )
 
         with gr.Row():
@@ -644,6 +686,9 @@ def build_refine_panel(
         stop_button=stop_button,
         status=status,
         regional_preset_button=regional_preset_button,
+        face_crop=face_crop,
+        face_crop_model=face_crop_model,
+        face_crop_confidence=face_crop_confidence,
         canvas_bg=canvas_bg,
         canvas_fg=canvas_fg,
         canvas_load_button=canvas_load_button,
@@ -841,7 +886,7 @@ def map_widget_values_to_sam3_args(values: tuple) -> dict[str, Any]:
         "threshold", "denoising_strength", "cfg_scale", "cn_weight",
         "cn_guidance_start", "cn_guidance_end", "cn_threshold_a", "cn_threshold_b",
         "mask_dilation", "mask_blur", "inpaint_only_masked_padding", "steps",
-        "cn_processor_res",
+        "cn_processor_res", "face_crop_confidence",
     ):
         v = keyed.get(k)
         if isinstance(v, str) and v.strip() != "":
@@ -897,6 +942,10 @@ def map_widget_values_to_sam3_args(values: tuple) -> dict[str, Any]:
         "sam3_cn_processor_res": _as_int(keyed.get("cn_processor_res"), 512),
         "sam3_cn_threshold_a": _as_float(keyed.get("cn_threshold_a"), -1.0),
         "sam3_cn_threshold_b": _as_float(keyed.get("cn_threshold_b"), -1.0),
+        # 얼굴 안에서만 찾기 (값이 없으면 꺼짐 — In-flight 의 Sam3Args 기본값과 같다)
+        "sam3_face_crop": bool(keyed.get("face_crop", False)),
+        "sam3_face_crop_model": str(keyed.get("face_crop_model") or "").strip() or FACE_CROP_DEFAULT_MODEL,
+        "sam3_face_crop_confidence": min(1.0, max(0.0, _as_float(keyed.get("face_crop_confidence"), FACE_CROP_DEFAULT_CONFIDENCE))),
         "_insert_mode": str(keyed.get("insert_mode") or "After selected"),
         "_inherit_main_prompt": bool(keyed.get("inherit_main_prompt", True)),
         # Fallback must match the widget default (value=False above): if the
@@ -1016,6 +1065,15 @@ def _refine_empty_message(results) -> str:
     reason = getattr(results, "reason", "")
     if reason == "empty_mask":
         text = "SAM3 Refine: 검출된 마스크가 없습니다. Target·Exclude·임계값을 확인하세요."
+    elif reason == "no_faces":
+        info = getattr(results, "face_crop", None)
+        where = ""
+        if info is not None:
+            where = f" ({html.escape(str(info.model))}, 신뢰도 {float(info.confidence):.2f})"
+        text = (
+            f"SAM3 Refine: 얼굴을 찾지 못했습니다{where}. "
+            "얼굴 검출 신뢰도를 낮추거나 '얼굴 안에서만 찾기'를 끄세요."
+        )
     elif reason == "interrupted":
         text = "SAM3 Refine: 사용자가 작업을 중단했습니다."
     elif reason == "runner_unavailable":
@@ -1248,6 +1306,14 @@ def handle_refine_click(
     # Forge's main thread. See forge_exclusive.run_exclusive.
     try:
         new_pairs = run_exclusive(REFINE_JOB, _refine, on_main_thread=True)
+    except FaceDetectorUnavailable as exc:
+        # 얼굴 안에서만 찾기의 검출기를 쓸 수 없음(모델 파일·ultralytics 없음) — 할 일을 상태 줄에 그대로 보인다.
+        print(f"[-] SAM3 Refine: {exc}", file=sys.stderr)
+        return _refine_error_return(
+            gallery_value,
+            "<span style='color:#c33'>SAM3 Refine: 얼굴 검출기를 쓸 수 없습니다 — "
+            f"{html.escape(str(exc))}</span>",
+        )
     except Exception:
         error = traceback.format_exc()
         print(f"[-] SAM3 Refine: handler failed:\n{error}", file=sys.stderr)

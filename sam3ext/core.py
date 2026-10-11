@@ -12,6 +12,11 @@ from typing import Any, Callable
 import numpy as np
 from PIL import Image
 
+from .face_crop import FaceCropInfo, assign_owners, box_to_image, grow_crop, paste_mask, plan_face_crops
+from .face_detect import DEFAULT_CONFIDENCE as FACE_CROP_DEFAULT_CONFIDENCE
+from .face_detect import DEFAULT_MODEL as FACE_CROP_DEFAULT_MODEL
+from .face_detect import detect_faces
+
 
 SAM3_NAME = "SAM3 Mask"
 EXTENSION_ROOT = Path(__file__).resolve().parent.parent
@@ -40,6 +45,17 @@ class Sam3Result:
     scores: list[float]
     device: str
     checkpoint: str
+    # '얼굴 안에서만 찾기'(face_crop=True)로 돌았을 때만 — 얼굴 수·상자·crop(sam3ext.face_crop.FaceCropInfo). 아니면 None.
+    face_crop: FaceCropInfo | None = None
+
+
+def describe_face_crop(result: Any) -> str | None:
+    """결과의 얼굴 crop 상태 한 줄(콘솔·Refine 상태용), 얼굴 crop 으로 돌지 않았으면 None.
+
+    ``result`` 는 ``Sam3Result`` 또는 같은 속성을 가진 대역(테스트의 SimpleNamespace — ``face_crop`` 이 없어도 됨).
+    """
+    info = getattr(result, "face_crop", None)
+    return None if info is None else info.status()
 
 
 def _resolve_device(device: str) -> str:
@@ -867,6 +883,16 @@ def _manual_mask_result(image: Image.Image, user_mask: np.ndarray) -> Sam3Result
     )
 
 
+def _user_mask_at(user_mask: np.ndarray, height: int, width: int) -> np.ndarray:
+    """Manual Mask 를 이미지 크기로(크기가 다를 때만 최근접 이웃으로 늘리고 bool 로) — 크기가 같으면 받은 그대로."""
+    if user_mask.shape != (height, width):
+        um_pil = Image.fromarray(user_mask.astype(np.uint8) * 255, mode="L").resize(
+            (width, height), Image.NEAREST
+        )
+        return np.asarray(um_pil) > 127
+    return user_mask
+
+
 def run_sam3_on_pil(
     image: Image.Image,
     prompt: str,
@@ -879,7 +905,19 @@ def run_sam3_on_pil(
     mask_outline_px: int = 0,
     exclude_prompt: str = "",
     user_mask: np.ndarray | None = None,
+    face_crop: bool = False,
+    face_crop_model: str = FACE_CROP_DEFAULT_MODEL,
+    face_crop_confidence: float = FACE_CROP_DEFAULT_CONFIDENCE,
 ) -> Sam3Result:
+    """SAM3 로 ``prompt`` 마스크를 만든다(``/`` 그룹마다 하나 — Individual 은 ``masks``, Combined 는 ``mask``).
+
+    ``face_crop`` (얼굴 안에서만 찾기): 먼저 ``face_crop_model``(models/adetailer 의 face_yolov8 등)로 얼굴 상자를 찾고,
+    상자마다 넓힌 정사각 crop 에서만 SAM3 를 돌려 마스크를 이미지 좌표로 붙인다(``sam3ext.face_crop``). 그러면
+    ``masks`` 는 그룹 × 얼굴마다 하나(그룹 순서, 그 안에서 얼굴은 왼쪽 → 오른쪽), ``mask`` 는 그 합집합이다. Exclude 는
+    crop 마다, Outline + Dilation px 만큼 넓힌 영역(마스크가 번질 수 있는 곳)에서 찾아 모든 마스크에서 뺀다.
+    Hull·Outline·Dilation·Manual Mask·Exclude 는 이미지 좌표에서 예전과 같은 순서로 한다. 얼굴이 없으면 SAM3 를
+    불러오지 않고 검출 없음과 같게 끝낸다 — 빈 마스크, Manual Mask 가 있으면 그것 그대로.
+    """
     # Target empty + no Exclude means the user requested their drawn mask.
     # Branch before Torch import/device checks/checkpoint download or load.
     if user_mask is not None and not (prompt or "").strip() and not (exclude_prompt or "").strip():
@@ -898,12 +936,40 @@ def run_sam3_on_pil(
         raise FileNotFoundError(_missing_checkpoint_message(checkpoint_path, allow_huggingface))
 
     checkpoint_key = "__hf__" if checkpoint_path is None else str(checkpoint_path.resolve())
-    _, processor = _get_model_bundle(checkpoint_key, resolved_device)
-    processor.set_confidence_threshold(float(threshold))
+    checkpoint_label = str(checkpoint_path) if checkpoint_path else "facebook/sam3::sam3.pt"
 
     pil_image = image.convert("RGB")
     rgb = np.asarray(pil_image)
     h, w = rgb.shape[:2]
+
+    # 얼굴 crop 계획 — SAM3 번들보다 먼저: 얼굴이 없으면 3.5 GB 번들을 올리지 않고 끝낸다.
+    face_info: FaceCropInfo | None = None
+    if face_crop:
+        detection = detect_faces(pil_image, face_crop_model, float(face_crop_confidence), resolved_device)
+        face_info = plan_face_crops(
+            detection.boxes,
+            detection.scores,
+            (w, h),
+            model=Path(detection.model_path).name if detection.model_path else str(face_crop_model),
+            confidence=float(face_crop_confidence),
+        )
+        print(f"[-] SAM3: {face_info.status()}", file=sys.stderr)
+        if not face_info.crops:
+            # 검출 없음과 같은 처리 — Manual Mask 를 칠했으면 아래 규칙(SAM3 가 못 찾으면 칠한 마스크 그대로)대로 그것을
+            # 쓴다. 찾을 crop 이 없으니 Exclude 도 찾지 않는다(얼굴 crop 의 Exclude 는 crop 안에서만).
+            no_face_masks: list[np.ndarray] = []
+            if user_mask is not None:
+                manual = _user_mask_at(user_mask, h, w)
+                no_face_masks = [manual]
+                print(
+                    f"[-] SAM3: user mask ({int(manual.sum())}px) kept as-is — face crop found no faces"
+                    + (" (Exclude not searched)" if (exclude_prompt or "").strip() else ""),
+                    file=sys.stderr,
+                )
+            return _assemble_result(rgb, no_face_masks, [], [], resolved_device, checkpoint_label, face_info)
+
+    _, processor = _get_model_bundle(checkpoint_key, resolved_device)
+    processor.set_confidence_threshold(float(threshold))
 
     groups = _split_prompt_groups(prompt) or [[prompt or ""]]
 
@@ -914,20 +980,32 @@ def run_sam3_on_pil(
     # 지역 변수라 run 이 끝나면 버려진다(다른 이미지·설정과 섞일 일 없음).
     outline_edges: np.ndarray | None = None
 
-    # 이미지 백본(ViT)은 이미지당 한 번만 — 예전엔 검출·제외 토큰마다 set_image 를 다시 돌렸다(기존 M2).
+    # SAM3 가 보는 영역: 보통은 이미지 전체 하나, 얼굴 crop 이면 얼굴마다 crop 하나(크기는 그대로 — SAM3 처리기가 전체
+    # 이미지 때처럼 작업 크기로 늘려 보고 마스크·상자를 crop 크기로 돌려준다).
+    if face_info is None:
+        regions: list[tuple[Any, Image.Image]] = [(None, pil_image)]
+    else:
+        regions = [(crop, pil_image.crop(crop.as_tuple())) for crop in face_info.crops]
+
+    # 이미지 백본(ViT)은 영역당 한 번만 — 예전엔 검출·제외 토큰마다 set_image 를 다시 돌렸다(기존 M2).
     # set_text_prompt 는 state["backbone_out"].update(텍스트 특징) 로 덮어쓰고 geometric_prompt·결과 키를
     # state 에 넣으므로, 토큰마다 state 와 backbone_out 을 얕은 복사해 set_image 직후 모양 그대로 넘긴다.
+    # 칸은 하나다: 얼굴 crop 은 영역 순서대로 다 돌므로 다음 영역으로 넘어가면 앞 영역의 백본 특징을 버린다(VRAM).
     image_state: dict | None = None
+    image_state_region: int | None = None
 
-    def _run_prompt(sub_prompt: str):
-        nonlocal image_state
+    def _run_prompt(sub_prompt: str, region: int = 0):
+        nonlocal image_state, image_state_region
+        region_image = regions[region][1]
         if resolved_device == "cuda":
             autocast = torch.autocast(device_type="cuda", dtype=torch.bfloat16)
         else:
             autocast = nullcontext()
         with _sam3_tf32(), autocast:
-            if image_state is None:
-                image_state = processor.set_image(pil_image)
+            if image_state is None or image_state_region != region:
+                image_state = None
+                image_state = processor.set_image(region_image)
+                image_state_region = region
             state = dict(image_state)
             state["backbone_out"] = dict(image_state["backbone_out"])
             state = processor.set_text_prompt(prompt=sub_prompt, state=state)
@@ -938,24 +1016,11 @@ def run_sam3_on_pil(
         if masks_np.size == 0:
             return [], boxes_np, scores_np
 
-        split = _clean_split_masks(masks_np, boxes_np, h, w)
+        split = _clean_split_masks(masks_np, boxes_np, region_image.height, region_image.width)
         return split, boxes_np, scores_np
 
-    for group_tokens in groups:
-        group_split: list[np.ndarray] = []
-        for sub_prompt in group_tokens:
-            split, boxes_np, scores_np = _run_prompt(sub_prompt)
-            group_split.extend(split)
-            if boxes_np.size:
-                for box in boxes_np:
-                    all_boxes.append(box.astype(float))
-            if scores_np.size:
-                for score in scores_np.tolist():
-                    all_scores.append(float(score))
-
-        if not group_split:
-            continue
-        group_mask = np.any(np.stack(group_split, axis=0), axis=0)
+    def _finish_group_mask(group_mask: np.ndarray) -> None:
+        nonlocal outline_edges
         if mask_hull:
             group_mask = _convex_hull_mask(group_mask)
         # Edge-aware expansion BEFORE plain dilation: snap to real object
@@ -967,6 +1032,75 @@ def run_sam3_on_pil(
         group_mask = _dilate_mask(group_mask, mask_dilation)
         if np.any(group_mask):
             group_masks.append(group_mask)
+
+    exclude_text = (exclude_prompt or "").strip()
+    # 얼굴 crop 의 Exclude 조각(이미지 좌표). None 이면 아래 Exclude 단계가 예전처럼 전체 이미지에서 찾는다.
+    face_exclude_pieces: list[np.ndarray] | None = None
+
+    if face_info is None:
+        for group_tokens in groups:
+            group_split: list[np.ndarray] = []
+            for sub_prompt in group_tokens:
+                split, boxes_np, scores_np = _run_prompt(sub_prompt)
+                group_split.extend(split)
+                if boxes_np.size:
+                    for box in boxes_np:
+                        all_boxes.append(box.astype(float))
+                if scores_np.size:
+                    for score in scores_np.tolist():
+                        all_scores.append(float(score))
+
+            if not group_split:
+                continue
+            _finish_group_mask(np.any(np.stack(group_split, axis=0), axis=0))
+    else:
+        # 영역(얼굴 crop)마다 검출·제외 토큰을 다 돌린 뒤 다음 영역으로 — 백본 특징은 한 영역 것만 들고 있는다.
+        # 조각은 이미지 좌표로 붙여 (그룹, 토큰)마다 모으고, 다 찾은 뒤 주인 얼굴을 정해 (그룹, 주인 얼굴) 칸에 모은다
+        # (face_crop.assign_owners — crop 가장자리에 잘린 조각은 옆 crop 에서 이어지는 조각과 묶어 정한다).
+        face_boxes = face_info.boxes
+        crops = face_info.crops
+        n_crops = len(crops)
+        found: list[list[tuple[list[np.ndarray], list[int]]]] = [[([], []) for _ in tokens] for tokens in groups]
+        face_exclude_pieces = []
+        exclude_tokens = [t for ex in _split_prompt_groups(exclude_text) for t in ex] if exclude_text else []
+        # Exclude 는 마스크가 번질 수 있는 곳까지 찾는다: Outline · Dilation 은 crop 밖으로 최대 그 px 합만큼 번지므로
+        # crop 을 그만큼 넓힌 영역에서(0 이면 crop 그대로 — 같은 백본 특징을 쓴다). 넓힌 영역은 regions 의 뒤쪽 칸.
+        growth = max(0, int(mask_outline_px)) + max(0, int(mask_dilation))
+        exclude_region: list[int] = list(range(n_crops))
+        if exclude_tokens and growth > 0:
+            for region, crop in enumerate(crops):
+                grown = grow_crop(crop, growth, (w, h))
+                if grown != crop:
+                    exclude_region[region] = len(regions)
+                    regions.append((grown, pil_image.crop(grown.as_tuple())))
+        for region, crop in enumerate(crops):
+            for group_index, group_tokens in enumerate(groups):
+                for token_index, sub_prompt in enumerate(group_tokens):
+                    split, boxes_np, scores_np = _run_prompt(sub_prompt, region)
+                    pieces, sources = found[group_index][token_index]
+                    for piece in split:
+                        if np.any(piece):
+                            pieces.append(paste_mask(piece, crop, (h, w)))
+                            sources.append(region)
+                    if boxes_np.size:
+                        for box in boxes_np:
+                            all_boxes.append(np.asarray(box_to_image(box.astype(float).tolist(), crop), dtype=float))
+                    if scores_np.size:
+                        for score in scores_np.tolist():
+                            all_scores.append(float(score))
+            exclude_crop = regions[exclude_region[region]][0]
+            for sub_prompt in exclude_tokens:
+                split, _, _ = _run_prompt(sub_prompt, exclude_region[region])
+                face_exclude_pieces.extend(paste_mask(piece, exclude_crop, (h, w)) for piece in split)
+        image_state = None
+        for group_index, tokens in enumerate(found):
+            per_face: list[list[np.ndarray]] = [[] for _ in crops]
+            for pieces, sources in tokens:
+                for piece, owner in zip(pieces, assign_owners(pieces, sources, face_boxes, crops)):
+                    per_face[owner].append(piece)
+            for owned in per_face:
+                if owned:
+                    _finish_group_mask(np.any(np.stack(owned, axis=0), axis=0))
 
     # Intersection narrowing with the user's drawn mask. Runs AFTER text
     # detect+hull+dilation so SAM3 is allowed to expand to the real object
@@ -981,11 +1115,7 @@ def run_sam3_on_pil(
     # The narrowed result becomes a single group mask, so downstream
     # exclude / individual-vs-combined logic still works unchanged.
     if user_mask is not None:
-        if user_mask.shape != (h, w):
-            um_pil = Image.fromarray(user_mask.astype(np.uint8) * 255, mode="L").resize(
-                (w, h), Image.NEAREST
-            )
-            user_mask = np.asarray(um_pil) > 127
+        user_mask = _user_mask_at(user_mask, h, w)
         sam3_combined = (
             np.any(np.stack(group_masks, axis=0), axis=0)
             if group_masks
@@ -1012,14 +1142,17 @@ def run_sam3_on_pil(
     # eating into face/eyes; exclude="face, eyes" detects those and
     # subtracts → mask covers clothes only, not face. No dilation/hull on
     # the exclude side — we want a tight mask of what to KEEP.
-    exclude_text = (exclude_prompt or "").strip()
+    # 얼굴 crop 이면 Exclude 조각은 위에서 crop 마다 찾아 이미지 좌표로 붙여 두었다(face_exclude_pieces).
     if exclude_text and group_masks:
-        exclude_groups = _split_prompt_groups(exclude_text)
-        exclude_pieces: list[np.ndarray] = []
-        for ex_tokens in exclude_groups:
-            for sub_prompt in ex_tokens:
-                split, _, _ = _run_prompt(sub_prompt)
-                exclude_pieces.extend(split)
+        if face_exclude_pieces is None:
+            exclude_groups = _split_prompt_groups(exclude_text)
+            exclude_pieces: list[np.ndarray] = []
+            for ex_tokens in exclude_groups:
+                for sub_prompt in ex_tokens:
+                    split, _, _ = _run_prompt(sub_prompt)
+                    exclude_pieces.extend(split)
+        else:
+            exclude_pieces = face_exclude_pieces
         if exclude_pieces:
             exclude_combined = np.any(np.stack(exclude_pieces, axis=0), axis=0)
             print(
@@ -1036,6 +1169,24 @@ def run_sam3_on_pil(
                 file=sys.stderr,
             )
 
+    return _assemble_result(rgb, group_masks, all_boxes, all_scores, resolved_device, checkpoint_label, face_info)
+
+
+# 오버레이에서 얼굴 crop 테두리 색(RGB) — SAM3 상자(파랑)와 구별되게.
+_FACE_CROP_OVERLAY_COLOR = (255, 190, 40)
+
+
+def _assemble_result(
+    rgb: np.ndarray,
+    group_masks: list[np.ndarray],
+    all_boxes: list,
+    all_scores: list[float],
+    device: str,
+    checkpoint_label: str,
+    face_info: FaceCropInfo | None,
+) -> Sam3Result:
+    """그룹 마스크 → ``Sam3Result``(Combined 마스크·Individual 마스크·오버레이). 얼굴 crop 이면 crop 테두리도 그린다."""
+    h, w = rgb.shape[:2]
     if group_masks:
         combined_mask = np.any(np.stack(group_masks, axis=0), axis=0).astype(np.uint8) * 255
         individual_masks = [Image.fromarray(mask.astype(np.uint8) * 255, mode="L") for mask in group_masks]
@@ -1052,6 +1203,21 @@ def run_sam3_on_pil(
     ).astype(np.uint8)
 
     import cv2
+
+    if face_info is not None:
+        for crop, score in zip(face_info.crops, face_info.scores):
+            overlay = np.ascontiguousarray(overlay)
+            cv2.rectangle(overlay, (crop.x0, crop.y0), (crop.x1 - 1, crop.y1 - 1), _FACE_CROP_OVERLAY_COLOR, 2)
+            cv2.putText(
+                overlay,
+                f"face {float(score):.2f}",
+                (crop.x0 + 4, min(crop.y1 - 6, crop.y0 + 18)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.5,
+                _FACE_CROP_OVERLAY_COLOR,
+                1,
+                cv2.LINE_AA,
+            )
 
     for idx, box in enumerate(boxes_out):
         x1, y1, x2, y2 = [int(round(v)) for v in box.tolist()]
@@ -1075,8 +1241,9 @@ def run_sam3_on_pil(
         overlay=Image.fromarray(overlay),
         boxes=boxes_out.astype(float).tolist(),
         scores=[float(score) for score in scores_out.tolist()],
-        device=resolved_device,
-        checkpoint=str(checkpoint_path) if checkpoint_path else "facebook/sam3::sam3.pt",
+        device=device,
+        checkpoint=checkpoint_label,
+        face_crop=face_info,
     )
 
 
@@ -1146,17 +1313,21 @@ def write_artifacts(result: Sam3Result, seed: int | None, label: str | None = No
     result.overlay.save(overlay_path, compress_level=2)
     for single_mask_path, mask in zip(_individual_paths(suffix), result.masks):
         mask.save(single_mask_path)
+    meta = {
+        "seed": seed,
+        "device": result.device,
+        "checkpoint": result.checkpoint,
+        "label": label,
+        "boxes": result.boxes,
+        "scores": result.scores,
+        "mask_count": len(result.masks),
+    }
+    face_info = getattr(result, "face_crop", None)
+    if face_info is not None:
+        meta["face_crop"] = face_info.as_meta()   # 얼굴 상자·점수·crop (얼굴 안에서만 찾기로 돌았을 때만)
     meta_path.write_text(
         json.dumps(
-            {
-                "seed": seed,
-                "device": result.device,
-                "checkpoint": result.checkpoint,
-                "label": label,
-                "boxes": result.boxes,
-                "scores": result.scores,
-                "mask_count": len(result.masks),
-            },
+            meta,
             ensure_ascii=False,
             indent=2,
         ),

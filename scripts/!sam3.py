@@ -25,7 +25,10 @@ except Exception:
 
 import sam3ext.core as _sam3_core
 
-if not all(hasattr(_sam3_core, name) for name in ("release_sam3", "describe_unload", "drop_offloaded_sam3")):
+if not all(
+    hasattr(_sam3_core, name)
+    for name in ("release_sam3", "describe_unload", "drop_offloaded_sam3", "describe_face_crop")
+):
     # Reload UI 는 이 스크립트만 다시 읽고 sam3ext.core 는 옛 모듈을 그대로 쓴다 — 옛 모듈의 캐시 번들을
     # 비운 뒤 새로 불러온다(run_sam3_on_pil 도 새 캐시를 쓰도록 아래 import 보다 먼저).
     import importlib
@@ -47,6 +50,10 @@ from sam3ext.core import (
     unload_sam3,
     write_artifacts,
 )
+from sam3ext.face_crop import face_crop_kwargs
+from sam3ext.face_detect import DEFAULT_CONFIDENCE as FACE_CROP_DEFAULT_CONFIDENCE
+from sam3ext.face_detect import DEFAULT_MODEL as FACE_CROP_DEFAULT_MODEL
+from sam3ext.face_detect import find_face_models
 from sam3ext.inpaint_core import apply_prompt_sr, copy_prompt, is_oom, run_inpaint_passes
 from sam3ext.notebook_store import register_notebook_routes
 from sam3ext import layout_lanes, quick_button as sam3_quick, ui_dock
@@ -113,7 +120,14 @@ txt2img_submit_button = img2img_submit_button = None
 
 # process() 가 UI 상태·XYZ 에 없는 키를 채울 때 쓰는 기본값 — Sam3Args(= UI 기본값)와 한 곳에서 맞춘다.
 # 예전엔 여기 따로 적힌 'latent noise' / unload_after=False 가 API 호출자에게 UI 와 다른 결과를 줬다.
-_SAM3_DEFAULTS: dict[str, Any] = Sam3Args().dict()
+# 얼굴 안에서만 찾기의 세 키는 검출기 모듈의 기본값으로 먼저 깐다 — Reload UI 뒤 옛 sam3ext.args 의 Sam3Args 에는 이 키가
+# 없어서, Sam3Args().dict() 만으로 만들면 process() 가 KeyError 로 멈춰 SAM3 가 통째로 꺼진다(새 Sam3Args 면 같은 값으로 덮임).
+_SAM3_DEFAULTS: dict[str, Any] = {
+    "sam3_face_crop": False,
+    "sam3_face_crop_model": FACE_CROP_DEFAULT_MODEL,
+    "sam3_face_crop_confidence": FACE_CROP_DEFAULT_CONFIDENCE,
+    **Sam3Args().dict(),
+}
 
 # XYZ '[SAM3] Checkpoint'·'[SAM3] Device' 축 cost — make_axis_on_xyz_grid 참고.
 SAM3_CHECKPOINT_AXIS_COST = 0.9
@@ -127,6 +141,12 @@ SOURCE_INIT = "init"
 INFOTEXT_SOURCE = "SAM3 Source"
 SOURCE_NOTE_INIT = "init image"          # 요청대로 원본으로 돌았다
 SOURCE_NOTE_OUTPUT = "output"            # 요청했지만 조건이 맞지 않아 예전처럼 부모 출력으로: 'output (<이유>)'
+
+# '얼굴 안에서만 찾기'로 돌았을 때 그 이미지에서 쓴 얼굴 수(0 = 얼굴을 못 찾아 마스크 없음). 결과 기록일 뿐 인자가 아니라
+# 붙여 넣기 대상이 아니다(ALL_ARGS 밖). 얼굴 crop 을 끄면 이 키가 없다.
+INFOTEXT_FACE_CROP_FACES = "SAM3 Face Crop Faces"
+# 얼굴 안에서만 찾기의 state 키(Sam3Args 의 맨 뒤 세 칸).
+FACE_CROP_STATE_KEYS = ("sam3_face_crop", "sam3_face_crop_model", "sam3_face_crop_confidence")
 
 
 class PromptSR(NamedTuple):
@@ -269,6 +289,21 @@ def make_axis_on_xyz_grid():
         xyz_grid.AxisOption("[SAM3] CN Weight", float, partial(set_value, field="sam3_cn_weight")),
         xyz_grid.AxisOption("[SAM3] CN Guidance Start", float, partial(set_value, field="sam3_cn_guidance_start")),
         xyz_grid.AxisOption("[SAM3] CN Guidance End", float, partial(set_value, field="sam3_cn_guidance_end")),
+        xyz_grid.AxisOption(
+            "[SAM3] Face Crop",
+            str,
+            partial(set_value, field="sam3_face_crop"),
+            choices=bool_choices,
+        ),
+        xyz_grid.AxisOption(
+            "[SAM3] Face Crop Model",
+            str,
+            partial(set_value, field="sam3_face_crop_model"),
+            choices=find_face_models,
+        ),
+        xyz_grid.AxisOption(
+            "[SAM3] Face Crop Confidence", float, partial(set_value, field="sam3_face_crop_confidence")
+        ),
     ]
 
     if not any(x.label.startswith("[SAM3]") for x in xyz_grid.axis_options):
@@ -512,7 +547,17 @@ class Sam3MaskScript(scripts.Script):
             "sam3_cn_processor_res": _xyz_or("sam3_cn_processor_res"),
             "sam3_cn_threshold_a": _xyz_or("sam3_cn_threshold_a"),
             "sam3_cn_threshold_b": _xyz_or("sam3_cn_threshold_b"),
+            # 얼굴 안에서만 찾기 — 키가 없는 예전 UI 상태·API 요청은 Sam3Args 기본값(꺼짐)
+            "sam3_face_crop": _bool_or("sam3_face_crop"),
+            "sam3_face_crop_model": str(_xyz_or("sam3_face_crop_model")),
+            "sam3_face_crop_confidence": _xyz_or("sam3_face_crop_confidence"),
         }
+
+        if "sam3_face_crop" not in (getattr(Sam3Args, "__fields__", None) or {}):
+            # Reload UI 는 이 스크립트만 새로 읽고 sam3ext.args 는 옛 모듈 그대로다 — 옛 Sam3Args(extra=forbid)에 모르는
+            # 키를 넣으면 검증이 통째로 실패해 SAM3 가 꺼진다. 그때는 얼굴 crop 키를 빼고(=꺼짐) 예전처럼 돈다(재시작하면 생김).
+            for key in FACE_CROP_STATE_KEYS:
+                payload.pop(key, None)
 
         if not hasattr(p, "extra_generation_params"):
             p.extra_generation_params = {}
@@ -674,6 +719,13 @@ class Sam3MaskScript(scripts.Script):
                 p.color_corrections = None
                 print("[-] SAM3: skipped Forge img2img color correction for the init-image result", file=sys.stderr)
         allow_huggingface = not getattr(shared.cmd_opts, "sam3_no_huggingface", False)
+        params = getattr(p, "extra_generation_params", None)
+        if isinstance(params, dict):
+            # 배치의 앞 장이 남긴 얼굴 수를 걷는다 — 이 장이 얼굴 crop 으로 돌면 아래에서 다시 적는다.
+            params.pop(INFOTEXT_FACE_CROP_FACES, None)
+        face_kwargs = face_crop_kwargs(args)   # 꺼져 있으면 {} — 예전과 똑같은 호출
+        # 🎯 빠른 버튼이 '얼굴을 못 찾음' 을 따로 알리게 이 장의 얼굴 crop 요약을 둔다(FaceCropInfo, 꺼져 있으면 None).
+        p._sam3_face_crop_info = None
         result = run_sam3_on_pil(
             image=image,
             prompt=args["sam3_prompt"],
@@ -685,7 +737,13 @@ class Sam3MaskScript(scripts.Script):
             mask_hull=bool(args.get("sam3_mask_hull", False)),
             mask_outline_px=int(args.get("sam3_mask_outline_px", 0)),
             exclude_prompt=str(args.get("sam3_exclude_prompt") or ""),
+            **face_kwargs,
         )
+        face_info = getattr(result, "face_crop", None)
+        if face_kwargs and face_info is not None:
+            p._sam3_face_crop_info = face_info
+            if isinstance(params, dict):
+                params[INFOTEXT_FACE_CROP_FACES] = face_info.count
 
         # 🎯 빠른 버튼이 결과를 판단한다(마스크 없음 / Mask only / 인페인트) — 이미지 객체 비교로는 알 수 없다
         p._sam3_mask_found = bool(np.any(np.asarray(result.mask)))
