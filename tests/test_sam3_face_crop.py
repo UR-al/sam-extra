@@ -249,6 +249,67 @@ class RunSam3FaceCropTests(unittest.TestCase):
         self.assertEqual(run.processor.images, [(64, 64), (64, 64)], "검출·제외 토큰이 crop 마다 백본 한 번")
         self.assertEqual(run.processor.prompts, ["skin", "eye", "skin", "eye"])
 
+    def test_a_neighbours_part_cut_at_this_crops_edge_stays_with_the_neighbour(self):
+        """큰 얼굴 A 의 머리카락(한 덩어리)이 작은 얼굴 B 의 crop 왼쪽 끝으로 들어온다 — B 의 crop 이 본 띠는 잘린 조각이고
+        그 무게중심은 A 의 crop 밖이다. 띠는 A 의 crop 에서 이어지는 조각과 묶여 A 의 패스로 간다."""
+        size = (400, 300)
+        face_a, face_b = (100, 100, 200, 200), (238, 150, 262, 174)
+        rgb = np.full((size[1], size[0], 3), BACKGROUND, dtype=np.uint8)
+        rgb[face_a[1]:face_a[3], face_a[0]:face_a[2]] = COLORS["skin"]
+        rgb[face_b[1]:face_b[3], face_b[0]:face_b[2]] = COLORS["skin"]
+        rgb[70:100, 95:234] = COLORS["hair"]
+        rgb[70:230, 200:234] = COLORS["hair"]       # A 의 머리카락 — x 233 까지(B 의 crop 은 x 230 부터)
+        rgb[146:150, 240:260] = COLORS["hair"]      # B 의 머리카락(A 의 것과 닿지 않음)
+        crop_a, crop_b = fc.face_crop_box(face_a, size), fc.face_crop_box(face_b, size)
+        self.assertEqual((crop_a.x1, crop_b.x0), (230, 230))
+        hair = _color(rgb, "hair")
+        own_b = np.zeros_like(hair)
+        own_b[146:150, 240:260] = True
+        own_a = hair & ~own_b
+
+        result = _Run(self, [face_a, face_b])(rgb, "hair", face_crop=True)
+        self.assertEqual(len(result.masks), 2)
+        crops = _crops_mask([crop_a, crop_b], hair.shape)
+        np.testing.assert_array_equal(_as_bool(result.masks[0]), own_a & crops, "A 의 머리카락은 B 의 crop 이 본 띠까지 A 의 패스")
+        np.testing.assert_array_equal(_as_bool(result.masks[1]), own_b, "B 의 패스엔 B 의 머리카락만")
+        np.testing.assert_array_equal(_as_bool(result.mask), hair & crops, "Combined 는 그대로")
+
+    def test_two_detector_boxes_on_one_face_make_one_pass(self):
+        face, duplicate = (40, 70, 80, 110), (48, 66, 92, 112)   # IoU 0.55 — ultralytics NMS(0.7)가 둘 다 남긴다
+        rgb = np.full((SIZE[1], SIZE[0], 3), BACKGROUND, dtype=np.uint8)
+        _draw_face(rgb, face)
+        run = _Run(self, [face, duplicate], scores=[0.6, 0.8])
+        result = run(rgb, "eye", face_crop=True)
+        self.assertEqual(result.face_crop.count, 1)
+        self.assertEqual(result.face_crop.boxes, [list(map(float, duplicate))], "점수가 높은 상자")
+        self.assertEqual(len(result.masks), 1, "한 얼굴의 두 눈이 한 패스")
+        np.testing.assert_array_equal(_as_bool(result.masks[0]), _color(rgb, "eye"))
+        self.assertEqual(len(run.processor.images), 1, "crop 도 하나")
+
+    def test_exclude_is_searched_as_far_as_the_mask_grows(self):
+        """Dilation · Outline 은 crop 밖으로 번진다 — Exclude 도 그만큼 넓힌 영역에서 찾아, crop 바로 밖의 보호 대상이 먹히지 않는다."""
+        face = (0, 0, 40, 40)
+        crop = fc.face_crop_box(face, SIZE)
+        rgb = np.full((SIZE[1], SIZE[0], 3), BACKGROUND, dtype=np.uint8)
+        rgb[10:14, crop.x1 - 4:crop.x1] = COLORS["eye"]               # 대상 — crop 오른쪽 끝에 닿음
+        rgb[6:18, crop.x1 + 1:crop.x1 + 6] = COLORS["mouth"]           # 보호할 것 — crop 밖 1 px
+        protect = _color(rgb, "mouth")
+        for kwargs in ({"mask_dilation": 4}, {"mask_outline_px": 2, "mask_dilation": 2}):
+            with self.subTest(**kwargs):
+                run = _Run(self, [face])
+                on = run(rgb, "eye", face_crop=True, exclude_prompt="mouth", **kwargs)
+                self.assertFalse((_as_bool(on.mask) & protect).any(), "넓힌 마스크가 보호 대상을 먹지 않는다")
+                grown = fc.grow_crop(crop, 4, SIZE)
+                self.assertEqual(run.processor.images, [(crop.width, crop.height), (grown.width, grown.height)])
+                self.assertEqual(run.processor.prompts, ["eye", "mouth"])
+                off = _Run(self, [face])
+                with mock.patch.object(core, "resolve_checkpoint_path", return_value=None), \
+                        mock.patch.object(core, "_get_model_bundle", return_value=(None, off.processor)), \
+                        contextlib.redirect_stderr(io.StringIO()):
+                    full = core.run_sam3_on_pil(Image.fromarray(rgb), "eye", 0.4, "", "cpu",
+                                                exclude_prompt="mouth", **kwargs)
+                np.testing.assert_array_equal(_as_bool(on.mask), _as_bool(full.mask), "얼굴 crop 을 끈 결과와 같다")
+
     def test_exclude_outside_the_faces_is_not_searched(self):
         rgb = self.rgb.copy()
         rgb[150:160, 10:20] = COLORS["skin"]     # 얼굴 밖 skin 색
@@ -276,6 +337,24 @@ class RunSam3FaceCropTests(unittest.TestCase):
         result = _Run(self, [FACE_A, FACE_B])(self.rgb, "eye", face_crop=True, user_mask=user)
         np.testing.assert_array_equal(_as_bool(result.mask), _color(self.rgb, "eye") & user & _crops_mask([self.crop_a], user.shape))
         self.assertEqual(len(result.masks), 1)
+
+    def test_user_mask_is_kept_as_is_when_no_faces(self):
+        """얼굴이 없으면 '검출 없음' 과 같다 — Manual Mask 는 SAM3 가 못 찾았을 때처럼 칠한 그대로 쓴다(SAM3 는 올리지 않음)."""
+        user = np.zeros(self.rgb.shape[:2], dtype=bool)
+        user[20:60, 20:60] = True
+        for prompt, exclude in (("hair", ""), ("", "mouth"), ("eye", "mouth")):
+            with self.subTest(prompt=prompt, exclude=exclude):
+                run = _Run(self, [], bundle_allowed=False)
+                result = run(self.rgb, prompt, user_mask=user, exclude_prompt=exclude, face_crop=True)
+                np.testing.assert_array_equal(_as_bool(result.mask), user)
+                self.assertEqual(len(result.masks), 1)
+                self.assertEqual(result.face_crop.count, 0)
+                self.assertIn("kept as-is — face crop found no faces", run.stderr)
+        small = np.zeros((48, 64), dtype=bool)       # 크기가 다른 Manual Mask 도 예전처럼 늘려 쓴다
+        small[:, :32] = True
+        result = _Run(self, [], bundle_allowed=False)(self.rgb, "hair", user_mask=small, face_crop=True)
+        np.testing.assert_array_equal(_as_bool(result.mask)[:, :128], np.ones((SIZE[1], 128), bool))
+        self.assertFalse(_as_bool(result.mask)[:, 128:].any())
 
     def test_no_faces_is_an_empty_result_without_loading_sam3(self):
         run = _Run(self, [], bundle_allowed=False)
@@ -389,7 +468,10 @@ class FaceCropArgsTests(unittest.TestCase):
         self.assertEqual([name for _w, name in infotext_fields][-3:], list(FACE_NAMES))
         checkbox = by_name["SAM3 Face Crop"]
         self.assertIs(checkbox.value, False)
-        self.assertIn("얼굴 안에서만 찾기", checkbox.label)
+        self.assertTrue(checkbox.label.startswith("Search inside faces only"))
+        labels = [str(getattr(w, "label", "") or "") for w in by_name.values()]
+        hangul = [label for label in labels if any("가" <= ch <= "힣" for ch in label)]
+        self.assertEqual(hangul, [], "SAM3 Mask 아코디언의 라벨은 이웃처럼 영어만")
         self.assertEqual(by_name["SAM3 Face Crop Model"].value, "face_yolov8n.pt")
         self.assertEqual(by_name["SAM3 Face Crop Confidence"].value, 0.3)
         self.assertEqual(by_name["SAM3 Face Crop Model"].elem_id, "sam3_txt2img_face_crop_model")
@@ -493,7 +575,15 @@ class ScriptFaceCropTests(unittest.TestCase):
         self.assertNotIn("SAM3 Error", p.extra_generation_params)
 
     def test_a_stale_args_module_after_reload_ui_keeps_sam3_on(self):
-        """Reload UI 는 스크립트만 새로 읽는다 — 옛 Sam3Args(extra=forbid, 얼굴 키 없음)면 얼굴 키를 빼고 예전처럼 돈다."""
+        """Reload UI 는 스크립트만 새로 읽는다 — 옛 Sam3Args(extra=forbid, 얼굴 키 없음)면 얼굴 키를 빼고 예전처럼 돈다.
+
+        실제와 같게 스크립트를 옛 Sam3Args 가 있는 채로 새로 실행한다 — 모듈 수준의 기본값 표(_SAM3_DEFAULTS)도 그
+        클래스로 만들어진다(예전 테스트는 이미 만들어진 표 뒤에 클래스만 바꿔 KeyError 를 놓쳤다).
+        """
+        import sam3ext
+
+        from tests.test_sam3_core_cache import _load_sam3_script
+
         seen: dict = {}
 
         class OldSam3Args:
@@ -515,13 +605,23 @@ class ScriptFaceCropTests(unittest.TestCase):
             def __getattr__(self, name):
                 return getattr(self._args, name)
 
-        p = _processing()
-        with mock.patch.object(self.module, "Sam3Args", OldSam3Args), contextlib.redirect_stderr(io.StringIO()):
-            self.module.Sam3MaskScript().process(p, True, {"sam3_prompt": "face", "sam3_face_crop": True})
-        self.assertIs(p._sam3_args["enabled"], True)
-        self.assertNotIn("SAM3 Error", p.extra_generation_params)
-        self.assertFalse(set(FACE_ATTRS) & set(seen), "옛 검증기에 얼굴 키를 넘기지 않는다")
-        self.assertEqual(seen["sam3_prompt"], "face")
+        with mock.patch.object(sam3ext, "Sam3Args", OldSam3Args), contextlib.redirect_stderr(io.StringIO()):
+            module = _load_sam3_script([])
+        self.assertIs(module.Sam3Args, OldSam3Args, "스크립트가 옛 클래스를 잡았다(Reload UI 와 같은 상태)")
+        for state in ({"sam3_prompt": "face"}, {"sam3_prompt": "face", "sam3_face_crop": True}):
+            with self.subTest(state=state):
+                seen.clear()
+                p = _processing()
+                with contextlib.redirect_stderr(io.StringIO()):
+                    module.Sam3MaskScript().process(p, True, state)
+                self.assertIs(p._sam3_args["enabled"], True)
+                self.assertNotIn("SAM3 Error", p.extra_generation_params)
+                self.assertFalse(set(FACE_ATTRS) & set(seen), "옛 검증기에 얼굴 키를 넘기지 않는다")
+                self.assertEqual(seen["sam3_prompt"], "face")
+        p = _processing(_sam3_xyz={"sam3_face_crop": "True"})
+        with contextlib.redirect_stderr(io.StringIO()):
+            module.Sam3MaskScript().process(p, True, {"sam3_prompt": "face"})
+        self.assertIs(p._sam3_args["enabled"], True, "XYZ 축에 얼굴 키가 있어도")
 
     def test_off_calls_detection_exactly_as_before(self):
         _p, _pp, seen = self._postprocess(_enabled_args(), _result())
@@ -551,6 +651,40 @@ class ScriptFaceCropTests(unittest.TestCase):
         self.assertIs(p._sam3_mask_found, False)
         self.assertEqual(p.extra_generation_params[self.module.INFOTEXT_FACE_CROP_FACES], 0)
         self.assertIs(p.extra_generation_params["SAM3 Enable"], True)
+
+    def test_the_face_crop_summary_is_left_for_the_quick_button(self):
+        result = _result(masks=0, faces=0)
+        p, _pp, _seen = self._postprocess(_enabled_args(sam3_face_crop=True), result)
+        self.assertIs(p._sam3_face_crop_info, result.face_crop)
+        p, _pp, _seen = self._postprocess(_enabled_args(), _result(masks=0, faces=0))
+        self.assertIsNone(p._sam3_face_crop_info, "얼굴 crop 을 끄면 없음(결과에 요약이 실려 와도)")
+
+    def test_quick_button_names_the_face_detector_when_no_faces(self):
+        """🎯 은 얼굴을 못 찾은 경우를 '프롬프트·임계값 확인' 이 아니라 얼굴 검출기 쪽으로 안내한다."""
+        from sam3ext import quick_button as qb
+        from tests.test_quick_button import _FakeSam3Script, _Forge, _gallery
+
+        class NoFaces(_FakeSam3Script):
+            def __init__(self, info):
+                super().__init__(mask=False)
+                self.info = info
+
+            def postprocess_image(self, p, pp, *args):
+                super().postprocess_image(p, pp, *args)
+                p._sam3_face_crop_info = self.info
+
+        geninfo = {"infotexts": ["girl\nSeed: 111"]}
+        none = fc.FaceCropInfo(model="face_<x>.pt", confidence=0.45, boxes=[], scores=[], crops=[])
+        _gallery_out, _info, message, _ = _Forge(sam3=NoFaces(none)).run(_gallery("a"), 0, geninfo)
+        self.assertIn("얼굴을 찾지 못했습니다 (face_&lt;x&gt;.pt, 신뢰도 0.45)", message)
+        self.assertIn("Search inside faces only", message)
+        self.assertNotIn("감지 프롬프트", message)
+        found = fc.FaceCropInfo(model="face_yolov8n.pt", confidence=0.3, boxes=[[0, 0, 4, 4]], scores=[0.9],
+                                crops=[fc.CropBox(0, 0, 8, 8)])
+        for info in (found, None):
+            with self.subTest(info=info):
+                _g, _i, message, _ = _Forge(sam3=NoFaces(info)).run(_gallery("a"), 0, geninfo)
+                self.assertEqual(message, qb.NO_MASK_MESSAGE, "얼굴은 찾았거나 얼굴 crop 이 꺼져 있으면 예전 안내")
 
     def test_the_face_count_belongs_to_each_image_of_a_batch(self):
         params = {"SAM3 Enable": True, self.module.INFOTEXT_FACE_CROP_FACES: 5}
@@ -650,6 +784,40 @@ class RefineFaceCropTests(unittest.TestCase):
         self.assertFalse(out)
         message = ui_refine._refine_empty_message(out)
         self.assertIn("얼굴을 찾지 못했습니다 (face_yolov8s.pt, 신뢰도 0.45)", message)
+
+    def test_manual_mask_with_no_faces_is_inpainted_like_no_detection(self):
+        """Refine 의 Manual Mask: 얼굴이 없어도 '검출 없음' 처럼 칠한 마스크로 인페인트한다(no_faces 로 끝내지 않음)."""
+        rgb = _two_faces_image()
+        user = np.zeros(rgb.shape[:2], dtype=bool)
+        user[20:60, 20:60] = True
+        args = {"sam3_prompt": "hair", "sam3_threshold": 0.4, "sam3_checkpoint": "sam3.pt", "sam3_device": "cpu",
+                "sam3_exclude_prompt": "mouth", "sam3_face_crop": True}
+        reached: dict = {}
+
+        class Reached(Exception):
+            pass
+
+        def inject(p2, args_):
+            reached["mask"] = p2.image_mask
+            reached["params"] = dict(p2.extra_generation_params)
+            raise Reached
+
+        detector = _Run(self, [])
+        with mock.patch.object(core, "resolve_checkpoint_path", return_value=None), \
+                mock.patch.object(core, "_get_model_bundle", side_effect=AssertionError("SAM3 bundle must not load")), \
+                mock.patch.object(core, "detect_faces", side_effect=detector._detect), \
+                mock.patch.object(self.inpaint_core, "build_standalone_i2i",
+                                  lambda *a, **k: types.SimpleNamespace(extra_generation_params={})), \
+                mock.patch.object(self.inpaint_core, "inject_controlnet_unit", inject), \
+                contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(Reached):
+                self.inpaint_core._run_sam3_refine_passes(
+                    Image.fromarray(rgb), args, user_mask=user, scripts_runner=None, script_args_template=[],
+                    allow_huggingface=False, sd_model=None, outpath_samples="", outpath_grids="", override_settings=None,
+                )
+        np.testing.assert_array_equal(_as_bool(reached["mask"]), user)
+        self.assertEqual(reached["params"]["SAM3 Refine Face Crop Faces"], 0)
+        self.assertIs(reached["params"]["SAM3 Refine Manual Mask"], True)
 
     def test_off_calls_detection_exactly_as_before(self):
         args = {"sam3_prompt": "eyes", "sam3_threshold": 0.4, "sam3_checkpoint": "sam3.pt", "sam3_device": "cpu"}

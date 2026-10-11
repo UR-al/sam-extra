@@ -9,14 +9,18 @@ numpy 와 ``face_detect`` 의 기본값만 쓴다(torch·ultralytics·Forge 없�
    (``box_to_image`` / ``box_to_crop``).
 3. crop 마스크를 ``paste_mask`` 로 이미지 크기 bool 마스크에 붙인다(비트 단위로 같은 자리).
 4. crop 이 겹치면 한 얼굴의 crop 에 옆 얼굴의 눈·머리카락이 들어온다 — 검출 조각마다 ``assign_owner`` 로 주인 얼굴을
-   정해(조각 무게중심에서 가장 가까운 얼굴, 얼굴 크기로 나눈 거리) 그 얼굴의 마스크에만 더한다. 조각을 버리지는 않으므로
-   모든 얼굴을 합친(Combined) 마스크는 주인을 정하지 않은 합집합과 같다.
+   정해(조각 무게중심에서 가장 가까운 얼굴, 얼굴 크기로 나눈 거리) 그 얼굴의 마스크에만 더한다. crop 의 안쪽 가장자리
+   (이미지 테두리가 아닌 변)에 잘린 조각은 그 너머에서 이어지는 다른 crop 의 조각과 한 물체로 묶어 묶음 전체의 무게중심으로
+   정한다(``assign_owners``) — 옆 얼굴의 머리카락 끝이 작은 얼굴의 crop 에 잘려 들어와도 그 얼굴의 패스에 섞이지 않는다.
+   조각을 버리지는 않으므로 모든 얼굴을 합친(Combined) 마스크는 주인을 정하지 않은 합집합과 같다.
+5. 한 얼굴에 검출기 상자가 둘 남으면(ultralytics NMS 는 IoU 0.7 미만이면 둘 다 둔다) 부위가 두 패스로 갈린다 — 계획에서
+   ``same_face`` 인 상자는 점수가 높은 하나만 남긴다(``dedupe_faces``).
 """
 from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import Any, Mapping, Sequence
+from typing import Any, Collection, Mapping, Sequence
 
 import numpy as np
 
@@ -29,6 +33,9 @@ EXPAND_TOP = 0.40
 EXPAND_BOTTOM = 0.20
 # 아주 작은 얼굴(멀리 있는 인물)도 SAM3 가 볼 주변이 조금은 있게 — crop 한 변의 최솟값(px, 이미지가 더 작으면 이미지 크기).
 MIN_CROP_SIDE = 32
+# 같은 얼굴로 볼 두 검출기 상자의 IoU 하한(또는 한 상자의 중심이 다른 상자 안). 서로 다른 두 얼굴의 상자가 이만큼
+# 겹치는 일은 드물고, 겹치더라도 crop 이 거의 같아 부위를 나눌 근거가 없다.
+SAME_FACE_IOU = 0.3
 
 Box = Sequence[float]   # (x0, y0, x1, y1) — 이미지 픽셀 좌표, x1·y1 은 끝(포함하지 않음)
 
@@ -137,6 +144,22 @@ def face_crop_box(box: Box, image_size: tuple[int, int]) -> CropBox | None:
     return square_crop(expand_box(clipped), image_size)
 
 
+def grow_crop(crop: CropBox, margin: int, image_size: tuple[int, int]) -> CropBox:
+    """crop 을 사방 ``margin`` px 넓힌 정사각 영역(중심 유지, 이미지 안으로 밂) — Exclude 를 찾을 곳.
+
+    Outline · Dilation 은 마스크를 crop 밖으로 최대 ``margin`` px(체스판 거리) 번지게 한다. 이 영역은 그 범위
+    (crop ± ``margin`` 을 이미지로 자른 것)를 늘 덮는다 — 이미지 끝에서 밀려도 반대쪽으로 그만큼 더 덮는다.
+    ``margin`` 이 0 이하면 crop 그대로.
+    """
+    margin = int(margin)
+    if margin <= 0:
+        return crop
+    grown = square_crop(
+        (crop.x0 - margin, crop.y0 - margin, crop.x1 + margin, crop.y1 + margin), image_size, min_side=1
+    )
+    return grown if grown is not None else crop
+
+
 def box_to_image(box: Box, crop: CropBox) -> list[float]:
     """crop 좌표의 상자(SAM3 출력) → 이미지 좌표. crop 은 크기를 바꾸지 않으므로 평행 이동."""
     x0, y0, x1, y1 = (float(v) for v in box)
@@ -184,23 +207,120 @@ def assign_owner(
     point: tuple[float, float],
     face_boxes: Sequence[Box],
     crops: Sequence[CropBox],
-    source: int,
+    source: int | Collection[int],
 ) -> int:
     """crop ``source`` 에서 찾은 조각(무게중심 ``point``)의 주인 얼굴 번호.
 
     후보 = 무게중심을 crop 안에 둔 얼굴들(+ ``source`` — 조각은 그 crop 안에 있으므로 늘 후보). 그중 얼굴 상자 중심까지의
     거리를 얼굴 크기(상자의 긴 변)로 나눈 값이 가장 작은 얼굴. 같으면 ``source``, 그다음 번호가 작은 얼굴.
+    ``source`` 는 여러 crop 에 걸친 조각 묶음(``assign_owners``)이면 그 crop 번호들이다.
     """
+    sources = {int(source)} if isinstance(source, (int, np.integer)) else {int(s) for s in source}
     px, py = point
-    candidates = {source} | {i for i, crop in enumerate(crops) if crop.contains(px, py)}
+    candidates = sources | {i for i, crop in enumerate(crops) if crop.contains(px, py)}
 
     def score(index: int) -> tuple[float, bool, int]:
         x0, y0, x1, y1 = (float(v) for v in face_boxes[index])
         size = max(x1 - x0, y1 - y0, 1.0)
         dist = math.hypot(px - (x0 + x1) / 2.0, py - (y0 + y1) / 2.0) / size
-        return (dist, index != source, index)
+        return (dist, index not in sources, index)
 
     return min(sorted(candidates), key=score)
+
+
+def _spread(line: np.ndarray) -> np.ndarray:
+    """가장자리를 따라 한 칸씩 넓힌다(8-연결 — 대각선으로 이어지는 픽셀도 닿은 것으로)."""
+    out = line.copy()
+    out[1:] |= line[:-1]
+    out[:-1] |= line[1:]
+    return out
+
+
+def edge_contact(piece: np.ndarray, crop: CropBox) -> tuple[tuple[int, int, int, int], np.ndarray] | None:
+    """crop 의 안쪽 가장자리에 닿은 조각이 그 너머에서 이어질 자리 — crop 바로 바깥 한 줄의 픽셀.
+
+    ``piece`` 는 이미지 좌표의 bool 마스크(``paste_mask`` 결과). 안쪽 가장자리 = 이미지 테두리가 아닌 crop 의 변 — 거기
+    닿은 조각은 crop 이 잘랐을 수 있다. 돌려주는 값은 ((y0, y1, x0, x1), 그 범위의 bool 마스크)이고, 안쪽 가장자리에
+    닿지 않았으면 None.
+    """
+    height, width = piece.shape
+    lines: list[tuple[int, int, int, int, np.ndarray]] = []   # (y0, y1, x0, x1, 바깥 한 줄)
+    if crop.x0 > 0:
+        line = piece[crop.y0:crop.y1, crop.x0]
+        if line.any():
+            lines.append((crop.y0, crop.y1, crop.x0 - 1, crop.x0, _spread(line)[:, None]))
+    if crop.x1 < width:
+        line = piece[crop.y0:crop.y1, crop.x1 - 1]
+        if line.any():
+            lines.append((crop.y0, crop.y1, crop.x1, crop.x1 + 1, _spread(line)[:, None]))
+    if crop.y0 > 0:
+        line = piece[crop.y0, crop.x0:crop.x1]
+        if line.any():
+            lines.append((crop.y0 - 1, crop.y0, crop.x0, crop.x1, _spread(line)[None, :]))
+    if crop.y1 < height:
+        line = piece[crop.y1 - 1, crop.x0:crop.x1]
+        if line.any():
+            lines.append((crop.y1, crop.y1 + 1, crop.x0, crop.x1, _spread(line)[None, :]))
+    if not lines:
+        return None
+    y0 = min(item[0] for item in lines)
+    y1 = max(item[1] for item in lines)
+    x0 = min(item[2] for item in lines)
+    x1 = max(item[3] for item in lines)
+    contact = np.zeros((y1 - y0, x1 - x0), dtype=bool)
+    for ly0, ly1, lx0, lx1, values in lines:
+        contact[ly0 - y0:ly1 - y0, lx0 - x0:lx1 - x0] |= values
+    return (y0, y1, x0, x1), contact
+
+
+def assign_owners(
+    pieces: Sequence[np.ndarray],
+    sources: Sequence[int],
+    face_boxes: Sequence[Box],
+    crops: Sequence[CropBox],
+) -> list[int]:
+    """같은 검출 토큰으로 찾은 조각들(이미지 좌표, ``sources[i]`` = 찾은 crop)의 주인 얼굴 번호.
+
+    crop 의 안쪽 가장자리에 잘린 조각은 그 너머 한 줄(``edge_contact``)에 걸친 다른 crop 의 조각과 한 물체로 묶는다 —
+    한 crop 에서 잘려 보인 물체의 나머지는 이웃 crop 이 본다. 묶음은 합친 마스크의 무게중심으로, 혼자인 조각은 제 무게중심으로
+    ``assign_owner`` 에 묻는다. 같은 crop 의 조각끼리는 묶지 않는다(SAM3 가 따로 낸 검출).
+    """
+    count = len(pieces)
+    parent = list(range(count))
+
+    def find(index: int) -> int:
+        while parent[index] != index:
+            parent[index] = parent[parent[index]]
+            index = parent[index]
+        return index
+
+    for i in range(count):
+        contact = edge_contact(pieces[i], crops[sources[i]])
+        if contact is None:
+            continue
+        (y0, y1, x0, x1), where = contact
+        for j in range(count):
+            if sources[j] == sources[i] or find(i) == find(j):
+                continue
+            if np.any(pieces[j][y0:y1, x0:x1] & where):
+                parent[find(j)] = find(i)
+
+    owners = [0] * count
+    clusters: dict[int, list[int]] = {}
+    for index in range(count):
+        clusters.setdefault(find(index), []).append(index)
+    for members in clusters.values():
+        if len(members) == 1:
+            joined = pieces[members[0]]
+        else:
+            joined = np.any(np.stack([pieces[i] for i in members], axis=0), axis=0)
+        point = mask_centroid(joined)
+        if point is None:
+            continue
+        owner = assign_owner(point, face_boxes, crops, [sources[i] for i in members])
+        for index in members:
+            owners[index] = owner
+    return owners
 
 
 def order_faces(boxes: Sequence[Box]) -> list[int]:
@@ -274,6 +394,44 @@ def face_crop_kwargs(args: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
+def box_iou(a: Box, b: Box) -> float:
+    """두 상자 (x0, y0, x1, y1) 의 IoU(겹친 넓이 / 합친 넓이). 넓이가 없으면 0."""
+    ax0, ay0, ax1, ay1 = (float(v) for v in a)
+    bx0, by0, bx1, by1 = (float(v) for v in b)
+    inter = max(0.0, min(ax1, bx1) - max(ax0, bx0)) * max(0.0, min(ay1, by1) - max(ay0, by0))
+    union = (ax1 - ax0) * (ay1 - ay0) + (bx1 - bx0) * (by1 - by0) - inter
+    return inter / union if union > 0 else 0.0
+
+
+def _centre_inside(a: Box, b: Box) -> bool:
+    ax0, ay0, ax1, ay1 = (float(v) for v in a)
+    bx0, by0, bx1, by1 = (float(v) for v in b)
+    cx, cy = (ax0 + ax1) / 2.0, (ay0 + ay1) / 2.0
+    return bx0 <= cx < bx1 and by0 <= cy < by1
+
+
+def same_face(a: Box, b: Box) -> bool:
+    """두 검출기 상자가 한 얼굴인가 — IoU 가 ``SAME_FACE_IOU`` 이상이거나 한 상자의 중심이 다른 상자 안."""
+    return box_iou(a, b) >= SAME_FACE_IOU or _centre_inside(a, b) or _centre_inside(b, a)
+
+
+def dedupe_faces(boxes: Sequence[Box], scores: Sequence[float]) -> list[int]:
+    """한 얼굴에 겹친 상자는 점수가 높은 하나만 — 남길 상자 번호(원래 순서).
+
+    점수 높은 순서(같거나 숫자가 아니면 앞 번호 먼저)로 보며, 이미 남긴 상자와 ``same_face`` 인 상자는 버린다.
+    """
+    def rank(index: int) -> tuple[bool, float, int]:
+        score = float(scores[index]) if index < len(scores) else float("nan")
+        finite = math.isfinite(score)
+        return (not finite, -score if finite else 0.0, index)
+
+    kept: list[int] = []
+    for index in sorted(range(len(boxes)), key=rank):
+        if not any(same_face(boxes[index], boxes[other]) for other in kept):
+            kept.append(index)
+    return sorted(kept)
+
+
 def plan_face_crops(
     boxes: Sequence[Box],
     scores: Sequence[float],
@@ -282,7 +440,10 @@ def plan_face_crops(
     model: str,
     confidence: float,
 ) -> FaceCropInfo:
-    """검출기 상자들 → 쓸 수 있는 얼굴만, 왼쪽 → 오른쪽 순서의 crop 계획(``image_size`` = (폭, 높이))."""
+    """검출기 상자들 → 쓸 수 있는 얼굴만, 왼쪽 → 오른쪽 순서의 crop 계획(``image_size`` = (폭, 높이)).
+
+    한 얼굴에 겹친 상자(``same_face``)는 점수가 높은 하나만 남긴다 — 둘 다 두면 그 얼굴의 부위가 두 패스로 갈린다.
+    """
     kept_boxes: list[list[float]] = []
     kept_scores: list[float] = []
     for index, box in enumerate(boxes):
@@ -291,6 +452,9 @@ def plan_face_crops(
             continue
         kept_boxes.append(list(clipped))
         kept_scores.append(float(scores[index]) if index < len(scores) else float("nan"))
+    unique = dedupe_faces(kept_boxes, kept_scores)
+    kept_boxes = [kept_boxes[i] for i in unique]
+    kept_scores = [kept_scores[i] for i in unique]
     order = order_faces(kept_boxes)
     ordered_boxes = [kept_boxes[i] for i in order]
     ordered_scores = [kept_scores[i] for i in order]

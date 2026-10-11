@@ -119,8 +119,8 @@ def _default_cn_module(choices: list[str]) -> str:
     return choices[0] if choices else "None"
 
 
-# '얼굴 안에서만 찾기' 체크박스 — 이웃 항목처럼 영어 라벨에 짧은 설명(—), 기능 이름은 한국어로 같이.
-FACE_CROP_LABEL = "Search inside faces only (얼굴 안에서만 찾기) — SAM3 runs on each face_yolov8 face crop"
+# '얼굴 안에서만 찾기' 체크박스 — 이 아코디언의 이웃 항목처럼 영어 라벨에 짧은 설명(—). (한국어 이름은 Refine 패널과 문서에만.)
+FACE_CROP_LABEL = "Search inside faces only — SAM3 runs on each face_yolov8 face crop"
 
 
 def default_face_model(choices: list[str]) -> str:

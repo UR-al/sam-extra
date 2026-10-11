@@ -51,6 +51,8 @@ from sam3ext.core import (
     write_artifacts,
 )
 from sam3ext.face_crop import face_crop_kwargs
+from sam3ext.face_detect import DEFAULT_CONFIDENCE as FACE_CROP_DEFAULT_CONFIDENCE
+from sam3ext.face_detect import DEFAULT_MODEL as FACE_CROP_DEFAULT_MODEL
 from sam3ext.face_detect import find_face_models
 from sam3ext.inpaint_core import apply_prompt_sr, copy_prompt, is_oom, run_inpaint_passes
 from sam3ext.notebook_store import register_notebook_routes
@@ -118,7 +120,14 @@ txt2img_submit_button = img2img_submit_button = None
 
 # process() 가 UI 상태·XYZ 에 없는 키를 채울 때 쓰는 기본값 — Sam3Args(= UI 기본값)와 한 곳에서 맞춘다.
 # 예전엔 여기 따로 적힌 'latent noise' / unload_after=False 가 API 호출자에게 UI 와 다른 결과를 줬다.
-_SAM3_DEFAULTS: dict[str, Any] = Sam3Args().dict()
+# 얼굴 안에서만 찾기의 세 키는 검출기 모듈의 기본값으로 먼저 깐다 — Reload UI 뒤 옛 sam3ext.args 의 Sam3Args 에는 이 키가
+# 없어서, Sam3Args().dict() 만으로 만들면 process() 가 KeyError 로 멈춰 SAM3 가 통째로 꺼진다(새 Sam3Args 면 같은 값으로 덮임).
+_SAM3_DEFAULTS: dict[str, Any] = {
+    "sam3_face_crop": False,
+    "sam3_face_crop_model": FACE_CROP_DEFAULT_MODEL,
+    "sam3_face_crop_confidence": FACE_CROP_DEFAULT_CONFIDENCE,
+    **Sam3Args().dict(),
+}
 
 # XYZ '[SAM3] Checkpoint'·'[SAM3] Device' 축 cost — make_axis_on_xyz_grid 참고.
 SAM3_CHECKPOINT_AXIS_COST = 0.9
@@ -715,6 +724,8 @@ class Sam3MaskScript(scripts.Script):
             # 배치의 앞 장이 남긴 얼굴 수를 걷는다 — 이 장이 얼굴 crop 으로 돌면 아래에서 다시 적는다.
             params.pop(INFOTEXT_FACE_CROP_FACES, None)
         face_kwargs = face_crop_kwargs(args)   # 꺼져 있으면 {} — 예전과 똑같은 호출
+        # 🎯 빠른 버튼이 '얼굴을 못 찾음' 을 따로 알리게 이 장의 얼굴 crop 요약을 둔다(FaceCropInfo, 꺼져 있으면 None).
+        p._sam3_face_crop_info = None
         result = run_sam3_on_pil(
             image=image,
             prompt=args["sam3_prompt"],
@@ -729,8 +740,10 @@ class Sam3MaskScript(scripts.Script):
             **face_kwargs,
         )
         face_info = getattr(result, "face_crop", None)
-        if face_kwargs and face_info is not None and isinstance(params, dict):
-            params[INFOTEXT_FACE_CROP_FACES] = face_info.count
+        if face_kwargs and face_info is not None:
+            p._sam3_face_crop_info = face_info
+            if isinstance(params, dict):
+                params[INFOTEXT_FACE_CROP_FACES] = face_info.count
 
         # 🎯 빠른 버튼이 결과를 판단한다(마스크 없음 / Mask only / 인페인트) — 이미지 객체 비교로는 알 수 없다
         p._sam3_mask_found = bool(np.any(np.asarray(result.mask)))

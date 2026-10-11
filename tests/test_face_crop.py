@@ -189,8 +189,144 @@ class OwnershipTests(unittest.TestCase):
         self.assertEqual(fc.assign_owner((5.0, 5.0), faces, crops, source=1), 1)
         self.assertEqual(fc.assign_owner((5.0, 5.0), faces, crops, source=0), 0)
 
+    def test_a_group_of_sources_are_all_candidates_and_win_ties(self):
+        faces = [[0, 0, 10, 10], [200, 0, 210, 10], [0, 0, 10, 10]]
+        crops = [fc.CropBox(0, 0, 40, 40), fc.CropBox(180, 0, 220, 40), fc.CropBox(0, 0, 40, 40)]
+        # 점(150, 5)은 어느 crop 에도 없다 — 찾은 crop 들(0, 1)만 후보, 오른쪽 얼굴이 가깝다
+        self.assertEqual(fc.assign_owner((150.0, 5.0), faces, crops, source=[0, 1]), 1)
+        self.assertEqual(fc.assign_owner((5.0, 5.0), faces, crops, source={2}), 2, "같으면 찾은 crop")
+        self.assertEqual(fc.assign_owner((5.0, 5.0), faces, crops, source=np.int64(0)), 0)
+
+
+def _box_mask(shape, x0, y0, x1, y1):
+    mask = np.zeros(shape, dtype=bool)
+    mask[y0:y1, x0:x1] = True
+    return mask
+
+
+class CutPieceTests(unittest.TestCase):
+    """crop 의 안쪽 가장자리에 잘린 조각은 옆 crop 에서 이어지는 조각과 한 물체로 묶어 주인을 정한다."""
+
+    SHAPE = (300, 400)   # (높이, 폭)
+
+    def setUp(self):
+        # 큰 얼굴 A(100 px)와 그 오른쪽의 작은 얼굴 B(24 px) — crop 이 맞닿는다(A 는 x < 230, B 는 x ≥ 230)
+        self.faces = [[100, 100, 200, 200], [238, 150, 262, 174]]
+        self.crops = [fc.face_crop_box(box, (400, 300)) for box in self.faces]
+
+    def test_crops_touch_in_this_setup(self):
+        a, b = self.crops
+        self.assertEqual((a.x1, b.x0), (230, 230))
+
+    def test_edge_contact_is_the_line_just_outside_inner_edges(self):
+        crop = fc.CropBox(10, 20, 30, 40)
+        piece = _box_mask((50, 50), 10, 25, 12, 28)          # 왼쪽 변(x 10)에 닿음
+        (y0, y1, x0, x1), where = fc.edge_contact(piece, crop)
+        self.assertEqual((y0, y1, x0, x1), (20, 40, 9, 10))
+        self.assertEqual(np.nonzero(where[:, 0])[0].tolist(), list(range(4, 9)), "닿은 줄 ±1(대각선 이웃 포함)")
+        self.assertIsNone(fc.edge_contact(_box_mask((50, 50), 15, 25, 20, 30), crop), "변에 닿지 않음")
+        image_edge = fc.CropBox(0, 0, 30, 40)
+        self.assertIsNone(fc.edge_contact(_box_mask((50, 50), 0, 5, 3, 9), image_edge), "이미지 테두리는 자른 변이 아니다")
+        corner = fc.edge_contact(_box_mask((50, 50), 27, 37, 30, 40), crop)   # 오른쪽 · 아래 두 변
+        (y0, y1, x0, x1), where = corner
+        self.assertEqual((y0, y1, x0, x1), (20, 41, 10, 31))
+        self.assertTrue(where[40 - y0, 27 - x0] and where[38 - y0, 30 - x0])
+        self.assertFalse(where[40 - y0, 20 - x0], "닿지 않은 곳은 비어 있다")
+
+    def test_a_neighbours_part_cut_at_this_crops_edge_goes_to_the_neighbour(self):
+        hair_a = np.zeros(self.SHAPE, dtype=bool)
+        hair_a[70:100, 95:234] = True
+        hair_a[70:230, 200:234] = True          # A 의 머리카락 — B 의 crop 으로 x 233 까지 들어간 한 덩어리
+        a, b = self.crops
+        seen_a = hair_a & _box_mask(self.SHAPE, *a.as_tuple())
+        seen_b = hair_a & _box_mask(self.SHAPE, *b.as_tuple())   # B 의 crop 이 본 띠(x 230..233)
+        own_b = _box_mask(self.SHAPE, 240, 146, 260, 150)
+        self.assertFalse(a.contains(*fc.mask_centroid(seen_b)), "띠의 무게중심은 A 의 crop 밖 — 예전 규칙이면 B 의 것")
+        owners = fc.assign_owners([seen_a, seen_b, own_b], [0, 1, 1], self.faces, self.crops)
+        self.assertEqual(owners, [0, 0, 1])
+
+    def test_pieces_that_do_not_meet_across_the_edge_stay_apart(self):
+        a, b = self.crops
+        near_a = _box_mask(self.SHAPE, 210, 150, 230, 160)    # A 의 crop 오른쪽 끝에 닿음
+        b_low = _box_mask(self.SHAPE, 230, 165, 236, 170)     # B 의 crop 왼쪽 끝에 닿지만 A 쪽 조각과 줄이 다름
+        owners = fc.assign_owners([near_a, b_low], [0, 1], self.faces, self.crops)
+        self.assertEqual(owners, [0, 1])
+
+    def test_single_pieces_match_assign_owner(self):
+        rng = np.random.default_rng(3)
+        checked = 0
+        for _ in range(200):
+            x0, y0 = int(rng.integers(60, 270)), int(rng.integers(50, 220))
+            piece = _box_mask(self.SHAPE, x0, y0, x0 + 3, y0 + 3)
+            sources = [i for i, crop in enumerate(self.crops) if crop.contains(x0, y0) and crop.contains(x0 + 2, y0 + 2)]
+            if not sources:
+                continue
+            want = fc.assign_owner(fc.mask_centroid(piece), self.faces, self.crops, sources[0])
+            self.assertEqual(fc.assign_owners([piece], sources[:1], self.faces, self.crops), [want])
+            checked += 1
+        self.assertGreater(checked, 50)
+
+
+class GrowCropTests(unittest.TestCase):
+    def test_zero_margin_is_the_crop(self):
+        crop = fc.CropBox(10, 10, 74, 74)
+        self.assertIs(fc.grow_crop(crop, 0, (256, 192)), crop)
+        self.assertIs(fc.grow_crop(crop, -3, (256, 192)), crop)
+
+    def test_grown_square_in_the_middle(self):
+        self.assertEqual(fc.grow_crop(fc.CropBox(100, 50, 164, 114), 6, (256, 192)), fc.CropBox(94, 44, 170, 120))
+
+    def test_random_crops_cover_the_margin_inside_the_image(self):
+        rng = np.random.default_rng(11)
+        for _ in range(500):
+            width, height = int(rng.integers(40, 400)), int(rng.integers(40, 400))
+            box = [float(rng.uniform(-20, width)), float(rng.uniform(-20, height))]
+            box += [box[0] + float(rng.uniform(1, 120)), box[1] + float(rng.uniform(1, 120))]
+            crop = fc.face_crop_box(box, (width, height))
+            if crop is None:
+                continue
+            margin = int(rng.integers(1, 40))
+            grown = fc.grow_crop(crop, margin, (width, height))
+            self.assertTrue(0 <= grown.x0 < grown.x1 <= width and 0 <= grown.y0 < grown.y1 <= height)
+            self.assertLessEqual(grown.x0, max(0, crop.x0 - margin))
+            self.assertLessEqual(grown.y0, max(0, crop.y0 - margin))
+            self.assertGreaterEqual(grown.x1, min(width, crop.x1 + margin))
+            self.assertGreaterEqual(grown.y1, min(height, crop.y1 + margin))
+            if grown.width < width and grown.height < height:
+                self.assertEqual(grown.width, grown.height, "이미지에 들어가면 정사각형")
+
+
+class DuplicateBoxTests(unittest.TestCase):
+    def test_iou(self):
+        self.assertAlmostEqual(fc.box_iou((40, 70, 80, 110), (48, 66, 92, 112)), 0.546, places=3)
+        self.assertEqual(fc.box_iou((0, 0, 10, 10), (20, 0, 30, 10)), 0.0)
+        self.assertEqual(fc.box_iou((0, 0, 0, 0), (0, 0, 0, 0)), 0.0)
+
+    def test_same_face(self):
+        self.assertTrue(fc.same_face((40, 70, 80, 110), (48, 66, 92, 112)), "IoU 0.55 — NMS(0.7)가 둘 다 남긴 상자")
+        self.assertTrue(fc.same_face((0, 0, 100, 100), (40, 40, 60, 60)), "작은 상자의 중심이 큰 상자 안")
+        self.assertFalse(fc.same_face((40, 70, 80, 110), (84, 70, 124, 110)), "나란한 두 얼굴")
+        self.assertFalse(fc.same_face((0, 0, 40, 40), (30, 30, 70, 70)), "모서리만 겹침(IoU 0.03)")
+
+    def test_dedupe_keeps_the_higher_score(self):
+        boxes = [[40, 70, 80, 110], [48, 66, 92, 112], [170, 70, 210, 110]]
+        self.assertEqual(fc.dedupe_faces(boxes, [0.6, 0.8, 0.5]), [1, 2])
+        self.assertEqual(fc.dedupe_faces(boxes, [0.8, 0.6, 0.5]), [0, 2])
+        self.assertEqual(fc.dedupe_faces(boxes, [0.7, 0.7, 0.5]), [0, 2], "같으면 앞 번호")
+        self.assertEqual(fc.dedupe_faces(boxes, [float("nan"), 0.6]), [1, 2], "점수 없는 상자는 나중")
+        self.assertEqual(fc.dedupe_faces([], []), [])
+
 
 class PlanTests(unittest.TestCase):
+    def test_two_boxes_on_one_face_are_one_face(self):
+        info = fc.plan_face_crops(
+            [[170, 70, 210, 110], [40, 70, 80, 110], [48, 66, 92, 112]], [0.9, 0.6, 0.8], (256, 192),
+            model="face_yolov8n.pt", confidence=0.3,
+        )
+        self.assertEqual(info.boxes, [[48.0, 66.0, 92.0, 112.0], [170.0, 70.0, 210.0, 110.0]])
+        self.assertEqual(info.scores, [0.8, 0.9])
+        self.assertEqual(info.count, 2)
+
     def test_faces_left_to_right_with_their_scores_and_bad_boxes_dropped(self):
         info = fc.plan_face_crops(
             [[300, 50, 340, 90], [10, 10, 10, 50], [20, 60, 60, 100], [900, 900, 950, 950]],

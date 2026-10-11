@@ -318,7 +318,7 @@ Manual Mask 교집합(Refine, 칠했을 때) → Exclude 영역 차감. Mask Blu
 
 ## 얼굴 안에서만 찾기 (Face crop)
 
-SAM3 Mask 아코디언의 **Search inside faces only (얼굴 안에서만 찾기)** 와 Refine 패널의 **SAM3 Refine Face Crop
+SAM3 Mask 아코디언의 **Search inside faces only** 와 Refine 패널의 **SAM3 Refine Face Crop
 (얼굴 안에서만 찾기)** — Detect(Target) · Exclude 프롬프트를 이미지 전체가 아니라 **얼굴 상자 안에서만** 찾습니다. SAM3 는 이미지
 전체를 1008×1008 로 줄여 보므로 작은 얼굴의 눈 · 입 · 눈썹 · 머리카락을 놓치거나 배경의 비슷한 것(옷의 눈 무늬 등)을 같이 잡는데,
 얼굴마다 잘라 그 작업 크기로 늘려 보면 얼굴 부위만, 더 크게 봅니다.
@@ -326,25 +326,36 @@ SAM3 Mask 아코디언의 **Search inside faces only (얼굴 안에서만 찾기
 1. ADetailer 가 쓰는 `models/adetailer` 의 YOLO 얼굴 모델로 얼굴 상자를 찾습니다 — 기본 `face_yolov8n.pt`, 신뢰도 0.3
    (ADetailer 의 모델 · 신뢰도와 같은 뜻, `face_yolov8s.pt` 도 애니 얼굴을 잡음). ADetailer 설정의 추가 모델 폴더
    (`ad_extra_models_dir`)도 봅니다. 목록에는 같은 폴더의 다른 YOLO 상자 모델(`hand_yolov8n.pt` 등)도 나와 그 상자 안에서
-   찾게 할 수 있습니다(클래스 이름이 필요한 YOLO-World 는 뺌).
+   찾게 할 수 있습니다(클래스 이름이 필요한 YOLO-World 는 뺌). 한 얼굴에 상자가 둘 남으면(IoU 0.3 이상이거나 한 상자의 중심이
+   다른 상자 안 — ultralytics 의 NMS 는 IoU 0.7 미만이면 둘 다 둠) 점수가 높은 하나만 씁니다(그 얼굴의 부위가 두 패스로 갈리지 않게).
 2. 상자를 옆 · 아래로 20 %, 위로 40 %(이마 · 머리카락) 넓히고, 중심을 지킨 정사각형으로 만들어 이미지 안으로 밉니다(잘라 내지
    않음). 한 변이 이미지보다 길면 그 축만 이미지 크기가 되고, 아주 작은 얼굴도 한 변 32 px 이상을 봅니다.
 3. crop 마다 지금 SAM3 설정(Detect · Exclude 프롬프트, Threshold, 체크포인트, 장치)을 그대로 돌리고 마스크를 원래 자리에 붙입니다
    (crop 은 크기를 바꾸지 않고 잘라만 내므로 픽셀 단위로 같은 자리). crop 이 겹치면 찾은 조각마다 무게중심에서 가장 가까운
    얼굴(얼굴 크기로 나눈 거리)의 것으로 셉니다 — 옆 얼굴의 눈이 이 얼굴의 패스에 섞이지 않고, 합친 마스크는 그대로입니다.
+   crop 의 안쪽 가장자리(이미지 테두리가 아닌 변)에 잘린 조각은 그 너머에서 이어지는 옆 crop 의 조각과 한 물체로 묶어 묶음 전체의
+   무게중심으로 정합니다 — 옆 얼굴의 머리카락 끝이 작은 얼굴의 crop 에 잘려 들어와도 옆 얼굴의 패스로 갑니다. (두 얼굴의 같은
+   부위가 crop 가장자리에서 맞닿아 SAM3 가 한 덩어리로 내면 그 덩어리는 한 얼굴의 패스로 같이 갑니다 — 합친 마스크는 같음.)
 4. 그 뒤는 예전과 같습니다: Convex Hull → Outline expand → Dilation(이미지 픽셀 단위 — crop 밖으로도 번짐) → Manual Mask
-   교집합(Refine) → Exclude 차감 → 인페인트 · ControlNet · 시드.
+   교집합(Refine) → Exclude 차감 → 인페인트 · ControlNet · 시드. Exclude 는 crop 마다 찾되 Outline expand + Dilation px 만큼
+   넓힌 정사각 영역에서 찾아, crop 밖으로 번진 마스크도 그 바로 밖의 보호 대상을 먹지 않습니다(둘 다 0 이면 crop 그대로 — 백본을
+   한 번 더 돌리지 않음).
 
 - **Mask Processing**: `Individual` 은 `/` 그룹 × 얼굴마다 패스 하나(그룹 순서, 그 안에서 얼굴은 왼쪽 → 오른쪽), `Combined` 는
   모두 합친 마스크로 한 번. 그 부위가 없는 얼굴의 패스는 생기지 않습니다.
 - **얼굴이 없으면** SAM3 를 불러오지 않고 '검출 없음' 과 같게 끝납니다 — 이미지는 그대로, 콘솔에
   `[-] SAM3: face crop — no faces found by face_yolov8n.pt (confidence 0.30); nothing to mask.`, Refine 은 상태 줄에
-  `얼굴을 찾지 못했습니다 (모델, 신뢰도)`.
+  `얼굴을 찾지 못했습니다 (모델, 신뢰도)`, 🎯 빠른 버튼도 같은 안내(얼굴 검출 신뢰도를 낮추거나 Search inside faces only 를 끄라고).
+  Refine 에서 Manual Mask 를 칠했으면 '검출 없음' 의 규칙대로 칠한 마스크를 그대로 인페인트합니다(찾을 crop 이 없어 Exclude 는
+  찾지 않음).
 - **받지 않습니다**: 모델 파일이나 `ultralytics`(ADetailer 가 Forge venv 에 깔아 둠)가 없으면 넣을 곳을 알려 주는 오류로 멈춥니다
   (In-flight 는 infotext `SAM3 Error` 와 콘솔, Refine 은 상태 줄). ultralytics 가 이름을 바꿔 GitHub 에서 받으려는 모델 이름
   (`yolov5s.pt` 꼴)도 거절합니다.
 - 얼굴 검출 장치: SAM3 Device 가 `cpu` 면 CPU, 아니면 ADetailer 처럼 지금 CUDA 장치(`cuda:1` 이어도 장치 번호는 주지 않음 —
   ultralytics 가 프로세스 기본 장치를 바꾸므로). 얼굴 모델은 이미지마다 불러오고(약 6\~22 MB) 끝나면 놓습니다.
+- ultralytics 자체 설정이 그대로 적용됩니다: 검출할 때마다 ultralytics 가 익명 사용 통계 이벤트를 쌓아 Google Analytics 로
+  보냅니다(많아야 30 초에 한 번, 설정 `sync` 가 켜져 있고 온라인일 때 — ADetailer 도 같음). 끄려면 Forge venv 에서
+  `yolo settings sync=False`. 이 확장은 그 설정을 바꾸지 않습니다(받는 것은 여전히 없음).
 - 오버레이(Replace output with overlay preview · 아티팩트)에 얼굴 crop 테두리(주황)와 얼굴 점수가 그려지고, 아티팩트 meta JSON 에
   `face_crop`(모델 · 신뢰도 · 얼굴 상자 · 점수 · crop)이 남습니다.
 
@@ -352,7 +363,7 @@ SAM3 Mask 아코디언의 **Search inside faces only (얼굴 안에서만 찾기
 
 | UI | state / API 키 | 기본값 | infotext (붙여 넣기) | XYZ 축 |
 |---|---|---|---|---|
-| Search inside faces only (얼굴 안에서만 찾기) | `sam3_face_crop` | `false` | `SAM3 Face Crop` | `[SAM3] Face Crop` |
+| Search inside faces only | `sam3_face_crop` | `false` | `SAM3 Face Crop` | `[SAM3] Face Crop` |
 | SAM3 Face Detector (models/adetailer) | `sam3_face_crop_model` | `face_yolov8n.pt` | `SAM3 Face Crop Model` | `[SAM3] Face Crop Model` |
 | SAM3 Face Detector Confidence | `sam3_face_crop_confidence` | `0.3` | `SAM3 Face Crop Confidence` | `[SAM3] Face Crop Confidence` |
 

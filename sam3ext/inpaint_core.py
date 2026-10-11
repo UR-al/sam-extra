@@ -1024,16 +1024,16 @@ def _run_sam3_refine_passes(
         print(f"[-] SAM3 Refine: {describe_unload(bool(kept))}", file=sys.stderr)
 
     face_info = getattr(sam3_result, "face_crop", None)
-    if face_info is not None and not face_info.crops:
-        # 얼굴 안에서만 찾기인데 얼굴이 없다 — 검출 없음과 같게 끝내되, 이유를 상태 줄에 따로 알린다.
-        print("[-] SAM3 Refine: face crop found no faces; nothing to do.", file=sys.stderr)
-        results = RefineResults(reason="no_faces")
-        results.face_crop = face_info
-        return results
-
     masks_source = sam3_result.masks if args.get("sam3_mask_mode") == "Individual" else None
     masks = [sam3_result.mask] if not masks_source else masks_source
     if not masks or not any(np_any(m) for m in masks):
+        if face_info is not None and not face_info.crops:
+            # 얼굴 안에서만 찾기인데 얼굴이 없다 — 검출 없음과 같게 끝내되, 이유를 상태 줄에 따로 알린다.
+            # (Manual Mask 를 칠했으면 run_sam3_on_pil 이 그것을 그대로 돌려주므로 여기 오지 않고 인페인트한다.)
+            print("[-] SAM3 Refine: face crop found no faces; nothing to do.", file=sys.stderr)
+            results = RefineResults(reason="no_faces")
+            results.face_crop = face_info
+            return results
         print("[-] SAM3 Refine: detection returned an empty mask; nothing to do.", file=sys.stderr)
         return RefineResults(reason="empty_mask")
 
