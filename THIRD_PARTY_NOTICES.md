@@ -104,6 +104,13 @@ Forge Neo 용으로 고친 [DominikDoom/a1111-sd-webui-tagcomplete](https://gith
   [DraconicDragon/dbr-e621-lists-archive](https://github.com/DraconicDragon/dbr-e621-lists-archive) 의
   `tag-lists/danbooru_e621_merged` 를 듭니다), `extra-quality-tags.csv` — 상류가 고른 품질 태그, `demo-chants.json` — 상류의 예시
   chant. 태그 이름·분류·게시물 수는 Danbooru·e621 사이트의 태그 데이터이고, 파일은 상류 저장소가 위 MIT `LICENSE` 로 배포한 그대로입니다.
+- 여섯째 목록 `tags/danbooru_2026-10-01_pt20-ia-dd.csv`(내장의 `tac_tagFile` 기본값)는 상류 tagcomplete 가 아니라
+  [DraconicDragon/dbr-e621-lists-archive](https://github.com/DraconicDragon/dbr-e621-lists-archive) 의 파일
+  `tag-lists/danbooru/danbooru_2026-10-01_pt20-ia-dd.csv`(git blob `acdc0685c5a52ac743363adfe4d6a9b4298331d0`, 5,602,650 바이트, 그 경로의
+  커밋 `0d3b4e4`, 2026-10-01)를 바이트 그대로 넣은 것입니다 — 2026-10-01 에 만든 Danbooru 태그 목록으로, 게시물 수 20 이상인 태그
+  220,510개(이름·분류·게시물 수·별칭, LF). 라이선스: 그 저장소의 **The Unlicense**(`LICENSE`, 퍼블릭 도메인 헌정 — 조건이 없지만 출처를
+  밝혀 둡니다). 태그 이름·분류·게시물 수는 Danbooru 사이트의 태그 데이터입니다. `tests/test_tagcomplete_vendor.py` 가 git blob·SHA-256 을
+  고정합니다.
 
 이 확장에서 바꾼 부분(MIT 는 수정을 허락합니다 — 바꾼 곳 전부):
 
@@ -115,7 +122,10 @@ Forge Neo 용으로 고친 [DominikDoom/a1111-sd-webui-tagcomplete](https://gith
   - `GET /tacapi/v1/wildcard-contents`(`api_tac` 안의 `get_wildcard_contents`): 새 함수 `_is_listed_wildcard_file` 로 와일드카드 폴더
     (`WILDCARD_PATH`, `WILDCARD_EXT_PATHS` — 이 헬퍼가 wc.txt·wce.txt 에 적는 폴더) 안의 `.txt` 만 돌려주고 나머지는 404. 상류는
     쿼리로 준 아무 파일이나 로그인 없이 돌려줬습니다.
-  - 나머지 함수(설정 등록 `on_ui_settings` 의 `tac_*` 57개 포함)와 다른 경로 14개는 상류와 글자까지 같습니다(테스트가 함수별 해시를 상류와 대조).
+  - 설정 등록 `on_ui_settings`: `tac_tagFile` 의 기본값만 `danbooru.csv` → `danbooru_2026-10-01_pt20-ia-dd.csv`(위 여섯째 목록).
+    키·이름·섹션·드롭다운과 다른 `tac_*` 56개는 상류와 같습니다(설정 대조 테스트가 이 한 곳만 다름을 확인하고, 이 문자열을 되돌리면 함수가
+    상류와 해시까지 같습니다). config.json 에 저장된 값은 그대로 쓰입니다.
+  - 나머지 함수와 다른 경로 14개는 상류와 글자까지 같습니다(테스트가 함수별 해시를 상류와 대조).
 - `shared_paths.py` — `TAGS_PATH` 가 이 확장의 `tags/`(`sam3ext/tagcomplete/paths.py` 의 `TAGS_DIR`)입니다. 상류는
   `scripts.basedir()/tags` 로, Forge 가 `scripts/` 의 파일을 실행하는 동안에만 맞는 값입니다. 그래서 `modules.scripts` import 는 뺐습니다.
 - `model_keyword_support.py`·`tag_frequency_db.py` — import 경로만(`scripts.shared_paths` → `sam3ext.tagcomplete.shared_paths`).
@@ -123,7 +133,8 @@ Forge Neo 용으로 고친 [DominikDoom/a1111-sd-webui-tagcomplete](https://gith
   `.gitattributes`·`.gitignore` 는 넣지 않았고, 태그 목록 다섯 개 밖의 상류 목록(`e621.csv` 등)도 넣지 않았습니다.
 - 이 확장의 코드(GPL-3.0-only, 상류 코드 아님): `sam3ext/tagcomplete/__init__.py`·`paths.py`·`coexist.py`(따로 설치된 tagcomplete
   가 켜져 있으면 내장이 쉼, 설정 스위치 `sam3_builtin_tagcomplete_enabled` 와 안내 줄, 로더가 읽는 숨은 설정
-  `sam3_tac_builtin_boot`)·`boot.py`(헬퍼 시작, 그 시작 정보), `scripts/builtin_tagcomplete.py`, `javascript/tagcomplete_loader.js`,
+  `sam3_tac_builtin_boot`, 고른 `tac_tagFile` 이 `tags/` 에 없을 때 페이지가 기본 목록을 대신 읽게 하는 정보)·`boot.py`(헬퍼 시작, 그 시작
+  정보), `scripts/builtin_tagcomplete.py`, `javascript/tagcomplete_loader.js`,
   `tools/migrate_tagcomplete.py`.
 
 ## sd-forge-negpip — NegPiP (AGPL-3.0-or-later)

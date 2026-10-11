@@ -24,10 +24,16 @@ const FILES = [
 const URLS = FILES.map((name, i) => `file=extensions/forge_sam3_extension/sam3ext/tagcomplete/javascript/${name}?${1000 + i}`);
 const ENABLED = { enabled: true, reason: null, upstream: "eduardoabreu81/sd-webui-tagcomplete-neo@8e0d81f", scripts: URLS };
 
-// Forge script.js / ui.js stand-in (same behaviour: `let opts`, callbacks run at once when opts are already filled)
+// Forge script.js / ui.js stand-in (same behaviour: `let opts`, callbacks run at once when opts are already filled;
+// load_webui_settings runs the available, then the changed callbacks; Apply settings sets a new opts object, then runs
+// the changed callbacks — ui.js's settings_json textarea setter)
 const FORGE = `
 let opts = {};
 const optionsAvailableCallbacks = [];
+const optionsChangedCallbacks = [];
+function onOptionsChanged(callback) {
+    optionsChangedCallbacks.push(callback);
+}
 function onOptionsAvailable(callback) {
     if (Object.keys(opts).length > 0) {
         callback();
@@ -47,6 +53,11 @@ function executeCallbacks(queue, arg) {
 function forgeLoadSettings(json) {
     opts = JSON.parse(json);
     executeCallbacks(optionsAvailableCallbacks);
+    executeCallbacks(optionsChangedCallbacks);
+}
+function forgeApplySettings(json) {
+    opts = JSON.parse(json);
+    executeCallbacks(optionsChangedCallbacks);
 }
 `;
 // a webui without onOptionsAvailable: the loader waits for opts to fill by itself
@@ -100,6 +111,8 @@ function load(t, { prompt = true, before = "", webui = FORGE, fastTimers = false
   return {
     window, doc, logs, fetches, uiUpdates, scripts, run,
     settings: (values) => window.forgeLoadSettings(JSON.stringify(values)),
+    apply: (values) => window.forgeApplySettings(JSON.stringify(values)),
+    opts: () => window.eval("opts"),   // Forge's `let opts` (not a window property)
     state: () => doc.documentElement.getAttribute("data-sam3-tagcomplete"),
   };
 }
@@ -253,6 +266,130 @@ test("defines no global names", async (t) => {
   t.after(() => fresh.window.close());
   const baseline = new Set(Object.getOwnPropertyNames(fresh.window));
   const added = Object.getOwnPropertyNames(env.window).filter((name) => !baseline.has(name));
-  assert.deepEqual(added.sort(), ["executeCallbacks", "fetch", "forgeLoadSettings", "gradioApp", "onOptionsAvailable"],
-    "only the test's own stand-ins (Forge's let/const are not window properties)");
+  assert.deepEqual(added.sort(), ["executeCallbacks", "fetch", "forgeApplySettings", "forgeLoadSettings", "gradioApp",
+    "onOptionsAvailable", "onOptionsChanged"], "only the test's own stand-ins (Forge's let/const are not window properties)");
+});
+
+// ---------------------------------------------------------------------------------------------------------------------
+// tac_tagFile names a file that is not in tags/: the page reads the default list instead (boot.tagFileFallback, computed
+// by the server — sam3ext/tagcomplete/coexist.py tag_file_fallback). Only the page's opts change, never another key.
+// ---------------------------------------------------------------------------------------------------------------------
+
+const MISSING = "KR_danbooru_tags_with_description-20260907.csv";
+const DEFAULT_LIST = "danbooru_2026-10-01_pt20-ia-dd.csv";
+const FALLBACK = { key: "tac_tagFile", missing: MISSING, use: DEFAULT_LIST };
+const WITH_FALLBACK = { ...ENABLED, tagFileFallback: FALLBACK };
+const FALLBACK_WARNING = `[sam-extra] Tag Autocomplete: tac_tagFile = '${MISSING}' is not in the tags folder; suggestions use`
+  + ` the default list '${DEFAULT_LIST}' on this page (the setting is not changed - pick another file in Settings -> Tag`
+  + " Autocomplete)";
+
+function tagSettings(tagFile, boot = WITH_FALLBACK, extra = {}) {
+  return { ...settingsWith(boot), tac_tagFile: tagFile, "tac_extra.extraFile": "danbooru_e621_merged.csv", ...extra };
+}
+
+test("a missing tac_tagFile is read as the default list on the page, before the upstream files are added", async (t) => {
+  const env = load(t);
+  const head = env.doc.head;
+  const append = head.appendChild.bind(head);
+  const seen = [];   // the page's tac_tagFile each time the loader adds an upstream file
+  head.appendChild = (node) => {
+    seen.push(env.opts().tac_tagFile);
+    return append(node);
+  };
+  env.settings(tagSettings(MISSING));
+  await until(() => env.scripts().length === 15, "15 scripts");
+  assert.deepEqual(seen, Array(15).fill(DEFAULT_LIST), "changed before the first upstream file is added");
+  assert.equal(env.opts().tac_tagFile, DEFAULT_LIST);
+  assert.equal(env.opts()["tac_extra.extraFile"], "danbooru_e621_merged.csv", "no other key changes");
+  assert.deepEqual(env.logs.warn, [FALLBACK_WARNING]);
+  env.scripts().forEach((script) => fire(env.window, script));
+  await until(() => env.state() === "started", "started");
+  assert.deepEqual(env.fetches, []);
+});
+
+test("after Apply settings the same missing name is read as the default again; another pick is left alone", async (t) => {
+  const env = load(t);
+  env.settings(tagSettings(MISSING));
+  await until(() => env.scripts().length === 15, "15 scripts");
+  env.apply(tagSettings(MISSING, WITH_FALLBACK, { tac_maxResults: 9 }));   // Forge makes a new opts object
+  assert.equal(env.opts().tac_maxResults, 9);
+  assert.equal(env.opts().tac_tagFile, DEFAULT_LIST);
+  env.apply(tagSettings("danbooru.csv"));
+  assert.equal(env.opts().tac_tagFile, "danbooru.csv", "the user's new choice");
+  env.apply(tagSettings("None"));
+  assert.equal(env.opts().tac_tagFile, "None", "'no list' is a choice too");
+  assert.equal(env.logs.warn.length, 1, "told once per page");
+});
+
+test("no fallback, a malformed one or one for another key: opts stay as Forge sent them", async (t) => {
+  for (const tagFileFallback of [null, undefined, "x", { ...FALLBACK, key: "tac_extra.extraFile" },
+    { ...FALLBACK, use: MISSING }, { ...FALLBACK, use: 3 }, { key: "tac_tagFile", missing: MISSING }]) {
+    const env = load(t);
+    env.settings(tagSettings(MISSING, { ...ENABLED, tagFileFallback }));
+    await until(() => env.scripts().length === 15, "15 scripts");
+    assert.equal(env.opts().tac_tagFile, MISSING, JSON.stringify(tagFileFallback));
+    assert.deepEqual(env.logs.warn, []);
+  }
+});
+
+test("the setting already names another file: the fallback is not used", async (t) => {
+  const env = load(t);
+  env.settings(tagSettings("danbooru.csv"));
+  await until(() => env.scripts().length === 15, "15 scripts");
+  assert.equal(env.opts().tac_tagFile, "danbooru.csv");
+  assert.deepEqual(env.logs.warn, []);
+});
+
+test("built-in not started: the fallback is not applied either", async (t) => {
+  const env = load(t);
+  env.settings(tagSettings(MISSING, { enabled: false, reason: "off", scripts: [], tagFileFallback: FALLBACK }));
+  await until(() => env.state() === "skipped", "skipped");
+  assert.equal(env.opts().tac_tagFile, MISSING);
+});
+
+test("a webui without onOptionsChanged: applied once", async (t) => {
+  const env = load(t, { webui: OLD_WEBUI, fastTimers: true });
+  env.settings(tagSettings(MISSING));
+  await until(() => env.scripts().length === 15, "15 scripts");
+  assert.equal(env.opts().tac_tagFile, DEFAULT_LIST);
+});
+
+// The real upstream files (sam3ext/tagcomplete/javascript, unchanged) on the loader's page: what upstream's own
+// syncOptions / ensureTagsLoaded request. jsdom does not fetch <script src>, so each file runs as an inline classic
+// script in the loader's order, then the loader's element gets its load event.
+const UPSTREAM = FILES.map((name) => readFileSync(path.join(ROOT, "sam3ext", "tagcomplete", "javascript", name), "utf8"));
+const UPSTREAM_SETTINGS = {
+  tac_active: true, "tac_activeIn.txt2img": true, "tac_activeIn.img2img": true, "tac_activeIn.negativePrompts": true,
+  tac_maxResults: 5, tac_useIndexedSearch: true, tac_chantFile: "None", "tac_translation.translationFile": "None",
+  "tac_translation.liveTranslation": false, "tac_extra.extraFile": "None", tac_keymap: "{}", tac_colormap: "{}",
+};
+
+test("upstream's own loading reads the default list for a missing tac_tagFile, and follows a new pick", async (t) => {
+  const forge = `${FORGE}\nfunction onUiUpdate(callback) {}\nfunction onUiLoaded(callback) {}\nfunction onAfterUiUpdate(callback) {}`;
+  const env = load(t, { webui: forge });
+  const requested = [];
+  env.window.fetch = async (url) => {
+    requested.push(String(url));
+    return { status: 200, ok: true, text: async () => "1girl,0,100,\nsolo,0,90,\n", json: async () => [] };
+  };
+  env.settings({ ...tagSettings(MISSING), ...UPSTREAM_SETTINGS });
+  await until(() => env.scripts().length === 15, "15 scripts");
+  UPSTREAM.forEach((source) => env.run(source));
+  env.scripts().forEach((script) => fire(env.window, script));
+  await until(() => env.state() === "started", "started");
+
+  env.window.eval("tagBasePath = 'extensions/forge_sam3_extension/tags'");   // upstream reads tmp/tagAutocompletePath.txt
+  await env.window.eval("syncOptions()");
+  assert.equal(env.window.eval("TAC_CFG.tagFile"), DEFAULT_LIST);
+  await env.window.eval("ensureTagsLoaded()");
+  assert.deepEqual(requested.map((url) => url.replace(/\?\d+$/, "")),
+    [`file=extensions/forge_sam3_extension/tags/${DEFAULT_LIST}`]);
+  assert.equal(env.window.eval("allTags.length"), 2);
+
+  env.apply({ ...tagSettings("danbooru.csv"), ...UPSTREAM_SETTINGS });
+  await env.window.eval("syncOptions()");   // upstream: 500 ms after the Apply settings click
+  assert.equal(env.window.eval("TAC_CFG.tagFile"), "danbooru.csv");
+  assert.ok(requested.some((url) => url.startsWith("file=extensions/forge_sam3_extension/tags/danbooru.csv?")));
+  assert.ok(!requested.some((url) => url.includes(MISSING)), "the missing name is never requested");
+  assert.deepEqual(env.logs.error, []);
 });

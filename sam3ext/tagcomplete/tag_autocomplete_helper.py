@@ -13,8 +13,11 @@
 #   same app;
 # - GET /tacapi/v1/wildcard-contents serves only .txt files inside the wildcard folders this helper lists in
 #   wc.txt / wce.txt (WILDCARD_PATH, WILDCARD_EXT_PATHS) and answers 404 otherwise (_is_listed_wildcard_file).
-#   Upstream served any existing file named by the query, without a login, to anyone who could reach Forge.
-# on_ui_settings (all 57 tac_* settings: keys, defaults, labels, section) and the other routes are unchanged.
+#   Upstream served any existing file named by the query, without a login, to anyone who could reach Forge;
+# - on_ui_settings: the default of tac_tagFile is "danbooru_2026-10-01_pt20-ia-dd.csv" (shipped in tags/, from
+#   DraconicDragon/dbr-e621-lists-archive, Unlicense) instead of "danbooru.csv". Only that string: its key, label,
+#   section, dropdown and the other 56 tac_* settings are as upstream (tests/test_tagcomplete_settings_parity.py).
+# The other routes are unchanged.
 
 # This helper script scans folders for wildcards and embeddings and writes them
 # to a temporary file to expose it to the javascript side
@@ -631,7 +634,7 @@ def on_ui_settings():
 
     tac_options = {
         # Main tag file
-        "tac_tagFile": shared.OptionInfo("danbooru.csv", "Tag filename", gr.Dropdown, lambda: {"choices": csv_files_withnone}, refresh=update_tag_files),
+        "tac_tagFile": shared.OptionInfo("danbooru_2026-10-01_pt20-ia-dd.csv", "Tag filename", gr.Dropdown, lambda: {"choices": csv_files_withnone}, refresh=update_tag_files),
         # Active in settings
         "tac_active": shared.OptionInfo(True, "Enable Tag Autocompletion"),
         "tac_activeIn.txt2img": shared.OptionInfo(True, "Active in txt2img").needs_restart(),

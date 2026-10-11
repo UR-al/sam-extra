@@ -1846,15 +1846,33 @@ txt2img·img2img 의 스타일 줄 아래에 접힌 칸 **구도 · 카메라** 
 따로 설치할 필요가 없습니다. 추천 규칙·단축키·색·번역·사용 횟수 정렬·CivitAI 트리거 단어 등 사용법은
 [상류 README](https://github.com/eduardoabreu81/sd-webui-tagcomplete-neo/blob/8e0d81fd0e25fd2cf98fb4d34d097df9f71a082b/README.md) 와 같습니다.
 
-- **설정은 그대로**: Settings → **Tag Autocomplete** 의 `tac_*` 설정 57개는 키·기본값·이름·섹션이 따로 설치하던 확장과 같아,
-  config.json 에 남아 있는 값이 그대로 쓰입니다. 맨 위에 안내 줄과 **내장 Tag Autocomplete 사용 (sam-extra)** 스위치(기본 켬,
-  바꾸면 Forge 재시작)가 더해졌습니다. 끄면 `tac_*` 설정은 화면에서만 사라지고 config.json 의 값은 그대로 남습니다.
-- **태그 파일**: `extensions/forge_sam3_extension/tags/` 에서 읽습니다. 저장소에는 다섯 개만 들어 있습니다 — `danbooru.csv`(기본
-  태그 파일), `danbooru_2025.csv`(TIPO 가 먼저 읽는 목록), `danbooru_e621_merged.csv`, `extra-quality-tags.csv`, `demo-chants.json`.
+- **설정은 그대로**: Settings → **Tag Autocomplete** 의 `tac_*` 설정 57개는 키·이름·섹션이 따로 설치하던 확장과 같아
+  (기본값은 `tac_tagFile` 하나만 다름 — 아래 **기본 태그 목록**), config.json 에 남아 있는 값이 그대로 쓰입니다. 맨 위에 안내 줄과
+  **내장 Tag Autocomplete 사용 (sam-extra)** 스위치(기본 켬, 바꾸면 Forge 재시작)가 더해졌습니다. 끄면 `tac_*` 설정은 화면에서만
+  사라지고 config.json 의 값은 그대로 남습니다.
+- **태그 파일**: `extensions/forge_sam3_extension/tags/` 에서 읽습니다. 저장소에는 여섯 개만 들어 있습니다 —
+  `danbooru_2026-10-01_pt20-ia-dd.csv`(기본 태그 파일), `danbooru.csv`(상류의 기본이던 목록), `danbooru_2025.csv`(TIPO 가 먼저 읽는
+  목록), `danbooru_e621_merged.csv`, `extra-quality-tags.csv`, `demo-chants.json`.
   상류의 다른 목록(`e621.csv`·`e621_sfw.csv`·`derpibooru.csv`·`EnglishDictionary.csv`·`noob_characters-chants.json`)은
   [상류 tags 폴더](https://github.com/eduardoabreu81/sd-webui-tagcomplete-neo/tree/8e0d81fd0e25fd2cf98fb4d34d097df9f71a082b/tags) 에서 받아
   같은 폴더에 두면 목록에 나타납니다. 직접 만든 목록, 사용 횟수(`tags/tag_frequency.db`), 시작할 때마다 다시 만드는 `tags/temp/` 는
   git 에 들어가지 않습니다.
+- **기본 태그 목록**: 2026-10-01 에 만든 Danbooru 목록 `danbooru_2026-10-01_pt20-ia-dd.csv` 입니다 — 게시물 수 20 이상인 태그
+  220,510개(별칭 포함). 출처는 [DraconicDragon/dbr-e621-lists-archive](https://github.com/DraconicDragon/dbr-e621-lists-archive) 의
+  `tag-lists/danbooru/` 이고 라이선스는 The Unlicense 입니다(파일은 그대로, `THIRD_PARTY_NOTICES.md`). 상류의 기본값은 `danbooru.csv`
+  였습니다. config.json 에 예전에 고른 값이 있으면 그 값이 계속 쓰입니다 — 한국어 설명이 붙은 목록(`KR_danbooru_tags_with_description-…csv`
+  같은 사용자 목록)도 `tags/` 에 있으면 Settings → **Tag Autocomplete** → **Tag filename** 에서 그대로 고를 수 있습니다. 저장된 값을
+  새 기본 목록으로 바꾸려면 그 칸에서 고르거나, Forge 를 끈 채로 Forge 폴더에서:
+
+  ```
+  venv\Scripts\python.exe -I extensions\forge_sam3_extension\tools\migrate_tagcomplete.py --set-tagfile danbooru_2026-10-01_pt20-ia-dd.csv --config config.json
+  venv\Scripts\python.exe -I extensions\forge_sam3_extension\tools\migrate_tagcomplete.py --set-tagfile danbooru_2026-10-01_pt20-ia-dd.csv --config config.json --apply --forge-stopped
+  ```
+
+  첫 줄은 바뀔 값(`'예전' -> '새것'`)만 보여 줍니다. 둘째 줄은 `config.json.bak-tagfile-<시각>` 백업을 먼저 쓰고(덮어쓰지 않음,
+  내용 확인) `tac_tagFile` 값만 바꿉니다 — 다른 설정·키 순서·들여쓰기·줄끝은 바이트까지 그대로입니다. Forge 가 떠 있으면
+  (`127.0.0.1:7860` 이 응답하면 — 다른 포트로 띄우면 `--forge-port <포트>` 를 포트마다) 아무것도 쓰지 않고 멈춥니다. 떠 있는 Forge 는
+  설정을 저장할 때 메모리의 값을 config.json 에 다시 쓰기 때문입니다.
 - **따로 설치한 확장에서 옮기기**: 예전 `extensions/sd-webui-tagcomplete-neo/tags/` 의 사용자 목록·상류 목록·사용 횟수·LoRA 해시
   캐시는 `tools/migrate_tagcomplete.py` 로 한 번 옮긴 뒤 그 확장을 지우세요. Forge 를 끈 채로, Forge 폴더에서:
 
@@ -1886,7 +1904,9 @@ txt2img·img2img 의 스타일 줄 아래에 접힌 칸 **구도 · 카메라** 
   막 떠서 확장들의 시작 작업이 끝나기 전에 열린 페이지(자동으로 여는 브라우저, Reload UI 뒤 새로 고침)에서도 상류처럼 시작합니다.
 - **고른 파일이 없을 때**: `tac_*` 가 고른 파일이 `tags/` 에 없으면(이름이 바뀐 파일 등) 상류는 브라우저 콘솔에 404 만 남기고 그
   목록을 통째로 건너뜁니다 — 태그 파일이 없으면 extra 파일도 읽지 않습니다. 내장은 Forge 를 시작할 때 콘솔
-  (`... is not in ... - pick another file`)과 설정 안내 줄에 그 이름을 알려 줍니다. Settings 에서 있는 파일을 다시 고르세요.
+  (`... is not in ...`)과 설정 안내 줄에 그 이름을 알려 줍니다. `tac_tagFile` 이면 그동안 기본 목록
+  (`danbooru_2026-10-01_pt20-ia-dd.csv`)으로 추천합니다 — 페이지가 읽는 값만 바꾸고 config.json 과 Settings 의 값은 그대로라,
+  Settings 에서 있는 파일을 다시 고르면 그 파일을 씁니다. 다른 설정(extra·번역·chant 파일)은 다시 고를 때까지 비어 있습니다.
 
 ## 별도 기능: MCP 서버 — 에이전트 연결
 
@@ -1977,6 +1997,7 @@ claude mcp add --scope user -e FORGE_URL=http://127.0.0.1:7861 -e SAM_EXTRA_MCP_
 | **Anima Character Reference / ReStyler** (워크플로 6) | [Anima ReStyler workflow](https://civitai.com/models/2803070/anima-restyler) · [원 아이디어 Reddit 게시물](https://www.reddit.com/r/StableDiffusion/s/0Az0DgoaKj) | 워크플로 페이지 조건 참고 | 동작을 Forge 네이티브 img2img/reference로 재구현 (vendor·코드 복사 없음) |
 | **NegPiP** (별도 기능) | [Haoming02/sd-forge-negpip](https://github.com/Haoming02/sd-forge-negpip) (commit `0585496`, 2026-09-30 보관) · 원작 hako-mikan | AGPL-3.0-or-later | `sam3ext/negpip/`·`scripts/negpip.py` 에 편입 (라이선스 전문 `sam3ext/negpip/LICENSE`, 수정 사항은 `THIRD_PARTY_NOTICES.md`) |
 | **Tag Autocomplete** (별도 기능) | [eduardoabreu81/sd-webui-tagcomplete-neo](https://github.com/eduardoabreu81/sd-webui-tagcomplete-neo) (commit `8e0d81f`, Forge Neo 포크) · 원본 [DominikDoom/a1111-sd-webui-tagcomplete](https://github.com/DominikDoom/a1111-sd-webui-tagcomplete) (Dominik Reh) | MIT | `sam3ext/tagcomplete/`·`tags/` 에 편입 (라이선스 전문 `sam3ext/tagcomplete/LICENSE`, 수정 사항은 `THIRD_PARTY_NOTICES.md`) |
+| **Tag Autocomplete 기본 태그 목록** (별도 기능) | [DraconicDragon/dbr-e621-lists-archive](https://github.com/DraconicDragon/dbr-e621-lists-archive) (`tag-lists/danbooru/danbooru_2026-10-01_pt20-ia-dd.csv`, Danbooru 태그 데이터) | The Unlicense | `tags/danbooru_2026-10-01_pt20-ia-dd.csv` 에 그대로 (출처·git blob 은 `THIRD_PARTY_NOTICES.md`) |
 | **Anima 3.8B (Qwen3.5 / v2)** (워크플로 7) | [GumGum10/forge-anima-3.8B](https://github.com/GumGum10/forge-anima-3.8B) (commit `59c27e5`) | MIT | `sam3ext/anima38/` 에 편입 (저장소에 포함, 수정 사항은 `THIRD_PARTY_NOTICES.md`) |
 | **TIPO 프롬프트 확장** (별도 기능) | [KBlueLeaf/TIPO-v2.1-1B-A200M](https://huggingface.co/KBlueLeaf/TIPO-v2.1-1B-A200M) · 모델 코드 [KohakUwULLM](https://github.com/KohakuBlueleaf/KohakUwULLM) | 가중치 Kohaku License 1.0 · 코드 Apache-2.0 | `sam3ext/tipo/kohaku/` 에 모델 코드만 편입, 가중치는 사용자가 받을 때 HF 에서 |
 | **Anima Safe PAG** (별도 기능) | [iljung1106/comfyui-anima-safe-pag](https://github.com/iljung1106/comfyui-anima-safe-pag) (commit `905b0107`) | MIT | Anima 배치·블록 선택을 이식, σ 적용 구간·번호 파싱 편입(`sam3ext/guidance/sigma_window.py`) |
@@ -2038,7 +2059,8 @@ LoRA Manager(GPL-3.0)는 vendor 그대로 실행하되, `lora_manager_core.py`�
 
 - 저장소에 함께 들어 있는 제3자 코드·자산(`sam3ext/anima38/` 의 MIT 코드, `mcp_server/sam_extra_mcp/forgeneo/` 의
   forgeneo-mcp 코드(MIT), `sam3ext/colorcraft/` 의 Colorcraft 코드·색 벡터(MIT), `sam3ext/speed/` 의 SPEED 코드(MIT),
-  진행 막대의 Smooth Progress 코드(MIT), `sam3ext/tagcomplete/` 의 Tag Autocomplete 코드와 `tags/` 의 태그 목록(MIT),
+  진행 막대의 Smooth Progress 코드(MIT), `sam3ext/tagcomplete/` 의 Tag Autocomplete 코드와 `tags/` 의 태그 목록(MIT — 기본 목록
+  `danbooru_2026-10-01_pt20-ia-dd.csv` 는 The Unlicense),
   `sam3ext/extra_samplers/` 의 DPM++ 4M SDE 코드(BSD-3-Clause)·Euler (SMEA) Dy
   코드(Apache-2.0), TIPO 모델 코드(Apache-2.0), `assets/` 의 Qwen3.5 토크나이저(Apache-2.0)·CLIP BPE 어휘(MIT))는 원래 고지를
   그대로 유지합니다 — 목록과 조건은 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) 참고.

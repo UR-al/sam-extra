@@ -13,6 +13,10 @@
 안내(콘솔 · 설정 안내 줄)는 예전 사본을 치우기 **전에** ``tools/migrate_tagcomplete.py`` 로 사용자 파일을 옮기라고, 그 사본의
 경로를 넣은 명령 그대로 알려 준다. 그 폴더의 ``tags/`` 에는 git 이 담지 않는 사용자 목록과 사용 횟수 DB 가 있다 — 먼저
 지우면 사라지고, 먼저 끄고 재시작하면 내장이 빈 ``tag_frequency.db`` 를 만든다(옮기기 도구는 그 빈 DB 를 옆으로 치우고 옮긴다).
+
+``tac_*`` 가 고른 파일이 tags/ 에 없으면 콘솔 · 안내 줄이 그 이름을 알린다. ``tac_tagFile`` 이면 기본 목록
+``DEFAULT_TAG_FILE`` 로 대신 추천한다(``tag_file_fallback`` → 시작 정보 → 로더가 페이지의 ``opts`` 에서만 바꿈 —
+config.json 은 그대로).
 """
 
 from __future__ import annotations
@@ -33,6 +37,10 @@ HIDDEN_SECTION = (None, "Hidden Options")
 UPSTREAM_MARKERS = ("javascript/tagAutocomplete.js", "scripts/tag_autocomplete_helper.py")
 # tac_* settings that name a file in tags/ ("None" = no file)
 TAG_FILE_SETTINGS = ("tac_tagFile", "tac_extra.extraFile", "tac_translation.translationFile", "tac_chantFile")
+# the built-in's default tac_tagFile (tag_autocomplete_helper.on_ui_settings — the parity test keeps the two equal); a
+# tac_tagFile that is not in tags/ is read as this file on the page (tag_file_fallback), the setting is not changed
+TAG_FILE_SETTING = "tac_tagFile"
+DEFAULT_TAG_FILE = "danbooru_2026-10-01_pt20-ia-dd.csv"
 MIGRATION_TOOL = Path("tools") / "migrate_tagcomplete.py"
 OLD_FOLDER_PLACEHOLDER = "<old sd-webui-tagcomplete-neo folder>"
 
@@ -133,6 +141,25 @@ def missing_tag_files(opts, tags_dir) -> list[tuple[str, str]]:
     return missing
 
 
+def tag_file_fallback(opts, tags_dir) -> dict | None:
+    """``tac_tagFile`` 이 고른 파일이 tags/ 에 없고 기본 목록(``DEFAULT_TAG_FILE``)은 있으면
+    ``{"key": "tac_tagFile", "missing": <고른 이름>, "use": DEFAULT_TAG_FILE}``, 아니면 None.
+
+    로더(``javascript/tagcomplete_loader.js``)가 이것을 시작 정보로 받아, 페이지의 ``opts`` 에서만 그 값을 기본 목록으로
+    바꿔 읽게 한다 — 상류는 없는 파일이면 추천 목록을 통째로 비운다. config.json 의 값과 Settings 화면은 그대로다
+    ("None" 은 사용자가 고른 '목록 없음'이라 그대로 둔다). ``missing`` 은 설정 값 그대로다 — 로더가 페이지의 값과 똑같은지 본다."""
+    for key, name in missing_tag_files(opts, tags_dir):
+        if key != TAG_FILE_SETTING or name == DEFAULT_TAG_FILE:
+            continue
+        try:
+            available = (Path(tags_dir) / DEFAULT_TAG_FILE).is_file()
+        except (OSError, ValueError):
+            available = False
+        if available:
+            return {"key": TAG_FILE_SETTING, "missing": getattr(opts, TAG_FILE_SETTING), "use": DEFAULT_TAG_FILE}
+    return None
+
+
 def _print(text: str) -> None:
     try:   # 레거시 콘솔 코드페이지(cp949 등)에서 경로의 글자로 시작이 죽지 않게
         print(text)
@@ -163,9 +190,15 @@ def warn_once(reason: str, source=None) -> None:
     _print(text)
 
 
-def warn_missing_files_once(missing, tags_dir, source=None) -> None:
+def _falls_back(fallback, key, name) -> bool:
+    """``(key, name)`` of ``missing_tag_files`` (name stripped) is the one ``fallback`` replaces."""
+    return bool(fallback) and fallback.get("key") == key and str(fallback.get("missing")).strip() == name
+
+
+def warn_missing_files_once(missing, tags_dir, source=None, fallback=None) -> None:
     """고른 파일이 tags/ 에 없다는 줄(키마다 프로세스당 한 번)과, 새로 알린 것이 있으면 옮기기 명령 한 줄. ``source`` 는
-    Forge 가 아는 예전 사본(꺼진 것)의 폴더 — 없으면 명령에 자리 표시."""
+    Forge 가 아는 예전 사본(꺼진 것)의 폴더 — 없으면 명령에 자리 표시. ``fallback`` 은 ``tag_file_fallback`` 의 값 — 그
+    키의 줄은 목록이 비는 대신 기본 목록으로 추천한다고 알린다."""
     printed = False
     for key, name in missing:
         token = f"missing:{key}:{name}"
@@ -173,6 +206,11 @@ def warn_missing_files_once(missing, tags_dir, source=None) -> None:
             continue
         _warned.add(token)
         printed = True
+        if _falls_back(fallback, key, name):
+            _print(f"[sam-extra] Tag Autocomplete: {key} = '{name}' is not in {tags_dir} - suggestions use the default"
+                   f" list '{fallback['use']}' instead until you pick another file in Settings -> Tag Autocomplete"
+                   " (the setting itself is not changed).")
+            continue
         _print(f"[sam-extra] Tag Autocomplete: {key} = '{name}' is not in {tags_dir} - pick another file in "
                "Settings -> Tag Autocomplete (the list stays empty until then).")
     if printed:
@@ -184,8 +222,8 @@ def _migration_html(source) -> str:
     return f"<code>{html.escape(migration_command(source))}</code>"
 
 
-def note_html(state: dict, tags_dir, missing=()) -> str:
-    """Settings → Tag Autocomplete 맨 위의 안내(저장되지 않는 OptionHTML)."""
+def note_html(state: dict, tags_dir, missing=(), fallback=None) -> str:
+    """Settings → Tag Autocomplete 맨 위의 안내(저장되지 않는 OptionHTML). ``fallback`` 은 ``tag_file_fallback`` 의 값."""
     code = state.get("code")
     reason = html.escape(str(state.get("reason") or ""))
     where = html.escape(str(tags_dir))
@@ -210,18 +248,26 @@ def note_html(state: dict, tags_dir, missing=()) -> str:
                 "콘솔의 <code>[sam-extra] Tag Autocomplete</code> 줄을 보세요.")
     if missing:
         items = ", ".join(f"<code>{html.escape(key)}</code> = <code>{html.escape(name)}</code>" for key, name in missing)
-        text += (f"<br>⚠ 고른 파일이 태그 폴더에 없습니다: {items} — 아래에서 있는 파일을 다시 고르세요(그 전까지 그 목록은 "
-                 "비어 있습니다). 예전 tagcomplete 폴더에 있던 목록이면 Forge 를 끄고 먼저 옮기세요: "
-                 f"{_migration_html(source)}")
+        empty = [key for key, name in missing if not _falls_back(fallback, key, name)]
+        text += f"<br>⚠ 고른 파일이 태그 폴더에 없습니다: {items} — 아래에서 있는 파일을 다시 고르세요"
+        if len(empty) < len(missing):
+            text += (f". 그 전까지 <code>{html.escape(fallback['key'])}</code> 는 기본 목록 "
+                     f"<code>{html.escape(fallback['use'])}</code> 로 추천합니다(설정 값은 바꾸지 않음)")
+            if empty:
+                text += f", 나머지({', '.join(f'<code>{html.escape(key)}</code>' for key in empty)})는 비어 있습니다"
+            text += "."
+        else:
+            text += "(그 전까지 그 목록은 비어 있습니다)."
+        text += f" 예전 tagcomplete 폴더에 있던 목록이면 Forge 를 끄고 먼저 옮기세요: {_migration_html(source)}"
     return text
 
 
-def boot_option(shared):
-    """숨은 설정 ``sam3_tac_builtin_boot`` — 값은 ``boot.manifest_json()``. Settings 화면에 없고(Forge 의 "Hidden Options"
-    섹션) config.json 에도 저장되지 않으며(``do_not_save``), 페이지의 ``opts`` 로만 로더에 간다."""
+def boot_option(shared, fallback=None):
+    """숨은 설정 ``sam3_tac_builtin_boot`` — 값은 ``boot.manifest_json(fallback)``. Settings 화면에 없고(Forge 의 "Hidden
+    Options" 섹션) config.json 에도 저장되지 않으며(``do_not_save``), 페이지의 ``opts`` 로만 로더에 간다."""
     from sam3ext.tagcomplete import boot
 
-    info = shared.OptionInfo(boot.manifest_json(), "sam-extra built-in Tag Autocomplete start-up (not saved)",
+    info = shared.OptionInfo(boot.manifest_json(fallback), "sam-extra built-in Tag Autocomplete start-up (not saved)",
                              section=HIDDEN_SECTION)
     info.do_not_save = True
     return info
@@ -233,11 +279,13 @@ def register_settings() -> None:
 
     from sam3ext.tagcomplete import boot, paths
 
+    # file names refer to our tags/ only while the built-in copy runs (otherwise to the other copy's folder)
+    running = boot.STATE.get("code") == "ok"
+    fallback = tag_file_fallback(shared.opts, paths.TAGS_DIR) if running else None
     option_html = getattr(shared, "OptionHTML", None)
     if option_html is not None:
-        # file names refer to our tags/ only while the built-in copy runs (otherwise to the other copy's folder)
-        missing = missing_tag_files(shared.opts, paths.TAGS_DIR) if boot.STATE.get("code") == "ok" else []
-        note = option_html(note_html(boot.STATE, paths.TAGS_DIR, missing))
+        missing = missing_tag_files(shared.opts, paths.TAGS_DIR) if running else []
+        note = option_html(note_html(boot.STATE, paths.TAGS_DIR, missing, fallback))
         note.section = SECTION
         shared.opts.add_option(OPT_NOTE, note)
     shared.opts.add_option(
@@ -247,4 +295,4 @@ def register_settings() -> None:
             "따로 설치한 tagcomplete 가 켜져 있으면 이 값과 관계없이 내장은 쉽니다."
         ).needs_restart(),
     )
-    shared.opts.add_option(OPT_BOOT, boot_option(shared))
+    shared.opts.add_option(OPT_BOOT, boot_option(shared, fallback))

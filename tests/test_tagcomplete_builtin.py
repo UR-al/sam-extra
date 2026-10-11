@@ -40,6 +40,9 @@ from tests import _tagcomplete_support as tac  # noqa: E402
 
 ENTRY = ROOT / "scripts" / "builtin_tagcomplete.py"
 HIDDEN = [None, "Hidden Options"]
+DEFAULT_TAG_FILE = "danbooru_2026-10-01_pt20-ia-dd.csv"
+MISSING = "KR_danbooru_tags_with_description-20260907.csv"
+FALLBACK = {"key": "tac_tagFile", "missing": MISSING, "use": DEFAULT_TAG_FILE}
 
 
 def load_entry(box, generation=1):
@@ -302,9 +305,12 @@ class EntryScriptTests(unittest.TestCase):
         opts = tac.Opts(tac_tagFile="KR_danbooru_tags_with_description-20260907.csv",
                         **{"tac_extra.extraFile": "danbooru_e621_merged.csv", "tac_chantFile": "demo-chants.json",
                            "tac_translation.translationFile": "None"})
+        # (no default list in this tags/ either: nothing to fall back to, the list stays empty as upstream's would)
         with tac.sandboxed(opts, tags_files=("danbooru_e621_merged.csv", "demo-chants.json")) as box:
             printed = load_entry(box)
             self.assertIn("tac_tagFile = 'KR_danbooru_tags_with_description-20260907.csv' is not in", printed)
+            self.assertIn("(the list stays empty until then)", printed)
+            self.assertNotIn("default list", printed)
             self.assertNotIn("tac_extra.extraFile", printed)
             self.assertNotIn("tac_chantFile", printed)
             # no old copy that Forge knows of: the command has a placeholder for the folder
@@ -316,9 +322,67 @@ class EntryScriptTests(unittest.TestCase):
             note = box.shared.opts.added[0][1].default
             self.assertIn("KR_danbooru_tags_with_description-20260907.csv", note)
             self.assertIn("⚠", note)
+            self.assertIn("(그 전까지 그 목록은 비어 있습니다)", note)
             self.assertIn(html.escape(command), note)
+            self.assertIsNone(self._boot(box)["tagFileFallback"])
             box.callbacks.registered.clear()
             self.assertNotIn("is not in", load_entry(box, 2), "printed once per process")
+
+    def test_a_missing_tag_file_is_read_as_the_default_list(self):
+        """The user's tac_tagFile names a file that is gone (the -20260907.csv of this PC's config.json; the folder has
+        -v2.csv): upstream would load nothing. The console line and the note say the default list is used instead, and
+        the page's loader gets {key, missing, use} — the setting itself (config.json) is not changed."""
+        opts = tac.Opts(tac_tagFile=MISSING, **{"tac_extra.extraFile": "danbooru_e621_merged.csv",
+                                                "tac_chantFile": "demo-chants.json", "tac_translation.translationFile": "None"})
+        with tac.sandboxed(opts, tags_files=(DEFAULT_TAG_FILE, "danbooru_e621_merged.csv", "demo-chants.json")) as box:
+            printed = load_entry(box)
+            self.assertIn(f"[sam-extra] Tag Autocomplete: tac_tagFile = '{MISSING}' is not in {box.tags} - suggestions use"
+                          f" the default list '{DEFAULT_TAG_FILE}' instead until you pick another file in Settings -> Tag"
+                          " Autocomplete (the setting itself is not changed).", printed)
+            self.assertNotIn("stays empty", printed)
+            self.assertIn(migration_command(None), printed, "the migration hint stays (the user's list may be elsewhere)")
+            self._settings(box)
+            note = box.shared.opts.added[0][1].default
+            self.assertIn(f"<code>tac_tagFile</code> = <code>{MISSING}</code>", note)
+            self.assertIn(f"그 전까지 <code>tac_tagFile</code> 는 기본 목록 <code>{DEFAULT_TAG_FILE}</code> 로 추천합니다"
+                          "(설정 값은 바꾸지 않음).", note)
+            self.assertNotIn("비어 있습니다", note)
+            self.assertEqual(self._boot(box)["tagFileFallback"], FALLBACK)
+            self.assertEqual(box.shared.opts.tac_tagFile, MISSING, "the setting is left as it is")
+
+    def test_with_another_missing_file_the_note_tells_both(self):
+        opts = tac.Opts(tac_tagFile=MISSING, **{"tac_extra.extraFile": "my-extra.csv"})
+        with tac.sandboxed(opts, tags_files=(DEFAULT_TAG_FILE,)) as box:
+            printed = load_entry(box)
+            self.assertIn("suggestions use the default list", printed)
+            self.assertIn("tac_extra.extraFile = 'my-extra.csv' is not in", printed)
+            self.assertEqual(printed.count("(the list stays empty until then)"), 1, "only the extra file's line")
+            self._settings(box)
+            note = box.shared.opts.added[0][1].default
+            self.assertIn("기본 목록", note)
+            self.assertIn("나머지(<code>tac_extra.extraFile</code>)는 비어 있습니다.", note)
+            self.assertEqual(self._boot(box)["tagFileFallback"], FALLBACK)
+
+    def test_no_fallback_when_nothing_is_missing_or_the_choice_is_none(self):
+        for value in (DEFAULT_TAG_FILE, "None", "", None):
+            with self.subTest(value=value), tac.sandboxed(tac.Opts(tac_tagFile=value), tags_files=(DEFAULT_TAG_FILE,)) as box:
+                printed = load_entry(box)
+                self.assertNotIn("is not in", printed)
+                self._settings(box)
+                self.assertIsNone(self._boot(box)["tagFileFallback"])
+
+    def test_no_fallback_while_another_copy_runs(self):
+        """The tac_* values then belong to that copy and its tags/ folder: nothing is said about ours."""
+        with tac.sandboxed(tac.Opts(tac_tagFile=MISSING), tags_files=(DEFAULT_TAG_FILE,)) as box:
+            other = fake_extension(box.root, "sd-webui-tagcomplete-neo")
+            box.extensions.active = lambda: [other]
+            printed = load_entry(box)
+            self.assertNotIn("default list", printed)
+            self._settings(box)
+            self.assertNotIn("기본 목록", box.shared.opts.added[0][1].default)
+            answer = self._boot(box)
+            self.assertFalse(answer["enabled"])
+            self.assertIsNone(answer["tagFileFallback"])
 
     def test_a_disabled_old_copy_is_named_in_the_missing_file_notice(self):
         """The old copy was disabled before its files were copied (what the old console line said): the built-in runs,
@@ -336,6 +400,38 @@ class EntryScriptTests(unittest.TestCase):
             self.assertIn(command, printed)
             self._settings(box)
             self.assertIn(html.escape(command), box.shared.opts.added[0][1].default)
+
+
+class TagFileFallbackTests(unittest.TestCase):
+    """coexist.tag_file_fallback — only tac_tagFile, only when its file is gone and the default list is there."""
+
+    def setUp(self):
+        import tempfile
+
+        self.tags = Path(tempfile.mkdtemp(prefix="sam3_tac_fallback_"))
+        self.addCleanup(lambda: __import__("shutil").rmtree(self.tags, ignore_errors=True))
+        (self.tags / DEFAULT_TAG_FILE).write_bytes(b"1girl,0,1,\n")
+        (self.tags / "danbooru.csv").write_bytes(b"1girl,0,1,\n")
+
+    def fallback(self, **values):
+        from sam3ext.tagcomplete import coexist
+
+        return coexist.tag_file_fallback(tac.Opts(**values), self.tags)
+
+    def test_cases(self):
+        self.assertEqual(self.fallback(tac_tagFile=MISSING), FALLBACK)
+        self.assertEqual(self.fallback(tac_tagFile=f"  {MISSING} "), {**FALLBACK, "missing": f"  {MISSING} "},
+                         "the value as the page has it (the loader compares it exactly)")
+        for value in ("danbooru.csv", DEFAULT_TAG_FILE, "None", "", None, 3):
+            with self.subTest(value=value):
+                self.assertIsNone(self.fallback(tac_tagFile=value))
+        self.assertIsNone(self.fallback(), "not set: Forge gives the default, which is there")
+        self.assertIsNone(self.fallback(**{"tac_tagFile": "danbooru.csv", "tac_extra.extraFile": "gone.csv"}),
+                          "only tac_tagFile falls back")
+
+    def test_no_default_list_no_fallback(self):
+        (self.tags / DEFAULT_TAG_FILE).unlink()
+        self.assertIsNone(self.fallback(tac_tagFile=MISSING))
 
 
 class ManifestTests(unittest.TestCase):
@@ -369,9 +465,17 @@ class ManifestTests(unittest.TestCase):
         from sam3ext.tagcomplete import boot
 
         boot.set_state("off", "turned off in Settings -> Tag Autocomplete")
-        self.assertEqual(json.loads(boot.manifest_json()),
-                         {"enabled": False, "reason": "turned off in Settings -> Tag Autocomplete",
-                          "upstream": "eduardoabreu81/sd-webui-tagcomplete-neo@8e0d81f", "scripts": []})
+        expected = {"enabled": False, "reason": "turned off in Settings -> Tag Autocomplete",
+                    "upstream": "eduardoabreu81/sd-webui-tagcomplete-neo@8e0d81f", "scripts": [], "tagFileFallback": None}
+        self.assertEqual(json.loads(boot.manifest_json()), expected)
+        self.assertEqual(json.loads(boot.manifest_json(FALLBACK)), expected, "not running: nothing for the page to read")
+
+    def test_the_tag_file_fallback_rides_along_while_running(self):
+        from sam3ext.tagcomplete import boot
+
+        boot.set_state("ok", None)
+        self.assertIsNone(boot.manifest()["tagFileFallback"])
+        self.assertEqual(json.loads(boot.manifest_json(FALLBACK))["tagFileFallback"], FALLBACK)
 
     def test_forge_webpath_is_used_when_present(self):
         from sam3ext.tagcomplete import boot

@@ -4,7 +4,8 @@
 Forge 가 이 파일을 불러올 때마다(시작 · Reload UI):
 
 1. 스위치가 켜져 있고 따로 설치된 tagcomplete 가 켜져 있지 않으면 상류 헬퍼를 시작한다(``boot.start_helper``) — 상류와 같은
-   tac_* 설정 57개, ``/tacapi/v1/*`` 경로 15개, 임시 파일, 사용 횟수 DB(``tags/tag_frequency.db``).
+   tac_* 설정 57개(``tac_tagFile`` 의 기본값만 ``danbooru_2026-10-01_pt20-ia-dd.csv``), ``/tacapi/v1/*`` 경로 15개, 임시 파일,
+   사용 횟수 DB(``tags/tag_frequency.db``). 고른 태그 파일이 ``tags/`` 에 없으면 콘솔에 알리고 기본 목록으로 대신 추천한다.
    아니면 이유를 콘솔에 한 번 남기고 아무것도 걸지 않는다 — 로더도 JS 를 붙이지 않는다. 따로 설치된 사본이 이유면, 그 폴더를
    치우기 전에 ``tools/migrate_tagcomplete.py`` 로 사용자 파일을 옮기는 명령을 함께 남긴다.
 2. Settings → Tag Autocomplete 에 sam3_* 두 줄(안내 · ``sam3_builtin_tagcomplete_enabled`` 스위치)을 tac_* 보다 먼저 올리고,
@@ -46,7 +47,7 @@ def _start() -> None:
             boot.set_state("failed" if failure else "ok", failure, source=old[0][1] if old else None)
     if boot.STATE["code"] == "ok":
         coexist.warn_missing_files_once(coexist.missing_tag_files(shared.opts, paths.TAGS_DIR), paths.TAGS_DIR,
-                                        boot.STATE["source"])
+                                        boot.STATE["source"], coexist.tag_file_fallback(shared.opts, paths.TAGS_DIR))
     elif boot.STATE["code"] != "failed":   # a failure already printed its traceback
         coexist.warn_once(boot.STATE["reason"], boot.STATE["source"])
 

@@ -25,6 +25,26 @@ before the old folder is removed. Everything else in temp/ is rebuilt by the hel
 * ``--progress`` appends one JSON line per finished file; a second run skips those whose copy is still intact.
 * Exit codes: 0 done (or nothing to do), 1 a precondition failed (nothing written), 2 conflicts, blocked or failed files.
 
+A separate, opt-in run sets the tag list Forge uses (``tac_tagFile``) in a config.json — e.g. to the built-in default
+``danbooru_2026-10-01_pt20-ia-dd.csv`` when config.json still names another list (a saved value wins over a default):
+
+    python tools/migrate_tagcomplete.py --set-tagfile <name> --config <forge>/config.json [--dst <sam-extra>/tags]
+                                        [--forge-port <port> ...] [--apply --forge-stopped]
+
+* ``<name>`` is a .csv file in ``--dst`` (what Settings -> Tag Autocomplete lists), not a path.
+* Dry run unless ``--apply``: prints ``tac_tagFile: 'old' -> 'new'`` and the backup it would write. ``--apply`` also needs
+  ``--forge-stopped``: a running Forge keeps its settings in memory and writes all of them back to config.json when
+  settings are saved, which would undo the edit (and Forge would not use it before a restart anyway).
+* Refused (exit 1, nothing written) while Forge looks alive: something answers on 127.0.0.1 at a ``--forge-port``
+  (default 7860; repeat it for every port this Forge is started with), or tag_frequency.db in ``--dst`` has an
+  unfinished write (``-journal`` / ``-wal``) next to it.
+* Writes ``config.json.bak-tagfile-<time>`` next to it first (never overwriting; the bytes are checked), then changes
+  only that value: every other byte of the file stays as it was — key order, indentation, line endings, other values.
+  A config.json without the key gets it as a new last member, written like the member before it. The new file is
+  written under a temporary name, checked, then renamed over config.json; config.json changed since it was read stops
+  the run before that.
+* Exit codes: 0 done, already set, or a dry run that --apply would carry out; 1 a precondition failed (nothing changed).
+
 Standard library only; run it with the Forge venv's ``python -I``.
 """
 
@@ -35,6 +55,7 @@ import hashlib
 import json
 import os
 import shutil
+import socket
 import sqlite3
 import sys
 import time
@@ -378,14 +399,249 @@ def run(src: Path, dst: Path, apply: bool, include_cache: bool, progress_path: P
     return 0
 
 
+# ---------------------------------------------------------------------------------------------------------------------
+# --set-tagfile: tac_tagFile in Forge's config.json
+# ---------------------------------------------------------------------------------------------------------------------
+
+TAG_FILE_KEY = "tac_tagFile"
+DEFAULT_FORGE_PORTS = (7860,)
+_JSON_SPACE = " \t\n\r"
+_BOM = "﻿"
+
+
+class ConfigError(ValueError):
+    pass
+
+
+def _skip_space(text: str, index: int) -> int:
+    while index < len(text) and text[index] in _JSON_SPACE:
+        index += 1
+    return index
+
+
+def top_level_members(text: str) -> list[tuple[str, int, int, int]]:
+    """``(key, key start, value start, value end)`` of the top-level object's members, in file order (offsets into
+    ``text``; ``key start`` is the opening quote). Raises ConfigError when ``text`` is not one JSON object."""
+    decoder = json.JSONDecoder()
+    index = _skip_space(text, 1 if text.startswith(_BOM) else 0)
+    if index >= len(text) or text[index] != "{":
+        raise ConfigError("not a JSON object")
+    index = _skip_space(text, index + 1)
+    members = []
+    try:
+        if index < len(text) and text[index] == "}":
+            index += 1
+        else:
+            while True:
+                if index >= len(text) or text[index] != '"':
+                    raise ConfigError(f"expected a key at offset {index}")
+                key, after_key = json.decoder.scanstring(text, index + 1)
+                colon = _skip_space(text, after_key)
+                if colon >= len(text) or text[colon] != ":":
+                    raise ConfigError(f"expected ':' at offset {colon}")
+                start = _skip_space(text, colon + 1)
+                _value, end = decoder.raw_decode(text, start)
+                members.append((key, index, start, end))
+                index = _skip_space(text, end)
+                if index < len(text) and text[index] == ",":
+                    index = _skip_space(text, index + 1)
+                    continue
+                if index < len(text) and text[index] == "}":
+                    index += 1
+                    break
+                raise ConfigError(f"expected ',' or '}}' at offset {index}")
+    except json.JSONDecodeError as error:
+        raise ConfigError(str(error)) from None
+    if _skip_space(text, index) != len(text):
+        raise ConfigError(f"text after the JSON object at offset {index}")
+    return members
+
+
+def with_tag_file(text: str, name: str) -> tuple[str, str | None]:
+    """``(new text, old value or None)`` — ``text`` with only the value of the top-level ``tac_tagFile`` replaced by
+    ``name`` (every other character as it was), or, without that key, with it added as the last member in the style
+    of the member before it (its line break, indentation and ``": "``)."""
+    members = top_level_members(text)
+    found = [member for member in members if member[0] == TAG_FILE_KEY]
+    if len(found) > 1:
+        raise ConfigError(f"{TAG_FILE_KEY} appears {len(found)} times - fix config.json by hand")
+    value = json.dumps(name, ensure_ascii=False)   # as Forge writes config.json (json.dump, ensure_ascii=False)
+    if found:
+        _key, _key_start, start, end = found[0]
+        old = json.loads(text[start:end])
+        if not isinstance(old, str):
+            raise ConfigError(f"{TAG_FILE_KEY} is not a string there: {text[start:end]}")
+        return text[:start] + value + text[end:], old
+    if not members:
+        raise ConfigError("it has no settings yet - start Forge once so it writes them, then run this again")
+    _key, key_start, start, end = members[-1]
+    lead = key_start
+    while lead > 0 and text[lead - 1] in _JSON_SPACE:
+        lead -= 1
+    # the key's own end: the separator is what lies between it and the value (e.g. ': ')
+    _name, after_key = json.decoder.scanstring(text, key_start + 1)
+    member = text[lead:key_start] + json.dumps(TAG_FILE_KEY) + text[after_key:start] + value
+    return text[:end] + "," + member + text[end:], None
+
+
+def forge_listening(ports, host: str = "127.0.0.1", timeout: float = 0.5) -> list[int]:
+    """The ports in ``ports`` where something accepts a TCP connection on ``host``."""
+    busy = []
+    for port in ports:
+        try:
+            with socket.create_connection((host, port), timeout=timeout):
+                busy.append(port)
+        except OSError:
+            continue
+    return busy
+
+
+def check_tag_file_name(name: str, tags: Path) -> str | None:
+    """Why ``name`` cannot be set (None when it can): a bare .csv file name that exists in ``tags``."""
+    if not name or name in (".", "..") or any(sep in name for sep in ("/", "\\", ":")) or name != name.strip():
+        return f"--set-tagfile takes a file name in {tags}, not a path: {name!r}"
+    if not name.lower().endswith(".csv"):
+        return f"--set-tagfile takes a .csv tag list (Settings -> Tag Autocomplete lists the *.csv in {tags}): {name!r}"
+    if not (tags / name).is_file():
+        return f"{name} is not in {tags} - the setting would name a missing file"
+    return None
+
+
+def _backup_path(config: Path) -> Path:
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    candidate = config.with_name(f"{config.name}.bak-tagfile-{stamp}")
+    if candidate.exists():
+        candidate = config.with_name(f"{config.name}.bak-tagfile-{stamp}-{uuid.uuid4().hex[:8]}")
+    return candidate
+
+
+def _write_new(path: Path, data: bytes) -> None:
+    """``data`` under a temporary name next to ``path`` (checked), then renamed over ``path``."""
+    temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex[:8]}.partial")
+    try:
+        with open(temporary, "xb") as handle:
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+        if temporary.read_bytes() != data:
+            raise OSError(f"{temporary} does not read back as written")
+        os.replace(temporary, path)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
+
+
+def _quote(value) -> str:
+    return "(not set)" if value is None else repr(value)
+
+
+def set_tag_file(config: Path, name: str, tags: Path, apply: bool, forge_stopped: bool, ports) -> int:
+    config, tags = Path(os.path.abspath(config)), Path(os.path.abspath(tags))
+    _print(f"[migrate_tagcomplete] SET {TAG_FILE_KEY} - {'APPLY' if apply else 'DRY RUN (add --apply --forge-stopped to write)'}")
+    _print(f"  config: {config}")
+    _print(f"  tags:   {tags}")
+
+    def abort(reason: str) -> int:
+        _print(f"[migrate_tagcomplete] ABORT: {reason} - nothing changed")
+        return 1
+
+    problem = check_tag_file_name(name, tags)
+    if problem:
+        return abort(problem)
+    if not config.is_file():
+        return abort(f"--config is not a file: {config}")
+    original = config.read_bytes()
+    try:
+        text = original.decode("utf-8")
+        new_text, old = with_tag_file(text, name)
+        before, after = json.loads(text.lstrip(_BOM)), json.loads(new_text.lstrip(_BOM))
+    except (UnicodeDecodeError, ValueError) as error:
+        return abort(f"{config} cannot be edited safely: {error}")
+    expected = dict(before)
+    expected[TAG_FILE_KEY] = name
+    if after != expected or list(after) != list(expected):
+        return abort("internal check failed: the edit would change more than tac_tagFile")
+    _print(f"  {TAG_FILE_KEY}: {_quote(old)} -> {name!r}")
+    if old == name:
+        _print(f"[migrate_tagcomplete] {TAG_FILE_KEY} is already {name!r} - nothing to change")
+        return 0
+    if apply and not forge_stopped:
+        return abort("--apply needs --forge-stopped: stop Forge first (it writes every setting it holds back into "
+                     "config.json when settings are saved, which would undo this edit), then confirm with --forge-stopped")
+    busy = forge_listening(ports)
+    if busy:
+        where = ", ".join(f"127.0.0.1:{port}" for port in busy)
+        return abort(f"Forge seems to be running ({where} answers) - stop it first (another program on that port: "
+                     "pass the ports this Forge uses with --forge-port)")
+    pending = _journal(tags / DATABASE)
+    if pending is not None:
+        return abort(f"{pending} exists (an unfinished write to the usage counts) - Forge seems to be running; stop it first")
+    data = new_text.encode("utf-8")
+    backup = _backup_path(config)
+    if not apply:
+        _print(f"  would write the backup {backup} ({len(original)} bytes), then config.json with only this value "
+               f"changed ({len(original)} -> {len(data)} bytes)")
+        _print("[migrate_tagcomplete] DRY RUN - add --apply --forge-stopped to write (Forge must be stopped)")
+        return 0
+    try:
+        with open(backup, "xb") as handle:
+            handle.write(original)
+        shutil.copystat(config, backup)
+        if backup.read_bytes() != original:
+            raise OSError(f"{backup} does not read back as config.json")
+    except OSError as error:
+        return abort(f"could not write the backup: {error}")
+    _print(f"  backup: {backup} (sha256 {hashlib.sha256(original).hexdigest()[:16]}, verified)")
+    if config.read_bytes() != original:
+        return abort(f"{config} changed while this ran (is Forge running?) - the backup is the earlier version")
+    try:
+        _write_new(config, data)
+    except OSError as error:
+        return abort(f"could not write {config}: {error} (the backup is {backup})")
+    if config.read_bytes() != data:
+        return abort(f"{config} does not read back as written - restore it from {backup}")
+    _print(f"[migrate_tagcomplete] {TAG_FILE_KEY}: {_quote(old)} -> {name!r} written to {config} "
+           f"(backup: {backup}); start Forge to use it")
+    return 0
+
+
+def _port(value: str) -> int:
+    try:
+        port = int(value)
+    except ValueError:
+        port = 0
+    if not 1 <= port <= 65535:
+        raise argparse.ArgumentTypeError(f"not a TCP port: {value!r}")
+    return port
+
+
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
-    parser.add_argument("--src", required=True, type=Path, help="the old extension folder (e.g. extensions/sd-webui-tagcomplete-neo)")
+    parser.add_argument("--src", type=Path, default=None, help="the old extension folder (e.g. extensions/sd-webui-tagcomplete-neo)")
     parser.add_argument("--dst", type=Path, default=DEFAULT_DST, help=f"sam-extra's tags folder (default: {DEFAULT_DST})")
     parser.add_argument("--progress", type=Path, default=None, help="JSONL file of finished files (appended)")
-    parser.add_argument("--apply", action="store_true", help="copy (without it: only show the plan)")
+    parser.add_argument("--apply", action="store_true", help="copy / write (without it: only show the plan)")
     parser.add_argument("--no-cache", action="store_true", help="leave temp/known_lora_hashes.txt (a rebuildable cache)")
+    parser.add_argument("--set-tagfile", metavar="NAME", default=None,
+                        help=f"instead of copying: set {TAG_FILE_KEY} in --config to NAME, a .csv in --dst")
+    parser.add_argument("--config", type=Path, default=None, help="Forge's config.json (with --set-tagfile)")
+    parser.add_argument("--forge-stopped", action="store_true",
+                        help="with --set-tagfile --apply: confirms that Forge is not running")
+    parser.add_argument("--forge-port", type=_port, action="append", default=None, metavar="PORT",
+                        help="with --set-tagfile: a port this Forge listens on, refused while 127.0.0.1:PORT answers "
+                             f"(repeatable; default {', '.join(map(str, DEFAULT_FORGE_PORTS))})")
     args = parser.parse_args(argv)
+    if args.set_tagfile is not None:
+        if args.src is not None:
+            parser.error("--set-tagfile and --src are separate runs: copy the files first, then set the tag file")
+        if args.config is None:
+            parser.error("--set-tagfile needs --config <forge>/config.json")
+        ports = args.forge_port if args.forge_port else list(DEFAULT_FORGE_PORTS)
+        return set_tag_file(args.config, args.set_tagfile, args.dst, args.apply, args.forge_stopped, ports)
+    if args.src is None:
+        parser.error("--src is required (or --set-tagfile NAME --config <forge>/config.json)")
+    if args.config is not None or args.forge_stopped or args.forge_port:
+        parser.error("--config, --forge-stopped and --forge-port go with --set-tagfile")
     return run(args.src, args.dst, args.apply, not args.no_cache, args.progress)
 
 

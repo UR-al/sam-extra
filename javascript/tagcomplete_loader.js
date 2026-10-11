@@ -12,6 +12,11 @@
 // 2. 그때 다른 tagcomplete 가 이미 실렸는지 본다 — 상류의 전역 TAC_CFG(var) · addAutocompleteToArea(function). 있으면 한 줄
 //    남기고 멈춘다. 같은 const/class 파일을 두 번 실으면 "Identifier has already been declared" 로 반만 초기화되므로 둘이 같은
 //    페이지에서 돌면 안 된다. 꺼졌으면(설정 스위치, 따로 설치된 사본, 시작 실패) 이유를 한 번 남기고 멈춘다.
+// 2b. 시작 정보에 tagFileFallback({key: "tac_tagFile", missing, use})이 있으면 — 서버가 본 결과 고른 태그 파일이 tags/ 에
+//    없고 기본 목록은 있음 — 페이지의 opts 에서만 opts.tac_tagFile 이 missing 일 때 use 로 바꾼다(상류는 없는 파일이면 추천
+//    목록을 통째로 비움). 상류 JS 를 붙이기 전이라 상류가 처음 읽는 값부터 바뀐 값이다. Forge 는 opts 를 페이지로 보내기만 하고
+//    되읽지 않으므로 config.json 과 Settings 화면의 값은 그대로다. Apply settings 뒤 Forge 가 opts 를 새로 채우면
+//    onOptionsChanged 에서 다시 바꾼다(상류는 누른 뒤 500 ms 에 다시 읽음) — 다른 파일을 고르면 그 값은 건드리지 않는다.
 // 3. 받은 순서(Forge 가 상류 확장 폴더에서 쓰던 이름순 그대로)대로 <script async=false> 를 <head> 에 붙인다 — 붙인
 //    차례대로 실행된다. 하나가 실패해도 나머지는 붙이고 콘솔에 남긴다.
 // 4. 다 실린 뒤 UI 가 이미 다 그려져 있으면(#txt2img_prompt) gradioApp() 에 빈 주석 노드를 넣었다 빼, Forge 의
@@ -22,6 +27,7 @@
     "use strict";
 
     var BOOT_OPTION = "sam3_tac_builtin_boot";
+    var TAG_FILE_SETTING = "tac_tagFile";
     var POLL_MS = 200;
     var PREFIX = "[sam-extra] Tag Autocomplete: ";
     var root = document.documentElement;
@@ -87,6 +93,33 @@
         return raw;
     }
 
+    // {key: "tac_tagFile", missing, use} from the boot information, or null — the loader changes no other setting
+    function readFallback(raw) {
+        if (!raw || typeof raw !== "object") return null;
+        if (raw.key !== TAG_FILE_SETTING || typeof raw.missing !== "string" || typeof raw.use !== "string") return null;
+        if (!raw.missing || !raw.use || raw.missing === raw.use) return null;
+        return { key: raw.key, missing: raw.missing, use: raw.use };
+    }
+
+    // Read the default list instead of a tag file that is not in tags/ — on this page's opts only (step 2b above).
+    function useTagFileFallback(raw) {
+        var fallback = readFallback(raw);
+        if (!fallback) return;
+        var told = false;
+        function apply() {
+            var options = currentOptions();
+            if (!options || options[fallback.key] !== fallback.missing) return;   // another file was picked: leave it
+            options[fallback.key] = fallback.use;
+            if (told) return;
+            told = true;
+            console.warn(PREFIX + fallback.key + " = '" + fallback.missing + "' is not in the tags folder; suggestions use"
+                + " the default list '" + fallback.use + "' on this page (the setting is not changed - pick another file in"
+                + " Settings -> Tag Autocomplete)");
+        }
+        apply();
+        if (typeof onOptionsChanged === "function") onOptionsChanged(apply);   // eslint-disable-line no-undef
+    }
+
     function nudgeUiUpdate() {
         if (typeof gradioApp !== "function") return;
         var app = gradioApp();
@@ -138,6 +171,7 @@
             console.log(PREFIX + "built-in copy not started: " + (boot.reason || "turned off"));
             return;
         }
+        useTagFileFallback(boot.tagFileFallback);   // before upstream's first syncOptions reads opts
         var urls = Array.isArray(boot.scripts) ? boot.scripts.filter(function (u) { return typeof u === "string"; }) : [];
         var failed = await addScripts(urls);
         setState(failed ? "failed" : "started");

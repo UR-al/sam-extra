@@ -1,11 +1,14 @@
 """Built-in Tag Autocomplete (sam3ext/tagcomplete — sd-webui-tagcomplete-neo 8e0d81f, MIT): what was copied is
 upstream's, what was changed is listed, and the MIT terms travel with it.
 
-* The 15 JS files, LICENSE and the five shipped tag lists are byte-identical to upstream 8e0d81f (SHA-256 pinned —
-  ``.gitattributes`` keeps them out of line-ending conversion).
+* The 15 JS files, LICENSE and the five tag lists from upstream are byte-identical to upstream 8e0d81f (SHA-256 pinned —
+  ``.gitattributes`` keeps them out of line-ending conversion). The sixth list, ``danbooru_2026-10-01_pt20-ia-dd.csv``
+  (the default ``tac_tagFile``), is DraconicDragon/dbr-e621-lists-archive's file byte for byte (its git blob SHA-1 as
+  that repository has it, and SHA-256 pinned).
 * In the four Python files, every upstream function sam-extra did not change is character-identical to upstream
   (``ast.get_source_segment`` SHA-256, the same check as tests/test_negpip_vendor.py). Changed: ``api_tac`` (only its
-  ``get_wildcard_contents`` route; its other 19 inner definitions are pinned too); new: ``_is_listed_wildcard_file``,
+  ``get_wildcard_contents`` route; its other 19 inner definitions are pinned too) and ``on_ui_settings`` (only the
+  ``tac_tagFile`` default — with the old string put back it hashes to upstream's); new: ``_is_listed_wildcard_file``,
   ``_api_tac_once``; the module-level imports (``scripts.*`` -> ``sam3ext.tagcomplete.*``) and ``TAGS_PATH``.
 * Each vendored Python file carries the upstream, copyright, MIT and modification notice; the own files say they are
   sam-extra's; THIRD_PARTY_NOTICES.md records the vendoring with both authors and the fork commit.
@@ -53,6 +56,16 @@ TAG_SHA256 = {
     "extra-quality-tags.csv": "dd1e3246f9a0548615bb47530369ace101788a0dd665e54eaa20736a91197e61",
     "demo-chants.json": "dd5e09cdbd0be73efa51a78307eb2881cc58027eddded919b5e458af152fd7c0",
 }
+# tags/ shipped in git from https://github.com/DraconicDragon/dbr-e621-lists-archive (The Unlicense), path
+# tag-lists/danbooru/<name>: SHA-256 and the git blob SHA-1 of that repository's file (GitHub contents API, 2026-10-11)
+ARCHIVE_TAGS = {
+    "danbooru_2026-10-01_pt20-ia-dd.csv": {
+        "sha256": "45afb2554525464ee49112512f6367ee004bd351afcef5f2435e99d6286884e3",
+        "git_blob": "acdc0685c5a52ac743363adfe4d6a9b4298331d0", "bytes": 5602650, "rows": 220510,
+    },
+}
+SHIPPED_TAGS = (*TAG_SHA256, *ARCHIVE_TAGS)
+DEFAULT_TAG_FILE = "danbooru_2026-10-01_pt20-ia-dd.csv"
 
 # Upstream 8e0d81f definitions sam-extra kept as they are (SHA-256[:16] of ast.get_source_segment, LF).
 UPSTREAM_FUNCTION_HASHES = {
@@ -81,7 +94,16 @@ UPSTREAM_FUNCTION_HASHES = {
         "update_tag_files": "c4c2a0d57d717cb4", "update_json_files": "ed8e9c29bac7aa0a",
         "refresh_embeddings": "c1a6a4a6a259231b", "refresh_temp_files": "8589567000444dd8",
         "write_style_names": "3f43ca3b0e756b39", "write_temp_files": "bb681b26fb7083ec",
-        "on_ui_settings": "80dd6a2665f7cce7", "get_style_mtime": "17aaf33724797d83",
+        "get_style_mtime": "17aaf33724797d83",
+    },
+}
+# Upstream 8e0d81f definitions sam-extra changed in one place: upstream's hash, and the (ours, upstream) text that turns
+# ours back into upstream's — nothing else in them differs.
+UPSTREAM_CHANGED_HASHES = {
+    "tag_autocomplete_helper.py": {
+        "on_ui_settings": ("80dd6a2665f7cce7",
+                           (f'"tac_tagFile": shared.OptionInfo("{DEFAULT_TAG_FILE}", "Tag filename"',
+                            '"tac_tagFile": shared.OptionInfo("danbooru.csv", "Tag filename"')),
     },
 }
 # api_tac's inner definitions (decorators included) other than get_wildcard_contents
@@ -132,6 +154,16 @@ def _sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+def _git_blob(data: bytes) -> str:
+    return hashlib.sha1(b"blob %d\0" % len(data) + data).hexdigest()
+
+
+def _segments(path: Path) -> dict:
+    source = path.read_text(encoding="utf-8")
+    return {node.name: ast.get_source_segment(source, node) for node in ast.parse(source).body
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))}
+
+
 class UpstreamFilesTests(unittest.TestCase):
     def test_the_15_js_files_are_upstream_bytes(self):
         folder = PACKAGE / "javascript"
@@ -153,6 +185,22 @@ class UpstreamFilesTests(unittest.TestCase):
                 self.assertEqual(_sha256(ROOT / "tags" / name), digest)
         self.assertIn(b"\r\n", (ROOT / "tags" / "danbooru_e621_merged.csv").read_bytes()[:4096], "CRLF as upstream")
 
+    def test_the_default_list_is_the_archive_file(self):
+        import csv
+
+        for name, pin in ARCHIVE_TAGS.items():
+            with self.subTest(file=name):
+                data = (ROOT / "tags" / name).read_bytes()
+                self.assertEqual(len(data), pin["bytes"])
+                self.assertEqual(hashlib.sha256(data).hexdigest(), pin["sha256"])
+                self.assertEqual(_git_blob(data), pin["git_blob"], "the archive repository's blob")
+                self.assertNotIn(b"\r", data, "LF as in the archive")
+                rows = list(csv.reader(data.decode("utf-8").splitlines()))
+                self.assertEqual(len(rows), pin["rows"])
+                self.assertEqual({len(row) for row in rows}, {4}, "name, category, post count, aliases")
+                self.assertEqual(rows[0][:2], ["1girl", "0"])
+        self.assertIn(DEFAULT_TAG_FILE, ARCHIVE_TAGS)
+
     def test_git_keeps_these_files_byte_for_byte(self):
         attributes = (ROOT / ".gitattributes").read_text(encoding="utf-8").split()
         for pattern in ("/tags/*.csv", "/tags/*.json", "/sam3ext/tagcomplete/javascript/*.js", "/sam3ext/tagcomplete/LICENSE"):
@@ -160,11 +208,11 @@ class UpstreamFilesTests(unittest.TestCase):
                 self.assertIn(pattern, attributes)
                 self.assertEqual(attributes[attributes.index(pattern) + 1], "-text")
 
-    def test_only_the_five_lists_are_tracked_in_tags(self):
+    def test_only_the_six_lists_are_tracked_in_tags(self):
         lines = [line.strip() for line in (ROOT / ".gitignore").read_text(encoding="utf-8").splitlines()]
         self.assertIn("/tags/*", lines)
         allowed = sorted(line[len("!/tags/"):] for line in lines if line.startswith("!/tags/"))
-        self.assertEqual(allowed, sorted(TAG_SHA256))
+        self.assertEqual(allowed, sorted(SHIPPED_TAGS))
 
 
 class UpstreamPythonTests(unittest.TestCase):
@@ -176,11 +224,21 @@ class UpstreamPythonTests(unittest.TestCase):
                     self.assertEqual(actual.get(function), digest)
 
     def test_every_definition_is_upstream_or_a_listed_change(self):
-        changed = {"tag_autocomplete_helper.py": {"api_tac", "_is_listed_wildcard_file", "_api_tac_once"}}
+        changed = {"tag_autocomplete_helper.py": {"api_tac", "_is_listed_wildcard_file", "_api_tac_once", "on_ui_settings"}}
         for name, expected in UPSTREAM_FUNCTION_HASHES.items():
             actual = set(_function_hashes(PACKAGE / name))
             with self.subTest(file=name):
                 self.assertEqual(actual - set(expected), changed.get(name, set()))
+
+    def test_on_ui_settings_changes_only_the_tag_file_default(self):
+        for name, functions in UPSTREAM_CHANGED_HASHES.items():
+            segments = _segments(PACKAGE / name)
+            for function, (digest, (ours, theirs)) in functions.items():
+                with self.subTest(file=name, function=function):
+                    self.assertEqual(segments[function].count(ours), 1)
+                    self.assertNotEqual(_digest(segments[function]), digest, "changed")
+                    self.assertEqual(_digest(segments[function].replace(ours, theirs)), digest,
+                                     "upstream's text once the default is put back")
 
     def test_api_tac_changes_only_the_wildcard_route(self):
         routes = _route_hashes(PACKAGE / "tag_autocomplete_helper.py")
@@ -198,6 +256,9 @@ class UpstreamPythonTests(unittest.TestCase):
             actual = _function_hashes(upstream.parent / name)
             for function, digest in expected.items():
                 with self.subTest(file=name, function=function):
+                    self.assertEqual(actual.get(function), digest)
+            for function, (digest, _texts) in UPSTREAM_CHANGED_HASHES.get(name, {}).items():
+                with self.subTest(file=name, changed=function):
                     self.assertEqual(actual.get(function), digest)
         self.assertLessEqual(UPSTREAM_ROUTE_HASHES.items(), _route_hashes(upstream).items())
         javascript = upstream.parents[1] / "javascript"
@@ -265,7 +326,13 @@ class LicenseNoticeTests(unittest.TestCase):
                        "Copyright (c) 2015 Jonathan Ong me@jongleberry.com",
                        # where the five shipped tag lists come from (upstream README "Tag Lists", tagAutocomplete.js)
                        "Danbooru", "e621", "DraconicDragon/dbr-e621-lists-archive", "danbooru_e621_merged.csv",
-                       "danbooru_2025.csv", "extra-quality-tags.csv", "demo-chants.json"):
+                       "danbooru_2025.csv", "extra-quality-tags.csv", "demo-chants.json",
+                       # the sixth list, the default tac_tagFile: its own source, path, blob and licence
+                       "https://github.com/DraconicDragon/dbr-e621-lists-archive", DEFAULT_TAG_FILE,
+                       "tag-lists/danbooru/danbooru_2026-10-01_pt20-ia-dd.csv",
+                       ARCHIVE_TAGS[DEFAULT_TAG_FILE]["git_blob"], "Unlicense", "220,510",
+                       # the one change in on_ui_settings
+                       "tac_tagFile", "on_ui_settings"):
             with self.subTest(needle=needle):
                 self.assertIn(needle, section)
         mit = text[text.index("## MIT License 전문"):]

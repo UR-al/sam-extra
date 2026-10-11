@@ -356,5 +356,246 @@ class MigrateTests(unittest.TestCase):
         self.assertEqual(migrate.DATABASE, "tag_frequency.db")
 
 
+# ---------------------------------------------------------------------------------------------------------------------
+# --set-tagfile: tac_tagFile in a config.json (temporary copies only)
+# ---------------------------------------------------------------------------------------------------------------------
+
+DEFAULT_TAG_FILE = "danbooru_2026-10-01_pt20-ia-dd.csv"
+OLD_TAG_FILE = "KR_danbooru_tags_with_description-20260907.csv"
+
+
+def forge_config(settings: dict) -> bytes:
+    """config.json as Forge writes it on Windows: json.dump(indent=4, ensure_ascii=False) through a text file (CRLF)."""
+    return json.dumps(settings, indent=4, ensure_ascii=False).replace("\n", "\r\n").encode("utf-8")
+
+
+SETTINGS = {
+    "VERSION_UID": "PY313",
+    "outdir_samples": "C:\\출력\\그림",          # a non-ASCII path, written as is
+    "sd_model_checkpoint": "anima\\animaOfficial.safetensors [abc]",
+    "tac_tagFile": OLD_TAG_FILE,
+    "tac_active": True,
+    "tac_maxResults": 5,
+    "cfg_scale": 4.5,
+    "tac_keymap": "{\n    \"MoveUp\": \"ArrowUp\"\n}",   # a JSON text inside a string
+    "nested": {"tac_tagFile": "not this one", "list": [1, 2.0, None, "a \"quoted\" tac_tagFile"]},
+    "note": "\"tac_tagFile\": \"also not this one\"",
+    "tac_chantFile": "demo-chants.json",
+    "empty": None,
+}
+
+
+class SetTagFileTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="sam3_settagfile_"))
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.forge = self.tmp / "forge"
+        self.forge.mkdir()
+        self.config = self.forge / "config.json"
+        self.original = forge_config(SETTINGS)
+        self.config.write_bytes(self.original)
+        self.tags = self.tmp / "forge_sam3_extension" / "tags"
+        self.tags.mkdir(parents=True)
+        for name in (DEFAULT_TAG_FILE, "danbooru.csv"):
+            (self.tags / name).write_bytes(b"1girl,0,1,\n")
+        # a port nothing listens on (bound, then closed) for the "is Forge running" probe
+        probe = __import__("socket").socket()
+        probe.bind(("127.0.0.1", 0))
+        self.free_port = probe.getsockname()[1]
+        probe.close()
+
+    def run_tool(self, *extra, name=DEFAULT_TAG_FILE, port=None):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            code = migrate.main(["--set-tagfile", name, "--config", str(self.config), "--dst", str(self.tags),
+                                 "--forge-port", str(port or self.free_port), *extra])
+        return code, out.getvalue()
+
+    def backups(self):
+        return sorted(p.name for p in self.forge.iterdir() if p.name.startswith("config.json.bak-tagfile-"))
+
+    def expected_bytes(self):
+        return self.original.replace(f'"tac_tagFile": "{OLD_TAG_FILE}"'.encode(),
+                                     f'"tac_tagFile": "{DEFAULT_TAG_FILE}"'.encode())
+
+    def test_dry_run_prints_old_and_new_and_writes_nothing(self):
+        code, out = self.run_tool()
+        self.assertEqual(code, 0)
+        self.assertEqual(self.config.read_bytes(), self.original)
+        self.assertEqual(self.backups(), [])
+        self.assertEqual(sorted(p.name for p in self.forge.iterdir()), ["config.json"])
+        self.assertIn("DRY RUN", out)
+        self.assertIn(f"tac_tagFile: '{OLD_TAG_FILE}' -> '{DEFAULT_TAG_FILE}'", out)
+        self.assertIn(f"would write the backup {self.forge / 'config.json.bak-tagfile-'}", out)
+        self.assertIn(f"config: {self.config}", out)
+
+    def test_apply_needs_forge_stopped(self):
+        code, out = self.run_tool("--apply")
+        self.assertEqual(code, 1)
+        self.assertIn("--apply needs --forge-stopped", out)
+        self.assertEqual(self.config.read_bytes(), self.original)
+        self.assertEqual(self.backups(), [])
+
+    def test_apply_changes_only_that_value_after_a_verified_backup(self):
+        before = self.config.stat().st_mtime_ns
+        code, out = self.run_tool("--apply", "--forge-stopped")
+        self.assertEqual(code, 0, out)
+        new = self.config.read_bytes()
+        self.assertEqual(new, self.expected_bytes(), "every other byte as it was")
+        self.assertEqual(new.count(b"\r\n"), self.original.count(b"\r\n"))
+        self.assertNotIn(b"\n", new.replace(b"\r\n", b""), "CRLF kept")
+        loaded = json.loads(new.decode("utf-8"))
+        self.assertEqual(list(loaded), list(SETTINGS), "key order")
+        self.assertEqual(loaded, {**SETTINGS, "tac_tagFile": DEFAULT_TAG_FILE})
+        (backup,) = self.backups()
+        self.assertRegex(backup, r"^config\.json\.bak-tagfile-\d{8}-\d{6}$")
+        self.assertEqual((self.forge / backup).read_bytes(), self.original)
+        self.assertEqual((self.forge / backup).stat().st_mtime_ns // 10**6, before // 10**6, "the backup keeps the time")
+        self.assertIn(f"tac_tagFile: '{OLD_TAG_FILE}' -> '{DEFAULT_TAG_FILE}' written to {self.config}", out)
+        self.assertIn(f"backup: {self.forge / backup}", out)
+        self.assertFalse(list(self.forge.glob("*.partial")))
+
+        code, out = self.run_tool("--apply", "--forge-stopped")
+        self.assertEqual(code, 0)
+        self.assertIn("is already", out)
+        self.assertEqual(len(self.backups()), 1, "no second backup")
+        self.assertEqual(self.config.read_bytes(), new)
+
+    def test_refused_while_something_answers_on_the_forge_port(self):
+        import socket
+
+        server = socket.socket()
+        server.bind(("127.0.0.1", 0))
+        server.listen()
+        self.addCleanup(server.close)
+        port = server.getsockname()[1]
+        for extra in ((), ("--apply", "--forge-stopped")):
+            with self.subTest(extra=extra):
+                code, out = self.run_tool(*extra, port=port)
+                self.assertEqual(code, 1)
+                self.assertIn(f"Forge seems to be running (127.0.0.1:{port} answers)", out)
+                self.assertEqual(self.config.read_bytes(), self.original)
+                self.assertEqual(self.backups(), [])
+
+    def test_every_given_port_is_probed_and_7860_is_the_default(self):
+        self.assertEqual(migrate.DEFAULT_FORGE_PORTS, (7860,))
+        with mock.patch.object(migrate, "forge_listening", return_value=[]) as probe:
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                migrate.main(["--set-tagfile", DEFAULT_TAG_FILE, "--config", str(self.config), "--dst", str(self.tags)])
+            self.assertEqual(probe.call_args.args[0], [7860])
+            with contextlib.redirect_stdout(out):
+                migrate.main(["--set-tagfile", DEFAULT_TAG_FILE, "--config", str(self.config), "--dst", str(self.tags),
+                              "--forge-port", "7860", "--forge-port", "17860"])
+            self.assertEqual(probe.call_args.args[0], [7860, 17860])
+
+    def test_refused_while_the_usage_counts_have_an_unfinished_write(self):
+        (self.tags / "tag_frequency.db-journal").write_bytes(b"")
+        code, out = self.run_tool("--apply", "--forge-stopped")
+        self.assertEqual(code, 1)
+        self.assertIn("unfinished write", out)
+        self.assertEqual(self.config.read_bytes(), self.original)
+        self.assertEqual(self.backups(), [])
+
+    def test_the_name_must_be_a_csv_in_the_tags_folder(self):
+        for name, message in (("gone.csv", "is not in"), ("sub/danbooru.csv", "not a path"),
+                              ("..\\danbooru.csv", "not a path"), ("demo-chants.json", ".csv tag list"),
+                              ("", "not a path"), (" danbooru.csv", "not a path")):
+            with self.subTest(name=name):
+                code, out = self.run_tool("--apply", "--forge-stopped", name=name)
+                self.assertEqual(code, 1)
+                self.assertIn(message, out)
+                self.assertEqual(self.config.read_bytes(), self.original)
+                self.assertEqual(self.backups(), [])
+        code, _ = self.run_tool("--apply", "--forge-stopped", name="danbooru.csv")
+        self.assertEqual(code, 0, "any list that is in tags/")
+
+    def test_a_config_without_the_key_gets_it_as_the_last_member(self):
+        settings = {key: value for key, value in SETTINGS.items() if key != "tac_tagFile"}
+        original = forge_config(settings)
+        self.config.write_bytes(original)
+        code, out = self.run_tool("--apply", "--forge-stopped")
+        self.assertEqual(code, 0, out)
+        self.assertIn(f"tac_tagFile: (not set) -> '{DEFAULT_TAG_FILE}'", out)
+        new = self.config.read_bytes()
+        self.assertEqual(new, original[:-3] + f',\r\n    "tac_tagFile": "{DEFAULT_TAG_FILE}"\r\n}}'.encode(),
+                         "after the last member, with its line break, indentation and ': '")
+        self.assertEqual(json.loads(new.decode("utf-8")), {**settings, "tac_tagFile": DEFAULT_TAG_FILE})
+
+    def test_a_byte_order_mark_and_lf_files_stay_as_they_are(self):
+        original = b"\xef\xbb\xbf" + json.dumps(SETTINGS, indent=2, ensure_ascii=False).encode("utf-8")
+        self.config.write_bytes(original)
+        code, out = self.run_tool("--apply", "--forge-stopped")
+        self.assertEqual(code, 0, out)
+        self.assertEqual(self.config.read_bytes(),
+                         original.replace(f'"tac_tagFile": "{OLD_TAG_FILE}"'.encode(),
+                                          f'"tac_tagFile": "{DEFAULT_TAG_FILE}"'.encode()))
+
+    def test_files_it_cannot_edit_safely_are_left_alone(self):
+        cases = {
+            "duplicate key": b'{\r\n    "tac_tagFile": "a.csv",\r\n    "tac_tagFile": "b.csv"\r\n}',
+            "not a string": b'{\r\n    "tac_tagFile": 3\r\n}',
+            "broken JSON": b'{\r\n    "tac_tagFile": "a.csv",\r\n}',
+            "text after it": b'{"tac_tagFile": "a.csv"} x',
+            "not an object": b'["tac_tagFile"]',
+            "no settings": b"{}",
+            "not UTF-8": b'{"tac_tagFile": "\xff.csv"}',
+        }
+        for label, data in cases.items():
+            with self.subTest(label):
+                self.config.write_bytes(data)
+                code, out = self.run_tool("--apply", "--forge-stopped")
+                self.assertEqual(code, 1)
+                self.assertIn("ABORT", out)
+                self.assertEqual(self.config.read_bytes(), data)
+                self.assertEqual(self.backups(), [])
+        self.config.unlink()
+        code, out = self.run_tool("--apply", "--forge-stopped")
+        self.assertEqual((code, "--config is not a file" in out), (1, True))
+
+    def test_a_config_changed_after_it_was_read_is_not_overwritten(self):
+        real = shutil.copystat
+        changed = forge_config({**SETTINGS, "cfg_scale": 7})
+
+        def meanwhile(src, dst, *args, **kwargs):   # Forge saving its settings right after the backup
+            real(src, dst, *args, **kwargs)
+            Path(src).write_bytes(changed)
+
+        with mock.patch.object(migrate.shutil, "copystat", meanwhile):
+            code, out = self.run_tool("--apply", "--forge-stopped")
+        self.assertEqual(code, 1)
+        self.assertIn("changed while this ran", out)
+        self.assertEqual(self.config.read_bytes(), changed)
+        (backup,) = self.backups()
+        self.assertEqual((self.forge / backup).read_bytes(), self.original)
+
+    def test_with_tag_file_touches_only_the_top_level_value(self):
+        text = self.original.decode("utf-8")
+        new, old = migrate.with_tag_file(text, "x.csv")
+        self.assertEqual(old, OLD_TAG_FILE)
+        start = text.index(f'"tac_tagFile": "{OLD_TAG_FILE}"') + len('"tac_tagFile": ')
+        self.assertEqual(new, text[:start] + '"x.csv"' + text[start + len(OLD_TAG_FILE) + 2:])
+        self.assertEqual(json.loads(new)["nested"], SETTINGS["nested"])
+        self.assertEqual(json.loads(new)["note"], SETTINGS["note"])
+        compact, old = migrate.with_tag_file('{"a":1,"b":[2]}', "x.csv")
+        self.assertEqual((compact, old), ('{"a":1,"b":[2],"tac_tagFile":"x.csv"}', None))
+        single, _ = migrate.with_tag_file('{\n\t"a": 1\n}\n', "한글.csv")
+        self.assertEqual(single, '{\n\t"a": 1,\n\t"tac_tagFile": "한글.csv"\n}\n')
+
+    def test_set_tagfile_and_copying_are_separate_runs(self):
+        for argv in (["--set-tagfile", DEFAULT_TAG_FILE, "--src", str(self.tmp), "--config", str(self.config)],
+                     ["--set-tagfile", DEFAULT_TAG_FILE],
+                     ["--src", str(self.tmp), "--config", str(self.config)],
+                     ["--src", str(self.tmp), "--forge-stopped"],
+                     ["--set-tagfile", DEFAULT_TAG_FILE, "--config", str(self.config), "--forge-port", "70000"],
+                     ["--set-tagfile", DEFAULT_TAG_FILE, "--config", str(self.config), "--forge-port", "x"],
+                     []):
+            with self.subTest(argv=argv), contextlib.redirect_stderr(io.StringIO()):
+                with self.assertRaises(SystemExit) as raised:
+                    migrate.main(argv)
+                self.assertEqual(raised.exception.code, 2)
+        self.assertEqual(self.config.read_bytes(), self.original)
+
+
 if __name__ == "__main__":
     unittest.main()
