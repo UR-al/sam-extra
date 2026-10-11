@@ -305,11 +305,12 @@ def drop_offloaded_sam3() -> bool:
         return True
 
 
-def release_sam3() -> None:
-    """캐시한 SAM3 번들을 진짜로 버리고 VRAM 을 회수한다.
+def release_sam3() -> bool:
+    """캐시한 SAM3 번들을 진짜로 버리고 VRAM 을 회수한다. 버린 번들이 있었으면 True.
 
     체크포인트(경로·파일 내용)나 장치가 바뀌었을 때(``_get_model_bundle``), 스크립트가 언로드될 때
-    (Reload UI — ``scripts/!sam3.py`` 의 ``on_script_unloaded``) 부른다. 버리기 전에 GPU 텐서의 저장소를
+    (Reload UI — ``scripts/!sam3.py`` 의 ``on_script_unloaded``), '모델 내리기' 버튼(sam3ext/unload_registry.py
+    — 'Unload after' 가 CPU RAM 에 보관한 사본도 함께) 때 부른다. 버리기 전에 GPU 텐서의 저장소를
     푼다 — 번들을 다른 누가 아직 쥐고 있어도(예: 검출 중 난 예외의 traceback 프레임) VRAM 은 비게.
     """
     import gc
@@ -317,6 +318,7 @@ def release_sam3() -> None:
     global _BUNDLE, _BUNDLE_KEY, _BUNDLE_OFFLOADED
     with _BUNDLE_LOCK:
         bundle = _BUNDLE
+        held = bundle is not None
         _BUNDLE = None
         _BUNDLE_KEY = None
         _BUNDLE_OFFLOADED = None
@@ -328,6 +330,7 @@ def release_sam3() -> None:
         del bundle
     gc.collect()
     _empty_cuda_cache()
+    return held
 
 
 # 캐시한 SAM3 번들 하나(약 3.5 GB). 16 GB GPU 에서 Anima/Qwen + LLLite 가 이미 OOM 경계라 여러 개는 두지

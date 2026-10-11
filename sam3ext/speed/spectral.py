@@ -112,8 +112,11 @@ def dct_basis(n: int, device=None, dtype: torch.dtype = torch.float64) -> torch.
     return matrix
 
 
-def clear_basis_cache() -> None:
+def clear_basis_cache() -> bool:
+    """Drops the cached DCT matrices (also the '모델 내리기' button). True when any was cached."""
+    held = bool(_BASIS_CACHE)
     _BASIS_CACHE.clear()
+    return held
 
 
 def dct2(x: torch.Tensor) -> torch.Tensor:

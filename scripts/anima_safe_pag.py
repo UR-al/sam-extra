@@ -1902,6 +1902,47 @@ def _index_tensor(indices, device):
     return cached
 
 
+def release_sampling_caches() -> bool:
+    """'모델 내리기' 버튼(sam3ext/unload_registry.py) — 장치 인덱스 텐서와 지난 패스가 남긴 텐서 · 요청 참조를 놓는다.
+    생성이 정상으로 끝나면 postprocess 가 이미 같은 것을 비운다 — 예외로 끝난 생성(postprocess 가 돌지 않음)이 남긴 것을
+    위해서다: APG·SMC·CNS·RDC 상태와 PAG/SLG 의 attn_raw·slg_raw(reset_pass), 약한 예측의 기준 cond_raw(장치 위
+    float32 행), 조건 모으기 condition_aggregation, CLIP Modulation 의 블록 델타(block_modulations · 장치별 typed 사본),
+    DAVE 가 쥔 요청(offset_p · run_p)과 forward 게이트 캐시(시그마 텐서), HiFlow 의 x0 궤적 · 지난 단계 텐서 · 요청 참조.
+    다음 생성의 attach 는 이것들을 어차피 새로 채운다. 버튼은 생성 중에 부르지 않는다(Forge 의 queue_lock). 놓은 것이
+    있었으면 True."""
+    hiflow_state = _HIFLOW["state"]
+    held = (
+        bool(_INDEX_TENSOR_CACHE)
+        or bool(_RUNTIME.rdc_state)
+        or any(value is not None for value in (_RUNTIME.apg.get("avg"), _RUNTIME.smc_prev, _RUNTIME.cns_x_t))
+        or any(_STATE.get(key) is not None for key in ("attn_raw", "slg_raw", "cond_raw"))
+        or _STATE.get("condition_aggregation") is not None
+        or _MOD.get("block_modulations") is not None
+        or bool(_MOD.get("typed"))
+        or any(_DAVE.get(key) is not None for key in ("offset_p", "run_p"))
+        or len(_HIFLOW["trajectory"]) > 0
+        or any(_HIFLOW.get(key) is not None for key in ("owner", "pass_p", "run_p"))
+        or any(getattr(hiflow_state, key, None) is not None for key in ("prev_out", "prev_ref"))
+    )
+    _INDEX_TENSOR_CACHE.clear()
+    _RUNTIME.reset_pass()
+    _STATE["cond_raw"] = None
+    _STATE.pop("condition_aggregation", None)
+    _MOD.update(block_modulations=None, typed={})
+    _DAVE.update(offset_p=None, run_p=None)
+    _DAVE["gate"].clear()
+    _hiflow_clear()
+    return held
+
+
+try:
+    from sam3ext import unload_registry as _unload_registry
+
+    _unload_registry.register("anima_safe_pag", "샘플링 캐시", release_sampling_caches)
+except Exception as _unload_error:   # 확장 업데이트 뒤 다시 시작하기 전의 옛 sam3ext — 버튼만 이 캐시를 모른다
+    _log(f"unload hook not registered: {type(_unload_error).__name__}: {_unload_error}")
+
+
 def _is_out_of_memory(exc: BaseException) -> bool:
     oom_type = getattr(torch, "OutOfMemoryError", None) if torch is not None else None
     if oom_type is not None and isinstance(exc, oom_type):
