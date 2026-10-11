@@ -3,6 +3,76 @@
 버전 태그는 GitHub Releases에도 발행됩니다. 아래는 요약이며, guidance/속도 기능의
 상세는 [docs/GUIDANCE.md](docs/GUIDANCE.md)를 참고하세요.
 
+## 미출시 (Unreleased) — SAM3 얼굴 안에서만 찾기 (Face crop)
+
+SAM3 Mask 아코디언과 Refine 패널에 **얼굴 안에서만 찾기**를 더합니다. 켜면 ADetailer 의 `models/adetailer` 얼굴 모델(기본
+`face_yolov8n.pt` · 신뢰도 0.3)로 얼굴 상자를 찾고, 상자마다 넓힌 정사각 crop 에서만 SAM3 를 돌려 마스크를 원래 자리에 붙입니다 —
+작은 얼굴의 눈 · 입 · 머리카락을 얼굴마다 따로 잡고, 얼굴 밖의 비슷한 것은 찾지 않습니다. **기본은 꺼짐이고 꺼져 있으면 결과는
+그대로**입니다(검출 함수도 예전과 같은 인자로 부름 — 기존 마스크 대조 테스트 그대로 통과). **SAM3 스크립트 인자(state 키) 3개가
+맨 뒤에** 붙습니다: `sam3_face_crop`(false) · `sam3_face_crop_model`("face_yolov8n.pt") · `sam3_face_crop_confidence`(0.3) — 키가
+없는 예전 API 요청 · UI 상태는 꺼짐으로 전과 같이 돕니다. 새 infotext 키는 `SAM3 Face Crop` · `SAM3 Face Crop Model` ·
+`SAM3 Face Crop Confidence`(켰을 때만, 붙여 넣기 됨)와 결과 기록 `SAM3 Face Crop Faces`, 새 XYZ 축은 `[SAM3] Face Crop` ·
+`[SAM3] Face Crop Model` · `[SAM3] Face Crop Confidence` 입니다. Forge 를 재시작하세요(Reload UI 만 하면 옛 모듈이 남아 얼굴 crop 은
+나오지 않고 SAM3 는 예전처럼 돕니다 — 옛 인자 검증기에는 새 키를 넘기지 않음). 실제
+얼굴 모델 · SAM3 로 본 화질은 확인하지 않았습니다(GPU 미사용, 가짜 검출기 · 가짜 SAM3 로 CPU 테스트만).
+
+### SAM3 — 얼굴 안에서만 찾기 (새 기능)
+
+- **흐름** (`sam3ext/face_crop.py` 순수 기하 · `sam3ext/face_detect.py` 검출기 · `sam3ext/core.py` `run_sam3_on_pil(face_crop=…)`):
+  얼굴 상자를 옆 · 아래 20 %, 위 40 % 넓혀 중심을 지킨 정사각형으로 만들고 이미지 안으로 밉니다(이미지보다 크면 그 축만 이미지
+  크기, 한 변 최소 32 px). crop 마다 같은 Detect · Exclude 프롬프트 · Threshold 로 SAM3 를 돌립니다 — crop 은 잘라만 내고(SAM3
+  처리기가 전체 이미지 때처럼 작업 크기 1008 로 늘려 봄) 마스크를 같은 자리에 붙이므로 좌표 변환은 평행 이동뿐입니다. 백본은
+  crop 마다 한 번, 한 crop 의 특징만 들고 다음 crop 으로 넘어갑니다. Hull · Outline · Dilation · Manual Mask · Exclude · 인페인트 ·
+  ControlNet · 시드는 이미지 좌표에서 예전 코드 그대로 돕니다(그 단계는 함수로 묶었을 뿐 같은 순서 · 같은 식).
+- **Individual / Combined**: `Sam3Result` 모양은 같습니다 — `masks` 는 `/` 그룹 × 얼굴마다 하나(그룹 순서, 그 안에서 얼굴은 왼쪽 →
+  오른쪽, 그 부위가 없는 얼굴은 빠짐), `mask` 는 합집합. crop 이 겹치면 조각마다 무게중심에서 가장 가까운 얼굴(얼굴 크기로 나눈
+  거리)의 마스크에 더해, 옆 얼굴의 눈이 이 얼굴의 패스에 섞이지 않습니다(조각은 버리지 않아 합집합은 같음). Exclude 도 crop
+  마다 찾아 모든 마스크에서 뺍니다.
+- **얼굴이 없으면** SAM3 번들을 올리지 않고 빈 마스크 — '검출 없음' 과 같은 처리(이미지 그대로)에 콘솔 한 줄
+  `[-] SAM3: face crop — no faces found by … (confidence …); nothing to mask.`, infotext `SAM3 Face Crop Faces: 0`. Refine 은 새 이유
+  `no_faces` 로 상태 줄에 `얼굴을 찾지 못했습니다 (모델, 신뢰도 …)` 를 띄웁니다.
+- **받지 않음**: 얼굴 모델은 `models/adetailer`(와 ADetailer 설정 `ad_extra_models_dir`)에서만 찾고, 없으면 넣을 곳을 적은
+  `FaceDetectorUnavailable` 로 멈춥니다(In-flight 는 `SAM3 Error`, Refine 은 상태 줄). `ultralytics` 는 ADetailer 가 깐 것을 켰을 때만
+  import 하고, 없으면 같은 오류로 알립니다. ultralytics 가 이름을 바꿔 GitHub 에서 받으려는 이름(`yolov5s.pt` 꼴)도 거절합니다.
+  호출 모양은 ADetailer 와 같고(`YOLO(경로)(image, conf=…)` 의 `boxes.xyxy` · `boxes.conf`), 장치는 SAM3 가 cpu 면 `"cpu"`, 아니면
+  ADetailer 처럼 `""` — 장치 번호를 주면 ultralytics 가 `torch.cuda.set_device` 로 프로세스 기본 장치를 바꾸기 때문입니다.
+  드롭다운은 기본 모델 → 나머지 `face_*` → 다른 YOLO 상자 모델 순서(YOLO-World 는 클래스 이름이 필요해 뺌).
+- **UI**: SAM3 Mask 아코디언은 Unload 줄 아래에 한 줄(`Search inside faces only (얼굴 안에서만 찾기) — SAM3 runs on each face_yolov8
+  face crop` · `SAM3 Face Detector (models/adetailer)` · `SAM3 Face Detector Confidence`), Refine 패널은 Convex Hull 줄 아래에 같은 모양의
+  한 줄(`SAM3 Refine Face Crop (얼굴 안에서만 찾기) …` · `SAM3 Refine Face Detector …` · `SAM3 Refine Face Detector Confidence`, 기본 꺼짐).
+  다른 항목은 옮기지 않았습니다. Refine 의 위젯 값 3개는 캔버스 칸(있을 때만 붙음) 앞에 붙어 Refine 입력이 40 → 43개(캔버스 포함
+  42 → 45)가 됩니다. Refine 결과 PNG 에는 `SAM3 Refine Face Crop` · `… Model` · `… Confidence` · `… Faces` 가 남습니다.
+- **기록**: 오버레이에 얼굴 crop 테두리(주황)와 점수, 아티팩트 meta JSON 에 `face_crop`(모델 · 신뢰도 · 얼굴 상자 · 점수 · crop).
+  Reload UI 때 옛 `sam3ext.core` 를 다시 불러오는 검사에 `describe_face_crop` 를 더했고, 옛 `sam3ext.args`(얼굴 키 없음)가 남아 있으면
+  process() 가 얼굴 키를 빼고 검증해 SAM3 가 `SAM3 Error` 로 꺼지지 않게 했습니다.
+
+### 문서 · 테스트
+
+- README: 새 절 [얼굴 안에서만 찾기](README.md#얼굴-안에서만-찾기-face-crop)(흐름 · Individual/Combined · 얼굴 없음 · 받지 않음 ·
+  장치 · 기록 · API 표와 예시), In-flight 목록 · Refine 표 · 마스크 후처리 순서 · XYZ 축 목록 · 의존성. THIRD_PARTY_NOTICES.md 의
+  '코드를 편입하지 않은 재구현' 표에 한 줄(ADetailer 의 호출 방식 — AGPL-3.0, 코드 사본 없음; ultralytics · 얼굴 모델은 포함하지 않음).
+- `test_face_crop.py`(38개 — 넓히기 비율, 가운데 · 네 모서리 · 이미지 밖에 걸친 얼굴의 정사각 crop 과 밀어 넣기, 작은 얼굴 32 px,
+  이미지보다 작은 한 변 · 큰 얼굴의 축 자름, 쓸 수 없는 상자(빈 · 밖 · NaN · inf · 모양 틀림), 뒤집힌 꼭짓점, 무작위 상자 500개에서
+  crop 이 이미지 안 · 얼굴 상자 전체를 담음 · 정사각, 상자 왕복, 무작위 마스크 100개의 비트 단위 붙여 넣기 · 크기 다른 마스크 ·
+  범위 밖 거절, 무게중심, 주인 얼굴(겹침 · crop 밖 얼굴은 후보 아님 · 얼굴 크기 · 같으면 원래 crop), 왼쪽 → 오른쪽 계획 ·
+  상태 줄 · meta, 키워드 변환(꺼짐이면 `{}`), 모델 폴더 목록 · 추가 폴더 · 이름 찾기, 가짜 ultralytics 로 상자 · 점수 · 호출 인자 ·
+  장치 · 얼굴 없음 · 모델 없음(불러오지 않음) · 폴더 없음 · ultralytics 없음 · 받으려는 이름 거절, 모듈 import 가 torch ·
+  ultralytics 를 올리지 않음).
+- `test_sam3_face_crop.py`(40개 — 프롬프트 색의 연결 성분을 찾는 가짜 SAM3 처리기와 가짜 검출기로 `run_sam3_on_pil`: 꺼짐이면
+  검출기를 부르지 않음, crop 안 결과가 전체 이미지 검출과 비트 단위로 같음 · SAM3 는 crop 만 봄, 상자의 이미지 좌표,
+  Individual = 그룹 × 얼굴(왼쪽 → 오른쪽) · Combined = 합집합, 부위 없는 얼굴, 겹친 얼굴의 주인, 옆 crop 가장자리에 잘린 조각,
+  Exclude 가 crop 마다 · hull 뒤에, 얼굴 밖 Exclude 무시, Outline · Dilation 이 이미지 좌표(crop 밖으로 번짐), Manual Mask,
+  얼굴 없음이면 번들을 올리지 않음 · 상태 줄, 검출기 오류, 오버레이, meta; 인자 기본값 · 맨 뒤 순서 · 강제 변환 · infotext
+  켬/끔 · Forge 붙여 넣기 변환 왕복 · 실제 Gradio 로 만든 아코디언의 위젯 · 붙여 넣기 칸 · 짧은 예전 값 목록; 스크립트의
+  process(UI · XYZ · 예전 API · Reload UI 뒤 옛 Sam3Args) · 꺼짐이면 예전 호출 · 얼굴 수 기록 · Individual/Combined 패스 · 얼굴 없음 · 배치의 얼굴 수 · XYZ 축;
+  Refine 의 키 위치 · 위젯 줄맞춤 · 값 변환(짧은 예전 목록은 꺼짐) · `no_faces` 상태 줄 · 꺼짐이면 예전 호출 · PNG 기록 · 검출기
+  오류의 상태 줄(HTML 이스케이프)). 돌연변이 확인: 주인 정하기를 끄면 2개, 붙여 넣기를 한 칸 밀면 9개가 실패.
+- `test_ui_refine.py` 의 Refine 입력 개수(42 · 40 → 45 · 43)를 새 위젯에 맞췄습니다.
+- 전체(작업 트리, CPU, `SAM3_FORGE_ROOT` = 이 PC 의 Forge): 3182 테스트(0.33.1 의 3104 + 78), 건너뜀 185. 그중 28개(DCW 원본 대조
+  23 · Safe PAG 1 · Extra Samplers 의 Spectrum 경로 4 — 모두 Forge 코드를 직접 실행하는 테스트)는 이 변경 전 같은 작업 트리에서도 똑같이
+  실패합니다: 이 PC 의 Forge 가 0.33.1 뒤에 바뀐 탓으로 보이고(예: 2026-10-07 `batch_cond_uncond` — `backend/sampling/sampling_function.py`
+  가 이제 `modules.shared` 를 import 해 DCW 대조가 Forge 파일을 불러오지 못함) SAM3 와 무관합니다(실패 목록이 변경 전후 같음).
+
 ## v0.33.1 — IPNDM_V 4차 계수 오타 (Linear Quadratic 에서 그림이 깨지던 것)
 
 **2026-10-05 정정 (GPU 확인 뒤)**: 아래 "Linear Quadratic 은 깨지던 그림이 정상으로 돌아오고" 는 틀렸습니다. 계수 오타 수정은

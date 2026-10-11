@@ -10,6 +10,9 @@ import gradio as gr
 from .__version__ import __version__
 from .args import ALL_ARGS
 from .core import SAM3_NAME, find_checkpoint_options
+from .face_detect import DEFAULT_CONFIDENCE as FACE_CROP_DEFAULT_CONFIDENCE
+from .face_detect import DEFAULT_MODEL as FACE_CROP_DEFAULT_MODEL
+from .face_detect import find_face_models
 
 try:
     from modules.sd_samplers import all_samplers as _all_samplers
@@ -114,6 +117,17 @@ def _default_cn_module(choices: list[str]) -> str:
         if preferred in choices:
             return preferred
     return choices[0] if choices else "None"
+
+
+# '얼굴 안에서만 찾기' 체크박스 — 이웃 항목처럼 영어 라벨에 짧은 설명(—), 기능 이름은 한국어로 같이.
+FACE_CROP_LABEL = "Search inside faces only (얼굴 안에서만 찾기) — SAM3 runs on each face_yolov8 face crop"
+
+
+def default_face_model(choices: list[str]) -> str:
+    """얼굴 검출기 드롭다운의 처음 값: face_yolov8n.pt 가 목록에 있으면 그것, 아니면 첫 항목."""
+    if FACE_CROP_DEFAULT_MODEL in choices:
+        return FACE_CROP_DEFAULT_MODEL
+    return choices[0] if choices else FACE_CROP_DEFAULT_MODEL
 
 
 class Widgets(SimpleNamespace):
@@ -277,6 +291,29 @@ def sam3_ui(is_img2img: bool, buttons: WebuiButtons):
                 label="Unload SAM3 from VRAM after detection (~3.5 GB) — recommended for ≤16 GB GPUs",
                 value=True,
                 elem_id=eid("unload_after"),
+            )
+
+        with gr.Row():
+            w.sam3_face_crop = gr.Checkbox(
+                label=FACE_CROP_LABEL,
+                value=False,
+                elem_id=eid("face_crop"),
+            )
+            face_models = find_face_models()
+            w.sam3_face_crop_model = gr.Dropdown(
+                label="SAM3 Face Detector (models/adetailer)",
+                choices=face_models,
+                value=default_face_model(face_models),
+                type="value",
+                elem_id=eid("face_crop_model"),
+            )
+            w.sam3_face_crop_confidence = gr.Slider(
+                label="SAM3 Face Detector Confidence",
+                minimum=0.0,
+                maximum=1.0,
+                step=0.01,
+                value=FACE_CROP_DEFAULT_CONFIDENCE,
+                elem_id=eid("face_crop_confidence"),
             )
 
         with gr.Accordion("Inpaint", open=False, elem_id=eid("inpaint_section")):

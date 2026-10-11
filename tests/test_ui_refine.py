@@ -18,9 +18,11 @@ from sam3ext.ui_refine import REFINE_ARG_KEYS, _refine_widget_count, build_refin
 
 class RefineInputAlignmentTests(unittest.TestCase):
     def test_optional_canvas_keeps_three_txt2img_extras_aligned(self):
-        self.assertEqual(_refine_widget_count(45), 42)  # canvas + 3 extras
-        self.assertEqual(_refine_widget_count(43), 40)  # no canvas + 3 extras
-        self.assertIsNone(_refine_widget_count(42))
+        # 위젯 43개(얼굴 안에서만 찾기 3개 포함) + 캔버스 2개
+        self.assertEqual(len(REFINE_ARG_KEYS), 45)
+        self.assertEqual(_refine_widget_count(48), 45)  # canvas + 3 extras
+        self.assertEqual(_refine_widget_count(46), 43)  # no canvas + 3 extras
+        self.assertIsNone(_refine_widget_count(45))
 
 
 class _FakeState:
