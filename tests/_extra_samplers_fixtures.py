@@ -13,6 +13,10 @@
   ``installed_k_diffusion_deis`` makes it ``k_diffusion.deis``) and Forge's predictors
   ``backend/modules/k_prediction.py`` (``forge_k_prediction()``; ``Prediction``/``PredictionDiscreteFlow``
   with their real ``percent_to_sigma``).
+* Pinned Forge versions of a file (``forge_git_source(rev, path)``: ``git show <rev>:<path>`` from the Forge
+  checkout's repository, or ``$SAM3_FORGE_GIT``; nothing is checked out or written) — e.g. Forge's built-in
+  Spectrum forecaster as of 2.29.2 and 2.30 (``forge_spectrum_forecaster_at``); without that repository or
+  commit those tests skip.
 * The three verbatim origin copies (``tests/_origin_*.py``) with the stand-ins their imports need.
 * Toy models: an elementwise x0 predictor, a CFG denoiser stand-in that runs the post-CFG list and
   the inpainting blend in Forge's order, the exact denoiser of Gaussian data with its closed-form
@@ -26,6 +30,7 @@ import contextlib
 import hashlib
 import importlib.util
 import os
+import subprocess
 import sys
 import types
 import unittest
@@ -169,6 +174,45 @@ def forge_spectrum_forecaster():
     if "spectrum" not in _CACHE:
         _CACHE["spectrum"] = forge_module_from_source(str(_SPECTRUM), "lib_spectrum.forecaster")
     return _CACHE["spectrum"]
+
+
+# Forge Neo releases the version-aware tests pin (sd-webui-forge-classic, neo branch).
+FORGE_2_29_2 = "d70373eb"
+FORGE_2_30 = "45f41b81"
+FORGE_GIT_ENV = "SAM3_FORGE_GIT"
+
+
+def forge_git_source(rev: str, rel_path) -> str:
+    """``rel_path`` as of Forge commit ``rev``: ``git show`` from the Forge checkout's repository (or
+    ``$SAM3_FORGE_GIT``) — read-only, nothing is checked out. ``unittest.SkipTest`` without a Forge
+    repository that has the commit (CI, an archive copy, a shallow clone)."""
+    roots = [Path(os.environ[FORGE_GIT_ENV])] if os.environ.get(FORGE_GIT_ENV) else []
+    roots.append(require_forge())
+    spec = f"{rev}:{Path(rel_path).as_posix()}"
+    reasons = []
+    for root in roots:
+        try:
+            result = subprocess.run(["git", "-C", str(root), "show", spec], capture_output=True,
+                                    encoding="utf-8", errors="replace", timeout=60)
+        except (OSError, subprocess.SubprocessError) as exc:
+            reasons.append(f"{root}: {type(exc).__name__}")
+            continue
+        if result.returncode == 0:
+            return result.stdout
+        reasons.append(f"{root}: {result.stderr.strip().splitlines()[-1] if result.stderr.strip() else result.returncode}")
+    raise unittest.SkipTest(f"Forge {spec} not readable ({'; '.join(reasons)}); set ${FORGE_GIT_ENV} to a Forge git checkout")
+
+
+def forge_spectrum_forecaster_at(rev: str):
+    """Forge's Spectrum forecaster as of commit ``rev`` (``forge_git_source``), as ``lib_spectrum.forecaster``."""
+    key = f"spectrum@{rev}"
+    if key not in _CACHE:
+        origin = f"{rev}:{_SPECTRUM.as_posix()}"
+        module = types.ModuleType("lib_spectrum.forecaster")
+        module.__file__ = origin
+        exec(compile(forge_git_source(rev, _SPECTRUM), origin, "exec"), module.__dict__)
+        _CACHE[key] = module
+    return _CACHE[key]
 
 
 class UnetPatcherStandIn:

@@ -53,8 +53,15 @@ def _load_pag_module():
             sys.modules["modules"] = old_modules
 
 
-def _load_forge_sampler():
+def _load_forge_sampler(batch_cond_uncond: bool = True):
     """Execute Forge's real batching/area math with only host services stubbed.
+
+    Forge 2.30 (45f41b81) reads ``modules.shared.batch_cond_uncond`` — Settings → Optimizations →
+    "Batch Cond/Uncond", on by default — in ``can_concat_cond`` and ``sampling_prepare`` (``from
+    modules import shared`` at import); Forge 2.29.2 (d70373eb) has no such read and always batches.
+    Every call gets its own ``modules``/``modules.shared`` stand-ins with ``batch_cond_uncond``, so a
+    loaded sampler keeps the value it was loaded with: load a fresh one for another value, never change
+    ``sampler.shared`` of a cached one. ``forge_sampler_honours_batch_flag`` tells the two versions apart.
 
     Skips the calling test (``unittest.SkipTest``) without a Forge checkout, as on GitHub CI."""
     spec = importlib.util.spec_from_file_location(
@@ -69,9 +76,15 @@ def _load_forge_sampler():
     fake_args = types.ModuleType("backend.args")
     fake_args.args = types.SimpleNamespace(disable_gpu_warning=True)
     fake_args.dynamic_args = types.SimpleNamespace(context_handler=None)
+    shared = types.ModuleType("modules.shared")
+    shared.batch_cond_uncond = bool(batch_cond_uncond)
+    modules = types.ModuleType("modules")
+    modules.__path__ = []
+    modules.shared = shared
     with mock.patch.dict(sys.modules, {
         "backend": backend, "backend.args": fake_args,
         "backend.sampling.condition": conditions,
+        "modules": modules, "modules.shared": shared,
     }):
         spec = importlib.util.spec_from_file_location(
             "_pag_test_sampler", require_forge_file("backend/sampling/sampling_function.py")
@@ -79,6 +92,12 @@ def _load_forge_sampler():
         sampler = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(sampler)
     return sampler, conditions.Condition, memory
+
+
+def forge_sampler_honours_batch_flag(sampler) -> bool:
+    """Does this ``_load_forge_sampler`` result read ``batch_cond_uncond`` (Forge 2.30+)? 2.29.2 never
+    imports ``modules.shared`` there, so its batching ignores the flag."""
+    return getattr(getattr(sampler, "shared", None), "batch_cond_uncond", None) is not None
 
 
 class AnimaSafePagTests(unittest.TestCase):
@@ -243,7 +262,16 @@ class AnimaSafePagTests(unittest.TestCase):
         self.assertEqual(self._post_cfg().item(), -0.5)
 
     def test_weighted_and_regional_guidance_survives_real_forge_aggregation(self):
-        sampler, Condition, memory = _load_forge_sampler()
+        self._weighted_and_regional_guidance(batch_cond_uncond=True)
+
+    def test_weighted_and_regional_guidance_without_batch_cond_uncond(self):
+        """Forge 2.30 "Batch Cond/Uncond" off: every condition is its own UNet call (like the
+        low-VRAM split), the weighted/regional PAG result is the same. 2.29.2 ignores the flag."""
+        self._weighted_and_regional_guidance(batch_cond_uncond=False)
+
+    def _weighted_and_regional_guidance(self, batch_cond_uncond):
+        sampler, Condition, memory = _load_forge_sampler(batch_cond_uncond=batch_cond_uncond)
+        batching = batch_cond_uncond or not forge_sampler_honours_batch_flag(sampler)
         p = self.pag
 
         class Model:
@@ -299,7 +327,8 @@ class AnimaSafePagTests(unittest.TestCase):
                         # cond=19/7, weak=39/7, result=28*19/7-80/7.
                         expected[..., 4:] = 452.0 / 7.0
                     torch.testing.assert_close(actual, expected)
-                    self.assertEqual(Model.calls, 3 if free_memory < 1 else (2 if layout == "region" else 1))
+                    split = free_memory < 1 or not batching
+                    self.assertEqual(Model.calls, 3 if split else (2 if layout == "region" else 1))
                     self.assertNotIn("condition_aggregation", p._STATE)
 
     def test_adaptive_guidance_counts_only_a_real_combined_batch_skip(self):

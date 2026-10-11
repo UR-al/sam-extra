@@ -61,8 +61,12 @@ class _Memory:
 
 
 @contextlib.contextmanager
-def _forge_stubs():
-    """sampling_function·condition·unet·prompt_parser 는 실제 파일, 그들이 import 하는 무거운 모듈(메모리·인자·utils·어텐션)만 대역."""
+def _forge_stubs(batch_cond_uncond=True):
+    """sampling_function·condition·unet·prompt_parser 는 실제 파일, 그들이 import 하는 무거운 모듈(메모리·인자·utils·어텐션)만 대역.
+
+    ``batch_cond_uncond``: Forge 2.30 의 Settings → Optimizations → Batch Cond/Uncond (기본 켬). 2.30 의
+    sampling_function 은 ``modules.shared.batch_cond_uncond`` 를 can_concat_cond·sampling_prepare 에서 읽고, 2.29.2 는 읽지
+    않는다(늘 묶음). 클래스마다 새 대역이라 값은 클래스의 것 — 불러 둔 모듈의 값을 바꾸지 않는다."""
     names = [n for n in sys.modules if n in ("backend", "modules") or n.startswith(("backend.", "modules."))]
     saved = {n: sys.modules.pop(n) for n in names}
 
@@ -90,7 +94,8 @@ def _forge_stubs():
     attention = module("backend.attention", attention_function=attention_function)
     shared_backend = module("backend.shared")
     modules = module("modules", [str(FORGE / "modules")])
-    shared = module("modules.shared", opts=types.SimpleNamespace(emphasis="Original"), sd_model=None)
+    shared = module("modules.shared", opts=types.SimpleNamespace(emphasis="Original"), sd_model=None,
+                    batch_cond_uncond=bool(batch_cond_uncond))
     backend.memory_management, backend.args, backend.utils, backend.attention = mm, args, utils, attention
     backend.shared = shared_backend
     modules.shared = shared
@@ -114,6 +119,8 @@ def _load(name, path):
 class _Harness:
     """Forge 소스와 내장 훅을 한 번 불러 둔다 (클래스마다)."""
 
+    BATCH_COND_UNCOND = True   # Forge 2.30 의 Batch Cond/Uncond — 기본값(켬)
+
     @classmethod
     def setUpClass(cls):
         for path in (SAMPLING, UNET, SD_HOOK):
@@ -123,7 +130,7 @@ class _Harness:
             import einops  # noqa: F401  (unet.py 가 import)
         except ImportError as exc:   # pragma: no cover - Forge venv 밖
             raise unittest.SkipTest(f"einops 없음: {exc}")
-        cls._stubs = _forge_stubs()
+        cls._stubs = _forge_stubs(cls.BATCH_COND_UNCOND)
         cls.shared = cls._stubs.__enter__()
         saved_neo = negpip_pkg.IS_NEO
         negpip_pkg.IS_NEO = True   # 테스트 프로세스엔 진짜 backend 가 없어 패키지는 False 로 읽었다 — 훅은 Forge Neo 경로로
@@ -410,6 +417,40 @@ class HookBatchLayoutTests(_Harness, unittest.TestCase):
             got = attn(h, context=ctx, mask=mask, transformer_options={"cond_or_uncond": [COND]})
         self.assertIn("attention mask", out.getvalue())
         self.assertTrue(torch.equal(got, attn.orig_forward(h, context=ctx, mask=mask)))
+
+
+class NoBatchCondUncondLayoutTests(_Harness, unittest.TestCase):
+    """Forge 2.30 의 Batch Cond/Uncond 를 끈 배치 모양: can_concat_cond 가 늘 거짓이라 조각마다 따로, to_run 순서대로(C 먼저,
+    그다음 U) 돈다 — 메모리와 무관하게. 행마다 제 항목·제 쪽 음수 항은 그대로. 2.29.2 는 설정을 읽지 않아 늘 [U, C] 로 묶는다."""
+
+    BATCH_COND_UNCOND = False
+    B, STEPS = HookBatchLayoutTests.B, HookBatchLayoutTests.STEPS
+    _items, _run, _orders = HookBatchLayoutTests._items, HookBatchLayoutTests._run, HookBatchLayoutTests._orders
+
+    def _honours_flag(self):
+        return getattr(self.sf, "shared", None) is self.shared   # 2.30+: sampling_function 이 modules.shared 를 읽는다
+
+    def test_cond_then_uncond_as_separate_calls_every_step(self):
+        calls, expected, native = self._run()
+        if self._honours_flag():
+            self.assertEqual([labels for labels, *_ in calls], ([[COND]] * 4 + [[UNCOND]] * 4) * self.STEPS)
+        else:
+            self.assertEqual(self._orders(calls), [[UNCOND, COND]], "Forge 2.29.2 — 설정과 무관하게 묶음")
+        seen = self._check_calls(calls, expected, native)
+        self.assertEqual(seen, {(COND, 0), (COND, 1), (UNCOND, 0), (UNCOND, 1)})
+
+    def test_and_prompt_chunks_each_get_their_own_call(self):
+        calls, expected, native = self._run(and_parts=2)
+        if self._honours_flag():
+            self.assertEqual([labels for labels, *_ in calls], ([[COND]] * 8 + [[UNCOND]] * 4) * self.STEPS)
+        else:
+            self.assertEqual(self._orders(calls), [[UNCOND, COND, COND]])
+        self._check_calls(calls, expected, native)
+
+    def test_cfg1_is_unchanged(self):
+        calls, expected, native = self._run(cfg1=True)
+        self.assertEqual({tuple(labels) for labels, *_ in calls}, {(COND,)})
+        self.assertEqual(self._check_calls(calls, expected, native), {(COND, 0), (COND, 1)})
 
 
 # ---- 스크립트까지: 실제 prompt_parser·Forge 파서·CLIP 토크나이저로 process_batch → denoiser_callback → 실제 배치 → 훅 ----

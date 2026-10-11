@@ -22,6 +22,7 @@ from . import connector_cache
 from .adapter import ProgressiveCrossAdapter
 from .connector_fp32 import make_connector_patcher
 from .marker import as_rows, read_run_ids, stamp_run_id
+from ..forge_batching import unet_rows_per_image
 from ..negpip.mask import build_negpip_mask, negpip_line_conds
 from .native_engine import anima_text_engine, emphasis_infotext, is_legacy_engine, qwen06_native_inputs
 from .files import (
@@ -358,7 +359,8 @@ class Anima3BRuntime:
 
     def _sampling_reserve(self, device) -> float | None:
         """다음 샘플링에서 Forge 가 비워 두려 할 VRAM — sampling_prepare → load_models_gpu 의 첫 free_memory 와
-        같은 셈(아직 안 올라간 UNet·커넥터 ×1.1 + 추론 몫). 하이레스면 큰 쪽 해상도. 셀 수 없으면 None."""
+        같은 셈(아직 안 올라간 UNet·커넥터 ×1.1 + 추론 몫). 하이레스면 큰 쪽 해상도. 셀 수 없으면 None.
+        추론 몫의 행 수는 Forge 와 같다: Batch Cond/Uncond 가 켜져 있으면(2.29.2 는 늘) 2 × batch, 끄면(2.30) batch."""
         processing = self._installed_processing
         unet = getattr(getattr(getattr(processing, "sd_model", None), "forge_objects", None), "unet", None)
         if unet is None:
@@ -368,7 +370,7 @@ class Anima3BRuntime:
             width = max(width, int(getattr(processing, "hr_upscale_to_x", 0) or 0))
             height = max(height, int(getattr(processing, "hr_upscale_to_y", 0) or 0))
         batch = max(1, int(getattr(processing, "batch_size", 1) or 1))
-        shape = [2 * batch, 16, max(1, height // 8), max(1, width // 8)]
+        shape = [unet_rows_per_image() * batch, 16, max(1, height // 8), max(1, width // 8)]
         inference = float(unet.memory_required(shape)) + float(getattr(unet, "extra_preserved_memory_during_sampling", 0) or 0)
         extra = max(
             float(memory_management.minimum_inference_memory()),

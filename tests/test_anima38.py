@@ -2191,6 +2191,45 @@ class EncoderResidencyTests(unittest.TestCase):
         self.runtime._release_encoder(self.te)
         self.unload.assert_called_once_with(self.te)
 
+    @staticmethod
+    def _forge_shared(shared):
+        modules = types.ModuleType("modules")
+        modules.__path__ = []
+        if shared is not None:
+            modules.shared = shared
+        return mock.patch.dict(sys.modules, {"modules": modules, "modules.shared": shared})
+
+    def test_inference_rows_follow_forge_batch_cond_uncond(self):
+        """Forge 2.30 sampling_prepare reserves inference memory for (2 if batch_cond_uncond else 1) * batch rows
+        (Settings → Optimizations → Batch Cond/Uncond); 2.29.2 keeps the constant shared.batch_cond_uncond = True."""
+
+        class Shared230:   # modules/shared_items.py Shared.batch_cond_uncond: a property over opts
+            def __init__(self, opts):
+                self.opts = opts
+
+            @property
+            def batch_cond_uncond(self):
+                return self.opts.batch_cond_uncond
+
+        self.free = 1e12
+        self.runtime._installed_processing.batch_size = 2
+        cases = (
+            ("2.30 on (default)", Shared230(types.SimpleNamespace(batch_cond_uncond=True)), 4),
+            ("2.30 off", Shared230(types.SimpleNamespace(batch_cond_uncond=False)), 2),
+            ("2.30 before the settings load", Shared230(types.SimpleNamespace()), 4),
+            ("2.29.2 (old constant)", types.SimpleNamespace(batch_cond_uncond=True), 4),
+            ("no attribute", types.SimpleNamespace(), 4),
+            ("outside Forge", None, 4),
+        )
+        for name, shared, rows in cases:
+            with self.subTest(name):
+                self.unet.shapes.clear()
+                with self._forge_shared(shared):
+                    if shared is None:
+                        sys.modules.pop("modules.shared")   # restored by the patch
+                    self.runtime._release_encoder(self.te)
+                self.assertEqual(self.unet.shapes, [[rows, 16, 192, 192]])
+
     def test_upcoming_qwen_needs_room_too(self):
         self.free = 17.3
         self.runtime._release_encoder(self.te, upcoming=(self.qwen,))

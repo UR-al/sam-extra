@@ -75,6 +75,7 @@ import gradio as gr
 from modules import script_callbacks, scripts
 
 from sam3ext import layout_lanes
+from sam3ext.forge_batching import batch_cond_uncond as _forge_batch_cond_uncond
 try:
     from modules import shared
 except ImportError:  # standalone/unit-test loader
@@ -308,11 +309,17 @@ INFOTEXT_CONTROLNET_GUARD = "Anima Perturbation ControlNet guard"
 INFOTEXT_CONTROLNET_GUARD_VALUE = (
     "PAG/SEG/SLG skipped while ControlNet is active (Forge guard; the ComfyUI node does not skip)"
 )
+# Forge 2.30 Settings → Optimizations → "Batch Cond/Uncond" 를 끄면 cond·uncond 가 늘 따로 호출돼(can_concat_cond)
+# ADG 가 uncond 행을 뺄 묶음 호출이 없다 — 동작은 그대로(ADG 는 켜진 채 아무것도 생략하지 않음), 알림만 남긴다.
+# 2.29.2 는 늘 묶는다(sam3ext/forge_batching.py). 설명용, 붙여넣기 때 되돌릴 설정은 없다.
+INFOTEXT_ADG_STATUS = "Anima Adaptive Guidance status"
+INFOTEXT_ADG_BATCH_OFF = "ADG inactive: Batch Cond/Uncond off"
 
 _EXTRA_GENERATION_PARAM_KEYS = (
     "Anima Perturbation Guidance",
     "Anima APG",
     "Anima Adaptive Guidance",
+    INFOTEXT_ADG_STATUS,
     "Anima CFG Orchestrator",
     "Anima DCW",
     "Anima RDC",
@@ -451,7 +458,28 @@ _ADG: dict = {
     "on": False,
     "start": 0.5,     # skip uncond once this fraction of steps has elapsed
     "interval": 0,    # 0 = skip every step after start; N>0 = still keep uncond every Nth step
+    "batch_off_warned": False,   # console note for Batch Cond/Uncond off, once per session
 }
+
+
+def _adg_batch_off_note(p) -> bool:
+    """ADG is on but Forge 2.30's Batch Cond/Uncond is off: there is never a combined cond+uncond call for
+    ADG to drop the uncond rows from. Write the infotext note (every request) and the console line (once
+    per session); ADG stays on and changes nothing. False (nothing written) when ADG is off or Forge
+    batches — always on 2.29.2."""
+    if not _ADG["on"] or shared is None or _forge_batch_cond_uncond(shared):
+        return False
+    params = getattr(p, "extra_generation_params", None)
+    if isinstance(params, dict):
+        params[INFOTEXT_ADG_STATUS] = INFOTEXT_ADG_BATCH_OFF
+    if not _ADG["batch_off_warned"]:
+        _ADG["batch_off_warned"] = True
+        _log(
+            f"{INFOTEXT_ADG_BATCH_OFF} - Forge runs cond and uncond as separate UNet calls, so Adaptive "
+            "Guidance has no combined batch to drop the uncond rows from and skips nothing (turn Settings → "
+            f"Optimizations → Batch Cond/Uncond back on to use it; infotext '{INFOTEXT_ADG_STATUS}')."
+        )
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -4140,7 +4168,9 @@ class AnimaSafePAG(scripts.Script):
                 "⚠️ 논문의 cosine-similarity 판정이 아닌 **고정 Skip-after 방식**입니다. "
                 "Forge가 cond/uncond를 같은 batch로 호출할 때만 후반 uncond row를 생략합니다. "
                 "low-VRAM 분리 호출에서는 스킵되지 않아 속도 차이가 없으며, 특정 향상률을 "
-                "보장하지 않습니다. 생략된 스텝에서는 perturbation도 함께 쉽니다."
+                "보장하지 않습니다. 생략된 스텝에서는 perturbation도 함께 쉽니다. "
+                "Forge 2.30의 Settings → Optimizations → **Batch Cond/Uncond**를 끄면 늘 분리 호출이라 "
+                "아무것도 생략하지 않습니다(infotext·콘솔에 `ADG inactive: Batch Cond/Uncond off`)."
             )
             adg_enabled = gr.Checkbox(
                 label="Enable Adaptive Guidance (combined-batch에서만 후반 uncond 생략)",
@@ -5894,6 +5924,7 @@ class AnimaSafePAG(scripts.Script):
                 p.extra_generation_params["Anima Adaptive Guidance"] = (
                     f"skip_after={_ADG['start']:.2f}, keep_every={_ADG['interval']}"
                 )
+                _adg_batch_off_note(p)
             if _TSR["on"]:
                 p.extra_generation_params["Anima TSR"] = f"k={tsr_k}, sigma={tsr_sigma}"
             if _HIST["mg_on"]:
@@ -6037,7 +6068,11 @@ class AnimaSafePAG(scripts.Script):
             elif _STATE["adg_skipped_steps"] > 0:
                 adg_verdict = f"SKIPPED-UNCOND({_STATE['adg_skipped_steps']} steps)"
             elif _STATE["split_cond_calls"] or _STATE["split_uncond_calls"]:
-                adg_verdict = "NO-SKIP(split/low-VRAM calls)"
+                adg_verdict = (
+                    "NO-SKIP(split/low-VRAM calls)"
+                    if shared is None or _forge_batch_cond_uncond(shared)
+                    else "NO-SKIP(split calls: Batch Cond/Uncond off)"
+                )
             else:
                 adg_verdict = "NO-SKIP"
             elapsed_text = f"{elapsed:.2f}s" if elapsed is not None else "?"

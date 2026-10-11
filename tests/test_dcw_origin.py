@@ -259,9 +259,10 @@ class DcwOriginTestCase(unittest.TestCase):
             args[index] = config[key]
         return args
 
-    def _attach(self, args, *, unet=None, xyz=None, steps=20, **request_fields):
+    def _attach(self, args, *, unet=None, xyz=None, steps=20, log=None, **request_fields):
         """``request_fields`` are StableDiffusionProcessing attributes such as ``cfg_scale``,
-        ``is_hr_pass``/``hr_cfg`` or the refiner fields; omitted, the pass CFG is unknown."""
+        ``is_hr_pass``/``hr_cfg`` or the refiner fields; omitted, the pass CFG is unknown.
+        ``log``: a mock that records the console lines (default: a fresh one per call)."""
         model = type("Anima", (), {})()
         model.forge_objects = types.SimpleNamespace(unet=unet or _ForgeUnet())
         request = types.SimpleNamespace(
@@ -269,15 +270,16 @@ class DcwOriginTestCase(unittest.TestCase):
         )
         if xyz:
             request._anima_safe_pag_xyz = dict(xyz)
-        with mock.patch.object(self.pag, "_log"):
+        with mock.patch.object(self.pag, "_log", mock.DEFAULT if log is None else log):
             self.pag.AnimaSafePAG().process_before_every_sampling(request, *args)
         return request, model.forge_objects.unet
 
     def _forge_step(self, model_options, x, sigma, cond_pred, uncond_pred, cond_scale, cond_extra=None,
-                    model=None):
+                    model=None, forge=None):
         """One Forge model call. ``uncond_pred=None`` is Forge at CFG == 1, which encodes no
-        negative prompt (modules/processing.py:481-483, hires :1606-1608)."""
-        sampler, Condition = self._forge_sampler()
+        negative prompt (modules/processing.py:481-483, hires :1606-1608). ``forge``: another
+        ``(sampling_function module, Condition)`` than the class's cached one (Batch Cond/Uncond off)."""
+        sampler, Condition = self._forge_sampler() if forge is None else forge
         cond = [{"model_conds": {"bias": Condition(cond_pred)}, **(cond_extra or {})}]
         uncond = None if uncond_pred is None else [{"model_conds": {"bias": Condition(uncond_pred)}}]
         with mock.patch.dict(sys.modules, {"backend.sampling.sampling_function": sampler}):
@@ -759,6 +761,87 @@ class AdaptiveGuidanceDcwTests(DcwOriginTestCase):
         self.assertEqual(self.pag._CFG["steps"], 0)
         self.assertIs(self.pag._RUNTIME.smc_prev, previous)
         self.assertIsNone(self.pag._APG["avg"])
+
+    # -- Forge 2.30 "Batch Cond/Uncond" off (Settings → Optimizations) ----------
+
+    def _adg_args(self, enabled=True):
+        args = self._forge_args(dict(dcw_enabled=True))
+        args[17] = enabled   # Adaptive Guidance
+        args[18] = 0.0       # skip from the first step
+        args[19] = 0         # never keep an uncond step
+        return args
+
+    def _fresh_note_state(self):
+        saved = self.pag._ADG["batch_off_warned"]
+        self.addCleanup(self.pag._ADG.__setitem__, "batch_off_warned", saved)
+        self.pag._ADG["batch_off_warned"] = False
+
+    def test_adg_with_batch_cond_uncond_off_skips_nothing_like_adg_off(self):
+        """Batch Cond/Uncond off: Forge 2.30 runs cond and uncond as separate UNet calls
+        (``can_concat_cond``), so ADG has no combined batch to drop the uncond rows from — the step is
+        bit-identical to ADG off (plain CFG + DCW). Forge 2.29.2 ignores the flag and still skips."""
+        self._fresh_note_state()
+        sigma, x, cond, uncond = self._schedule()[3]
+        _request, unet = self._attach(self._adg_args(enabled=False))
+        reference = self._forge_step(unet.model_options, x, sigma, cond, uncond, 4.0)
+
+        self.setUp()
+        sampler, condition, _memory = _BASE._load_forge_sampler(batch_cond_uncond=False)   # fresh, never the cached one
+        with mock.patch.object(self.pag, "shared", types.SimpleNamespace(batch_cond_uncond=False)):
+            _request, unet = self._attach(self._adg_args())
+        model = _CountingForgeModel()
+        out = self._forge_step(unet.model_options, x, sigma, cond, uncond, 4.0, model=model,
+                               forge=(sampler, condition))
+
+        self.assertTrue(self.pag._ADG["on"], "ADG stays on - only the note is new")
+        if _BASE.forge_sampler_honours_batch_flag(sampler):   # Forge 2.30+
+            self.assertTrue(torch.equal(out, reference))
+            self.assertEqual(self.pag._STATE["adg_skipped_steps"], 0)
+            self.assertEqual((self.pag._STATE["split_cond_calls"], self.pag._STATE["split_uncond_calls"],
+                              self.pag._STATE["combined_calls"]), (1, 1, 0))
+            self.assertEqual(model.rows, 2)
+        else:   # Forge 2.29.2: one combined call, ADG evaluates the cond rows only
+            torch.testing.assert_close(out, ORIGIN.apply_dcw(cond, x, sigma, 0.05, 0.01), rtol=1e-5, atol=2e-5)
+            self.assertEqual(self.pag._STATE["adg_skipped_steps"], 1)
+            self.assertEqual(model.rows, 1)
+
+    def test_adg_batch_off_note_in_infotext_every_request_and_console_once(self):
+        self._fresh_note_state()
+        log = mock.Mock()
+        with mock.patch.object(self.pag, "shared", types.SimpleNamespace(batch_cond_uncond=False)):
+            first, _unet = self._attach(self._adg_args(), log=log)
+            self.setUp()
+            second, _unet = self._attach(self._adg_args(), log=log)
+        for request in (first, second):
+            self.assertEqual(request.extra_generation_params[self.pag.INFOTEXT_ADG_STATUS],
+                             "ADG inactive: Batch Cond/Uncond off")
+            self.assertEqual(request.extra_generation_params["Anima Adaptive Guidance"],
+                             "skip_after=0.00, keep_every=0")
+        notes = [call.args[0] for call in log.call_args_list if "ADG inactive" in call.args[0]]
+        self.assertEqual(len(notes), 1, "console: once per session")
+        self.assertIn("Batch Cond/Uncond", notes[0])
+        self.assertIn(self.pag.INFOTEXT_ADG_STATUS, notes[0])
+        self.assertIn(self.pag.INFOTEXT_ADG_STATUS, self.pag._EXTRA_GENERATION_PARAM_KEYS,
+                      "cleared per pass / XYZ cell like the other guidance keys")
+
+    def test_adg_batch_note_absent_when_forge_batches_or_adg_is_off(self):
+        cases = (
+            ("2.30, Batch Cond/Uncond on", types.SimpleNamespace(batch_cond_uncond=True), True),
+            ("2.29.2 shared (constant True)", types.SimpleNamespace(batch_cond_uncond=True, opts=None), True),
+            ("no batch_cond_uncond attribute", types.SimpleNamespace(), True),
+            ("outside Forge (no shared)", None, True),
+            ("ADG off, Batch Cond/Uncond off", types.SimpleNamespace(batch_cond_uncond=False), False),
+        )
+        for name, forge_shared, adg in cases:
+            with self.subTest(name):
+                self.setUp()
+                self._fresh_note_state()
+                log = mock.Mock()
+                with mock.patch.object(self.pag, "shared", forge_shared):
+                    request, _unet = self._attach(self._adg_args(enabled=adg), log=log)
+                self.assertNotIn(self.pag.INFOTEXT_ADG_STATUS, request.extra_generation_params)
+                self.assertFalse(any("ADG inactive" in call.args[0] for call in log.call_args_list))
+                self.assertFalse(self.pag._ADG["batch_off_warned"])
 
 
 if __name__ == "__main__":

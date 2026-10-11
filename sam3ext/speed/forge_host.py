@@ -502,7 +502,8 @@ def runtime_guard(p, model, x, sigmas) -> str | None:
     if _spectrum_wrapper(unet):
         return (
             "Forge Spectrum Integrated is on - SPEED steps aside (its stop-caching point comes from "
-            "the step count and it can forecast a coarse-sized tensor across the size change)"
+            "the step count, and across the size change it can forecast a coarse-sized tensor on Forge "
+            "2.29.2 or re-runs the model and restarts its history on Forge 2.30)"
         )
     return None
 
