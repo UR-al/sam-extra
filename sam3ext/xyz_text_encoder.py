@@ -3,20 +3,23 @@
 Forge Neo (2.30) keeps VAEs and text encoders in ONE list: the "VAE / Text Encoder" dropdown, saved as
 ``opts.forge_additional_modules`` (full paths). It tells them apart only while loading the model —
 ``backend/loader.py`` ``replace_state_dict`` looks at each file's keys and shapes and writes a text encoder into one
-slot of the checkpoint (``text_encoders.<slot>.``); the family's ``clip_target`` then reads the slot(s) it uses
-(Anima ``qwen3_06b``, Krea2 ``qwen3vl_4b``, Flux ``clip_l`` + ``t5xxl`` …). A file that matches no branch is ignored.
+slot of the checkpoint (``text_encoders.<slot>.``, CLIP-L / CLIP-G where the checkpoint's family keeps them); the
+family's ``clip_target`` then reads the slot(s) it uses (Anima ``qwen3_06b``, Krea2 ``qwen3vl_4b``, Flux ``clip_l`` +
+``t5xxl`` …). A file that matches no branch is ignored.
 
-The stock XYZ ``VAE`` axis hot-swaps VAE weights; there is no text-encoder axis. This module decides, from the
-safetensors HEADER only (no tensor is read), which slot a file fills - ``te_slots`` mirrors replace_state_dict's
-branches in their order (``tests/test_xyz_text_encoder_origin.py`` runs Forge's own function on the same headers) - and
-builds one cell's module list: the current list with the entry of the picked file's slot replaced (``compose``). The
-WebUI seam (``scripts/modules_xyz_text_encoder.py``) hands that list to Forge through ``p.override_settings``, the
-path the API and Forge's built-in PiD script use, so Forge reloads the model exactly as if the file had been chosen in
-the dropdown, writes the real list into the image's ``Module N`` infotext, and puts the user's selection back after
-every cell (``process_images``' ``finally``) - config.json and the dropdown are never touched.
+The stock XYZ ``VAE`` axis hot-swaps VAE weights; there is no text-encoder axis. This module decides, from the file's
+header only (no tensor is read: the safetensors JSON header, or a GGUF file's tensor table after Forge's
+``gguf_remapping`` renames), which slot a file fills - ``te_slots`` mirrors replace_state_dict's branches in their order
+(``tests/test_xyz_text_encoder_origin.py`` runs Forge's own functions on the same headers) - and which encoders a
+checkpoint has built in (``checkpoint_profile``). It builds one cell's module list: the current list with the entry of
+the picked file's slot replaced, or the pick added when the checkpoint has that slot built in (``compose``).
+``sam3ext/xyz_text_encoder_cell.py`` hands that list to Forge's model loader for the cell without touching Forge's
+settings (config.json and the dropdown stay as they are).
 
-Values: ``Use Forge current`` (no change), a module file (basename, the dropdown's relative path, or the name without
-extension), or ``a + b`` (text mode) for families with two encoders (Flux CLIP-L + T5).
+Values: ``Use Forge current`` (also ``None``, the stock VAE axis's word for it: no change), a module file (basename,
+the dropdown's relative path, or the name without extension), or ``a + b`` (text mode) for families with two encoders
+(Flux CLIP-L + T5). The axis may sit on two of X/Y/Z (CLIP-L files on one, T5 files on the other): the second builds
+on the first's list, and two axes may not pick the same slot.
 """
 from __future__ import annotations
 
@@ -25,6 +28,7 @@ import re
 from dataclasses import dataclass
 
 from .anima38.files import ARCHITECTURE as _ANIMA38_ADAPTER, QWEN35_MARKERS, V2_ARCHITECTURE as _ANIMA38_V2
+from .gguf_header import read_gguf_shapes
 # The stdlib-only copy of the header reader (sam3ext/anima_core.py has the same function but imports torch).
 from .vae_degrid_models import read_safetensors_header
 
@@ -34,12 +38,18 @@ CURRENT = "Use Forge current"
 # Checkpoint (1.0) stays the outer loop, then this axis, then the stock VAE axis (0.7): a text-encoder change reloads
 # the model like a checkpoint change does.
 COST = 0.9
-# Set on the cell's copy of ``p`` by the axis (``{"value": …, "modules": [...]}``) and read by the hook's before_process.
+# Set on the cell's copy of ``p`` by the axis (``{"value": …, "modules": [...], "slots": frozenset, "origin": [...]}`` -
+# ``origin`` is the selection the first Text Encoder axis of the cell started from; ``None`` for "Use Forge current")
+# and read by the hook.
 CELL_ATTR = "_sam_extra_xyz_text_encoder"
+# Set on the grid's ``p`` by ``confirm``: the slots each Text Encoder axis picks (two axes may not share one).
+CONFIRMED_ATTR = "_sam_extra_xyz_text_encoder_axes"
 MODULES_KEY = "forge_additional_modules"
 CHECKPOINT_KEY = "sd_model_checkpoint"
-VAE_KEY = "sd_vae"
 SAFETENSORS_EXTENSIONS = (".safetensors", ".sft")
+GGUF_EXTENSION = ".gguf"
+# A pick whose slot is not read (a pickle file): it conflicts with any pick of another axis.
+UNKNOWN_SLOT = "?"
 
 SLOT_NAMES = {
     "clip_l": "CLIP-L",
@@ -55,6 +65,10 @@ SLOT_NAMES = {
     "qwen3_8b": "Qwen3 8B",
     "ministral3_3b": "Ministral 3 3B",
 }
+# Words that mean "the selection as it is" elsewhere in Forge (the stock VAE axis's "None", the Hires module dropdown's
+# "Built-in" …). "None" is accepted as "Use Forge current"; the others get a pointer to it.
+CURRENT_ALIASES = ("current", "none")
+NOT_A_FILE_WORDS = ("default", "automatic", "auto", "built-in", "builtin", "built in", "use same choices")
 
 
 class AxisValueError(ValueError):
@@ -70,7 +84,8 @@ class ForgeLoadError(Exception):
 # ---------------------------------------------------------------------------------------------------------------------
 
 # CLIP-G / CLIP-L: Forge tries these keys and accepts the first whose shape[0] is 1280 / 768. (Where the weights then
-# go depends on the checkpoint — nowhere for a family without CLIP — but the file is a CLIP-G / CLIP-L encoder.)
+# go depends on the checkpoint — nowhere for a family without CLIP, see PREFIX_L / PREFIX_G — but the file is a CLIP-G
+# / CLIP-L encoder.)
 CLIP_G_KEYS = (
     "conditioner.embedders.1.model.transformer.resblocks.0.ln_1.bias",
     "text_encoders.clip_g.transformer.text_model.encoder.layers.0.layer_norm1.bias",
@@ -114,9 +129,10 @@ def _dim0(header: dict, key: str):
 def te_slots(header: dict) -> frozenset:
     """The text-encoder slots replace_state_dict would write this file into (empty: none — Forge ignores it).
 
-    ``header`` is a safetensors header (``{key: {"dtype", "shape", "data_offsets"}, "__metadata__": …}``). The order and
-    the ``if`` / ``elif`` structure are Forge's: a Qwen3-VL file that also has the Qwen3 keys is Qwen3-VL. Raises
-    ``ForgeLoadError`` where Forge itself would fail (its asserts, or a key it reads that is missing)."""
+    ``header`` is a safetensors header (``{key: {"dtype", "shape", "data_offsets"}, "__metadata__": …}``; a GGUF file's
+    comes from ``gguf_header``). The order and the ``if`` / ``elif`` structure are Forge's: a Qwen3-VL file that also
+    has the Qwen3 keys is Qwen3-VL. Raises ``ForgeLoadError`` where Forge itself would fail (its asserts, or a key it
+    reads that is missing)."""
     slots = set()
     if any(key in header and _dim0(header, key) == 1280 for key in CLIP_G_KEYS):
         slots.add("clip_g")
@@ -156,6 +172,148 @@ def te_slots(header: dict) -> frozenset:
 
 
 # ---------------------------------------------------------------------------------------------------------------------
+# GGUF files — backend/loader_gguf.py gguf_remapping (Forge Neo 2.30): the key renames, in Forge's order
+# ---------------------------------------------------------------------------------------------------------------------
+
+GGUF_T5_TEST_KEY = "enc.blk.0.attn_k.weight"
+GGUF_T5_FORMAT = (
+    ("enc.", "encoder."), (".blk.", ".block."), ("token_embd", "shared"), ("output_norm", "final_layer_norm"),
+    ("attn_q", "layer.0.SelfAttention.q"), ("attn_k", "layer.0.SelfAttention.k"), ("attn_v", "layer.0.SelfAttention.v"),
+    ("attn_o", "layer.0.SelfAttention.o"), ("attn_norm", "layer.0.layer_norm"),
+    ("attn_rel_b", "layer.0.SelfAttention.relative_attention_bias"), ("ffn_up", "layer.1.DenseReluDense.wi_1"),
+    ("ffn_down", "layer.1.DenseReluDense.wo"), ("ffn_gate", "layer.1.DenseReluDense.wi_0"),
+    ("ffn_norm", "layer.1.layer_norm"),
+)
+GGUF_LLM_TEST_KEY = "blk.0.attn_norm.weight"
+GGUF_LLM_FORMAT = (
+    ("blk.", "model.layers."), ("attn_norm", "input_layernorm"), ("attn_q_norm.", "self_attn.q_norm."),
+    ("attn_k_norm.", "self_attn.k_norm."), ("attn_v_norm.", "self_attn.v_norm."), ("attn_q", "self_attn.q_proj"),
+    ("attn_k", "self_attn.k_proj"), ("attn_v", "self_attn.v_proj"), ("attn_output", "self_attn.o_proj"),
+    ("ffn_up", "mlp.up_proj"), ("ffn_down", "mlp.down_proj"), ("ffn_gate", "mlp.gate_proj"),
+    ("ffn_norm", "post_attention_layernorm"), ("token_embd", "model.embed_tokens"), ("output_norm", "model.norm"),
+    ("output.weight", "lm_head.weight"),
+)
+GGUF_PATCH_EMBED_KEY = "v.patch_embd.weight.1"
+GGUF_CLIP_VISION_TEST_KEY = "mm.0.weight"
+GGUF_CLIP_VISION_FORMAT = (
+    ("mm.", "visual.merger.mlp."), ("v.post_ln.", "visual.merger.ln_q."), ("v.patch_embd", "visual.patch_embed.proj"),
+    ("v.blk.", "visual.blocks."), ("ffn_up", "mlp.up_proj"), ("ffn_down", "mlp.down_proj"), ("ffn_gate", "mlp.gate_proj"),
+    ("attn_out.", "attn.proj."), ("ln1.", "norm1."), ("ln2.", "norm2."),
+)
+
+
+def _rename(shapes: dict, table) -> dict:
+    out = {}
+    for key, shape in shapes.items():
+        for old, new in table:
+            key = key.replace(old, new)
+        out[key] = shape
+    return out
+
+
+def gguf_remap(shapes: dict) -> dict:
+    """The tensor names Forge's ``gguf_remapping`` gives a GGUF file before ``replace_state_dict`` looks at them (T5
+    and LLM names to Hugging Face ones, the Qwen2.5-VL vision tower's ``mm.`` / ``v.`` names). Shapes stay; the vision
+    tower's q/k/v merge and patch-embedding stack only rename keys no branch looks at."""
+    if GGUF_T5_TEST_KEY in shapes:
+        shapes = _rename(shapes, GGUF_T5_FORMAT)
+    if GGUF_LLM_TEST_KEY in shapes:
+        shapes = _rename(shapes, GGUF_LLM_FORMAT)
+    if GGUF_PATCH_EMBED_KEY in shapes:
+        shapes = {key: shape for key, shape in shapes.items() if key != GGUF_PATCH_EMBED_KEY}
+    if GGUF_CLIP_VISION_TEST_KEY in shapes:
+        shapes = _rename(shapes, GGUF_CLIP_VISION_FORMAT)
+    return shapes
+
+
+def gguf_header(shapes) -> dict | None:
+    """A safetensors-style header (``{key: {"shape": [...]}}``) for a GGUF tensor table, after Forge's renames."""
+    if shapes is None:
+        return None
+    return {key: {"shape": list(shape)} for key, shape in gguf_remap(dict(shapes)).items()}
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# What a checkpoint has built in — replace_state_dict's model type and where it writes CLIP-L / CLIP-G
+# ---------------------------------------------------------------------------------------------------------------------
+
+UNET_PREFIXES = ("model.diffusion_model.", "net.")
+LEGACY_TEST_KEY = "model.diffusion_model.input_blocks.4.1.transformer_blocks.0.attn2.to_k.weight"
+FLUX_TEST_KEYS = (
+    "model.diffusion_model.double_blocks.0.img_attn.norm.key_norm.scale",
+    "model.diffusion_model.double_blocks.0.img_attn.norm.key_norm.weight",
+    "model.diffusion_model.single_transformer_blocks.0.mlp_fc1.qweight",
+)
+LEGACY_TYPES = {768: "sd1", 1280: "xlrf", 2048: "sdxl"}
+PREFIX_L = {
+    "-": None,
+    "sd1": "cond_stage_model.transformer.",
+    "xlrf": None,
+    "sdxl": "conditioner.embedders.0.transformer.",
+    "flux": "text_encoders.clip_l.transformer.",
+}
+PREFIX_G = {
+    "-": None,
+    "sd1": None,
+    "xlrf": "conditioner.embedders.0.model.transformer.",
+    "sdxl": "conditioner.embedders.1.model.transformer.",
+    "flux": None,
+}
+TEXT_ENCODERS_PREFIX = "text_encoders."
+
+
+@dataclass(frozen=True)
+class Checkpoint:
+    """What the axis knows of a checkpoint: ``model_type`` (replace_state_dict's: ``sd1`` / ``xlrf`` / ``sdxl`` /
+    ``flux`` / ``-``) and ``slots``, the encoder slots it fills itself (SD1 / SDXL CLIP, an all-in-one Flux file's CLIP-L
+    and T5 …) - a picked encoder of such a slot replaces the built-in one, as when it is chosen in the dropdown."""
+
+    name: str
+    model_type: str = "-"
+    slots: frozenset = frozenset()
+
+    def loads(self, slot) -> bool:
+        """Whether Forge writes an encoder of this slot into the model at all (CLIP-L / CLIP-G only where the family
+        keeps them; replace_state_dict drops them otherwise)."""
+        if slot == "clip_l":
+            return PREFIX_L.get(self.model_type) is not None
+        if slot == "clip_g":
+            return PREFIX_G.get(self.model_type) is not None
+        return True
+
+
+def checkpoint_profile(name: str, header) -> Checkpoint | None:
+    """``Checkpoint`` from a checkpoint's header (``None``: not readable). Keys as replace_state_dict sees them:
+    ``preprocess_state_dict`` puts ``model.diffusion_model.`` before every key of a file that has no UNet prefix (a
+    UNet-only file - no built-in encoder)."""
+    if not isinstance(header, dict):
+        return None
+    header = {key: value for key, value in header.items() if isinstance(key, str) and key != "__metadata__"}
+    if not any(key.startswith(UNET_PREFIXES) for key in header):
+        header = {UNET_PREFIXES[0] + key: value for key, value in header.items()}
+    keys = list(header)
+    model_type = "-"
+    legacy = header.get(LEGACY_TEST_KEY)
+    shape = legacy.get("shape") if isinstance(legacy, dict) else None
+    if isinstance(shape, (list, tuple)):
+        model_type = LEGACY_TYPES.get(shape[1] if len(shape) > 1 else None, "-")
+    elif any(key in header for key in FLUX_TEST_KEYS):
+        model_type = "flux"
+    slots = set()
+    prefix_l, prefix_g = PREFIX_L[model_type], PREFIX_G[model_type]
+    for key in keys:
+        if prefix_l and key.startswith(prefix_l):
+            slots.add("clip_l")
+        if prefix_g and key.startswith(prefix_g):
+            slots.add("clip_g")
+        if key.startswith(TEXT_ENCODERS_PREFIX):
+            slot = key[len(TEXT_ENCODERS_PREFIX):].split(".", 1)[0]
+            if slot in SLOT_NAMES and slot not in ("clip_l", "clip_g"):
+                slots.add(slot)
+    return Checkpoint(name, model_type, frozenset(slots))
+
+
+# ---------------------------------------------------------------------------------------------------------------------
 # What a module file is
 # ---------------------------------------------------------------------------------------------------------------------
 
@@ -163,8 +321,8 @@ def te_slots(header: dict) -> frozenset:
 class Kind:
     """``kind``: ``te`` (one slot - usable), ``multi`` (several slots), ``vae``, ``qwen35`` (Anima 3.8B's Qwen3.5,
     which Forge ignores), ``adapter`` (Anima 3.8B adapter), ``invalid`` (Forge would fail), ``unknown`` (no branch
-    matches), ``unreadable`` (no safetensors header), ``opaque`` (GGUF / pickle: not read without loading it;
-    ``in_te_dir`` says whether it sits in a text-encoder folder)."""
+    matches), ``unreadable`` (no header Forge could read), ``opaque`` (a pickle file - .pt / .pth / .bin / .ckpt - not
+    read without loading it; ``in_te_dir`` says whether it sits in a text-encoder folder)."""
 
     kind: str
     slots: tuple = ()
@@ -182,10 +340,11 @@ class Kind:
 
 
 def is_qwen35_header(name: str, header: dict) -> bool:
-    """Anima 3.8B's Qwen3.5-4B file (sam3ext/anima38/files.py ``is_unused_qwen35_module``): the marker in the name and
-    no ``model.`` key - replace_state_dict matches nothing and sam-extra's loader filter drops it from the list."""
+    """Anima 3.8B's Qwen3.5-4B file (sam3ext/anima38/files.py ``is_unused_qwen35_module``): a ``.safetensors`` file with
+    the marker in the name and no ``model.`` key - replace_state_dict matches nothing and sam-extra's loader filter
+    drops it from the list."""
     lowered = name.lower()
-    if not any(marker in lowered for marker in QWEN35_MARKERS):
+    if not lowered.endswith(".safetensors") or not any(marker in lowered for marker in QWEN35_MARKERS):
         return False
     return not any(isinstance(key, str) and key.startswith("model.") for key in header if key != "__metadata__")
 
@@ -226,21 +385,49 @@ def _under(path: str, roots) -> bool:
     return False
 
 
-def classify_file(path: str, *, te_roots=()) -> Kind:
-    """``Kind`` of a module file; safetensors headers are cached by (path, size, mtime_ns)."""
-    path = str(path)
-    if not path.lower().endswith(SAFETENSORS_EXTENSIONS):
-        return Kind("opaque", detail=os.path.splitext(path)[1].lower(), in_te_dir=_under(path, te_roots))
+def _cached(kind: str, path: str, read):
+    """``read(path)`` once per (path, size, mtime_ns); ``None`` when the file cannot be stat'ed."""
     try:
         stat = os.stat(path)
     except OSError:
-        return Kind("unreadable")
-    key = (os.path.normcase(os.path.abspath(path)), stat.st_size, stat.st_mtime_ns)
-    kind = _CACHE.get(key)
-    if kind is None:
-        kind = classify_header(os.path.basename(path), read_safetensors_header(path))
-        _CACHE[key] = kind
-    return kind
+        return None
+    key = (kind, os.path.normcase(os.path.abspath(path)), stat.st_size, stat.st_mtime_ns)
+    if key not in _CACHE:
+        _CACHE[key] = read(path)
+    return _CACHE[key]
+
+
+def read_header(path: str):
+    """The header of a module or checkpoint file: safetensors JSON, or a GGUF tensor table after Forge's renames
+    (``None``: not readable; other extensions: not read)."""
+    lowered = path.lower()
+    if lowered.endswith(SAFETENSORS_EXTENSIONS):
+        return read_safetensors_header(path)
+    if lowered.endswith(GGUF_EXTENSION):
+        return gguf_header(read_gguf_shapes(path))
+    return None
+
+
+def classify_file(path: str, *, te_roots=()) -> Kind:
+    """``Kind`` of a module file; headers are cached by (path, size, mtime_ns)."""
+    path = str(path)
+    if not path.lower().endswith(SAFETENSORS_EXTENSIONS + (GGUF_EXTENSION,)):
+        return Kind("opaque", detail=os.path.splitext(path)[1].lower(), in_te_dir=_under(path, te_roots))
+    kind = _cached("module", path, lambda p: classify_header(os.path.basename(p), read_header(p)))
+    return kind if kind is not None else Kind("unreadable")
+
+
+def checkpoint_file(path, name: str | None = None) -> Checkpoint | None:
+    """``Checkpoint`` of a checkpoint file (safetensors or GGUF; ``None`` for anything else or an unreadable file)."""
+    if not path:
+        return None
+    path = str(path)
+    if not path.lower().endswith(SAFETENSORS_EXTENSIONS + (GGUF_EXTENSION,)):
+        return None
+    profile = _cached("checkpoint", path, lambda p: checkpoint_profile(os.path.basename(p), read_header(p)))
+    if profile is not None and name and profile.name != name:
+        profile = Checkpoint(name, profile.model_type, profile.slots)
+    return profile
 
 
 def clear_cache() -> None:
@@ -265,7 +452,7 @@ def slot_name(slot) -> str:
 
 
 def is_current(value) -> bool:
-    return str(value).strip().casefold() in (CURRENT.casefold(), "current")
+    return str(value).strip().casefold() in (CURRENT.casefold(), *CURRENT_ALIASES)
 
 
 def resolve(value, module_list) -> str:
@@ -288,8 +475,12 @@ def resolve(value, module_list) -> str:
     if by_stem:
         raise AxisValueError(f'{AXIS_LABEL}: "{text}" matches several files ({", ".join(sorted(by_stem))}) - '
                              'write the name with its extension')
+    if text.casefold() in NOT_A_FILE_WORDS:
+        raise AxisValueError(f'{AXIS_LABEL}: "{text}" is not a file of Forge\'s VAE / Text Encoder list - for the '
+                             f'encoders selected there now, use "{CURRENT}"')
     raise AxisValueError(f'{AXIS_LABEL}: unknown file "{text}" - it is not in Forge\'s VAE / Text Encoder list '
-                         '(put it in models/text_encoder and press the refresh button next to that list)')
+                         '(put it in models/text_encoder and press the refresh button next to that list; '
+                         f'"{CURRENT}" keeps the encoders selected there)')
 
 
 def parse_value(value, module_list) -> tuple:
@@ -348,10 +539,10 @@ def _not_a_te_message(name: str, kind: Kind) -> str:
     if kind.kind == "invalid":
         return f"{head} is not a text encoder Forge can load ({kind.detail})"
     if kind.kind == "unreadable":
-        return f"{head} is not a text encoder Forge can load (its safetensors header cannot be read)"
+        return f"{head} is not a text encoder Forge can load (its header cannot be read)"
     if kind.kind == "opaque":
         return (f"{head} is not a text encoder Forge can load as far as the axis can tell "
-                "(a GGUF / pickle file outside a text-encoder folder)")
+                "(a pickle file outside a text-encoder folder)")
     return f"{head} is not a text encoder Forge can load (no text-encoder key Forge recognises)"
 
 
@@ -360,24 +551,54 @@ def _describe(kinds) -> str:
     slots = sorted({slot for kind in kinds for slot in kind.slots if kind.kind in ("te", "multi")})
     names = [slot_name(slot) for slot in slots]
     if any(kind.kind == "opaque" and kind.in_te_dir for kind in kinds):
-        names.append("a GGUF encoder")
+        names.append("a pickle encoder")
     return ", ".join(names) if names else "no text encoder"
 
 
-def compose(base, picks, *, module_list, classify) -> list:
+def _no_slot_message(name, slot, base_kinds, checkpoint, opaque) -> str:
+    what = slot_name(slot)
+    head = f'{AXIS_LABEL}: "{name}" is a {what} encoder'
+    if opaque:
+        return (f'{head}; the current VAE / Text Encoder selection has no other {what} encoder the axis can see, and '
+                f'it cannot tell whether "{_basename(opaque[0])}" (a pickle file, not read without loading it) fills '
+                f'that slot - put a safetensors or GGUF {what} encoder in that list first')
+    base_kinds = list(base_kinds)
+    if base_kinds:
+        selection = f"the current VAE / Text Encoder selection has none (it has: {_describe(base_kinds)})"
+    else:
+        selection = "the current VAE / Text Encoder selection has no text encoder"
+    if checkpoint is None:
+        where = "and the axis cannot read the checkpoint to see whether it has one built in"
+    else:
+        built_in = ", ".join(slot_name(s) for s in sorted(checkpoint.slots)) or "no encoder"
+        where = f'and the checkpoint "{checkpoint.name}" has none built in (it has: {built_in})'
+    return (f"{head} but {selection} {where} - the axis only swaps an encoder the model already has. To compare "
+            f"{what} encoders, add one to that list first")
+
+
+def compose(base, picks, *, module_list, classify, checkpoint=None, added=()) -> list:
     """The module list of one cell: ``base`` (normalised) with the entries of each pick's slot replaced by the pick.
 
     * entries that are not text encoders (VAEs, Qwen3.5, …) stay;
-    * every entry of the pick's slot is replaced; with none, the pick is added when the selection has no text encoder
-      at all (as when it is chosen in the dropdown: the checkpoint's own encoder is replaced), and is an error otherwise
-      (the model would load it and never use it);
-    * a GGUF / pickle encoder (its slot is not read) only replaces the selection's one text encoder, and only alone;
+    * every entry of the pick's slot is replaced; with none, the pick is added when the ``checkpoint`` has that slot
+      built in (it replaces the built-in encoder, as when chosen in the dropdown) or when neither the selection nor
+      the checkpoint has any encoder the axis can see (a checkpoint that cannot be read, or one with no built-in
+      encoder) - otherwise it is an error: the axis swaps encoders the model has, it does not guess whether the model
+      reads another slot;
+    * CLIP-L / CLIP-G picks are an error for a checkpoint whose family Forge loads no CLIP-L / CLIP-G into;
+    * a pickle encoder (its slot is not read) only replaces the selection's one text encoder, and only alone;
     * two picks of one slot are an error.
 
-    ``classify(path) -> Kind``. Returns full paths, sorted (``modules_change``'s normalisation). Raises AxisValueError."""
+    ``classify(path) -> Kind``; ``checkpoint``: ``Checkpoint`` or ``None`` (unknown); ``added``: entries of ``base``
+    that an earlier Text Encoder axis of the cell put in - replaced like any entry of their slot, but not the
+    selection's encoders for the rules above (so the second axis accepts what its ``confirm`` accepted). Returns full
+    paths, sorted (``modules_change``'s normalisation). Raises AxisValueError."""
     kept = normalise(base, module_list)
     kinds = {path: classify(path) for path in kept}
-    base_te = [path for path in kept if kinds[path].is_te_entry]
+    added = set(normalise(added, module_list))
+    base_te = [path for path in kept if kinds[path].is_te_entry and path not in added]
+    opaque = [path for path in base_te if kinds[path].kind == "opaque"]
+    built_in = checkpoint.slots if checkpoint is not None else frozenset()
     result = list(kept)
     picked_slots = {}
     pick_paths = []
@@ -397,16 +618,19 @@ def compose(base, picks, *, module_list, classify) -> list:
     for name, path, kind in pick_paths:
         if kind.kind == "opaque":
             if len(pick_paths) > 1:
-                raise AxisValueError(f'{AXIS_LABEL}: "{name}" is a {kind.detail or "GGUF"} file whose slot cannot be read '
+                raise AxisValueError(f'{AXIS_LABEL}: "{name}" is a pickle file ({kind.detail}) whose slot cannot be read '
                                      'without loading it - it can only be used alone')
             if len(base_te) != 1:
                 raise AxisValueError(
-                    f'{AXIS_LABEL}: "{name}" is a {kind.detail or "GGUF"} file whose slot cannot be read without loading '
+                    f'{AXIS_LABEL}: "{name}" is a pickle file ({kind.detail}) whose slot cannot be read without loading '
                     f'it - it can only replace the one text encoder of the current VAE / Text Encoder selection, '
                     f'which has {len(base_te)}')
             result = [entry for entry in result if entry != base_te[0]] + [path]
             continue
         slot = kind.slot
+        if checkpoint is not None and not checkpoint.loads(slot):
+            raise AxisValueError(f'{AXIS_LABEL}: "{name}" is a {slot_name(slot)} encoder, which Forge does not load '
+                                 f'for the checkpoint "{checkpoint.name}" (its family has no {slot_name(slot)} slot)')
         partial = [entry for entry in kept if kinds[entry].kind == "multi" and slot in kinds[entry].slots]
         if partial:
             raise AxisValueError(f'{AXIS_LABEL}: "{name}" would replace only part of "{_basename(partial[0])}", which '
@@ -414,42 +638,62 @@ def compose(base, picks, *, module_list, classify) -> list:
         same = [entry for entry in kept if kinds[entry].kind == "te" and kinds[entry].slot == slot]
         if same:
             result = [entry for entry in result if entry not in same] + [path]
-        elif not base_te:
+        elif slot in built_in:
             result.append(path)
-        elif len(base_te) == 1 and kinds[base_te[0]].kind == "opaque" and len(pick_paths) == 1:
-            # the selection's one encoder is a GGUF whose slot is not read: the pick takes its place
+        elif len(base_te) == 1 and opaque and len(pick_paths) == 1:
+            # the selection's one encoder is a pickle file whose slot is not read: the pick takes its place
             result = [entry for entry in result if entry != base_te[0]] + [path]
+        elif not base_te and not built_in:
+            result.append(path)
         else:
-            raise AxisValueError(
-                f'{AXIS_LABEL}: "{name}" is a {slot_name(slot)} encoder but the current VAE / Text Encoder selection '
-                f'has none (it has: {_describe(kinds[entry] for entry in base_te)}) - the model would load it and not '
-                f'use it. To compare {slot_name(slot)} encoders, add one to that list first')
+            raise AxisValueError(_no_slot_message(name, slot, (kinds[entry] for entry in base_te), checkpoint, opaque))
     return sorted(dict.fromkeys(result))
 
 
-def plan(value, *, base, module_list, classify):
+def pick_slots(value, module_list, classify) -> frozenset:
+    """The slots one value picks (``UNKNOWN_SLOT`` for a pickle file); empty for "Use Forge current"."""
+    slots = set()
+    for name in parse_value(value, module_list):
+        kind = classify(module_list[name])
+        slots.update(kind.slots if kind.kind == "te" else (UNKNOWN_SLOT,))
+    return frozenset(slots)
+
+
+def overlap(first: frozenset, second: frozenset) -> frozenset:
+    """Slots two axes would both pick (any slot against a pickle file, whose slot is not read)."""
+    if (UNKNOWN_SLOT in first and second) or (UNKNOWN_SLOT in second and first):
+        return frozenset(first | second)
+    return frozenset(first & second)
+
+
+def plan(value, *, base, module_list, classify, checkpoint=None, added=()):
     """The cell's module list for ``value`` (``None`` for "Use Forge current"). Raises AxisValueError."""
     picks = parse_value(value, module_list)
     if not picks:
         return None
-    return compose(base, picks, module_list=module_list, classify=classify)
+    return compose(base, picks, module_list=module_list, classify=classify, checkpoint=checkpoint, added=added)
 
 
 # ---------------------------------------------------------------------------------------------------------------------
 # Dropdown choices, cell labels
 # ---------------------------------------------------------------------------------------------------------------------
 
-def choices(module_list, module_map, current, classify, *, use_short=True) -> list:
-    """"Use Forge current", then the text encoders of a slot the current selection has (every single-slot encoder when
-    it has none), shown as the dropdown shows them (file name, or relative path). GGUF / pickle files are not listed
-    (their slot is not read) but can be typed in text mode."""
+def choices(module_list, module_map, current, classify, *, use_short=True, checkpoint=None) -> list:
+    """"Use Forge current", then the text encoders of a slot the model has - in the current selection or built into the
+    ``checkpoint`` (every single-slot encoder Forge loads for it when neither has one the axis can see) - shown as the
+    dropdown shows them (file name, or relative path). Pickle files are not listed (their slot is not read) but can be
+    typed in text mode."""
     encoders = [kind for kind in map(classify, normalise(current, module_list)) if kind.is_te_entry]
     slots = {slot for kind in encoders for slot in kind.slots}
-    has_encoder = bool(encoders)
+    if checkpoint is not None:
+        slots |= checkpoint.slots
+    has_encoder = bool(encoders) or bool(slots)
     found = []
     for name, path in module_list.items():
         kind = classify(path)
         if kind.kind != "te" or (has_encoder and kind.slot not in slots):
+            continue
+        if checkpoint is not None and not checkpoint.loads(kind.slot):
             continue
         found.append(name if use_short else (module_map or {}).get(name, name))
     return [CURRENT, *sorted(found, key=str.casefold)]
@@ -468,30 +712,13 @@ def format_label(value, *, module_list, current, classify) -> str:
 
 
 # ---------------------------------------------------------------------------------------------------------------------
-# One cell's override_settings
+# The cell's Module N list
 # ---------------------------------------------------------------------------------------------------------------------
 
-def checkpoint_to_carry(loading_parameters, selected):
-    """The checkpoint to keep for the cell when another axis chose it (the stock Checkpoint axis writes
-    ``forge_loading_parameters`` and puts ``opts.sd_model_checkpoint`` back, which this cell's settings refresh would
-    otherwise undo): its name when it is not the dropdown's checkpoint, else ``None``."""
-    info = (loading_parameters or {}).get("checkpoint_info")
-    if info is None or selected is None:
-        return None
-    if getattr(info, "filename", None) == getattr(selected, "filename", None):
-        return None
-    return getattr(info, "name", None) or getattr(info, "title", None)
-
-
-def cell_overrides(override_settings, modules, base_modules, carry_checkpoint=None):
-    """A NEW ``override_settings`` dict for the cell, or ``None`` when ``modules`` is the selection already.
-
-    New because xyz_grid gives every cell a shallow copy of ``p``: the dict is the parent's, shared by every cell (and
-    the stock Checkpoint axis reads ``sd_model_checkpoint`` from it). An API caller's checkpoint is kept."""
-    if list(modules) == list(base_modules):
-        return None
-    settings = dict(override_settings or {})
-    settings[MODULES_KEY] = list(modules)
-    if carry_checkpoint and CHECKPOINT_KEY not in (override_settings or {}):
-        settings[CHECKPOINT_KEY] = carry_checkpoint
-    return settings
+def swap_entries(listing, base, cell) -> list:
+    """``listing`` (Forge's ``Module N`` list for the selection, e.g. with the stock VAE axis's VAE swapped in) with the
+    entries the cell took out of ``base`` removed and the ones it put in added (order kept, new ones last)."""
+    removed = [entry for entry in base if entry not in cell]
+    added = [entry for entry in cell if entry not in base]
+    out = [entry for entry in listing if entry not in removed]
+    return out + [entry for entry in added if entry not in out]

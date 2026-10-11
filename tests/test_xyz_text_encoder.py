@@ -1,17 +1,20 @@
-"""XYZ ``[Modules] Text Encoder`` — the pure logic (sam3ext/xyz_text_encoder.py), without Forge.
+"""XYZ ``[Modules] Text Encoder`` — the pure logic (sam3ext/xyz_text_encoder.py, sam3ext/gguf_header.py), without Forge.
 
 * the slot classifier on headers of every replace_state_dict branch (Forge's own function on the same headers:
   tests/test_xyz_text_encoder_origin.py) and the special files (Qwen3.5, the Anima 3.8B adapter, VAEs …);
-* real small ``.safetensors`` files: the header reader and its (path, size, mtime) cache;
-* values (name, relative path, stem, ``a + b``), the cell's module list (``compose``), the dropdown choices, the
-  cell labels and the cell's ``override_settings``.
+* real small ``.safetensors`` and ``.gguf`` files: the header readers and their (path, size, mtime) cache, GGUF tensor
+  names through Forge's renames;
+* what a checkpoint has built in (model type, encoder slots);
+* values (name, relative path, stem, ``a + b``, ``None``), the cell's module list (``compose``, also with the
+  checkpoint's built-in encoders and on top of another Text Encoder axis), the dropdown choices, the cell labels and the
+  cell's ``Module N`` list.
 """
 from __future__ import annotations
 
 import os
+import struct
 import sys
 import tempfile
-import types
 import unittest
 from pathlib import Path
 
@@ -19,9 +22,10 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from sam3ext import gguf_header  # noqa: E402
 from sam3ext import xyz_text_encoder as xte  # noqa: E402
 from tests import _xyz_text_encoder_support as fx  # noqa: E402
-from sam3ext.xyz_text_encoder import Kind  # noqa: E402
+from sam3ext.xyz_text_encoder import Checkpoint, Kind  # noqa: E402
 
 
 class TeSlotsTests(unittest.TestCase):
@@ -76,6 +80,11 @@ class ClassifyTests(unittest.TestCase):
         self.assertEqual(self.kind("qwen35_4b", "Qwen3.5-4B.safetensors").kind, "qwen35")
         self.assertEqual(self.kind("qwen35_4b", "other.safetensors").kind, "unknown")
 
+    def test_qwen35_filter_only_takes_safetensors(self):
+        # sam-extra's loader filter (anima38/files.py is_unused_qwen35_module) drops only .safetensors files
+        self.assertEqual(self.kind("qwen35_4b", "qwen35_4b.sft").kind, "unknown")
+        self.assertEqual(self.kind("qwen35_4b", "qwen35_4b.gguf").kind, "unknown")
+
     def test_v2_connector_metadata_is_an_adapter(self):
         h = fx.header({"x": [1]}, {"architecture": "anima_qwen35_quality_anchored_semantic_connector_v2"})
         self.assertEqual(xte.classify_header("c.safetensors", h).kind, "adapter")
@@ -83,9 +92,39 @@ class ClassifyTests(unittest.TestCase):
     def test_is_te_entry(self):
         self.assertTrue(Kind("te", ("qwen3_06b",)).is_te_entry)
         self.assertTrue(Kind("multi", ("clip_g", "clip_l")).is_te_entry)
-        self.assertTrue(Kind("opaque", detail=".gguf", in_te_dir=True).is_te_entry)
-        for kind in (Kind("opaque", detail=".gguf"), Kind("vae"), Kind("qwen35"), Kind("adapter"), Kind("unknown")):
+        self.assertTrue(Kind("opaque", detail=".pt", in_te_dir=True).is_te_entry)
+        for kind in (Kind("opaque", detail=".pt"), Kind("vae"), Kind("qwen35"), Kind("adapter"), Kind("unknown")):
             self.assertFalse(kind.is_te_entry, kind)
+
+
+class GgufRemapTests(unittest.TestCase):
+    def test_every_case(self):
+        for name, (shapes, expected) in fx.GGUF_CASES.items():
+            with self.subTest(case=name):
+                header = xte.gguf_header(shapes)
+                self.assertEqual(xte.te_slots(header), frozenset(expected))
+
+    def test_t5_names(self):
+        header = xte.gguf_header(fx.GGUF_CASES["t5xxl_q8"][0])
+        self.assertEqual(set(header), {"encoder.block.0.layer.0.SelfAttention.k.weight", "shared.weight",
+                                       "encoder.block.0.layer.0.layer_norm.weight", "encoder.final_layer_norm.weight"})
+        self.assertEqual(header["shared.weight"], {"shape": [32128, 4096]})
+
+    def test_llm_names(self):
+        header = xte.gguf_header(fx.GGUF_CASES["qwen3_06b_q8"][0])
+        self.assertEqual(set(header), {"model.layers.0.input_layernorm.weight", "model.layers.0.self_attn.q_norm.weight",
+                                       "model.layers.0.post_attention_layernorm.weight",
+                                       "model.layers.0.self_attn.q_proj.weight", "model.embed_tokens.weight"})
+
+    def test_vision_names(self):
+        shapes = dict(fx.GGUF_CASES["qwen25_vision_mmproj"][0], **{"v.patch_embd.weight.1": [1280, 3, 14, 14]})
+        header = xte.gguf_header(shapes)
+        self.assertIn("visual.blocks.0.attn.proj.weight", header)
+        self.assertIn("visual.merger.mlp.0.weight", header)
+        self.assertNotIn("v.patch_embd.weight.1", header)
+
+    def test_none(self):
+        self.assertIsNone(xte.gguf_header(None))
 
 
 class FileTests(unittest.TestCase):
@@ -112,23 +151,41 @@ class FileTests(unittest.TestCase):
         self.assertEqual(xte.classify_file(adapter).kind, "adapter")
         self.assertEqual(xte.classify_file(sft), Kind("te", ("t5xxl",)))
 
+    def test_gguf_files_are_read_by_their_tensor_names(self):
+        for name, (shapes, expected) in fx.GGUF_CASES.items():
+            with self.subTest(case=name):
+                path = fx.write_gguf(self.dir / "text_encoder" / f"{name}.gguf", shapes)
+                kind = xte.classify_file(path)
+                if expected:
+                    self.assertEqual(kind, Kind("te", tuple(expected)))
+                else:
+                    self.assertEqual(kind.kind, "unknown")
+
+    def test_gguf_vae(self):
+        path = fx.write_gguf(self.dir / "VAE" / "vae.gguf", {"decoder.conv_in.weight": [512, 16, 3, 3]})
+        self.assertEqual(xte.classify_file(path).kind, "vae")
+
     def test_unreadable_and_missing(self):
         bad = self.dir / "broken.safetensors"
         bad.write_bytes(b"\x05\x00")
         self.assertEqual(xte.classify_file(bad).kind, "unreadable")
         self.assertEqual(xte.classify_file(self.dir / "missing.safetensors").kind, "unreadable")
+        gguf = self.dir / "broken.gguf"
+        gguf.write_bytes(b"GGUF")
+        self.assertEqual(xte.classify_file(gguf).kind, "unreadable")
+        self.assertEqual(xte.classify_file(self.dir / "missing.gguf").kind, "unreadable")
 
-    def test_opaque_files_are_placed_by_folder(self):
+    def test_pickle_files_are_placed_by_folder(self):
         roots = [self.dir / "text_encoder"]
-        te = self.dir / "text_encoder" / "sub" / "t5-q8.gguf"
+        te = self.dir / "text_encoder" / "sub" / "t5.pt"
         te.parent.mkdir(parents=True)
-        te.write_bytes(b"GGUF")
-        other = self.dir / "VAE" / "vae.gguf"
+        te.write_bytes(b"PK")
+        other = self.dir / "VAE" / "vae.pt"
         other.parent.mkdir(parents=True)
-        other.write_bytes(b"GGUF")
-        self.assertEqual(xte.classify_file(te, te_roots=roots), Kind("opaque", detail=".gguf", in_te_dir=True))
-        self.assertEqual(xte.classify_file(other, te_roots=roots), Kind("opaque", detail=".gguf", in_te_dir=False))
-        self.assertEqual(xte.classify_file(self.dir / "x.pt", te_roots=roots).in_te_dir, False)
+        other.write_bytes(b"PK")
+        self.assertEqual(xte.classify_file(te, te_roots=roots), Kind("opaque", detail=".pt", in_te_dir=True))
+        self.assertEqual(xte.classify_file(other, te_roots=roots), Kind("opaque", detail=".pt", in_te_dir=False))
+        self.assertEqual(xte.classify_file(self.dir / "x.bin", te_roots=roots).in_te_dir, False)
 
     def test_cache_follows_size_and_mtime(self):
         path = self.dir / "te.safetensors"
@@ -148,15 +205,136 @@ class FileTests(unittest.TestCase):
 
     def test_cache_hit_does_not_read_the_file(self):
         path = fx.write_safetensors(self.dir / "te.safetensors", fx.CASES["qwen3_06b"][0])
+        gguf = fx.write_gguf(self.dir / "te.gguf", fx.GGUF_CASES["t5xxl_q8"][0])
         xte.classify_file(path)
+        xte.classify_file(gguf)
         calls = []
-        original = xte.read_safetensors_header
-        xte.read_safetensors_header = lambda p: calls.append(p) or original(p)
+        original_st, original_gguf = xte.read_safetensors_header, xte.read_gguf_shapes
+        xte.read_safetensors_header = lambda p: calls.append(p) or original_st(p)
+        xte.read_gguf_shapes = lambda p: calls.append(p) or original_gguf(p)
         try:
             xte.classify_file(path)
+            xte.classify_file(gguf)
         finally:
-            xte.read_safetensors_header = original
+            xte.read_safetensors_header, xte.read_gguf_shapes = original_st, original_gguf
         self.assertEqual(calls, [])
+
+
+class GgufReaderTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.dir = Path(self.tmp.name)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def read(self, shapes, **kwargs):
+        return gguf_header.read_gguf_shapes(fx.write_gguf(self.dir / "f.gguf", shapes, **kwargs))
+
+    def test_shapes_are_the_dimensions_reversed(self):
+        self.assertEqual(self.read({"a": [32128, 4096], "b": [1024], "c": [2, 3, 4]}),
+                         {"a": (32128, 4096), "b": (1024,), "c": (2, 3, 4)})
+
+    def test_orig_shape_wins(self):
+        got = self.read({"a": [4, 8], "b": [2]}, orig_shapes={"a": [32128, 1]})
+        self.assertEqual(got, {"a": (32128, 1), "b": (2,)})
+
+    def test_other_keys_are_skipped(self):
+        kv = [("general.name", fx.GGUF_STRING, "t5"), ("general.alignment", fx.GGUF_UINT32, 32),
+              ("tokenizer.tokens", fx.GGUF_ARRAY, (fx.GGUF_STRING, ["<pad>", "</s>", "▁the"] * 50)),
+              ("scores", fx.GGUF_ARRAY, (fx.GGUF_FLOAT32, [0.5] * 40)),
+              ("nested", fx.GGUF_ARRAY, (fx.GGUF_ARRAY, [(fx.GGUF_UINT32, [1, 2]), (fx.GGUF_UINT32, [3])])),
+              # not INT32: not a shape (Forge's get_orig_shape wants ARRAY of INT32)
+              ("comfy.gguf.orig_shape.b", fx.GGUF_ARRAY, (fx.GGUF_UINT64, [7, 7])),
+              ("comfy.gguf.orig_shape.c", fx.GGUF_ARRAY, (fx.GGUF_INT32, []))]
+        self.assertEqual(self.read({"a": [3], "b": [5], "c": [6]}, kv=kv), {"a": (3,), "b": (5,), "c": (6,)})
+
+    def test_a_duplicated_key_keeps_its_first_value(self):
+        kv = [("comfy.gguf.orig_shape.a", fx.GGUF_ARRAY, (fx.GGUF_INT32, [10]))]
+        got = self.read({"a": [3]}, kv=kv, orig_shapes={"a": [20]})
+        self.assertEqual(got, {"a": (10,)})
+
+    def test_version_two_and_data(self):
+        self.assertEqual(self.read({"a": [2, 2]}, version=2, with_data=True), {"a": (2, 2)})
+
+    def test_what_forge_cannot_open(self):
+        cases = {
+            "bad magic": dict(magic=b"GGUG"),
+            "version 1": dict(version=1),
+            "version 4": dict(version=4),
+            "big-endian": dict(order=">"),
+        }
+        for name, kwargs in cases.items():
+            with self.subTest(case=name):
+                self.assertIsNone(self.read({"a": [2]}, **kwargs))
+        with self.subTest(case="not utf-8"):
+            self.assertIsNone(self.read({"a": [2]}, raw_names={"a": b"\xff\xfe"}))
+
+    def test_duplicated_tensor(self):
+        path = fx.write_gguf(self.dir / "f.gguf", {"a": [2], "b": [3]}, raw_names={"b": b"a"})
+        self.assertIsNone(gguf_header.read_gguf_shapes(path))
+
+    def test_truncated(self):
+        path = fx.write_gguf(self.dir / "f.gguf", {"a": [2], "b": [3]})
+        data = path.read_bytes()
+        for cut in (3, 10, 30, len(data) - 1):
+            with self.subTest(cut=cut):
+                path.write_bytes(data[:cut])
+                self.assertIsNone(gguf_header.read_gguf_shapes(path))
+
+    def test_absurd_counts(self):
+        path = self.dir / "f.gguf"
+        path.write_bytes(b"GGUF" + struct.pack("<IQQ", 3, 1 << 60, 0))
+        self.assertIsNone(gguf_header.read_gguf_shapes(path))
+        path.write_bytes(b"GGUF" + struct.pack("<IQQ", 3, 0, 1) + struct.pack("<Q", 1 << 60))
+        self.assertIsNone(gguf_header.read_gguf_shapes(path))
+
+    def test_missing_file(self):
+        self.assertIsNone(gguf_header.read_gguf_shapes(self.dir / "nope.gguf"))
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# Checkpoints
+# ---------------------------------------------------------------------------------------------------------------------
+
+class CheckpointTests(unittest.TestCase):
+    def test_every_case(self):
+        for name, (shapes, model_type, slots) in fx.CHECKPOINTS.items():
+            with self.subTest(case=name):
+                self.assertEqual(xte.checkpoint_profile(name, fx.header(shapes)), Checkpoint(name, model_type,
+                                                                                            frozenset(slots)))
+
+    def test_loads(self):
+        expected = {"-": (False, False), "sd1": (True, False), "xlrf": (False, True), "sdxl": (True, True),
+                    "flux": (True, False)}
+        for model_type, (clip_l, clip_g) in expected.items():
+            checkpoint = Checkpoint("c", model_type)
+            self.assertEqual((checkpoint.loads("clip_l"), checkpoint.loads("clip_g")), (clip_l, clip_g), model_type)
+            self.assertTrue(checkpoint.loads("t5xxl"))
+            self.assertTrue(checkpoint.loads("qwen3_06b"))
+
+    def test_metadata_and_unreadable(self):
+        self.assertIsNone(xte.checkpoint_profile("x", None))
+        self.assertEqual(xte.checkpoint_profile("x", fx.header({}, {"a": "b"})), Checkpoint("x"))
+
+    def test_files(self):
+        with tempfile.TemporaryDirectory() as folder:
+            xte.clear_cache()
+            path = fx.write_checkpoint(folder, "sdxl")
+            self.assertEqual(xte.checkpoint_file(path), Checkpoint("sdxl.safetensors", "sdxl",
+                                                                  frozenset({"clip_l", "clip_g"})))
+            self.assertEqual(xte.checkpoint_file(path, "sdxl_base_1.0").name, "sdxl_base_1.0")
+            gguf = fx.write_gguf(Path(folder) / "flux1-dev-Q8_0.gguf", fx.GGUF_CASES["flux_unet_q8"][0])
+            self.assertEqual(xte.checkpoint_file(gguf), Checkpoint("flux1-dev-Q8_0.gguf", "flux"))
+            ckpt = Path(folder) / "v1-5.ckpt"
+            ckpt.write_bytes(b"PK")
+            self.assertIsNone(xte.checkpoint_file(ckpt))
+            self.assertIsNone(xte.checkpoint_file(Path(folder) / "missing.safetensors"))
+            self.assertIsNone(xte.checkpoint_file(None))
+            broken = Path(folder) / "broken.safetensors"
+            broken.write_bytes(b"\x01")
+            self.assertIsNone(xte.checkpoint_file(broken))
+            xte.clear_cache()
 
 
 # ---------------------------------------------------------------------------------------------------------------------
@@ -180,16 +358,23 @@ FILES = {
     "Anima-3.8B-expanded_adapter.safetensors": (TE, Kind("adapter")),
     "h3_qwen3vl_8b_tap24.safetensors": (TE, Kind("unknown")),
     "qwen3vl_32b_two_slots.safetensors": (TE, Kind("multi", ("qwen25_7b", "qwen3_8b"))),
-    # Flux-style files (not on the development PC)
+    # Flux / SDXL-style files (not on the development PC)
     "ae.safetensors": (VAE, Kind("vae")),
     "clip_l.safetensors": (TE + r"\flux", Kind("te", ("clip_l",))),
     "clip_l_other.safetensors": (TE, Kind("te", ("clip_l",))),
+    "clip_g.safetensors": (TE, Kind("te", ("clip_g",))),
     "t5xxl_fp16.safetensors": (TE + r"\flux", Kind("te", ("t5xxl",))),
     "t5xxl_fp8.safetensors": (TE, Kind("te", ("t5xxl",))),
+    "flan-t5-xxl-fp16.safetensors": (TE, Kind("te", ("t5xxl",))),
     "clip_lg_combined.safetensors": (TE, Kind("multi", ("clip_g", "clip_l"))),
-    "t5-q8.gguf": (TE, Kind("opaque", detail=".gguf", in_te_dir=True)),
-    "t5-q4.gguf": (TE, Kind("opaque", detail=".gguf", in_te_dir=True)),
-    "vae-q8.gguf": (VAE, Kind("opaque", detail=".gguf")),
+    # GGUF encoders are read by their tensor names (FileTests): a slot like any safetensors encoder
+    "t5-v1_1-xxl-encoder-Q8_0.gguf": (TE, Kind("te", ("t5xxl",))),
+    "t5-v1_1-xxl-encoder-Q4_K_M.gguf": (TE, Kind("te", ("t5xxl",))),
+    "Qwen3-0.6B-Q8_0.gguf": (TE, Kind("te", ("qwen3_06b",))),
+    # pickle files are not read
+    "t5-old.pt": (TE, Kind("opaque", detail=".pt", in_te_dir=True)),
+    "t5-older.bin": (TE, Kind("opaque", detail=".bin", in_te_dir=True)),
+    "vae-old.pt": (VAE, Kind("opaque", detail=".pt")),
     "a+b.safetensors": (TE, Kind("te", ("qwen3_06b",))),
 }
 MODULE_LIST = {name: f"{folder}\\{name}" for name, (folder, _) in FILES.items()}
@@ -208,17 +393,33 @@ def paths(*names):
 ANIMA = paths("qwen_image_vae.safetensors", "qwen_3_06b_base.safetensors")
 KREA = paths("qwen_image_vae.safetensors", "krea2UncensoredLLMCLIP_v10.safetensors")
 FLUX = paths("ae.safetensors", "clip_l.safetensors", "t5xxl_fp16.safetensors")
+FLUX_GGUF = paths("ae.safetensors", "clip_l.safetensors", "t5-v1_1-xxl-encoder-Q8_0.gguf")
+
+ANIMA_CKPT = Checkpoint("anima.safetensors", "-")
+FLUX_UNET = Checkpoint("flux1-dev-fp8.safetensors", "flux")
+FLUX_AIO = Checkpoint("flux1-dev.safetensors", "flux", frozenset({"clip_l", "t5xxl"}))
+SDXL = Checkpoint("sdxl.safetensors", "sdxl", frozenset({"clip_l", "clip_g"}))
+SD1 = Checkpoint("v1-5.safetensors", "sd1", frozenset({"clip_l"}))
 
 
-def plan(value, base):
-    return xte.plan(value, base=base, module_list=MODULE_LIST, classify=classify)
+def plan(value, base, checkpoint=None):
+    return xte.plan(value, base=base, module_list=MODULE_LIST, classify=classify, checkpoint=checkpoint)
 
 
 class ValueTests(unittest.TestCase):
     def test_current(self):
-        for value in ("Use Forge current", "use forge current", " current ", "Current"):
-            self.assertEqual(xte.parse_value(value, MODULE_LIST), ())
-            self.assertIsNone(plan(value, ANIMA))
+        for value in ("Use Forge current", "use forge current", " current ", "Current", "None", "none", " NONE "):
+            with self.subTest(value=value):
+                self.assertEqual(xte.parse_value(value, MODULE_LIST), ())
+                self.assertIsNone(plan(value, ANIMA))
+
+    def test_words_for_the_selection_point_to_current(self):
+        for value in ("Default", "Automatic", "Built-in", "Use same choices"):
+            with self.subTest(value=value):
+                with self.assertRaises(xte.AxisValueError) as caught:
+                    xte.parse_value(value, MODULE_LIST)
+                self.assertIn('use "Use Forge current"', str(caught.exception))
+                self.assertNotIn("put it in models/text_encoder", str(caught.exception))
 
     def test_resolve_forms(self):
         name = "qwen_3_06b_base_full_fp32.safetensors"
@@ -228,9 +429,11 @@ class ValueTests(unittest.TestCase):
                 self.assertEqual(xte.resolve(value, MODULE_LIST), name)
         self.assertEqual(xte.resolve(r"flux\clip_l.safetensors", MODULE_LIST), "clip_l.safetensors")
         self.assertEqual(xte.resolve("flux/clip_l.safetensors", MODULE_LIST), "clip_l.safetensors")
+        # a file really named like one of the words is still that file
+        self.assertEqual(xte.resolve("default", {"default.safetensors": "x"}), "default.safetensors")
 
     def test_resolve_errors(self):
-        with self.assertRaisesRegex(xte.AxisValueError, 'unknown file "nope.safetensors"'):
+        with self.assertRaisesRegex(xte.AxisValueError, 'unknown file "nope.safetensors".*"Use Forge current" keeps'):
             xte.resolve("nope.safetensors", MODULE_LIST)
         with self.assertRaisesRegex(xte.AxisValueError, "empty value"):
             xte.resolve("  ", MODULE_LIST)
@@ -258,13 +461,15 @@ class ComposeTests(unittest.TestCase):
     def test_anima_replace_keeps_the_vae(self):
         self.assertEqual(plan("qwen_3_06b_base_full_fp32", ANIMA),
                          paths("qwen_image_vae.safetensors", "qwen_3_06b_base_full_fp32.safetensors"))
+        self.assertEqual(plan("qwen_3_06b_base_full_fp32", ANIMA, ANIMA_CKPT),
+                         paths("qwen_image_vae.safetensors", "qwen_3_06b_base_full_fp32.safetensors"))
 
     def test_same_value_is_the_selection(self):
         self.assertEqual(plan("qwen_3_06b_base", ANIMA), ANIMA)
-        self.assertIsNone(xte.cell_overrides({}, plan("qwen_3_06b_base", ANIMA), ANIMA))
 
     def test_krea(self):
-        self.assertEqual(plan("qwen3vl_4b_bf16", KREA), paths("qwen_image_vae.safetensors", "qwen3vl_4b_bf16.safetensors"))
+        self.assertEqual(plan("qwen3vl_4b_bf16", KREA),
+                         paths("qwen_image_vae.safetensors", "qwen3vl_4b_bf16.safetensors"))
 
     def test_flux_t5_only(self):
         self.assertEqual(plan("t5xxl_fp8", FLUX), paths("ae.safetensors", "clip_l.safetensors", "t5xxl_fp8.safetensors"))
@@ -280,15 +485,54 @@ class ComposeTests(unittest.TestCase):
     def test_incompatible(self):
         with self.assertRaises(xte.AxisValueError) as caught:
             plan("qwen3vl_4b_bf16", ANIMA)
+        message = str(caught.exception)
         self.assertIn('"qwen3vl_4b_bf16.safetensors" is a Qwen3-VL 4B encoder but the current VAE / Text Encoder '
-                      'selection has none (it has: Qwen3 0.6B)', str(caught.exception))
-        # Flux: a CLIP-L next to a T5 that the checkpoint's own CLIP-L may or may not go with — not guessed
-        with self.assertRaisesRegex(xte.AxisValueError, r"CLIP-L encoder .* \(it has: T5-XXL\)"):
-            plan("clip_l_other", paths("ae.safetensors", "t5xxl_fp16.safetensors"))
+                      'selection has none (it has: Qwen3 0.6B) and the axis cannot read the checkpoint', message)
+        self.assertNotIn("not use it", message)
+        with self.assertRaises(xte.AxisValueError) as caught:
+            plan("qwen3vl_4b_bf16", ANIMA, ANIMA_CKPT)
+        self.assertIn('and the checkpoint "anima.safetensors" has none built in (it has: no encoder) - the axis only '
+                      'swaps an encoder the model already has', str(caught.exception))
+        # Flux UNet-only with a T5 but no CLIP-L: whether the model reads a CLIP-L is not guessed
+        with self.assertRaisesRegex(xte.AxisValueError, r"CLIP-L encoder but .* \(it has: T5-XXL\)"):
+            plan("clip_l_other", paths("ae.safetensors", "t5xxl_fp16.safetensors"), FLUX_UNET)
 
-    def test_append_when_the_selection_has_no_encoder(self):
+    def test_checkpoint_built_in_encoder_is_replaced(self):
+        # Flux all-in-one with only a T5 in the list: a CLIP-L pick replaces the checkpoint's own CLIP-L
+        self.assertEqual(plan("clip_l_other", paths("ae.safetensors", "t5xxl_fp16.safetensors"), FLUX_AIO),
+                         paths("ae.safetensors", "clip_l_other.safetensors", "t5xxl_fp16.safetensors"))
+        # SDXL with only a CLIP-L override: a CLIP-G pick replaces the built-in CLIP-G
+        self.assertEqual(plan("clip_g", paths("clip_l_other.safetensors"), SDXL),
+                         paths("clip_g.safetensors", "clip_l_other.safetensors"))
+        # SDXL with its built-in encoders only
+        self.assertEqual(plan("clip_l_other", [], SDXL), paths("clip_l_other.safetensors"))
+        self.assertEqual(plan("clip_l_other + clip_g", [], SDXL), paths("clip_g.safetensors", "clip_l_other.safetensors"))
+
+    def test_slots_the_checkpoint_does_not_have(self):
+        # SDXL / SD1 with the encoders built in and nothing in the list: T5 / Qwen would be loaded and never read
+        for value in ("t5xxl_fp8", "qwen_3_06b_base", "krea2UncensoredLLMCLIP_v10"):
+            with self.subTest(value=value):
+                with self.assertRaises(xte.AxisValueError) as caught:
+                    plan(value, [], SDXL)
+                self.assertIn('the checkpoint "sdxl.safetensors" has none built in (it has: CLIP-G, CLIP-L)',
+                              str(caught.exception))
+        with self.assertRaises(xte.AxisValueError) as caught:
+            plan("t5xxl_fp8", [], SD1)
+        self.assertIn('selection has no text encoder and the checkpoint "v1-5.safetensors" has none built in (it has: '
+                      'CLIP-L)', str(caught.exception))
+
+    def test_clip_for_a_family_without_clip(self):
+        # replace_state_dict drops CLIP-G for SD1 and CLIP-L / CLIP-G for model type "-" (Anima, Krea2 …)
+        with self.assertRaisesRegex(xte.AxisValueError, 'is a CLIP-G encoder, which Forge does not load for the '
+                                                        'checkpoint "v1-5.safetensors"'):
+            plan("clip_g", [], SD1)
+        with self.assertRaisesRegex(xte.AxisValueError, "is a CLIP-L encoder, which Forge does not load"):
+            plan("clip_l_other", ANIMA + paths("clip_l.safetensors"), ANIMA_CKPT)
+
+    def test_append_when_the_model_has_no_encoder_the_axis_can_see(self):
         self.assertEqual(plan("qwen_3_06b_base", paths("qwen_image_vae.safetensors")), ANIMA)
-        self.assertEqual(plan("clip_l + t5xxl_fp8", paths("ae.safetensors")),
+        self.assertEqual(plan("qwen_3_06b_base", paths("qwen_image_vae.safetensors"), ANIMA_CKPT), ANIMA)
+        self.assertEqual(plan("clip_l + t5xxl_fp8", paths("ae.safetensors"), FLUX_UNET),
                          paths("ae.safetensors", "clip_l.safetensors", "t5xxl_fp8.safetensors"))
         self.assertEqual(plan("qwen_3_06b_base", []), paths("qwen_3_06b_base.safetensors"))
 
@@ -319,7 +563,7 @@ class ComposeTests(unittest.TestCase):
             "Anima-3.8B-expanded_adapter": "is an Anima 3.8B adapter, not a text encoder - choose it in the Anima 3.8B",
             "h3_qwen3vl_8b_tap24": "no text-encoder key Forge recognises",
             "qwen3vl_32b_two_slots": r"fills several slots: Qwen2.5-VL 7B, Qwen3 8B",
-            "vae-q8.gguf": "outside a text-encoder folder",
+            "vae-old.pt": "a pickle file outside a text-encoder folder",
         }
         for value, message in expected.items():
             with self.subTest(value=value):
@@ -331,26 +575,49 @@ class ComposeTests(unittest.TestCase):
         with self.assertRaisesRegex(xte.AxisValueError, "only part of"):
             plan("clip_l_other", paths("clip_lg_combined.safetensors"))
 
-    def test_gguf(self):
-        gguf_base = paths("ae.safetensors", "clip_l.safetensors", "t5-q8.gguf")
-        # GGUF replaces the selection's one encoder ...
-        self.assertEqual(plan("t5-q4.gguf", paths("ae.safetensors", "t5xxl_fp16.safetensors")),
-                         paths("ae.safetensors", "t5-q4.gguf"))
-        self.assertEqual(plan("t5-q4.gguf", paths("ae.safetensors", "t5-q8.gguf")), paths("ae.safetensors", "t5-q4.gguf"))
-        # ... a safetensors encoder replaces a GGUF that is the selection's one encoder
-        self.assertEqual(plan("t5xxl_fp8", paths("ae.safetensors", "t5-q8.gguf")),
+    def test_gguf_encoders_have_a_slot(self):
+        # the common low-VRAM Flux setup: CLIP-L safetensors + T5 GGUF
+        self.assertEqual(plan("t5xxl_fp8", FLUX_GGUF),
+                         paths("ae.safetensors", "clip_l.safetensors", "t5xxl_fp8.safetensors"))
+        self.assertEqual(plan("t5-v1_1-xxl-encoder-Q4_K_M", FLUX_GGUF),
+                         paths("ae.safetensors", "clip_l.safetensors", "t5-v1_1-xxl-encoder-Q4_K_M.gguf"))
+        self.assertEqual(plan("t5-v1_1-xxl-encoder-Q4_K_M", FLUX),
+                         paths("ae.safetensors", "clip_l.safetensors", "t5-v1_1-xxl-encoder-Q4_K_M.gguf"))
+        self.assertEqual(plan("clip_l_other + t5-v1_1-xxl-encoder-Q4_K_M.gguf", FLUX),
+                         paths("ae.safetensors", "clip_l_other.safetensors", "t5-v1_1-xxl-encoder-Q4_K_M.gguf"))
+        self.assertEqual(plan("Qwen3-0.6B-Q8_0", ANIMA), paths("qwen_image_vae.safetensors", "Qwen3-0.6B-Q8_0.gguf"))
+
+    def test_a_gguf_of_the_slot_never_survives_next_to_the_pick(self):
+        # a GGUF T5 and a safetensors T5 both in the list: the pick replaces both (Forge would load the GGUF last,
+        # sorted, and its T5 branch would wipe the pick)
+        base = paths("ae.safetensors", "clip_l.safetensors", "t5-v1_1-xxl-encoder-Q8_0.gguf", "t5xxl_fp16.safetensors")
+        self.assertEqual(plan("flan-t5-xxl-fp16", base),
+                         paths("ae.safetensors", "clip_l.safetensors", "flan-t5-xxl-fp16.safetensors"))
+
+    def test_pickle(self):
+        # a pickle file replaces the selection's one encoder ...
+        self.assertEqual(plan("t5-old.pt", paths("ae.safetensors", "t5xxl_fp16.safetensors")),
+                         paths("ae.safetensors", "t5-old.pt"))
+        self.assertEqual(plan("t5-old.pt", paths("ae.safetensors", "t5-older.bin")), paths("ae.safetensors", "t5-old.pt"))
+        # ... a safetensors encoder replaces a pickle file that is the selection's one encoder
+        self.assertEqual(plan("t5xxl_fp8", paths("ae.safetensors", "t5-old.pt")),
                          paths("ae.safetensors", "t5xxl_fp8.safetensors"))
         # ... but not with two encoders, none, or in a pair
         with self.assertRaisesRegex(xte.AxisValueError, "which has 2"):
-            plan("t5-q4.gguf", FLUX)
+            plan("t5-old.pt", FLUX)
         with self.assertRaisesRegex(xte.AxisValueError, "which has 0"):
-            plan("t5-q4.gguf", paths("ae.safetensors"))
+            plan("t5-old.pt", paths("ae.safetensors"))
         with self.assertRaisesRegex(xte.AxisValueError, "only be used alone"):
-            plan("clip_l_other + t5-q4.gguf", FLUX)
-        with self.assertRaisesRegex(xte.AxisValueError, r"it has: CLIP-L, a GGUF encoder"):
-            plan("t5xxl_fp8", gguf_base)
-        # a GGUF VAE in the selection is not an encoder
-        self.assertEqual(plan("qwen_3_06b_base", paths("vae-q8.gguf")), paths("vae-q8.gguf", "qwen_3_06b_base.safetensors"))
+            plan("clip_l_other + t5-old.pt", FLUX)
+        # a pickle encoder next to a CLIP-L: the axis cannot tell whether it is the T5 - it says so
+        with self.assertRaises(xte.AxisValueError) as caught:
+            plan("t5xxl_fp8", paths("ae.safetensors", "clip_l.safetensors", "t5-old.pt"))
+        message = str(caught.exception)
+        self.assertIn('cannot tell whether "t5-old.pt" (a pickle file, not read without loading it) fills that slot',
+                      message)
+        self.assertNotIn("not use it", message)
+        # a pickle VAE in the selection is not an encoder
+        self.assertEqual(plan("qwen_3_06b_base", paths("vae-old.pt")), paths("vae-old.pt", "qwen_3_06b_base.safetensors"))
 
     def test_effective_base(self):
         self.assertEqual(xte.effective_base({}, ANIMA), ANIMA)
@@ -359,41 +626,108 @@ class ComposeTests(unittest.TestCase):
         self.assertEqual(xte.effective_base({"forge_additional_modules": "a"}, ANIMA), ANIMA)
 
 
+class TwoAxesTests(unittest.TestCase):
+    def slots(self, value):
+        return xte.pick_slots(value, MODULE_LIST, classify)
+
+    def test_pick_slots(self):
+        self.assertEqual(self.slots("Use Forge current"), frozenset())
+        self.assertEqual(self.slots("None"), frozenset())
+        self.assertEqual(self.slots("clip_l_other"), {"clip_l"})
+        self.assertEqual(self.slots("clip_l_other + t5xxl_fp8"), {"clip_l", "t5xxl"})
+        self.assertEqual(self.slots("t5-old.pt"), {xte.UNKNOWN_SLOT})
+        with self.assertRaises(xte.AxisValueError):
+            self.slots("nope")
+
+    def test_overlap(self):
+        self.assertEqual(xte.overlap(frozenset({"clip_l"}), frozenset({"t5xxl"})), frozenset())
+        self.assertEqual(xte.overlap(frozenset({"clip_l", "t5xxl"}), frozenset({"t5xxl"})), {"t5xxl"})
+        self.assertTrue(xte.overlap(frozenset({xte.UNKNOWN_SLOT}), frozenset({"t5xxl"})))
+        self.assertEqual(xte.overlap(frozenset({xte.UNKNOWN_SLOT}), frozenset()), frozenset())
+
+    def test_second_axis_builds_on_the_first(self):
+        first = plan("clip_l_other", FLUX)
+        self.assertEqual(plan("t5xxl_fp8", first),
+                         paths("ae.safetensors", "clip_l_other.safetensors", "t5xxl_fp8.safetensors"))
+
+    def test_what_the_first_axis_added_is_not_the_selections(self):
+        # nothing in the list (a checkpoint the axis cannot read, or Flux UNet-only): each axis adds its encoder, as its
+        # confirm accepted against the selection
+        for checkpoint in (None, FLUX_UNET):
+            with self.subTest(checkpoint=checkpoint):
+                first = plan("clip_l_other", paths("ae.safetensors"), checkpoint)
+                added = [entry for entry in first if entry not in paths("ae.safetensors")]
+                self.assertEqual(xte.plan("t5xxl_fp8", base=first, module_list=MODULE_LIST, classify=classify,
+                                          checkpoint=checkpoint, added=added),
+                                 paths("ae.safetensors", "clip_l_other.safetensors", "t5xxl_fp8.safetensors"))
+                with self.assertRaisesRegex(xte.AxisValueError, "T5-XXL encoder but"):
+                    plan("t5xxl_fp8", first, checkpoint)
+
+
 class ChoicesTests(unittest.TestCase):
-    def test_anima_selection_gives_the_four_qwen3_06b_files(self):
-        self.assertEqual(xte.choices(MODULE_LIST, MODULE_MAP, ANIMA, classify), [
-            "Use Forge current", "a+b.safetensors", "qwen_3_06b_base.safetensors",
-            "qwen_3_06b_base_fp16_uncensored.safetensors", "qwen_3_06b_base_fp32_uncensored.safetensors",
-            "qwen_3_06b_base_full_fp32.safetensors"])
+    def choices(self, current, checkpoint=None, **kwargs):
+        return xte.choices(MODULE_LIST, MODULE_MAP, current, classify, checkpoint=checkpoint, **kwargs)
+
+    def test_anima_selection_gives_the_qwen3_06b_files(self):
+        expected = ["Use Forge current", "a+b.safetensors", "Qwen3-0.6B-Q8_0.gguf", "qwen_3_06b_base.safetensors",
+                    "qwen_3_06b_base_fp16_uncensored.safetensors", "qwen_3_06b_base_fp32_uncensored.safetensors",
+                    "qwen_3_06b_base_full_fp32.safetensors"]
+        self.assertEqual(self.choices(ANIMA), expected)
+        self.assertEqual(self.choices(ANIMA, ANIMA_CKPT), expected)
 
     def test_krea_selection(self):
-        self.assertEqual(xte.choices(MODULE_LIST, MODULE_MAP, KREA, classify), [
+        self.assertEqual(self.choices(KREA), [
             "Use Forge current", "krea2UncensoredLLMCLIP_v10.safetensors", "qwen3-vl-4b-heretic.safetensors",
             "qwen3vl_4b_bf16.safetensors"])
 
     def test_no_encoder_lists_every_single_slot_encoder(self):
-        got = xte.choices(MODULE_LIST, MODULE_MAP, paths("qwen_image_vae.safetensors"), classify)
+        got = self.choices(paths("qwen_image_vae.safetensors"))
         expected = sorted((name for name, (_, kind) in FILES.items() if kind.kind == "te"), key=str.casefold)
         self.assertEqual(got, ["Use Forge current", *expected])
-        for excluded in ("qwen35_4b.safetensors", "Anima-3.8B-expanded_adapter.safetensors", "t5-q8.gguf",
+        for excluded in ("qwen35_4b.safetensors", "Anima-3.8B-expanded_adapter.safetensors", "t5-old.pt",
                          "qwen3vl_32b_two_slots.safetensors", "qwen_image_vae.safetensors"):
             self.assertNotIn(excluded, got)
 
-    def test_relative_paths_when_the_dropdown_shows_them(self):
-        got = xte.choices(MODULE_LIST, MODULE_MAP, FLUX, classify, use_short=False)
-        self.assertEqual(got, ["Use Forge current", "clip_l_other.safetensors", r"flux\clip_l.safetensors",
-                               r"flux\t5xxl_fp16.safetensors", "t5xxl_fp8.safetensors"])
+    def test_no_encoder_and_a_family_without_clip(self):
+        got = self.choices(paths("qwen_image_vae.safetensors"), ANIMA_CKPT)
+        for name in ("clip_l.safetensors", "clip_l_other.safetensors", "clip_g.safetensors"):
+            self.assertNotIn(name, got)
+        self.assertIn("qwen_3_06b_base.safetensors", got)
 
-    def test_gguf_is_never_listed(self):
-        # its slot is not read; it can still be typed in text mode (ComposeTests.test_gguf)
-        for current in (paths("ae.safetensors", "t5xxl_fp16.safetensors"), paths("ae.safetensors", "t5-q8.gguf"), FLUX,
+    def test_built_in_encoders_count_as_the_models(self):
+        # SDXL with its own CLIPs and nothing in the list: only CLIP-L / CLIP-G files
+        self.assertEqual(self.choices([], SDXL), ["Use Forge current", "clip_g.safetensors", "clip_l.safetensors",
+                                                  "clip_l_other.safetensors"])
+        # SD1: CLIP-L only (Forge drops CLIP-G)
+        self.assertEqual(self.choices([], SD1), ["Use Forge current", "clip_l.safetensors", "clip_l_other.safetensors"])
+        # Flux all-in-one with a T5 override: CLIP-L files too
+        got = self.choices(paths("ae.safetensors", "t5xxl_fp16.safetensors"), FLUX_AIO)
+        self.assertIn("clip_l_other.safetensors", got)
+        self.assertIn("t5xxl_fp8.safetensors", got)
+        self.assertNotIn("clip_g.safetensors", got)
+        self.assertNotIn("qwen_3_06b_base.safetensors", got)
+
+    def test_relative_paths_when_the_dropdown_shows_them(self):
+        got = self.choices(FLUX, use_short=False)
+        self.assertEqual(got, ["Use Forge current", "clip_l_other.safetensors", "flan-t5-xxl-fp16.safetensors",
+                               r"flux\clip_l.safetensors", r"flux\t5xxl_fp16.safetensors",
+                               "t5-v1_1-xxl-encoder-Q4_K_M.gguf", "t5-v1_1-xxl-encoder-Q8_0.gguf",
+                               "t5xxl_fp8.safetensors"])
+
+    def test_gguf_is_listed_like_safetensors(self):
+        got = self.choices(FLUX_GGUF)
+        for name in ("t5-v1_1-xxl-encoder-Q8_0.gguf", "t5-v1_1-xxl-encoder-Q4_K_M.gguf", "t5xxl_fp16.safetensors",
+                     "clip_l_other.safetensors"):
+            self.assertIn(name, got)
+
+    def test_pickle_is_never_listed(self):
+        for current in (paths("ae.safetensors", "t5xxl_fp16.safetensors"), paths("ae.safetensors", "t5-old.pt"), FLUX,
                         paths("ae.safetensors")):
-            got = xte.choices(MODULE_LIST, MODULE_MAP, current, classify)
-            for name in ("t5-q8.gguf", "t5-q4.gguf", "vae-q8.gguf"):
+            got = self.choices(current)
+            for name in ("t5-old.pt", "t5-older.bin", "vae-old.pt"):
                 self.assertNotIn(name, got)
-        # a selection whose one encoder is a GGUF has an encoder (of no known slot): nothing else is offered
-        self.assertEqual(xte.choices(MODULE_LIST, MODULE_MAP, paths("ae.safetensors", "t5-q8.gguf"), classify),
-                         ["Use Forge current"])
+        # a selection whose one encoder is a pickle file has an encoder (of no known slot): nothing else is offered
+        self.assertEqual(self.choices(paths("ae.safetensors", "t5-old.pt")), ["Use Forge current"])
 
 
 class LabelTests(unittest.TestCase):
@@ -404,41 +738,21 @@ class LabelTests(unittest.TestCase):
         self.assertEqual(self.label("qwen_3_06b_base_full_fp32.safetensors"), "Text Encoder: qwen_3_06b_base_full_fp32")
         self.assertEqual(self.label("clip_l_other + t5xxl_fp8", FLUX), "Text Encoder: clip_l_other + t5xxl_fp8")
         self.assertEqual(self.label("Use Forge current"), "Text Encoder: current (qwen_3_06b_base)")
+        self.assertEqual(self.label("None"), "Text Encoder: current (qwen_3_06b_base)")
         self.assertEqual(self.label("Use Forge current", FLUX), "Text Encoder: current (clip_l + t5xxl_fp16)")
         self.assertEqual(self.label("Use Forge current", paths("ae.safetensors")), "Text Encoder: current")
         self.assertEqual(self.label("nope"), "Text Encoder: nope")
 
 
-class CellOverridesTests(unittest.TestCase):
-    NEW = paths("qwen_image_vae.safetensors", "qwen_3_06b_base_full_fp32.safetensors")
-
-    def test_new_dict_parent_untouched(self):
-        parent = {"CLIP_stop_at_last_layers": 2}
-        new = xte.cell_overrides(parent, self.NEW, ANIMA)
-        self.assertIsNot(new, parent)
-        self.assertEqual(parent, {"CLIP_stop_at_last_layers": 2})
-        self.assertEqual(new, {"CLIP_stop_at_last_layers": 2, "forge_additional_modules": self.NEW})
-        new["forge_additional_modules"].append("x")
-        self.assertNotIn("x", self.NEW)
-
-    def test_no_op_when_unchanged(self):
-        self.assertIsNone(xte.cell_overrides({}, ANIMA, ANIMA, carry_checkpoint="other.safetensors"))
-
-    def test_checkpoint(self):
-        self.assertEqual(xte.cell_overrides({}, self.NEW, ANIMA, "b.safetensors")["sd_model_checkpoint"], "b.safetensors")
-        self.assertNotIn("sd_model_checkpoint", xte.cell_overrides({}, self.NEW, ANIMA, None))
-        kept = xte.cell_overrides({"sd_model_checkpoint": "api.safetensors"}, self.NEW, ANIMA, "b.safetensors")
-        self.assertEqual(kept["sd_model_checkpoint"], "api.safetensors")
-
-    def test_checkpoint_to_carry(self):
-        a = types.SimpleNamespace(filename=r"C:\ckpt\a.safetensors", name="a.safetensors", title="a.safetensors [1]")
-        a2 = types.SimpleNamespace(filename=r"C:\ckpt\a.safetensors", name="a.safetensors", title="a.safetensors [1]")
-        b = types.SimpleNamespace(filename=r"C:\ckpt\b.safetensors", name="b.safetensors", title="b.safetensors [2]")
-        self.assertIsNone(xte.checkpoint_to_carry({"checkpoint_info": a}, a2))   # same file, other object
-        self.assertEqual(xte.checkpoint_to_carry({"checkpoint_info": b}, a), "b.safetensors")
-        self.assertIsNone(xte.checkpoint_to_carry({}, a))
-        self.assertIsNone(xte.checkpoint_to_carry(None, a))
-        self.assertIsNone(xte.checkpoint_to_carry({"checkpoint_info": b}, None))
+class SwapEntriesTests(unittest.TestCase):
+    def test_cell_encoders_go_into_forges_list(self):
+        base = ["vae", "te"]
+        self.assertEqual(xte.swap_entries(["vae", "te"], base, ["vae", "te2"]), ["vae", "te2"])
+        # the stock VAE axis rebuilt the list from the selection with another VAE last
+        self.assertEqual(xte.swap_entries(["te", "vae_hdr"], base, ["vae", "te2"]), ["vae_hdr", "te2"])
+        # an encoder added to a selection without one
+        self.assertEqual(xte.swap_entries(["vae"], ["vae"], ["te", "vae"]), ["vae", "te"])
+        self.assertEqual(xte.swap_entries([], [], ["te"]), ["te"])
 
 
 class ConstantsTests(unittest.TestCase):
@@ -452,6 +766,8 @@ class ConstantsTests(unittest.TestCase):
         for _shapes, _metadata, expected in fx.CASES.values():
             if expected != fx.RAISES:
                 slots |= set(expected)
+        for _shapes, expected in fx.GGUF_CASES.values():
+            slots |= set(expected)
         self.assertLessEqual(slots, set(xte.SLOT_NAMES))
 
 

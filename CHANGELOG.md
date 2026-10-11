@@ -6,40 +6,56 @@
 ## 미출시 (Unreleased) — XYZ `[Modules] Text Encoder` 축
 
 Forge 기본 XYZ 에는 `VAE` 축만 있고 텍스트 인코더를 바꿔 가며 뽑는 축이 없어, **`[Modules] Text Encoder`** 축을 더합니다
-(txt2img · img2img). 칸마다 VAE / Text Encoder 드롭다운에서 그 파일을 고른 것과 똑같이 생성하고, 칸이 끝나면 원래 선택으로
-돌아갑니다. 새 스크립트 인자 · 설정 · infotext 키는 없습니다(각 이미지의 `Module N` 이 실제 목록을 적음). 다른 기능의 결과는
-그대로입니다. Forge 를 재시작하세요(새 스크립트 파일). 실제 모델로 뽑아 보지는 않았습니다(GPU 미사용 — Forge 의 설정 · 재로딩 ·
-복원 코드를 가짜 로더 위에서 돌린 CPU 테스트만).
+(txt2img · img2img). 칸마다 VAE / Text Encoder 드롭다운에서 그 파일을 고른 것과 같은 모델로 생성하고, Forge 설정(config.json ·
+드롭다운)에는 쓰지 않습니다. 새 스크립트 인자 · 설정 · infotext 키는 없습니다(각 이미지의 `Module N` 이 실제 목록을 적음). 다른
+기능의 결과는 그대로입니다. Forge 를 재시작하세요(새 스크립트 파일). 실제 모델로 뽑아 보지는 않았습니다(GPU 미사용 — Forge 의
+설정 · 재로딩 · 복원 · Hires · Refiner 코드를 가짜 로더 위에서 돌린 CPU 테스트만).
 
 ### XYZ — `[Modules] Text Encoder` (새 기능)
 
-- **값**: `Use Forge current`, 인코더 파일(드롭다운의 이름 · 하위 폴더 경로 · 확장자 뺀 이름), 텍스트 입력의 `a + b`(Flux 의
-  CLIP-L + T5 처럼 인코더가 둘인 모델). 드롭다운 후보는 지금 선택의 인코더와 같은 자리(slot)를 채우는 파일만입니다(Anima 면
-  Qwen3 0.6B, Krea2 면 Qwen3-VL 4B). 칸 라벨은 `Text Encoder: <이름>` · `Text Encoder: current (<지금 인코더>)`.
-- **자리 판정** (`sam3ext/xyz_text_encoder.py` `te_slots`): Forge Neo 2.30 `backend/loader.py` `replace_state_dict` 의 분기를 같은
-  순서로 옮긴 것을 safetensors 헤더에만 씁니다(CLIP-L/G · T5/UMT5 · Gemma 2 · Qwen3-VL 4B/8B · Qwen2.5-VL · Qwen3 0.6B/4B/8B ·
-  Ministral 3, Qwen3-VL 키와 Qwen3 키를 함께 가진 파일은 Forge 처럼 Qwen3-VL). 결과는 (경로, 크기, 수정 시각)으로 캐시합니다.
-  VAE · Anima 3.8B 의 Qwen3.5 파일 · 3.8B 어댑터 · Forge 가 못 읽는 파일 · 자리가 둘인 파일은 값으로 쓸 수 없고, 지금 선택에
-  없는 자리의 인코더(예: Anima 선택에 Qwen3-VL — 불러와도 안 쓰임)나 같은 자리의 두 파일은 그리드를 시작하기 전에 영어 오류로
-  막습니다. GGUF · pickle 은 자리를 읽을 수 없어 후보에서 빠지고, 텍스트 입력으로는 지금 선택의 인코더가 하나일 때 그것을 바꿉니다.
-  Forge 코드는 옮기지 않은 재구현이라 THIRD_PARTY_NOTICES.md 의 재구현 표에 한 줄을 더했습니다.
-- **바꾸는 방법** (`scripts/modules_xyz_text_encoder.py`): 축은 칸의 모듈 목록(지금 선택에서 그 자리만 바꾼 것)을 칸의 `p` 복사본에
-  적고, 늘 켜진 훅이 `before_process` 에서 칸에 **새** `override_settings`(`forge_additional_modules`)를 줍니다 — API 의
-  `override_settings` 와 Forge 내장 PiD 가 쓰는 길이라, Forge 가 `modules_change` · `checkpoint_change`(저장 안 함)로 모델을 다시
-  불러오고, 칸이 끝나면 `process_images` 의 `finally` 가 원래 선택을 되돌립니다(오류 · 중단 포함, 호출자가
-  `override_settings_restore_afterwards=False` 를 보내도). config.json · 드롭다운은 건드리지 않습니다. 기본 `Checkpoint name` 축이 고른
-  체크포인트는 그 칸에 함께 넘기고(축 순서와 무관), 기본 `VAE` 축은 바뀐 모델 위에서 VAE 를 바꿉니다. 처음 설정 파일에
-  `forge_additional_modules` 가 아직 없으면 되돌릴 수 있게 메모리에만 기본값을 넣습니다. cost 0.9 — `Checkpoint name`(1.0) 안쪽,
-  `VAE`(0.7) 바깥 루프.
+- **값**: `Use Forge current`(`None` 도 같음), 인코더 파일(드롭다운의 이름 · 하위 폴더 경로 · 확장자 뺀 이름), 텍스트 입력의
+  `a + b`(Flux 의 CLIP-L + T5 처럼 인코더가 둘인 모델). `Default` · `Automatic` · `Built-in` 은 `Use Forge current` 를 안내하는
+  오류입니다. 드롭다운 후보는 모델이 이미 가진 자리(slot) — 지금 선택에 든 인코더의 자리와 체크포인트에 든 인코더의 자리 — 를
+  채우는 파일만입니다. 칸 라벨은 `Text Encoder: <이름>` · `Text Encoder: current (<지금 인코더>)`.
+- **자리 판정** (`sam3ext/xyz_text_encoder.py`): Forge Neo 2.30 `backend/loader.py` `replace_state_dict` 의 분기를 같은 순서로
+  옮긴 `te_slots` 를 파일 헤더에만 씁니다(CLIP-L/G · T5/UMT5 · Gemma 2 · Qwen3-VL 4B/8B · Qwen2.5-VL · Qwen3 0.6B/4B/8B ·
+  Ministral 3, Qwen3-VL 키와 Qwen3 키를 함께 가진 파일은 Forge 처럼 Qwen3-VL). GGUF 는 새 `sam3ext/gguf_header.py`(표준 라이브러리만)가
+  텐서 표의 이름 · 모양을 Forge(gguf-py `GGUFReader` + `comfy.gguf.orig_shape`)와 같게 읽고, Forge 의 `gguf_remapping` 이름 바꾸기를
+  거쳐 판정합니다 — Flux 의 CLIP-L safetensors + T5 GGUF 같은 구성에서도 T5 를 비교할 수 있고, GGUF T5 가 고른 T5 옆에 남아 그
+  가중치를 덮어쓰지 않습니다. 체크포인트도 헤더로 계열(`sd1` · `xlrf` · `sdxl` · `flux` · 그 밖)과 내장 인코더의 자리를 읽어
+  (`checkpoint_profile`), 내장 인코더 자리의 파일은 체크포인트 것을 대신하게 더하고(Flux 올인원에 CLIP-L, SDXL 에 CLIP-G), 계열이
+  받지 않는 CLIP 과 모델이 가진 적 없는 자리(인코더가 내장된 SDXL 에 T5)는 막습니다. 결과는 (경로, 크기, 수정 시각)으로 캐시합니다.
+  VAE · Anima 3.8B 의 Qwen3.5 파일 · 3.8B 어댑터 · Forge 가 못 읽는 파일 · 자리가 둘인 파일 · 같은 자리의 두 파일도 그리드를
+  시작하기 전에 영어 오류로 막습니다. pickle(`.pt` · `.bin`)은 자리를 읽지 않아 후보에서 빠지고, 텍스트 입력으로는 지금 선택의
+  인코더가 하나일 때 그것을 바꿉니다. Forge 코드는 옮기지 않은 재구현이라 THIRD_PARTY_NOTICES.md 의 재구현 표에 한 줄을 더했습니다.
+- **바꾸는 방법** (`sam3ext/xyz_text_encoder_cell.py`, `scripts/modules_xyz_text_encoder.py`): 축은 칸의 모듈 목록을 칸의 `p`
+  복사본에 적고, 늘 켜진 훅이 `before_process` 에서 그 목록을 기본 `Checkpoint name` 축처럼 다음 모델 로드가 읽는 loading
+  parameters(`sd_models.model_data.forge_loading_parameters`, 칸의 체크포인트는 그대로)와 infotext 의 `Module N` 목록
+  (`processing._overridden_modules`)에만 넣습니다. Forge 설정(`shared.opts`)에는 쓰지 않으므로 그리드 도중 페이지를 열거나 새로
+  고칠 때(`on_preset_change` 가 설정을 저장) · 설정 적용 · 드롭다운 변경으로 config.json 이 저장돼도 사용자의 선택이 남고, 도중에
+  바꾼 드롭다운 선택이 칸이 끝날 때 되돌려지지도 않습니다. 칸이 끝나면(`postprocess`, 실패한 칸은 다음 칸이나 다음 작업이 시작될
+  때) 두 값을 원래대로 돌립니다. Forge 가 칸 안에서 설정으로 loading parameters 를 다시 만드는 곳 — API 요청의
+  `override_settings`, Hires 체크포인트 · 모듈 전환과 그 복원, Refiner 전환과 그 복원 — 은 모두
+  `main_entry.refresh_model_loading_parameters` 를 거치므로 그 함수를 한 번 감싸, 칸이 출발한 모듈 목록으로 다시 만들 때만 칸의
+  목록을(설정의 체크포인트로 다시 만들었으면 칸의 체크포인트도) 넣습니다. 다른 목록(Hires 전용 모듈, PiD, 도중에 바꾼 드롭다운)은
+  Forge 가 만든 그대로입니다. 기본 `VAE` 축이 Forge 의 `Module N` 목록을 설정에서 다시 만들면 `process` 가 칸의 인코더를 다시 넣고,
+  칸 안의 패스(ADetailer · SAM3 refine)는 칸의 모델로 그립니다. cost 0.9 — `Checkpoint name`(1.0) 안쪽, `VAE`(0.7) 바깥 루프.
+- **축 둘**: 이 축을 X · Y 처럼 두 축에 둘 수 있습니다(Flux: CLIP-L 파일 축 + T5 파일 축). 두 번째 축은 첫 축이 만든 목록 위에서
+  자기 자리만 바꾸고, 한쪽의 `Use Forge current` 는 다른 쪽 파일을 그대로 둡니다. 같은 자리를 고르는 두 축은 `confirm` 에서 막습니다.
 - **Anima 3.8B**: 0.6B 쪽(Qwen3 0.6B) 인코더를 바꿉니다. Qwen3.5 4B 는 런타임이 따로 찾으므로 대상이 아닙니다.
-- **한계**: Hires 모듈을 따로 골라 두었으면(`Use same choices` 가 아님) 2패스는 그 목록을 씁니다. 인코더가 바뀐 칸은 모델을 통째로
-  다시 불러옵니다(드롭다운에서 바꿀 때와 같음).
-- **테스트**: `tests/test_xyz_text_encoder.py`(자리 판정 · 값 · 목록 · 후보 · 라벨), `tests/test_xyz_text_encoder_script.py`(등록 ·
-  Reload UI · 훅), `tests/test_xyz_text_encoder_origin.py` — Forge 의 `replace_state_dict` 를 같은 헤더에 돌려 자리를 대조(체크아웃의
-  `models/text_encoder` 파일 헤더 포함)하고, Forge 의 `process_images` · `set_config` · `modules_change` · `checkpoint_change` ·
-  `refresh_model_loading_parameters` 와 xyz_grid 의 `apply_checkpoint` · `apply_vae` 로 그리드를 돌려 칸마다 불러온 체크포인트 · 모듈,
-  `Module N`, 그리드 뒤 원래 설정 복원을 확인합니다(체크포인트 축 양쪽 순서, VAE 축, 중간의 `Use Forge current`, 실패한 칸, API 의
-  모듈 목록). `tests/test_integration_load_order.py` 에 `[Modules]` 축 하나를 더했습니다.
+- **한계**: 자리 확인은 Checkpoint 드롭다운(API 면 `override_settings`)의 체크포인트로 합니다 — `Checkpoint name` 축의 값은 보지
+  않습니다. `.ckpt` 체크포인트는 읽지 않아 내장 인코더를 모릅니다. Hires 의 모듈을 따로 골라 두었으면(`Use same choices` 가 아님)
+  2패스는 그 목록을 씁니다. 인코더가 바뀐 칸은 모델을 통째로 다시 불러옵니다(드롭다운에서 바꿀 때와 같음).
+- **테스트**: `tests/test_xyz_text_encoder.py`(자리 판정 · GGUF 읽기 · 체크포인트 · 값 · 목록 · 축 둘 · 후보 · 라벨),
+  `tests/test_xyz_text_encoder_script.py`(등록 · Reload UI · 훅 · 축 둘 · 체크포인트), `tests/test_xyz_text_encoder_origin.py` — Forge 의
+  `replace_state_dict` · `gguf_remapping` · `preprocess_state_dict` 를 같은 헤더에 돌려 자리 · 내장 인코더를 대조하고(체크아웃의
+  `models/text_encoder` 파일 헤더 포함), GGUF 읽기를 Forge 의 gguf-py `GGUFReader` · `get_orig_shape` 와 대조하고, Forge 의
+  `process_images` · `set_config` · `modules_change` · `checkpoint_change` · `refresh_model_loading_parameters` · Hires 의 모델 전환
+  문장 · `apply_refiner` 의 전환 문장과 xyz_grid 의 `apply_checkpoint` · `apply_vae` 로 그리드를 돌려 칸마다 불러온 체크포인트 · 모듈,
+  `Module N`, 칸 도중 페이지가 저장할 설정, 그리드 뒤 원래 값을 확인합니다(체크포인트 축 양쪽 순서, VAE 축, 축 둘, 중간의
+  `Use Forge current`, 실패한 칸, API 의 모듈 목록 · 체크포인트, 도중의 드롭다운 변경, Hires · Refiner, 칸 안의 패스). 소스 가드가
+  `replace_state_dict` 의 탐지 키 · 너비 · 자리 이름 · 계열 표와 `gguf_remapping` 의 이름 표를 지킵니다.
+  `tests/test_integration_load_order.py` 에 `[Modules]` 축 하나를 더했습니다.
 
 ## v0.33.1 — IPNDM_V 4차 계수 오타 (Linear Quadratic 에서 그림이 깨지던 것)
 
