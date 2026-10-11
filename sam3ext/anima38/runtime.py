@@ -1474,6 +1474,52 @@ class Anima3BRuntime:
         if installed_processing is not None and installed_processing is not processing:
             self._reset_cond_caches(installed_processing)
 
+    def unload_models(self) -> bool:
+        """'모델 내리기' 버튼(sam3ext/unload_registry.py) — 쥔 모델과 캐시를 모두 놓는다: Qwen3.5 4B·토크나이저, v1 어댑터,
+        v2 커넥터 번들과 그 Forge 패처, run(장치 사본 포함)·Qwen3.5 특징·TE 줄 캐시. 다음 생성이 파일에서 다시 읽는다.
+
+        생성 중에는 불리지 않는다(버튼이 Forge 의 queue_lock 을 쥔 채 부른다). 예외로 끝난 생성의 설치가 남아 있으면
+        release_foreign_install 처럼 먼저 restore 로 내린다. 그것이 던져도 나머지는 놓고 예외를 올린다. 쥔 것이 있었으면 True."""
+        held = (
+            any(value is not None for value in (
+                self._qwen, self._qwen_clip, self._adapter, self._v2_models,
+                self._v2_connector_patcher, self._v2_sampling_patcher, self._installed_processing,
+            ))
+            or bool(self._v2_runs or self._semantic_cache or self._native_cache)
+        )
+        patchers = (self._v2_connector_patcher, self._v2_sampling_patcher, getattr(self._qwen_clip, "patcher", None))
+        stale = self._installed_processing
+        try:
+            if stale is not None:
+                self.restore(stale)
+        finally:
+            try:
+                self._unload_patchers(*patchers)   # Forge 목록에 아직 있으면(대개 Forge 가 먼저 내렸다)
+            finally:
+                self._drop_all()
+        return held
+
+    def _drop_all(self) -> None:
+        """unload_models 의 끝 — 모델·패처·캐시 참조를 모두 놓는다."""
+        self._qwen = None
+        self._qwen_clip = None
+        self._tokenizer = None
+        self._qwen_path = None
+        self._adapter = None
+        self._adapter_key = None
+        self._v2_models = None
+        self._v2_key = None
+        self._v2_source = None
+        self._v2_connector_patcher = None
+        self._v2_sampling_patcher = None
+        self._v2_sampling_unets = []
+        self._installed_processing = None
+        self._installed_model = None
+        self._clear_v2_runs()
+        self._v2_run_counter = 0
+        self._semantic_cache.clear()
+        self._native_cache.clear()
+
     @staticmethod
     def _reset_cond_caches(processing, include_negative: bool = True) -> None:
         """마커가 든 조건이 다음 생성(또는 hires 2차 패스)에 재사용되지 않게 이 생성 전용 캐시로 바꾼다."""
@@ -1499,3 +1545,9 @@ def shared_runtime() -> Anima3BRuntime:
     if _SHARED_RUNTIME is None:
         _SHARED_RUNTIME = Anima3BRuntime()
     return _SHARED_RUNTIME
+
+
+def unload_shared_runtime() -> bool:
+    """'모델 내리기' 버튼의 훅 — 공용 런타임이 있으면 그 모델·캐시를 놓는다(없으면 만들지 않는다). 놓은 것이 있으면 True."""
+    runtime = _SHARED_RUNTIME
+    return runtime.unload_models() if runtime is not None else False

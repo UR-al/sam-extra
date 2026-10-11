@@ -3,6 +3,63 @@
 버전 태그는 GitHub Releases에도 발행됩니다. 아래는 요약이며, guidance/속도 기능의
 상세는 [docs/GUIDANCE.md](docs/GUIDANCE.md)를 참고하세요.
 
+## 미출시 (Unreleased) — 모델 내리기 버튼
+
+notebook 레이아웃 탭 줄의 `기본값 저장` 바로 오른쪽에 **`모델 내리기`** 버튼을 더합니다(같은 모양 · 같은 줄, 버튼 옆에 자기 결과
+한 줄). 누르면 확인 없이 Forge 의 모델과 sam-extra 가 메모리에 쥔 모델을 모두 내리고 GPU 캐시를 비운 뒤
+`VRAM 사용 19.6 GB → 3.1 GB (Forge 모델 · SAM3) · 이 프로세스 예약 15.2 → 0.0 GB` 처럼 보여 줍니다(README 의 **모델 내리기 버튼**
+절). 생성 결과 · 스크립트 인자 · infotext · 설정은 그대로입니다. Forge 를 재시작하세요(새 스크립트 · JS · 바뀐 Python 파일).
+
+- **거절**: 생성 중이면 아무것도 하지 않고 `생성 중에는 내릴 수 없습니다`. Forge 의 `modules.call_queue.queue_lock` 을 기다리지
+  않고(`acquire(blocking=False)`) 잡아 보고 — txt2img/img2img Generate · API 생성 · sam-extra 의 Refine · Tile-Repair · 캐릭터
+  레퍼런스가 이 잠금을 쥐고 돈다 — 잡았어도 `shared.state` 에 작업(`job` 이름 · `job_count` ≠ 0)이 있으면 거절합니다.
+  `interrupted` 만으로는 거절하지 않습니다(쉬는 동안 Interrupt 를 누르면 다음 작업 시작까지 True 로 남음 — 중단 중인 작업은 `job`
+  으로 걸림). 내리는 동안 잠금을 쥐고 있어 그사이 누른 Generate 는 기다렸다가 시작합니다. 두 탭에서 동시에 누르면 하나씩.
+- **Forge 의 모델**: Settings 의 `Unload All Models` 와 `POST /sdapi/v1/unload-checkpoint` 가 부르는
+  `modules.sd_models.unload_model_weights` 를 그대로 한 번 부릅니다(`unload_all_models` → `FakeInitialModel` → `forge_hash` 비움 →
+  `soft_empty_cache` → `gc`). `forge_loading_parameters`(고른 체크포인트 · VAE/TE · Low Bits)는 그대로라 다음 생성의
+  `forge_model_reload` 가 같은 설정으로 다시 읽습니다 — 테스트가 Forge 체크아웃의 두 함수를 AST 로 확인합니다.
+- **sam-extra 의 해제 훅** (`sam3ext/unload_registry.py`, 이 순서): SAM3 번들(`release_sam3` — `Unload after` 의 RAM 보관 사본까지,
+  이제 버린 번들이 있었는지 돌려줌) · Anima 3.8B(`Anima3BRuntime.unload_models` 새로 — Qwen3.5 4B · 토크나이저 · v1 어댑터 · v2
+  커넥터와 Forge 패처 · run 장치 사본 · 특징/TE 줄 캐시, 예외로 남은 설치는 먼저 restore) · IP-Adapter(`IpaRuntime.unload`) ·
+  DeGrid(`DegridRuntime.unload` — VRAM 과 RAM 의 NAFNet) · TIPO(`TipoRuntime.unload`) · Modulation CLIP-L(`clear_modulation_caches`)
+  · Colorcraft(`release_caches` 새로 — 기저 벡터 · 장치 사본 · 앵커) · 샘플링 캐시(SPEED DCT 기저 · HiFlow 마스크 · MG/HiGS DCT,
+  각 `clear_*` 가 이제 bool) — 그리고 스크립트가 직접 등록하는 VAE 2x 디코더(`scripts/anima_vae_2x.py release_decoders`)와 Safe PAG 의
+  인덱스 텐서 · 지난 패스 텐서(`scripts/anima_safe_pag.py release_sampling_caches`, 같은 이름 "샘플링 캐시"). 패키지 모듈은 이름으로
+  적어 누를 때 `sys.modules` 에서 찾습니다 — import 되지 않은 모듈은 건너뛰고(쥔 것이 없음), 업데이트 뒤 재시작하지 않은 옛 모듈은
+  그 항목만 "Forge 를 다시 시작하세요" 로 실패합니다. 공용 런타임이 아직 없으면 만들지 않습니다. 새 기능(예: 얼굴 검출기)은
+  `BUILTIN_HOOKS` 한 줄이나 `register(key, 이름, 함수)` 로 더합니다. LLLite · ControlNet 모델은 Forge 의 ControlNet 이 쥐므로
+  Forge 의 내리기를 따릅니다. MCP 서버는 모델을 쥐지 않습니다.
+- **한 항목의 실패는 나머지를 막지 않습니다**: Forge 의 내리기 · 각 훅 · 캐시 비우기 · VRAM 재기를 따로 감싸, 실패한 것은 결과 글
+  끝에 `실패: TIPO` 처럼 이름을, 툴팁과 Forge 콘솔에 이유(콘솔은 traceback)를 남깁니다.
+- **비우기 · 재기**: `gc.collect()` 뒤 CUDA 가 있으면 `torch.cuda.synchronize` · `empty_cache` · `ipc_collect`. 앞뒤로
+  `torch.cuda.mem_get_info`(GPU 전체 사용 = 전체 − 남은 것, 다른 프로그램 몫 포함)와 `memory_reserved`(이 프로세스)를 잽니다
+  (장치는 Forge 의 `get_torch_device`). CUDA 가 없으면 `모델 내림 (…) · CUDA GPU 가 없어 VRAM 은 재지 않았습니다`.
+- **API**: 새 경로는 없습니다 — Forge 의 `POST /sdapi/v1/unload-checkpoint` 는 Forge 의 모델만 내린다고 README 에 적었습니다.
+
+### 파일
+
+- 새로: `sam3ext/unload_models.py`(순서 · 거절 · 결과 글, Forge · torch 는 Host 로 받는 순수 로직) · `sam3ext/unload_registry.py` ·
+  `sam3ext/ui_unload_models.py`(숨은 Gradio 버튼 — footer 의 on_after_component, 요청 id 입력 → JSON, Gradio 큐 ·
+  `concurrency_limit=1`) · `scripts/layout_unload_models.py`(연결만, Script 클래스 없음, negpip.py 보다 앞) ·
+  `javascript/notebook_unload_models.js`(기본값 저장 묶음 바로 뒤에 붙이고, 줄이 다시 그려지면 다시 붙임 · 버튼은 `aria-disabled`
+  로만 바쁨을 알려 포커스 유지) · `style.css` 한 규칙(기본값 저장의 클래스를 그대로 쓰고 `order: 2` · `margin-left: 0`).
+
+### 테스트
+
+- `test_unload_models.py`(41개): 거절(잠금이 잡혀 있으면 잠금 · Forge · 훅을 건드리지 않음, `job`/`job_count` 로 거절하고 잠금을
+  돌려줌, 쉬는 동안의 `interrupted` 는 거절 아님, 진행 중인 두 번째 클릭) · 순서(Forge 한 번 → 훅 → 캐시 → 재기 → 잠금 반환) ·
+  훅이 던져도 모두 불림 · 결과 글 · 툴팁 · JSON 형식 · 같은 이름은 한 번 · CPU 전용 경로(가짜 torch.cuda 와 진짜 torch) · 재기 실패 ·
+  `unload_model_weights` 한 번 부름과 모델 유무 · 목록(순서, 모든 항목이 실제 함수 이름인지 AST, import 안 된 모듈은 건너뜀, 옛 모듈
+  안내, 같은 key 바꿔 끼움) · 기능 훅마다 놓은 뒤 다시 쓰면 파일에서 다시 읽는지(SAM3 · Anima 3.8B · IP-Adapter · DeGrid · TIPO ·
+  Modulation · Colorcraft · 세 샘플링 행렬 · 두 스크립트의 등록과 해제) · 다른 스레드가 쥔 진짜 잠금에서 기다리지 않고 거절.
+- `test_unload_models_gradio.py`(16개, 진짜 Gradio 4.40): 숨은 버튼의 입력 · 출력 · js · 큐 · `concurrency_limit`, footer 뒤 자리,
+  process_api 로 누른 결과와 거절, 처리기가 던지지 않음, 콘솔 기록, 화면마다 한 번 · Reload UI, 일회용 footer · `forge_host()` 가
+  Forge 의 잠금 · state · sd_models · 장치를 읽는지 · Forge 의 진짜 FIFOLock · Forge 체크아웃의 unload/reload 경로(AST) · 스크립트 파일.
+- `tests/js/notebook_unload_models.test.mjs`(14개, jsdom): 기본값 저장 바로 뒤 · 같은 클래스 · 자기 결과 줄, 먼저 붙었을 때 옮김,
+  레이아웃이 없거나 Forge 기본 화면이면 없음, 다시 그린 줄에 다시 붙음, 요청 id · 결과 한 줄 · 툴팁, 거절 · 일부 실패 · 지난 결과 ·
+  두 번 누름 · 포커스 · 시간 초과 · 연결 없음, CSS.
+
 ## v0.33.1 — IPNDM_V 4차 계수 오타 (Linear Quadratic 에서 그림이 깨지던 것)
 
 **2026-10-05 정정 (GPU 확인 뒤)**: 아래 "Linear Quadratic 은 깨지던 그림이 정상으로 돌아오고" 는 틀렸습니다. 계수 오타 수정은

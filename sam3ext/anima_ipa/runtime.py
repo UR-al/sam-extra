@@ -98,6 +98,12 @@ class IpaRuntime:
             self._loaded = self._loader(self._models_dir)
         return self._loaded
 
+    def unload(self) -> bool:
+        """'모델 내리기' 버튼 — 어댑터 가중치와 SigLIP2 인코더(쉴 때 CPU RAM)를 놓는다. 다음 세션이 파일에서 다시 읽는다.
+        세션은 생성 안에서만 돌고 버튼은 생성 중에 부르지 않는다. 쥔 것이 있었으면 True."""
+        loaded, self._loaded = self._loaded, None
+        return loaded is not None
+
     @contextmanager
     def session(self, sd_model, image, options: IpaOptions) -> Iterator[int]:
         """참조를 인코딩하고, 샘플링 동안만 주입된 패처를 끼운다.
@@ -154,3 +160,9 @@ def shared_runtime() -> IpaRuntime:
     if _SHARED is None:
         _SHARED = IpaRuntime()
     return _SHARED
+
+
+def unload_shared_runtime() -> bool:
+    """'모델 내리기' 버튼의 훅(sam3ext/unload_registry.py) — 공용 런타임이 있을 때만(만들지 않는다). 놓은 것이 있으면 True."""
+    runtime = _SHARED
+    return runtime.unload() if runtime is not None else False

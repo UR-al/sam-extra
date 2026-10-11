@@ -257,6 +257,16 @@ def clear_anchor_cache():
     _ANCHOR_CACHE.clear()
 
 
+def release_caches() -> bool:
+    """The '모델 내리기' button (sam3ext/unload_registry.py): drops the family vectors (and their device copies) and the
+    anchors. The next Colorcraft run reloads the vectors and encodes its anchors again. True when anything was cached."""
+    held = bool(_BASIS_CACHE or _BASIS_DEVICE_CACHE or _ANCHOR_CACHE)
+    _BASIS_DEVICE_CACHE.clear()
+    _BASIS_CACHE.clear()
+    _ANCHOR_CACHE.clear()
+    return held
+
+
 def encode_anchors(vae, latent_format, colors, cache, device=None):
     """Model-space anchors for ``colors`` — ``vae.encode`` of a flat 512x512 image + ``process_in``.
 
@@ -798,6 +808,6 @@ def _without_anchor_edits(pairs):
 __all__ = [
     "ANCHOR_CACHE_LIMIT", "INFOTEXT_PRE_DD", "OPT_LOG", "OPT_PRE_DD", "OWNER", "OWNER_ATTR", "attach",
     "clear_anchor_cache", "detach_owned", "encode_anchors", "grid_downscale", "inner_pass", "latent_grid",
-    "make_callback", "process", "run_evaluation",
+    "make_callback", "process", "release_caches", "run_evaluation",
 ]
 
