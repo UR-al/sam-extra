@@ -459,6 +459,25 @@ class GrowthRequestTests(unittest.TestCase):
         self.assertEqual(info.as_meta()["faces"][0]["crop"], before_meta["faces"][0]["crop"], "원래 crop 은 그대로")
 
 
+class ContinuingPiecesTests(unittest.TestCase):
+    """키운 crop 의 결과 중 무엇을 쓰나 — 앞 결과(그 얼굴 · 토큰이 앞 crop 에서 찾은 조각들)와 한 픽셀이라도 겹치는 조각만."""
+
+    SHAPE = (60, 80)
+
+    def test_only_pieces_that_overlap_the_earlier_result(self):
+        earlier = [_box_mask(self.SHAPE, 10, 10, 30, 30), _box_mask(self.SHAPE, 50, 10, 55, 15)]
+        longer = _box_mask(self.SHAPE, 20, 10, 40, 50)    # 앞 조각을 더 길게 본 것
+        corner = _box_mask(self.SHAPE, 54, 14, 70, 20)    # 두 번째 앞 조각과 한 픽셀(54, 14)만 겹침
+        beside = _box_mask(self.SHAPE, 30, 10, 45, 30)    # 앞 조각 바로 옆(x 30 부터) — 닿기만 함
+        apart = _box_mask(self.SHAPE, 60, 40, 75, 55)
+        self.assertEqual(fc.continuing_pieces([longer, corner, beside, apart], earlier), [True, True, False, False])
+
+    def test_no_earlier_result_keeps_nothing(self):
+        piece = _box_mask(self.SHAPE, 0, 0, 10, 10)
+        self.assertEqual(fc.continuing_pieces([piece], []), [False])
+        self.assertEqual(fc.continuing_pieces([], [piece]), [])
+
+
 class DuplicateBoxTests(unittest.TestCase):
     def test_iou(self):
         self.assertAlmostEqual(fc.box_iou((40, 70, 80, 110), (48, 66, 92, 112)), 0.546, places=3)

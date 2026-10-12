@@ -17,8 +17,9 @@ numpy 와 ``face_detect`` 의 기본값만 쓴다(torch·ultralytics·Forge 없�
    ``same_face`` 인 상자는 점수가 높은 하나만 남긴다(``dedupe_faces``).
 6. 얼굴 밖으로 나가는 부위(머리카락)는 crop 의 안쪽 가장자리에서 잘려 직선 모서리가 남는다 — 검출 토큰마다, 그 얼굴이 주인인
    조각이 그 얼굴 crop 의 안쪽 가장자리에 충분히 닿았으면(``touching_sides``) 그 얼굴의 crop 을 닿은 쪽으로 키워
-   (``grow_toward`` — 정사각·이미지 안으로 밂은 그대로) 그 토큰만 SAM3 를 다시 돌린다(``growth_requests``, 상한
-   ``GROW_ROUNDS``). 닿지 않으면 SAM3 호출도 마스크도 키우기 전과 같다.
+   (``grow_toward`` — 정사각·이미지 안으로 밂은 그대로) 그 토큰만 SAM3 를 다시 돌린다(``growth_requests``, 얼굴 × 토큰마다
+   ``GROW_ROUNDS`` 번까지). 키운 crop 의 결과는 앞 결과와 겹치는 조각만 쓴다(``continuing_pieces`` — 키운 crop 에 새로 들어온,
+   얼굴 쪽 마스크와 끊긴 것은 버린다). 닿지 않으면 SAM3 호출도 마스크도 키우기 전과 같다.
 """
 from __future__ import annotations
 
@@ -448,6 +449,22 @@ def growth_requests(
         if grown != crops[face]:
             requests[face] = (sides, grown)
     return requests
+
+
+def continuing_pieces(pieces: Sequence[np.ndarray], earlier: Sequence[np.ndarray]) -> list[bool]:
+    """키운 crop 에서 찾은 조각마다(이미지 좌표) 앞 결과(``earlier`` — 그 얼굴 · 토큰이 앞 crop 에서 찾은 조각들)와 한 픽셀이라도
+    겹치는지 — 겹치는 조각만 쓴다.
+
+    키운 crop 은 앞 crop 이 본 것(가장자리에 잘린 머리카락)을 더 넓게 보려는 것이다. 앞 결과와 겹치지 않는 조각은 키운 crop 에 새로
+    들어온, 얼굴 쪽 마스크와 끊긴 것(얼굴이 검출되지 않은 사람의 머리카락 등)이라 버린다 — 그런 조각으로 마스크가 늘거나 crop 을
+    그쪽으로 더 키우지 않게. ``earlier`` 가 비면 모두 False.
+    """
+    if not earlier:
+        return [False] * len(pieces)
+    seen = np.asarray(earlier[0], dtype=bool)
+    if len(earlier) > 1:
+        seen = np.any(np.stack([np.asarray(piece, dtype=bool) for piece in earlier], axis=0), axis=0)
+    return [bool(np.any(np.logical_and(np.asarray(piece, dtype=bool), seen))) for piece in pieces]
 
 
 def order_faces(boxes: Sequence[Box]) -> list[int]:
