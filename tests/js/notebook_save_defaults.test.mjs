@@ -141,15 +141,23 @@ function ui(env) {
   };
 }
 
-test("one button at the right end of the notebook tab row, with a live status", (t) => {
+test("one button at the right end of the notebook tab row, with a live status on a row line of its own", (t) => {
   const env = build(t);
   assert.equal(env.hooks.ensureButton(), true);
   assert.equal(env.hooks.ensureButton(), true);
   const { wrap, button, status } = ui(env);
   const row = env.doc.querySelector("#txt2img_extra_tabs > .tab-nav");
   assert.equal(env.doc.querySelectorAll("#sam3_save_defaults").length, 1);
+  assert.equal(env.doc.querySelectorAll("#sam3_save_defaults_status").length, 1);
   assert.equal(wrap.parentElement, row);
-  assert.equal(row.lastElementChild, wrap, "after Generation · 임베딩 · 체크포인트 · 로라 · Manage and the controls");
+  assert.equal(wrap.previousElementSibling, row.querySelector(".extra-networks-controls-div"),
+    "after Generation · 임베딩 · 체크포인트 · 로라 · Manage and the controls");
+  // the result is not in the button's flex item (a long one pushed the buttons left): a row item right after it,
+  // that style.css puts on a line of its own under the buttons
+  assert.equal(status.parentElement, row);
+  assert.equal(status.previousElementSibling, wrap);
+  assert.equal(row.lastElementChild, status);
+  assert.equal(wrap.contains(status), false);
   assert.equal(wrap.className, "sam3-save-defaults");
   assert.equal(button.textContent, "기본값 저장");
   assert.equal(button.type, "button");
@@ -183,7 +191,32 @@ test("no notebook layout, no button; it is re-attached when Gradio redraws the r
   row.replaceWith(fresh);
   assert.equal(env.hooks.ensureButton(), true);
   assert.equal(ui(env).wrap.parentElement, fresh);
+  assert.equal(ui(env).status.parentElement, fresh);
+  assert.equal(ui(env).status.previousElementSibling, ui(env).wrap);
   assert.equal(env.doc.querySelectorAll("#sam3_save_defaults").length, 1);
+  assert.equal(env.doc.querySelectorAll("#sam3_save_defaults_status").length, 1);
+});
+
+test("the result line goes after the unload result line when that one is right after the group (no tug of war)", (t) => {
+  const env = build(t);
+  assert.equal(env.hooks.ensureButton(), true);
+  const row = env.doc.querySelector("#txt2img_extra_tabs > .tab-nav");
+  // what javascript/notebook_unload_models.js does with its own result: right after the save group
+  const unloadStatus = env.doc.createElement("span");
+  unloadStatus.id = "sam3_unload_models_status";
+  unloadStatus.className = "sam3-save-defaults-status sam3-unload-models-status";
+  ui(env).wrap.after(unloadStatus);
+  for (let i = 0; i < 3; i++) {
+    assert.equal(env.hooks.ensureButton(), true);
+    assert.equal(unloadStatus.previousElementSibling, ui(env).wrap, "the unload result keeps its place");
+    assert.equal(ui(env).status.previousElementSibling, unloadStatus);
+    assert.equal(row.lastElementChild, ui(env).status);
+  }
+  const moves = [];
+  new env.window.MutationObserver((records) => moves.push(...records)).observe(row, { childList: true });
+  env.hooks.ensureButton();
+  env.hooks.ensureButton();
+  return delay(5).then(() => assert.deepEqual(moves, [], "settled: nothing moves on later checks"));
 });
 
 test("one click: Forge's Defaults Apply, then the active preset — one combined status", async (t) => {
@@ -420,6 +453,18 @@ test("the CSS keeps the button at the row's right end in the existing look", () 
   const wrap = block("#sam3_notebook_layout .sam3-notebook-extra-tabs > .tab-nav > .sam3-save-defaults");
   assert.match(wrap, /order: 1;/);
   assert.match(wrap, /margin-left: auto;/);
+  // the result: a whole line of the row under the buttons, right-aligned (the same rule as 모델 내리기's result);
+  // the rendered layout is tests/js/notebook_unload_models_layout.test.mjs
+  const line = block("#sam3_notebook_layout .sam3-notebook-extra-tabs > .tab-nav > .sam3-unload-models-status");
+  assert.ok(CSS.includes("#sam3_notebook_layout .sam3-notebook-extra-tabs > .tab-nav > .sam3-save-defaults-status,\n"
+    + "#sam3_notebook_layout .sam3-notebook-extra-tabs > .tab-nav > .sam3-unload-models-status {")
+    || CSS.includes("#sam3_notebook_layout .sam3-notebook-extra-tabs > .tab-nav > .sam3-save-defaults-status,\r\n"
+    + "#sam3_notebook_layout .sam3-notebook-extra-tabs > .tab-nav > .sam3-unload-models-status {"),
+    "the save result shares the row-line rule");
+  assert.match(line, /order: 2;/);
+  assert.match(line, /flex: 0 0 100%;/);
+  assert.match(line, /max-width: none;/);
+  assert.match(line, /text-align: right;/);
   assert.match(block("#sam3_notebook_layout .sam3-notebook-extra-tabs > .tab-nav:has(> .extra-networks-controls-div) > .sam3-save-defaults"),
     /margin-left: 0;/);
   assert.match(block(".sam3-save-defaults-button"), /var\(--button-secondary-background-fill/);

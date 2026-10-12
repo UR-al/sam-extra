@@ -115,13 +115,15 @@ test("right after '기본값 저장' inside its group, with the save button's lo
   // one flex item of the row with the save button: the two wrap together on a narrow window
   assert.equal(wrap.parentElement, save, "inside the save group");
   assert.equal(wrap.previousElementSibling, saveButton, "right after the save button (tab order too)");
-  assert.equal(wrap.nextElementSibling, env.doc.querySelector("#sam3_save_defaults_status"),
-    "the save result follows both buttons");
+  assert.equal(wrap.nextElementSibling, null, "the group holds the two buttons only (the save result is a row line too)");
   assert.equal(save.querySelector("button"), saveButton, "the save script still finds its own button first");
-  // the result is not in the buttons' flex item: a row item that style.css puts on a line of its own
+  // the result is not in the buttons' flex item: a row item that style.css puts on a line of its own, right after the
+  // group; the save result follows it
+  const saveStatus = env.doc.querySelector("#sam3_save_defaults_status");
   assert.equal(status.parentElement, row);
   assert.equal(status.previousElementSibling, save);
-  assert.equal(row.lastElementChild, status);
+  assert.equal(status.nextElementSibling, saveStatus);
+  assert.equal(row.lastElementChild, saveStatus);
   assert.equal(wrap.contains(status), false);
   assert.ok(wrap.classList.contains("sam3-unload-models"));
   assert.ok(!wrap.classList.contains("sam3-save-defaults"), "not a second save group");
@@ -151,15 +153,20 @@ test("mounted before the save button: moved into its group on the next check", (
   assert.equal(ui(env).wrap.parentElement, row);
   assert.equal(ui(env).status.previousElementSibling, ui(env).wrap);
   assert.equal(row.lastElementChild, ui(env).status);
-  env.saveHooks.ensureButton();                              // the save script appends its group at the end
-  assert.equal(row.lastElementChild, ui(env).save);
+  env.saveHooks.ensureButton();                              // the save script appends its group (and result) at the end
+  const saveStatus = env.doc.querySelector("#sam3_save_defaults_status");
+  assert.equal(saveStatus.previousElementSibling, ui(env).save);
+  assert.equal(row.lastElementChild, saveStatus);
   env.hooks.ensureButton();
   assert.equal(ui(env).wrap.parentElement, ui(env).save);
   assert.equal(ui(env).wrap.previousElementSibling, ui(env).save.querySelector("button"));
   assert.equal(ui(env).status.previousElementSibling, ui(env).save);
-  assert.equal(row.lastElementChild, ui(env).status);
+  assert.equal(ui(env).status.nextElementSibling, saveStatus);
   env.saveHooks.ensureButton();                              // the save script leaves its group (and ours in it) alone
   assert.equal(ui(env).wrap.parentElement, ui(env).save);
+  assert.equal(ui(env).status.previousElementSibling, ui(env).save, "and puts its result after ours");
+  assert.equal(saveStatus.previousElementSibling, ui(env).status);
+  assert.equal(row.lastElementChild, saveStatus);
   assert.equal(env.doc.querySelectorAll("#sam3_unload_models, #sam3_unload_models_status").length, 2);
 });
 
