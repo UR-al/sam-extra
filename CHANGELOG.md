@@ -3,6 +3,137 @@
 버전 태그는 GitHub Releases에도 발행됩니다. 아래는 요약이며, guidance/속도 기능의
 상세는 [docs/GUIDANCE.md](docs/GUIDANCE.md)를 참고하세요.
 
+## v0.34.1 — 기본값 저장 뒤 Apply settings 되돌림 · 얼굴 crop 키우기(잘린 머리카락) · 저장 결과 줄 자리 · Tag Autocomplete 안내 넘침
+
+2026-10-12. v0.34.0 의 실제 확인(시험용 Forge 2.30-6)에서 찾은 네 가지를 고친 판입니다: **기본값 저장** 뒤 같은 페이지에서 누른
+Settings → **Apply settings** 가 방금 저장한 프리셋 값을 되돌리던 것, **얼굴 안에서만 찾기**에서 crop 밖으로 뻗은 머리카락이 crop
+경계에서 직선으로 잘리던 것(이제 그 얼굴의 crop 을 키워 다시 찾음), 기본값 저장의 긴 결과 글이 두 버튼을 왼쪽으로 밀던 것,
+Settings → Tag Autocomplete 안내의 긴 옮기기 명령이 상자 밖으로 넘치던 것입니다. 스크립트 인자 · state 키 · infotext · 설정 키 ·
+설정 기본값 · XYZ 축은 그대로입니다. 얼굴 crop 을 끈 결과와, 켜도 마스크가 crop 가장자리에 닿지 않은 결과는 v0.34.0 과 같습니다.
+CPU 테스트 전체가 Forge 2.29.2 · 2.30-2 · 2.30-6 에서 실패 없이 통과합니다(아래 **문서 · 테스트**). **실제 Forge 의 GPU 확인은 아직
+하지 않았습니다**(아래 **GPU 확인**).
+
+**업그레이드할 때**
+
+- Forge 를 **완전히 다시 시작**하고 페이지를 새로 고치세요 — 바뀐 `sam3ext` 모듈(`core.py` · `face_crop.py` · `save_defaults.py` ·
+  `ui_save_defaults.py` · `tagcomplete/coexist.py`)은 Reload UI 로는 다 읽히지 않고, 바뀐 JS · CSS(`notebook_save_defaults.js` ·
+  `style.css`)는 페이지를 새로 고쳐야 읽힙니다.
+- 페이지 쪽에서 바뀌는 것(사용자 스크립트 · CSS 로 건드렸다면): 기본값 저장의 결과 글 `#sam3_save_defaults_status` 는 이제 버튼 묶음
+  `#sam3_save_defaults` 밖, 탭 줄의 따로 된 항목입니다. 숨은 저장 버튼 뒤에 Gradio 이벤트 하나(`refresh_settings`)가 더 걸리고 결과
+  JSON 에 `written_keys` 가 더해집니다. Settings → Tag Autocomplete 안내(`sam3_tac_builtin_note`)는 `<div class="sam3-tac-note">` 하나로
+  감쌉니다.
+
+### 기본값 저장 — Apply settings 가 저장한 프리셋 값을 되돌리던 것 (고침)
+
+기본값 저장이 `anima_t2i_sampler` 같은 프리셋 설정을 config.json 에 쓴 뒤에도 Settings 탭의 그 칸들은 페이지를 열 때 받은 값을 들고
+있어서, 같은 페이지에서 Apply settings 를 누르면 Forge 의 `run_settings` 가 모든 칸의 값을 다시 써 저장한 값이 예전 값으로
+돌아갔습니다(v0.34.0 실제 확인: `ER SDE (Tunable)` 로 저장 → Apply 뒤 `ER SDE`). 이제 같은 클릭에서 그 칸들도 새 값을 받습니다 —
+Settings 탭을 한 번도 열지 않았어도.
+
+- 결과 JSON 에 이번에 config 에 쓴 키 목록 `written_keys` 가 들어갑니다(바뀌지 않은 값 포함, 0 그대로 둔 칸 · Forge 에 없는 키는
+  빠짐 — `save_defaults.written_keys_of` · `preset_option_keys`).
+- 숨은 저장 버튼의 click 뒤에 `.then` 하나(`sam3ext/ui_save_defaults.py` 의 `refresh_settings`)를 겁니다. 출력은 Forge 의 키 → Settings
+  칸 표(`shared.settings_components`, 빠른 설정 줄 포함) 중 모든 프리셋의 키 칸입니다 — 누를 때 어느 프리셋이 활성일지 모르기
+  때문입니다. `written_keys` 에 든 키의 칸만 Forge 가 페이지를 열 때 넣는 그대로(`ui_settings.get_value_for_setting` — 값 · 선택지 ·
+  범위) 바꾸고, 나머지 칸(다른 프리셋 · 0 그대로 둔 칸 · Settings 의 다른 설정)은 그대로 둡니다. 저장이 실패했거나 결과가 다른
+  모양이면 아무 칸도 바꾸지 않고, 칸 하나의 값을 못 만들면 그 칸만 두고 콘솔에 알립니다.
+- 칸이 없는 키(Forge 가 숨긴 체크포인트 · 모듈 · Low Bits), gr.State 자리, 이 화면에 없는 칸(Settings 탭을 숨긴 화면)은 출력에 넣지
+  않습니다. 칸 표를 못 읽어도 저장 버튼은 그대로 연결하고 콘솔에 `[sam-extra] save defaults: Settings fields are not refreshed …` 를
+  남깁니다(그때는 예전처럼 저장 뒤 페이지를 새로 고친 다음 Apply settings 를 쓰세요).
+- Gradio 4.40 의 탭은 고르지 않은 탭의 칸도 페이지에 띄워 두므로(display: none) Settings 탭을 열지 않았어도 Apply settings 가 새 값을
+  보냅니다. 로컬 CPU Gradio 4.40 페이지 + headless Chrome(Forge 아님, Settings 탭을 열지 않음)에서 확인: 고치기 전에는 Apply 가
+  `DPM++ 2M` · 30 · 512 · 7 을 다시 썼고, 고친 뒤에는 저장한 `Euler` · 20 · 1024 · 6 을 보냅니다.
+
+### SAM3 얼굴 안에서만 찾기 — crop 가장자리에 잘린 머리카락은 crop 을 키워 다시 찾기 (고침)
+
+v0.34.0 GPU 확인에서 crop 밖으로 뻗은 머리카락(포니테일 · 긴 머리)이 crop 경계에서 직선으로 잘렸습니다(전체 이미지 SAM3 대비 잃은
+몫 c02 46.5 % · c06 45 % · c07 18 % · c04 12 % · c10 7 %). 이제 Detect 토큰마다, 그 얼굴이 주인인 조각이 그 얼굴 crop 의 안쪽
+가장자리에 닿았으면 그 얼굴의 crop 을 키워 **그 토큰만** 다시 찾습니다. 얼굴 crop 을 끈 결과는 그대로이고, 켜도 아무것도 닿지
+않으면 SAM3 호출 · 마스크 · 상자 · 오버레이 · 상태 줄 · meta 가 v0.34.0 과 비트 단위로 같습니다.
+
+- **방아쇠** (`face_crop.touching_sides` · `growth_requests`): 안쪽 가장자리(이미지 테두리가 아닌 변)의 2 px 띠를 변을 따라 투영한
+  길이가 max(4 px, 변 길이의 2 %) 이상이면 닿은 것입니다. 이미지 테두리와 이미지 전체 crop 은 닿지 않습니다. 기존 `assign_owners` 로
+  주인을 정해, 옆 얼굴이 주인인 조각(옆 얼굴의 머리카락이 이 crop 가장자리에 잘려 든 것)으로는 키우지 않습니다 — 주인을 보지 않는
+  방아쇠는 실측 마스크에서 눈 · 얼굴 crop 까지 잘못 키웠습니다(c03 · c10).
+- **키우기** (`face_crop.grow_toward`): 한 변을 1.5 배(올림, 적어도 1 px)로, 닿은 쪽으로만(그 축에 닿은 변이 둘이거나 없으면 양쪽
+  반씩) 키우고, 정사각 · 이미지 안으로 밂은 v0.34.0 규칙 그대로입니다 — 키운 crop 은 늘 원래 crop 을 품습니다. 얼굴 × 토큰마다
+  2 번(`GROW_ROUNDS`)까지, crop 이 이미지 전체가 되거나 더 닿지 않으면 멈춥니다.
+- **다시 찾기** (`core.run_sam3_on_pil`): 키운 crop 에서 찾은 그 토큰의 결과(조각 · 상자 · 점수)로 바꿉니다(합치지 않음). 같은 crop
+  으로 키운 토큰들은 백본을 한 번만 돌리고, 라운드마다 주인을 다시 정합니다. 키운 crop 에서 아무것도 못 찾으면 앞 결과를 지키고 그
+  얼굴 · 토큰은 더 키우지 않습니다. 키운 얼굴의 Exclude 는 그 얼굴이 쓴 crop 들을 품는 영역 + Outline expand · Dilation px 에서도 한 번
+  더 찾습니다. 마지막 주인 정하기는 토큰마다 실제로 쓴 crop 으로 하고, 상자 · 점수 순서는 예전처럼 얼굴 → 그룹 → 토큰입니다.
+- **기록**: 콘솔 `[-] SAM3: face crop — face 1 'hair' reached the crop edge (right); SAM3 again on 1067x832@149,0 (round 1/2)`
+  (키운 crop 에서 못 찾았으면 `… nothing found in the grown crop …`), 상태 줄 끝의 `; grown where the mask reached the crop edge: …`,
+  아티팩트 meta 의 그 얼굴 항목 `grown`(프롬프트 · 마지막 crop · 키운 횟수 · 닿은 변), 오버레이의 키운 crop 가는 선(얼굴 crop 과 같은
+  색). 키운 것이 없으면 모두 예전 그대로입니다. 새 인자 · infotext 키는 없습니다.
+- **비용 · 효과 (GPU 없이 다시 대어 봄)**: v0.34.0 GPU 확인의 실측 마스크(그림 10장 · 얼굴 16개)에 방아쇠를 대면 머리카락만 그림
+  5장의 얼굴 8개에서 키웠고(1\~2 번, 머리카락 SAM3 호출 9번 더 — 키운 crop 하나마다 백본 1 번과 그 토큰), 눈 · 입 · 얼굴로는 한 번도
+  키우지 않았습니다. 전체 이미지 SAM3 의 머리카락 중 crop 이 보는 몫은(키운 crop 이 전체 이미지만큼 찾는다고 볼 때) c02 53 → 100 % ·
+  c06 55 → 100 % · c07 82 → 95 % · c04 88 → 97 % · c10 93 → 99.6 % 입니다. 실제 `run_sam3_on_pil` 을 저장된 결과로 답하는 대역
+  처리기로 돌려도 같은 얼굴들에서 키웠습니다(다른 점: c10 의 한 얼굴은 2 번, 연결 성분을 SAM3 인스턴스 대신 쓴 탓에 c03 의 한
+  얼굴은 이미지 전체까지 — 위 방법으로는 키우지 않음). 진짜 SAM3 로 키운 crop 을 돌린 결과는 아직 없습니다(아래 **GPU 확인**).
+- **한계**: 얼굴 쪽 마스크와 끊긴 머리카락(c07 의 후드 아래 긴 머리)은 따라가지 않고, 원래 crop 에서 아무것도 못 찾은 부위(c07 의
+  아주 작은 입)를 찾으려고 키우지도 않습니다. 키운 crop 의 결과로 바꾸므로(합치지 않음) 더 넓게 본 SAM3 가 가는 머리카락 끝을 놓칠 수
+  있는지는 GPU 확인에서 봅니다. 방아쇠 · 키우기 값은 그림 10장으로 정했습니다.
+
+### 화면 — 기본값 저장 결과 줄 · Tag Autocomplete 안내 상자 (고침)
+
+- **기본값 저장 결과가 두 버튼을 밀던 것**: 결과 글이 버튼 묶음 안에 있어서 긴 결과(예: 프리셋 저장 실패 메시지)가 나오는 동안
+  `기본값 저장` · `모델 내리기` 두 버튼이 왼쪽으로 밀렸습니다(1920 px 창에서 약 487 px). 이제 모델 내리기의 결과처럼 버튼 묶음 밖,
+  탭 줄의 따로 된 항목으로 버튼 아래 한 줄에 오른쪽 정렬로 나옵니다(`javascript/notebook_save_defaults.js`, `style.css` 는 모델 내리기
+  결과 줄의 규칙을 함께 씀 — 모양 · 색 · 글자 크기는 그대로). 두 결과가 함께 보이면 한 줄씩(모델 내리기 결과 아래에 기본값 저장 결과)
+  이고, 두 스크립트는 서로의 결과 글을 옮기지 않습니다. 탭 줄을 다시 그리면 결과 글도 다시 붙습니다.
+- **Tag Autocomplete 안내의 옮기기 명령이 상자 밖으로 넘치던 것**: 고른 태그 파일이 없을 때 안내 끝의 옮기기 명령(긴 절대 경로)에
+  끊을 자리가 없어 Forge 의 `.settings-info` 상자 오른쪽 밖으로 넘쳤습니다. 안내 전체를 `<div class="sam3-tac-note">`
+  (`coexist.NOTE_CLASS`)로 감싸고 그 안에서만 넘칠 때 아무 데서나 줄을 바꿉니다(`overflow-wrap: anywhere`). 글 · 명령 · 상자 모양은
+  그대로입니다.
+
+### GPU 확인 — 아직 하지 않음
+
+이 판의 확인은 모두 CPU 입니다(테스트 · 대역 페이지 · 저장된 마스크에 다시 대어 보기). 실제 Forge(2.30-6) 에서 아래를 확인하기
+전입니다 — 확인하면 이 절을 고칩니다.
+
+- 기본값 저장 → (새로 고치지 않고) Settings → Apply settings 뒤 config.json 의 `anima_*` 값이 저장한 그대로인지(Settings 탭을 연 적이
+  없을 때와 연 뒤), Settings 칸에 저장한 값이 보이는지. Forge 2.29.2 · 2.30-2 · 2.30-6 시작과 Reload UI 뒤 콘솔에 연결 실패 줄이 없는지,
+  빠른 설정 줄에 프리셋 키를 둔 화면에서 그 칸의 change 가 오류 없이 도는지.
+- 얼굴 안에서만 찾기를 켠 머리카락(c02 · c04 · c06 · c07 · c10)에서 키운 crop 이 직선 자름을 없애는지와 전체 이미지 머리카락 대비 몫,
+  c03 의 얼굴별 머리카락 분리, 눈 · 입 · 얼굴이 v0.34.0 결과와 같은지, 키운 crop 의 SAM3 시간과 VRAM(키운 crop 도 이미지보다 크지 않아
+  작업 크기 1008 그대로), Exclude 와 Dilation · Outline expand 를 함께 쓴 경우.
+- 1920 · 1280(로라 탭) · 1024 px 실제 페이지에서 두 결과 줄의 자리, Settings → Tag Autocomplete 상자 안의 옮기기 명령.
+
+### 문서 · 테스트
+
+- README: 기본값 저장 절(Settings 칸도 새 값 · 결과 줄은 버튼 아래, 두 결과가 함께면 한 줄씩), 얼굴 안에서만 찾기 절의 새 4. 단계
+  (키우기 · 비용 · 한계)와 오버레이 · meta · 콘솔 기록, 마스크 후처리 순서 문단.
+- 기본값 저장: `test_save_defaults.py` 의 `WrittenKeysTests`(4개), `test_save_defaults_gradio.py` 의 `SettingsRefreshTests`(9개 — Gradio
+  `process_api` 와 이어진 이벤트를 따르는 페이지 상태로 저장 → Apply settings, 쓴 키의 칸만 바뀜, 저장 실패 · 칸 없음 · 칸 하나 · 값을
+  못 만드는 칸 · 조회 실패)와 `ForgeSettingsTests`(2개 — Forge 체크아웃의 `ui_settings.py` · `ui.py` 를 AST 로, 진짜
+  `create_setting_component` · `get_value_for_setting` · `UiSettings.run_settings` · `Options.same_type` 와 `presets.register` 의 실제
+  설정으로 저장 → Apply). 고치기 전 코드에서는 Apply 뒤 `anima_t2i_sampler` 가 `ER SDE` 로 돌아가 실패합니다.
+- 결과 줄: `tests/js/notebook_unload_models_layout.test.mjs` 에 창 너비 다섯 가지 × (긴 저장 결과 · 두 결과 함께) 10개(headless Chrome),
+  jsdom 자리 테스트 3개를 새 자리로 고치고 두 결과 글이 자리를 주고받지 않는지 1개. 고치기 전 코드에서는 저장 버튼이 −487 px(1920) ·
+  −1038 px(1280 로라) · −782 px(1024) 움직여 실패합니다.
+- 안내 상자: `test_tagcomplete_builtin.py` 의 `SettingsNoteWrapTests`(1개 — 안내의 모든 상태가 묶음 하나 · CSS 규칙), 새
+  `tests/js/tagcomplete_settings_note_layout.test.mjs`(4개 — headless Chrome 이 1600 · 1024 · 600 px 에서 모든 `<code>` 가 상자 안인지,
+  묶음 이름이 coexist.py 와 같은지). 고치기 전에는 명령이 상자 오른쪽으로 63 px 넘쳐 실패합니다.
+- 얼굴 crop 키우기: `test_face_crop.py` 17개(방아쇠의 띠 · 문턱 · 흩어진 픽셀 · 이미지 테두리 · 이미지 전체, 닿은 쪽으로 키우기 ·
+  밀어 넣기 · 이미지 전체로 자름 · 작은 crop · 무작위 500개에서 정사각 · 이미지 안 · 원래 crop 을 품음, `enclosing_crop`, 옆 얼굴
+  조각으로는 키우지 않음 · 얼굴 거르기 · 상태 줄 · meta), `test_sam3_face_crop.py` 의 `FaceCropGrowthTests` 8개(가짜 SAM3 로 — 닿지
+  않으면 키우기를 끈 것과 같음, 한 번 키워 전체 이미지 결과와 같고 눈 토큰은 다시 돌리지 않음, 상한, 이미지 테두리, 이미지 전체에서
+  멈춤, 옆 얼굴의 잘린 조각, 키운 crop 에서 못 찾음, Exclude). 기존 2개 고침: 이웃 crop 가장자리 조각 테스트는 키우기를 끈(상한 0)
+  예전 결과와 키운 결과를 둘 다 보고, Exclude 범위 테스트는 대상을 가장자리 띠 밖으로 2 px 옮김(보려던 Exclude 범위는 그대로).
+  돌연변이 확인: 방아쇠가 모든 주인의 조각을 셈 · 키운 영역에서 Exclude 를 찾지 않음 · 바꾸기 대신 합치기 · 띠 1 px · 키운 crop 에서
+  못 찾은 뒤에도 키움 · 이미지 테두리를 안쪽 변으로 셈 — 각각 전용 테스트가 실패합니다. 무작위 장면 400개(가짜 SAM3)를 v0.34.0 과
+  비교하면 얼굴 crop 끔 400/400 · 켬 · 키우지 않음 279/279 가 마스크 · 얼굴별 마스크 · 오버레이 · 상자 · 점수 · 처리기 호출 · 상태 줄 ·
+  meta · stderr 까지 같고, 키운 121개 중 Exclude 가 없는 39개는 새 합친 마스크가 예전 것을 품습니다.
+- 전체(CPU, `CUDA_VISIBLE_DEVICES=-1`, 각 Forge 체크아웃의 extensions 에 이 판을 복사해 `SAM3_FORGE_ROOT` 로), 2026-10-12:
+  Forge 2.29.2(`d70373eb`) 3747 테스트 · 건너뜀 32, 2.30-2(`45f41b81`) 3747 · 건너뜀 31, 2.30-6(`ede60e1a`) 3747 ·
+  건너뜀 30 — 셋 다 실패 0 · 오류 0(v0.34.0 은 3706). 설치된 Forge(2.30-6) 를 `SAM3_FORGE_ROOT` 로 둔 작업 트리(확장 폴더 밖이라
+  Forge 옆을 찾는 테스트는 건너뜀): 3651 · 건너뜀 188 · 실패 0 · 오류 0 — 건너뜀이 v0.34.0 때보다 2개 많은 것은 이 PC 에서 따로
+  설치했던 sd-webui-tagcomplete-neo 를 `_removed_extensions` 안의 다른 이름으로 옮겨 상류 대조 2개가 건너뛰기 때문입니다.
+  JS(`npm test`, node:test + jsdom + headless Chrome) 312개 모두 통과(2.30-6 체크아웃 옆 — 작업 트리에서는 Forge 의 `progressbar.js`
+  를 쓰는 1개를 건너뜀).
+
 ## v0.34.0 — 얼굴 안에서만 찾기 · 태그 자동완성 내장 · XYZ Text Encoder 축 · XYZ VAE 축 형식 혼합 수정 · 모델 내리기 버튼 · Forge 2.30 호환
 
 2026-10-12. 따로 만든 다섯 갈래를 한 판으로 합쳤습니다: SAM3 의 **얼굴 안에서만 찾기**(face_yolov8 얼굴 상자 안에서만 SAM3),
@@ -364,7 +495,8 @@ Forge Neo 2.30 에서 달라진 것에 맞춥니다. CPU 테스트 전체가 2.2
 
 **알려진 문제**: 기본값 저장을 누른 뒤 같은 페이지에서 Settings 의 **Apply settings** 를 누르면 방금 저장한 값이 예전 값으로 돌아갑니다
 (저장 뒤 페이지를 새로 고친 다음 Apply 를 쓰세요). 기본값 저장 메시지가 길면 두 버튼이 왼쪽으로 밀리고, Settings → Tag Autocomplete
-안내 상자에서 긴 옮기기 명령이 상자 밖으로 넘칩니다.
+안내 상자에서 긴 옮기기 명령이 상자 밖으로 넘칩니다. → 셋 다 v0.34.1 에서 고쳤습니다(crop 경계에서 잘리던 머리카락도 v0.34.1 은
+crop 을 키워 다시 찾습니다 — 위 v0.34.1 절).
 
 ### 문서 · 테스트
 
