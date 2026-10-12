@@ -529,6 +529,56 @@ class SavePresetTests(unittest.TestCase):
         self.assertEqual(payload["kept"], [])
 
 
+class WrittenKeysTests(unittest.TestCase):
+    """The result names every key the click wrote, so the Settings tab's fields for exactly those keys can be refreshed
+    (sam3ext/ui_save_defaults.py settings_updates) — otherwise a later Apply settings writes the page's old values back."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+
+    def test_written_keys_are_every_key_written_unchanged_ones_too(self):
+        host = make_host(tmp=self.tmp.name, data=sizes())
+        values = ui_values(t2i_hr_step=10)        # (a Hires steps 0 written once is kept at 0 the next time)
+        first = sd.save_preset("a", "anima", values, host)
+        self.assertEqual(first["written_keys"], [t.format(p="anima") for t, _k, _l in sd.FIELDS])
+        self.assertEqual(len(first["written_keys"]), first["written"])
+        again = sd.save_preset("b", "anima", values, host)               # nothing changed, still all written
+        self.assertEqual((again["changed"], again["written_keys"]), (0, first["written_keys"]))
+        self.assertEqual(sd.written_keys_of(sd.to_json(again)), first["written_keys"])
+
+    def test_kept_and_skipped_keys_are_not_written_keys(self):
+        host = make_host(tmp=self.tmp.name)                               # sizes 0: kept
+        payload = sd.save_preset("a", "anima", ui_values(), host)
+        kept = [k["key"] for k in payload["kept"]]
+        self.assertEqual(len(kept), 4)
+        self.assertFalse(set(kept) & set(payload["written_keys"]))
+        self.assertEqual(len(payload["written_keys"]), payload["written"])
+        payload = sd.save_preset("b", "sd", ui_values(), make_host(tmp=self.tmp.name, data=sizes("sd")))
+        self.assertEqual(payload["skipped"], ["sd_t2i_dcfg", "sd_t2i_hr_dcfg", "sd_i2i_dcfg"])
+        self.assertFalse(set(payload["skipped"]) & set(payload["written_keys"]))
+        self.assertEqual(len(payload["written_keys"]), 19)
+
+    def test_a_refused_or_broken_result_names_no_key(self):
+        refused = sd.save_preset("a", "anima", ui_values(t2i_sampler="nope"), make_host(tmp=self.tmp.name))
+        self.assertFalse(refused["ok"])
+        self.assertNotIn("written_keys", refused)
+        for text in (sd.to_json(refused), "", "not json", "[]", "null", json.dumps({"ok": True}),
+                     json.dumps({"ok": "yes", "written_keys": ["anima_t2i_step"]}),
+                     json.dumps({"ok": True, "written_keys": "anima_t2i_step"}), None, 7):
+            with self.subTest(text=text):
+                self.assertEqual(sd.written_keys_of(text), [])
+        mixed = json.dumps({"ok": True, "written_keys": ["anima_t2i_step", 3, None, "anima_t2i_cfg"]})
+        self.assertEqual(sd.written_keys_of(mixed), ["anima_t2i_step", "anima_t2i_cfg"])
+
+    def test_preset_option_keys_cover_every_preset_in_field_order(self):
+        keys = sd.preset_option_keys(["sd", "anima"])
+        self.assertEqual(len(keys), 2 * len(sd.FIELDS))
+        self.assertEqual(keys[:len(sd.FIELDS)], [t.format(p="sd") for t, _k, _l in sd.FIELDS])
+        self.assertEqual(keys[len(sd.FIELDS):], [t.format(p="anima") for t, _k, _l in sd.FIELDS])
+        self.assertEqual(sd.preset_option_keys([]), [])
+
+
 # ---------------------------------------------------------------------------------------------------------
 # Forge's real code (skipped without a Forge checkout)
 # ---------------------------------------------------------------------------------------------------------
