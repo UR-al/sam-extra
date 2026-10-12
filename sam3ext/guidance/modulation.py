@@ -543,16 +543,20 @@ def prepare_block_modulations(
     }
 
 
-def clear_modulation_caches() -> None:
-    """Release the persistent ~CLIP+adapter CPU cache on script unload."""
+def clear_modulation_caches() -> bool:
+    """Release the persistent ~CLIP+adapter CPU cache on script unload (and for the '모델 내리기' button).
+
+    Returns True when anything was cached."""
     global _CLIP_CACHE_KEY, _CLIP_CACHE_VALUE
     with _CACHE_LOCK:
+        held = bool(_CPU_ADAPTER_CACHE or _POOLED_CACHE) or _CLIP_CACHE_VALUE is not None
         _CPU_ADAPTER_CACHE.clear()
         _VERIFIED_OFFICIAL_ADAPTERS.clear()
         _POOLED_CACHE.clear()
         _CLIP_CACHE_KEY = None
         _CLIP_CACHE_VALUE = None
     gc.collect()
+    return held
 
 
 __all__ = [

@@ -196,6 +196,23 @@ def _build_decoder(path: str, device, dtype):
         return None
 
 
+def release_decoders() -> bool:
+    """'모델 내리기' 버튼(sam3ext/unload_registry.py) — 만들어 둔 12ch 디코더를 놓는다(다음 2x 디코드가 파일에서 다시 만든다).
+    Forge 의 메모리 관리에 맡긴 디코더가 GPU 에 남아 있었다면 그 전에 Forge 의 unload_all_models 가 내린다.
+    쥔 디코더가 있었으면 True."""
+    held = any(decoder is not None for decoder in _DECODER_CACHE.values())
+    _DECODER_CACHE.clear()
+    return held
+
+
+try:
+    from sam3ext import unload_registry as _unload_registry
+
+    _unload_registry.register("anima_vae_2x", "VAE 2x 디코더", release_decoders)
+except Exception as _unload_error:   # 확장 업데이트 뒤 다시 시작하기 전의 옛 sam3ext — 버튼만 이 디코더를 모른다
+    _log(f"unload hook not registered: {type(_unload_error).__name__}: {_unload_error}")
+
+
 # ---------------------------------------------------------------------------
 # The 12ch → 3ch 2x transform (unit-verifiable)
 # ---------------------------------------------------------------------------

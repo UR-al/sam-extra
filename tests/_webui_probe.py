@@ -19,6 +19,14 @@ checkout, ``k_diffusion.sampling`` is Forge's file, the XYZ grid starts with the
    Forge's modules stay imported), the callbacks registered anew run again — before_ui on a reloaded
    XYZ grid and on the one that was already there, app start on the same FastAPI app — and the sampler
    and scheduler lists are read once more.
+
+The built-in Tag Autocomplete (``scripts/builtin_tagcomplete.py``) writes files when its helper starts
+(``<forge>/tmp/tagAutocompletePath.txt``, ``tags/temp/*``, ``tags/tag_frequency.db``): here ``modules.paths``,
+the embeddings / LoRA folders and ``sam3ext.tagcomplete.paths.TAGS_DIR`` point into a temporary folder, so a
+probe run never touches the extension's tags/ or a Forge install.
+
+The Forge checkout is found like the other Forge-reading tests do (``tests/_extra_schedulers_support.forge_root``:
+next to the extension, else ``$SAM3_FORGE_ROOT``).
 """
 
 from __future__ import annotations
@@ -32,7 +40,9 @@ import io
 import json
 import os
 import re
+import shutil
 import sys
+import tempfile
 import types
 from pathlib import Path
 
@@ -40,12 +50,16 @@ os.environ.setdefault("GRADIO_ANALYTICS_ENABLED", "False")
 os.environ.setdefault("CUDA_VISIBLE_DEVICES", "-1")
 
 ROOT = Path(__file__).resolve().parents[1]
-FORGE = ROOT.parents[1]
 sys.path.insert(0, str(ROOT))
 
 import gradio as gr  # noqa: E402,F401
 
 from tests import _extra_samplers_fixtures as esf  # noqa: E402
+from tests._extra_schedulers_support import forge_root  # noqa: E402
+
+FORGE = forge_root() or ROOT.parents[1]
+# scripts/builtin_tagcomplete.py: everything its helper writes goes below this folder (see the module docstring)
+SANDBOX = Path(tempfile.mkdtemp(prefix="sam3_probe_"))
 
 
 def forge_xyz_labels() -> list:
@@ -70,12 +84,31 @@ class AxisOption:
         self.choices, self.prepare = choices, prepare
 
 
+def _forge_apply_vae(p, x, xs):
+    """Stands for xyz_grid's ``apply_vae`` (the "VAE" axis sam-extra replaces in place)."""
+    p.override_settings["sd_vae"] = x
+
+
+def vae_axis(xyz) -> dict:
+    """Where the "VAE" axis is, and whether it is sam-extra's copy wrapping Forge's apply (not an earlier copy)."""
+    index = next(i for i, option in enumerate(xyz.axis_options) if option.label == "VAE")
+    option = xyz.axis_options[index]
+    return {"index": index, "wraps_forge": option.apply is not _forge_apply_vae
+            and getattr(option, "_sam_extra_stock_apply", None) is _forge_apply_vae}
+
+
 def new_xyz_grid():
     module = types.ModuleType("xyz_grid.py")
     module.AxisOption = AxisOption
     module.AxisOptionImg2Img = AxisOption
     module.AxisOptionTxt2Img = AxisOption
-    module.axis_options = [AxisOption(label, str, None) for label in forge_xyz_labels()]
+    module.axis_options = [AxisOption(label, str, _forge_apply_vae if label == "VAE" else None)
+                           for label in forge_xyz_labels()]
+    # xyz_grid's format functions (scripts/!sam3.py builds its "[SAM3] …" axes with them in before_ui)
+    module.format_value = lambda p, opt, x: x
+    module.format_value_add_label = lambda p, opt, x: f"{opt.label}: {x}"
+    module.format_remove_path = lambda p, opt, x: os.path.basename(str(x))
+    module.format_nothing = lambda *args, **kwargs: ""
     return module
 
 
@@ -119,6 +152,12 @@ class OptionInfo:
 
     def html(self, *args, **kwargs):
         return self
+
+
+class OptionHTML(OptionInfo):
+    def __init__(self, text):
+        super().__init__(str(text).strip(), label="")
+        self.do_not_save = True
 
 
 class Options(types.SimpleNamespace):
@@ -199,10 +238,16 @@ class Webui:
             "modules.sd_samplers_extra": esf.forge_sd_samplers_extra(),
         })
         shared.OptionInfo = OptionInfo
+        shared.OptionHTML = OptionHTML
         shared.state = types.SimpleNamespace(sampling_step=0, sampling_steps=0, job="", job_count=0,
                                              interrupted=False, skipped=False, textinfo=None)
-        shared.cmd_opts = types.SimpleNamespace()
+        # the built-in Tag Autocomplete reads these folders (sam3ext/tagcomplete/shared_paths.py)
+        for name in ("embeddings", "Lora", "extensions"):
+            (SANDBOX / "forge" / name).mkdir(parents=True, exist_ok=True)
+        shared.cmd_opts = types.SimpleNamespace(embeddings_dir=str(SANDBOX / "forge" / "embeddings"),
+                                                lora_dir=str(SANDBOX / "forge" / "Lora"))
         shared.sd_model = None
+        shared.prompt_styles = None
         self.k_sampling = esf.forge_k_sampling()
         self.k_deis = esf.forge_deis()
 
@@ -254,12 +299,26 @@ class Webui:
         negpip_anima.patch_anima_negpip = lambda *a, **k: None
         negpip_sd = types.ModuleType("sam3ext.negpip.sd")
         negpip_sd.patch_sd_negpip = lambda *a, **k: None
+        # Forge modules the built-in Tag Autocomplete helper imports; folders inside the sandbox
+        paths = types.ModuleType("modules.paths")
+        paths.script_path = str(SANDBOX / "forge")
+        paths.extensions_dir = str(SANDBOX / "forge" / "extensions")
+        extensions = types.ModuleType("modules.extensions")
+        extensions.active = lambda: []
+        extensions.extensions_builtin_dir = str(SANDBOX / "forge" / "extensions-builtin")
+        hashes = types.ModuleType("modules.hashes")
+        hashes.sha256_from_cache = lambda *a, **k: None
+        sd_models = types.ModuleType("modules.sd_models")
+        errors = types.ModuleType("modules.errors")
+        errors.report = lambda message, exc_info=False: None
         stubs = {
             "modules": modules, "modules.scripts": scripts, "modules.script_callbacks": callbacks,
             "modules.processing": processing, "modules.scripts_postprocessing": postprocessing,
             "modules.prompt_parser": prompt_parser, "modules.ui_components": ui_components,
             "k_diffusion": k_package, "k_diffusion.sampling": self.k_sampling, "k_diffusion.deis": self.k_deis,
             "sam3ext.negpip.anima": negpip_anima, "sam3ext.negpip.sd": negpip_sd,
+            "modules.paths": paths, "modules.extensions": extensions, "modules.hashes": hashes,
+            "modules.sd_models": sd_models, "modules.errors": errors,
             **self.persistent,
         }
         for name, module in stubs.items():
@@ -354,9 +413,20 @@ def routes(app):
     return out
 
 
+def tagcomplete_report():
+    from sam3ext.tagcomplete import boot
+
+    return {"state": dict(boot.STATE)}
+
+
 def main():
     from fastapi import FastAPI
 
+    from sam3ext.tagcomplete import paths as tagcomplete_paths
+
+    tagcomplete_paths.TAGS_DIR = SANDBOX / "tags"   # before the helper's shared_paths reads it
+    tagcomplete_paths.TAGS_TEMP_DIR = tagcomplete_paths.TAGS_DIR / "temp"
+    tagcomplete_paths.TAG_FREQUENCY_DB = tagcomplete_paths.TAGS_DIR / "tag_frequency.db"
     webui = Webui()
     app = FastAPI()
     demo = types.SimpleNamespace(blocks={}, dependencies=[], fns=[])
@@ -366,6 +436,7 @@ def main():
     report["forge_xyz"] = [option.label for option in xyz.axis_options]
     stubs, scripts_module, callbacks, loaded, failed = load_all(webui, xyz, 1)
     report["load_failed"] = failed
+    report["tagcomplete"] = tagcomplete_report()
     samplers = webui.persistent["modules.sd_samplers"]
     schedulers = webui.persistent["modules.sd_schedulers"]
     # registration order, before the on_before_ui callbacks (scripts/list_order.py sorts the lists there)
@@ -378,6 +449,7 @@ def main():
     report["options"] = list(webui.options)
     report["before_ui_errors"] = run_callbacks(stubs, callbacks, "on_before_ui")
     report["xyz"] = [option.label for option in xyz.axis_options]
+    report["vae_axis"] = vae_axis(xyz)
     report["app_errors"] = run_callbacks(stubs, callbacks, "on_app_started", demo, app)
     report["routes"] = routes(app)
     report["scripts"] = scripts_info(stubs, scripts_module, loaded)
@@ -393,14 +465,17 @@ def main():
     reloaded_xyz = new_xyz_grid()
     stubs, scripts_module, callbacks, loaded, failed = load_all(webui, reloaded_xyz, 2)
     report["reload_load_failed"] = failed
+    report["reload_tagcomplete"] = tagcomplete_report()
     report["reload_settings_errors"] = run_callbacks(stubs, callbacks, "on_ui_settings")
     report["reload_options"] = list(webui.options)
     report["reload_before_ui_errors"] = run_callbacks(stubs, callbacks, "on_before_ui")
     report["reload_xyz"] = [option.label for option in reloaded_xyz.axis_options]
+    report["reload_vae_axis"] = vae_axis(reloaded_xyz)
     # the XYZ module from before the reload, if a host kept it
     stubs_same, _, callbacks_same, _, _ = load_all(webui, xyz, 3)
     run_callbacks(stubs_same, callbacks_same, "on_before_ui")
     report["kept_xyz"] = [option.label for option in xyz.axis_options]
+    report["kept_vae_axis"] = vae_axis(xyz)
     report["reload_app_errors"] = run_callbacks(stubs, callbacks, "on_app_started", demo, app)
     report["reload_routes"] = routes(app)
     report["reload_samplers"] = [x.name for x in samplers.all_samplers]
@@ -408,8 +483,12 @@ def main():
     report["reload_schedulers"] = [x.label for x in schedulers.all_schedulers]
     report["reload_visible_schedulers"] = [x.label for x in schedulers.schedulers]
     report["reload_scheduler_map"] = sorted(schedulers.schedulers_map)
+    report["sandbox_files"] = sorted(path.relative_to(SANDBOX).as_posix() for path in SANDBOX.rglob("*") if path.is_file())
     sys.stdout.write(json.dumps(report))
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    finally:
+        shutil.rmtree(SANDBOX, ignore_errors=True)

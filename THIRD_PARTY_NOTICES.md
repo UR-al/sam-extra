@@ -78,6 +78,65 @@ MIT(Copyright (c) 2026 Eduardo Abreu)이며, 각 파일 머리에 저작권·허
 
 MIT 고지 전문은 이 문서 끝에 있습니다. 이 확장의 GPL-3.0-only 라이선스는 이 코드의 상류 조건을 대체하지 않습니다.
 
+## sd-webui-tagcomplete-neo — Tag Autocomplete (MIT)
+
+`sam3ext/tagcomplete/` 의 `tag_autocomplete_helper.py`·`shared_paths.py`·`model_keyword_support.py`·`tag_frequency_db.py` 와
+`javascript/` 15개, 그리고 `tags/` 의 다섯 목록(`danbooru.csv`·`danbooru_2025.csv`·`danbooru_e621_merged.csv`·`extra-quality-tags.csv`·
+`demo-chants.json`)은 [eduardoabreu81/sd-webui-tagcomplete-neo](https://github.com/eduardoabreu81/sd-webui-tagcomplete-neo)
+(commit `8e0d81fd0e25fd2cf98fb4d34d097df9f71a082b`, 2026-05-08)를 편입한 것입니다. 이 저장소는 Eduardo Abreu(eduardoabreu81)가 2026년에
+Forge Neo 용으로 고친 [DominikDoom/a1111-sd-webui-tagcomplete](https://github.com/DominikDoom/a1111-sd-webui-tagcomplete) 의 포크입니다.
+
+- 저작권: **Copyright (c) 2022 Dominik Reh** (상류 `LICENSE` 의 줄 — 원본 저장소의 저자, 여러 기여자 포함)와 포크의 변경
+  (`40d3196` 부터 `8e0d81f` 까지, 2026, **Eduardo Abreu**). 포크는 자기 저작권 줄이나 파일 머리 고지를 더하지 않았고 같은 MIT `LICENSE` 로
+  배포합니다.
+- 라이선스: **MIT**. 전문은 코드 옆 `sam3ext/tagcomplete/LICENSE`(상류 `LICENSE` 무수정 사본, `tests/test_tagcomplete_vendor.py` 가
+  SHA-256 을 고정)와 이 문서 끝에 있습니다. 편입한 파일은 계속 MIT 를 따르고, 이 확장의 GPL-3.0-only 가 대체하지 않습니다.
+- 편입한 Python 파일마다 머리에 상류·저작권·MIT 고지와 수정 고지(`MODIFIED by sam-extra, 2026-10-11`)를 달았습니다. JS 15개·`LICENSE`·
+  태그 목록 다섯 개는 상류와 바이트까지 같습니다(`.gitattributes` 의 `-text` 로 줄끝 변환 없이 저장, 테스트가 SHA-256 고정).
+- `javascript/_caretPosition.js`(입력 칸의 커서 위치 계산)는 다시 다른 MIT 프로젝트
+  [component/textarea-caret-position](https://github.com/component/textarea-caret-position) 의 코드입니다 — 파일 첫 줄
+  `// From https://github.com/component/textarea-caret-position`, 원본 저장소가 `90664d4`(2023-02-26)에서 넣었고 그 라이선스는
+  함께 넣지 않았습니다. 저작권: **Copyright (c) 2015 Jonathan Ong me@jongleberry.com**(그 프로젝트 `LICENSE` 의 줄), 라이선스:
+  **MIT**(전문은 이 문서 끝 — 같은 조건). 이 파일도 바꾸지 않았습니다.
+- 태그 목록 다섯 개의 출처(상류 README 의 "Tag Lists" 표): `danbooru.csv` — Danbooru(danbooru.donmai.us) 태그 상위 10만 개,
+  `danbooru_2025.csv` — 2025년에 갱신한 Danbooru 목록, `danbooru_e621_merged.csv` — Danbooru 와 e621(e621.net) 태그를 합치고 분류를
+  하나로 맞춘 목록(상류 `tagAutocomplete.js` 의 주석이 그 분류의 출처로
+  [DraconicDragon/dbr-e621-lists-archive](https://github.com/DraconicDragon/dbr-e621-lists-archive) 의
+  `tag-lists/danbooru_e621_merged` 를 듭니다), `extra-quality-tags.csv` — 상류가 고른 품질 태그, `demo-chants.json` — 상류의 예시
+  chant. 태그 이름·분류·게시물 수는 Danbooru·e621 사이트의 태그 데이터이고, 파일은 상류 저장소가 위 MIT `LICENSE` 로 배포한 그대로입니다.
+- 여섯째 목록 `tags/danbooru_2026-10-01_pt20-ia-dd.csv`(내장의 `tac_tagFile` 기본값)는 상류 tagcomplete 가 아니라
+  [DraconicDragon/dbr-e621-lists-archive](https://github.com/DraconicDragon/dbr-e621-lists-archive) 의 파일
+  `tag-lists/danbooru/danbooru_2026-10-01_pt20-ia-dd.csv`(git blob `acdc0685c5a52ac743363adfe4d6a9b4298331d0`, 5,602,650 바이트, 그 경로의
+  커밋 `0d3b4e4`, 2026-10-01)를 바이트 그대로 넣은 것입니다 — 2026-10-01 에 만든 Danbooru 태그 목록으로, 게시물 수 20 이상인 태그
+  220,510개(이름·분류·게시물 수·별칭, LF). 라이선스: 그 저장소의 **The Unlicense**(`LICENSE`, 퍼블릭 도메인 헌정 — 조건이 없지만 출처를
+  밝혀 둡니다). 태그 이름·분류·게시물 수는 Danbooru 사이트의 태그 데이터입니다. `tests/test_tagcomplete_vendor.py` 가 git blob·SHA-256 을
+  고정합니다.
+
+이 확장에서 바꾼 부분(MIT 는 수정을 허락합니다 — 바꾼 곳 전부):
+
+- `tag_autocomplete_helper.py`
+  - import: `scripts.model_keyword_support`·`scripts.shared_paths`·`scripts.tag_frequency_db` → `sam3ext.tagcomplete.*`(상류의
+    `tag_frequency_db` sys.path 대체 경로는 뺌). Forge 의 스크립트 로더가 아니라 `sam3ext/tagcomplete/boot.py` 의 `start_helper()`
+    가 불러옵니다(`scripts/builtin_tagcomplete.py` 에서).
+  - `/tacapi/v1/*` 경로를 앱마다 한 번만 붙입니다 — 새 함수 `_api_tac_once` 가 `api_tac` 을 부르고, 같은 앱에 이미 있으면 건너뜁니다.
+  - `GET /tacapi/v1/wildcard-contents`(`api_tac` 안의 `get_wildcard_contents`): 새 함수 `_is_listed_wildcard_file` 로 와일드카드 폴더
+    (`WILDCARD_PATH`, `WILDCARD_EXT_PATHS` — 이 헬퍼가 wc.txt·wce.txt 에 적는 폴더) 안의 `.txt` 만 돌려주고 나머지는 404. 상류는
+    쿼리로 준 아무 파일이나 로그인 없이 돌려줬습니다.
+  - 설정 등록 `on_ui_settings`: `tac_tagFile` 의 기본값만 `danbooru.csv` → `danbooru_2026-10-01_pt20-ia-dd.csv`(위 여섯째 목록).
+    키·이름·섹션·드롭다운과 다른 `tac_*` 56개는 상류와 같습니다(설정 대조 테스트가 이 한 곳만 다름을 확인하고, 이 문자열을 되돌리면 함수가
+    상류와 해시까지 같습니다). config.json 에 저장된 값은 그대로 쓰입니다.
+  - 나머지 함수와 다른 경로 14개는 상류와 글자까지 같습니다(테스트가 함수별 해시를 상류와 대조).
+- `shared_paths.py` — `TAGS_PATH` 가 이 확장의 `tags/`(`sam3ext/tagcomplete/paths.py` 의 `TAGS_DIR`)입니다. 상류는
+  `scripts.basedir()/tags` 로, Forge 가 `scripts/` 의 파일을 실행하는 동안에만 맞는 값입니다. 그래서 `modules.scripts` import 는 뺐습니다.
+- `model_keyword_support.py`·`tag_frequency_db.py` — import 경로만(`scripts.shared_paths` → `sam3ext.tagcomplete.shared_paths`).
+- 상류 `install.py`(`pyyaml` 설치) 대신 `requirements.txt` 에 `pyyaml` 을 적었습니다. 상류의 `README.md`·`.github/`(배너·FUNDING)·
+  `.gitattributes`·`.gitignore` 는 넣지 않았고, 태그 목록 다섯 개 밖의 상류 목록(`e621.csv` 등)도 넣지 않았습니다.
+- 이 확장의 코드(GPL-3.0-only, 상류 코드 아님): `sam3ext/tagcomplete/__init__.py`·`paths.py`·`coexist.py`(따로 설치된 tagcomplete
+  가 켜져 있으면 내장이 쉼, 설정 스위치 `sam3_builtin_tagcomplete_enabled` 와 안내 줄, 로더가 읽는 숨은 설정
+  `sam3_tac_builtin_boot`, 고른 `tac_tagFile` 이 `tags/` 에 없을 때 페이지가 기본 목록을 대신 읽게 하는 정보)·`boot.py`(헬퍼 시작, 그 시작
+  정보), `scripts/builtin_tagcomplete.py`, `javascript/tagcomplete_loader.js`,
+  `tools/migrate_tagcomplete.py`.
+
 ## sd-forge-negpip — NegPiP (AGPL-3.0-or-later)
 
 `sam3ext/negpip/`(`__init__.py`·`anima.py`·`sd.py`·`utils.py`·`mask.py`)와 `scripts/negpip.py` 는
@@ -546,6 +605,9 @@ Guidance 등)은 README 의 출처 / 크레딧 절과 [docs/GUIDANCE.md](docs/GU
 | Extra Schedulers — React Cosinusoidal DynSF | `sam3ext/extra_schedulers/schedulers.py` `react_cosinusoidal_dynsf` | 식: yoinked-h, [Panchovix/stable-diffusion-webui-reForge](https://github.com/Panchovix/stable-diffusion-webui-reForge) commit `25a5fb38f`(2024-09-27, `ldm_patched/modules/samplers.py` 692-700줄 @ `739b2e1`) | AGPL-3.0(코드 사용 안 함) | 공개된 한 줄 식 재구현, reForge(AGPL-3.0) 코드 미사용 — 라벨과 계수 기본값 2.15 만 맞춤(infotext 호환) |
 | Extra Schedulers — Flow Cosmos rho7 | `sam3ext/extra_schedulers/schedulers.py` `flow_cosmos_rho7` | 이름 `flow_cosmos_rho7` 와 스케줄 착상(Cosmos-Predict2 의 EDM σ 0.002~80 에 Karras ρ 7 을 깔고 t = σ/(1+σ) 로 바꿈 — 이 확장에서는 그 값이 아코디언 ρ · σ̃ max · σ̃ min 의 기본값): [KeithZ117/Comfyui-anima-sampler](https://github.com/KeithZ117/Comfyui-anima-sampler) commit `effba3c5`(`cosmos_schedules.py` `build_flow_cosmos_rho_sigmas`); 식: Karras et al. [arXiv:2206.00364](https://arxiv.org/abs/2206.00364) ρ 램프 + 정류 흐름 시간 변환; 같은 σ 범위: ComfyUI `comfy/supported_models.py` 의 Cosmos 설정 | MIT(코드 사용 안 함) · eps/v 분기: [crowsonkb/k-diffusion](https://github.com/crowsonkb/k-diffusion) MIT(Forge 함수를 부름) | 식에서 새로 작성(코드 사본 없음) — 이름과 착상만 크레딧. eps/v 모델의 Karras 분기는 Forge 의 `k_diffusion.sampling.get_sigmas_karras`(k-diffusion 의 함수, Forge `modules_forge/packages/k_diffusion/sampling.py`)를 실행 중에 아코디언의 ρ(기본 7)로 부르는 것(코드 사본 없음 — Forge 의 Karras 와 같은 함수). 상류 함수의 숫자는 테스트 안의 몇 줄짜리 참조식으로만 대조 |
 | Extra Schedulers — Flow Cosmos Dynamic | `sam3ext/extra_schedulers/schedulers.py` `flow_cosmos_dynamic` | 이 확장의 조합: 위 Karras Dynamic 행의 램프(스텝마다 ρ + 2cos(2πi/n) — 그 변형의 출처는 미확인)를 위 Flow Cosmos rho7 행의 σ̃ 범위와 흐름 시간 변환 t = s/(1 + s) 에 씀; Karras et al. [arXiv:2206.00364](https://arxiv.org/abs/2206.00364) | —(다른 프로젝트의 코드 · 스케줄 없음) | 이 확장의 코드 — Karras Dynamic 과 같은 값 함수(`_karras_dynamic_values`)를 씀. eps/v 모델에서는 이 확장의 Karras Dynamic 그대로(아코디언의 ρ) |
+| SAM3 얼굴 안에서만 찾기 — 얼굴 검출 · crop | `sam3ext/face_detect.py` · `sam3ext/face_crop.py` | 검출기 연결 방식: [Bing-su/adetailer](https://github.com/Bing-su/adetailer)(설치된 Forge Neo 판 `aadetailer-neoforge`)의 모델 폴더 `models/adetailer` · 설정 `ad_extra_models_dir` · `ultralytics.YOLO(경로)(image, conf=…)` 의 `boxes.xyxy` · `boxes.conf` · 장치 `""`/`"cpu"`; 얼굴마다 잘라 보고 되붙이는 흐름의 착상은 얼굴 파싱 도구(예: [yakhyo/uniface](https://github.com/yakhyo/uniface))의 검출 → crop → 파싱 순서 | AGPL-3.0(ADetailer — 코드 사본 없음) · MIT(uniface — 코드 사용 안 함) | 같은 호출 모양으로 새로 작성(코드 사본 없음). 넓히기 비율 · 정사각 · 밀어 넣기 · 주인 얼굴 정하기는 이 확장의 식. ultralytics(AGPL-3.0)는 포함하지 않고 Forge venv 에 있는 것을 실행 중에 import, 얼굴 모델 파일(Bingsu/adetailer 의 face_yolov8n/s)도 받지도 포함하지도 않음 |
+| XYZ `[Modules] Text Encoder` — 텍스트 인코더 자리(slot) · 체크포인트 내장 인코더 판정, GGUF 헤더 읽기 | `sam3ext/xyz_text_encoder.py` `te_slots` · `checkpoint_profile` · `gguf_remap`, `sam3ext/gguf_header.py` | Forge Neo(2.30-6-gede60e1a) `backend/loader.py` `replace_state_dict` 의 텍스트 인코더 분기(알아보는 키 이름 · 모양 · 분기 순서)와 모델 종류 표(`prefix_L` · `prefix_G`), `preprocess_state_dict`; `backend/loader_gguf.py` `gguf_remapping` 의 텐서 이름 대응표(파일 주석상 [city96/ComfyUI-GGUF](https://github.com/city96/ComfyUI-GGUF) `loader.py` 유래); GGUF 파일 형식(ggml · llama.cpp 의 gguf-py, Forge `modules_forge/packages/gguf`) | AGPL-3.0 · Apache-2.0 · MIT(코드 사용 안 함) | 로더가 파일을 어느 자리에 넣는지, 체크포인트에 어느 인코더가 들어 있는지를 헤더만으로 다시 판정하는 새 코드(가중치를 읽지 않고, Forge 가 assert 로 멈출 파일은 오류로 돌려줌). 이름 대응표는 Forge 가 쓰는 텐서 이름 값과 같게 맞춘 것. GGUF 헤더 읽기는 형식(매직 · 버전 · 키/값 표 · 텐서 표)에서 표준 라이브러리로 새로 작성 — gguf-py 코드 사본 없음. 대조 테스트(`tests/test_xyz_text_encoder_origin.py`)는 Forge 파일과 gguf-py 를 읽기 전용으로 실행 |
+| XYZ `VAE` 축(Forge 의 축을 제자리에서 교체) — 제자리 VAE 교체 가능 판정 | `sam3ext/xyz_vae.py` `strict_shapes` · `swappable` · `vae_family` · `predicted_shapes`, `sam3ext/xyz_vae_cell.py`, `scripts/modules_xyz_text_encoder.py` `replace_vae_axis` | Forge Neo(2.30-6-gede60e1a) `modules/sd_vae.py` `_load_vae_dict`(엄격한 `load_state_dict`, 버리는 키 `loss*` · `vae_ignore_keys`), `backend/loader.py` 의 VAE 클래스 선택(`post_quant_conv.weight` 면 `Qwen2DVAE`, 아니면 `WanVAE`)과 `replace_state_dict` 의 VAE 분기 · 형식 변환 키, `huggingface_guess` 의 `vae_key_prefix`, `scripts/xyz_grid.py` 의 `VAE` 축 | AGPL-3.0(코드 사용 안 함) | 파일을 Forge 가 만든 VAE 에 그대로 넣을 수 있는지(텐서 이름 · 모양이 같은지)를 헤더만으로 다시 판정하는 새 코드. Forge 의 축 객체는 복사해 `apply` 만 감쌈(Forge 의 `apply_vae` 를 그대로 부름, 코드 사본 없음). 대조 테스트(`tests/test_xyz_vae_origin.py`)는 Forge 파일을 읽기 전용으로 실행하고, Forge 의 `WanVAE` · `Qwen2DVAE` 를 별도 프로세스에서 CPU 로 만들어 대조 |
 
 ## 라이선스 없는 저장소 — 이름만 참고 (코드 미사용)
 
@@ -568,6 +630,8 @@ DenOfEquity 저장소는 아무 파일도 열지 않았습니다. README 에서 
 
 `sam3ext/anima38/`(Copyright (c) 2026 GumGum10 contributors),
 `mcp_server/sam_extra_mcp/forgeneo/`·`server.py`·`service.py` 와 `tests/test_mcp_forgeneo_upstream.py` 의 forgeneo-mcp 코드(Copyright (c) 2026 Eduardo Abreu),
+`sam3ext/tagcomplete/` 의 Tag Autocomplete 코드와 `tags/` 의 태그 목록 다섯 개(Copyright (c) 2022 Dominik Reh; Forge Neo 포크의 변경 2026 Eduardo Abreu — 같은 조건, 전문 사본 `sam3ext/tagcomplete/LICENSE`),
+`sam3ext/tagcomplete/javascript/_caretPosition.js` 의 textarea-caret-position 코드(Copyright (c) 2015 Jonathan Ong me@jongleberry.com),
 `assets/bpe_simple_vocab_16e6.txt.gz`(Copyright (c) 2021 OpenAI),
 `scripts/anima_detail_daemon.py` 의 Detail Daemon 코드(Copyright (c) 2024 Sahand Ahmadian, Copyright (c) 2024 Jonseed),
 `sam3ext/colorcraft/`·`javascript/colorcraft_sliders.js` 와 Colorcraft 대조 테스트 사본의 ComfyUI-Colorcraft 코드(Copyright (c) 2026 Sahand Ahmadian Tehrani (Muerrilla); 포크 aoleg/ComfyUI-Colorcraft — Oleg Afonin),

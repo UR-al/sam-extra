@@ -11,6 +11,8 @@
 Forge 체크아웃이 있으면(없으면 건너뜀 — CI) Forge 의 진짜 코드로 확인한다: presets.register 가 만드는 설정(모든
 프리셋), forge_main_entry 의 컴포넌트·출력 순서, 그리고 저장한 값이 on_preset_change 로 다시 읽혀 같은 UI 값이 되는지
 (modules_change 의 저장 모양과도 같은지), 그리고 0 으로 둔 칸이 저장 뒤에도 Forge 에서 건너뛰어지는지(칸마다).
+Forge 2.30-6(ede60e1a)부터 on_preset_change 가 읽는 설정 ``sd_modules_dropdown_use_short`` 는 그 Forge 의
+shared_options.py 기본값으로 가짜 opts 에 넣고, 끈 경우(드롭다운이 폴더 아래 경로)도 왕복을 확인한다.
 """
 from __future__ import annotations
 
@@ -557,10 +559,40 @@ def forge_labels(presets_module):
     # shared_options.py keys main_entry's functions also set
     templates = {"forge_preset": FakeInfo("sd"), "sd_model_checkpoint": FakeInfo(None),
                  "forge_additional_modules": FakeInfo([]), "forge_unet_storage_dtype": FakeInfo("Automatic")}
+    # ... and the plain settings on_preset_change reads (shared.opts.<name>), with this Forge's defaults —
+    # 2.30-6 (ede60e1a): sd_modules_dropdown_use_short (default on). Older Forge reads none.
+    for name, default in _forge_shared_option_defaults(on_preset_change_option_reads()).items():
+        templates.setdefault(name, FakeInfo(default))
     with mock.patch.dict(sys.modules, {"modules": package, "modules.options": options,
                                        "modules.shared_items": shared_items}):
         presets_module.register(templates)
     return templates
+
+
+def _forge_shared_option_defaults(names):
+    """modules/shared_options.py 의 ``"name": OptionInfo(default, …)`` 기본값 — 이 Forge 에 있는 이름만(import 없이 AST)."""
+    tree = ast.parse(require_forge_file("modules/shared_options.py").read_text(encoding="utf-8"))
+    found = {}
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Dict):
+            continue
+        for key, value in zip(node.keys, node.values):
+            if not (isinstance(key, ast.Constant) and key.value in names):
+                continue
+            while isinstance(value, ast.Call) and isinstance(value.func, ast.Attribute):  # .info(…).needs_reload_ui()
+                value = value.func.value
+            if isinstance(value, ast.Call) and getattr(value.func, "id", None) == "OptionInfo" and value.args:
+                found[key.value] = ast.literal_eval(value.args[0])
+    return found
+
+
+def on_preset_change_option_reads():
+    """Settings Forge's on_preset_change reads as plain attributes (``shared.opts.<name>``, not getattr with a
+    default) — FakeOpts must know them, or every call raises AttributeError."""
+    func = _function(_main_entry_tree(), "on_preset_change")
+    called = {id(node.func) for node in ast.walk(func) if isinstance(node, ast.Call)}    # shared.opts.set(…) / .save(…)
+    return {node.attr for node in ast.walk(func)
+            if isinstance(node, ast.Attribute) and id(node) not in called and ast.unparse(node.value) == "shared.opts"}
 
 
 def _main_entry_tree():
@@ -573,6 +605,15 @@ def _function(tree, name):
         if isinstance(node, ast.FunctionDef) and node.name == name:
             return node
     raise AssertionError(f"{name} not found in modules_forge/main_entry.py")
+
+
+def _preset_key(node):
+    """The first ``getattr(shared.opts, f"..._{preset}...", …)`` key under ``node`` as a FIELDS template, or None."""
+    for child in ast.walk(node):
+        if isinstance(child, ast.Call) and getattr(child.func, "id", None) == "getattr" \
+                and len(child.args) > 1 and isinstance(child.args[1], ast.JoinedStr):
+            return "".join(part.value if isinstance(part, ast.Constant) else "{p}" for part in child.args[1].values)
+    return None
 
 
 def forge_functions(names, namespace):
@@ -603,14 +644,19 @@ class ForgeContractTests(unittest.TestCase):
         func = _function(_main_entry_tree(), "on_preset_change")
         returned = func.body[-1]
         self.assertIsInstance(returned, ast.Return)
+        # A value read into a local above the return (2.30-6, ede60e1a: modules_value) counts as that element's key.
+        local_values = {}
+        for node in func.body:
+            if isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
+                local_values.setdefault(node.targets[0].id, node.value)      # its first assignment
         keys = []
-        for element in returned.value.elts:
-            for node in ast.walk(element):
-                if isinstance(node, ast.Call) and getattr(node.func, "id", None) == "getattr" \
-                        and isinstance(node.args[1], ast.JoinedStr):
-                    keys.append("".join(part.value if isinstance(part, ast.Constant) else "{p}"
-                                        for part in node.args[1].values))
-                    break
+        for element in returned.value.elts[:20]:
+            key = _preset_key(element)
+            if key is None:
+                followed = [_preset_key(local_values[node.id]) for node in ast.walk(element)
+                            if isinstance(node, ast.Name) and node.id in local_values]
+                key = next((k for k in followed if k is not None), None)
+            keys.append(key)
         # the two batch updates read their keys in batch_args_t2i / batch_args_i2i above the return
         self.assertEqual(len(keys), 20)
         self.assertEqual(keys, [template for template, _kind, _label in sd.FIELDS[:20]])
@@ -621,6 +667,22 @@ class ForgeContractTests(unittest.TestCase):
                 and len(node.args) > 1 and isinstance(node.args[1], ast.JoinedStr)}
         self.assertLessEqual({"{p}_t2i_batch_size", "{p}_i2i_batch_size"}, read)
         self.assertEqual([t for t, _k, _l in sd.FIELDS[20:]], ["{p}_t2i_batch_size", "{p}_i2i_batch_size"])
+
+    def test_fake_opts_know_every_setting_on_preset_change_reads(self):
+        """Forge 2.30-6 (ede60e1a) made on_preset_change read ``shared.opts.sd_modules_dropdown_use_short``; a
+        setting FakeOpts does not know raises AttributeError in every test that runs Forge's function. The labels
+        take each such setting's default from this Forge's shared_options.py; a new one must be looked at here."""
+        reads = on_preset_change_option_reads()
+        self.assertLessEqual(reads, {"sd_model_checkpoint", "sd_modules_dropdown_use_short"},
+                             "on_preset_change reads a new setting - check what it does to the saved values")
+        labels = forge_labels(_forge_presets_module())
+        opts = FakeOpts(labels)
+        for name in reads:
+            with self.subTest(name=name):
+                self.assertIn(name, labels)
+                getattr(opts, name)
+        if "sd_modules_dropdown_use_short" in reads:
+            self.assertIs(opts.sd_modules_dropdown_use_short, True)     # Forge's default: file names only
 
     def test_mini_registry_matches_forge_for_its_presets(self):
         real = forge_labels(_forge_presets_module())
@@ -647,12 +709,16 @@ class ForgeRoundTripTests(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
 
-    def _forge(self, opts):
+    def _forge(self, opts, modules=None):
+        """Forge's on_preset_change / modules_change over ``modules`` (file name → (full path, path under its
+        models folder)) — refresh_models' module_list and, from 2.30-6 (ede60e1a), module_map."""
         import gradio as gr
 
-        module_list = dict(MODULES)
+        modules = modules if modules is not None else {name: (path, name) for name, path in MODULES.items()}
+        module_list = {name: full for name, (full, _rel) in modules.items()}
+        module_map = {name: rel for name, (_full, rel) in modules.items()}
         shared = types.SimpleNamespace(opts=opts, config_filename=str(Path(self.tmp.name) / "config.json"))
-        namespace = {"os": os, "gr": gr, "shared": shared, "module_list": module_list,
+        namespace = {"os": os, "gr": gr, "shared": shared, "module_list": module_list, "module_map": module_map,
                      "use_shift": self.presets_module.use_shift, "use_distill": self.presets_module.use_distill,
                      "is_video": self.presets_module.is_video,
                      "refresh_model_loading_parameters": lambda **kwargs: None}
@@ -718,6 +784,38 @@ class ForgeRoundTripTests(unittest.TestCase):
                 self.assertEqual(host.opts.data["forge_additional_modules_anima"],
                                  forge_opts.data["forge_additional_modules_anima"])
 
+    def test_module_dropdown_with_folders_round_trips(self):
+        """Forge 2.30-6 (ede60e1a): with Settings → 'Show filenames without folder in the VAE / Text Encoder
+        dropdown' (sd_modules_dropdown_use_short) off, the dropdown lists paths under the models folder
+        ('sdxl/clip_l_anime.safetensors') and on_preset_change maps the stored modules back to them through
+        module_map. The button takes the base name like modules_change, so both spellings round-trip."""
+        if "sd_modules_dropdown_use_short" not in self.labels:
+            self.skipTest("this Forge's VAE / Text Encoder dropdown always lists file names (before 2.30-6, ede60e1a)")
+        root = os.path.join("C:" + os.sep, "forge", "models")
+        modules = {
+            "qwen_image_vae.safetensors": (os.path.join(root, "VAE", "qwen_image_vae.safetensors"),
+                                           "qwen_image_vae.safetensors"),
+            "clip_l_anime.safetensors": (os.path.join(root, "text_encoder", "sdxl", "clip_l_anime.safetensors"),
+                                         os.path.join("sdxl", "clip_l_anime.safetensors")),
+        }
+        module_paths = {name: full for name, (full, _rel) in modules.items()}
+        for short in (True, False):
+            shown = [name if short else rel for name, (_full, rel) in modules.items()]   # the dropdown's values
+            with self.subTest(sd_modules_dropdown_use_short=short):
+                host = make_host(labels=self.labels, presets=self.preset_names, tmp=self.tmp.name,
+                                 module_paths=module_paths, data={"sd_modules_dropdown_use_short": short})
+                payload = sd.save_preset("f", "anima", ui_values(modules=shown), host)
+                self.assertTrue(payload["ok"], payload)
+                self.assertEqual(host.opts.data["forge_additional_modules_anima"], sorted(module_paths.values()))
+                on_preset_change, _modules_change = self._forge(host.opts, modules)
+                self.assertEqual(sorted(on_preset_change("anima")[1]["value"]), sorted(shown))
+
+                forge_opts = FakeOpts(self.labels, {"sd_modules_dropdown_use_short": short})
+                _on_preset_change, modules_change = self._forge(forge_opts, modules)
+                modules_change(list(shown), "anima", save=False, refresh=False)
+                self.assertEqual(forge_opts.data["forge_additional_modules_anima"],
+                                 host.opts.data["forge_additional_modules_anima"])
+
     def test_other_presets_are_untouched_and_forge_preset_is_not_written(self):
         host = make_host(labels=self.labels, presets=self.preset_names, tmp=self.tmp.name,
                          data={"forge_preset": "xl", "xl_t2i_step": 24, "sd_t2i_cfg": 6.0})
@@ -744,7 +842,8 @@ class ForgeSkipFieldTests(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.shared = types.SimpleNamespace(opts=None, config_filename=str(Path(self.tmp.name) / "config.json"))
-        namespace = {"os": os, "gr": gr, "shared": self.shared, "use_shift": self.presets_module.use_shift,
+        namespace = {"os": os, "gr": gr, "shared": self.shared, "module_map": {},
+                     "use_shift": self.presets_module.use_shift,
                      "use_distill": self.presets_module.use_distill, "is_video": self.presets_module.is_video}
         (self.forge_on_preset_change,) = forge_functions(["on_preset_change"], namespace)
 

@@ -22,6 +22,11 @@ BUTTON_TOOLTIP = (
 )
 SAM3_SCRIPT_STEM = "!sam3"
 NO_MASK_MESSAGE = "SAM3: 선택한 이미지에서 마스크를 찾지 못했습니다 (감지 프롬프트·임계값을 확인하세요)."
+# 'Search inside faces only'(얼굴 안에서만 찾기)를 켰는데 얼굴이 없을 때 — 프롬프트·임계값이 아니라 얼굴 검출기 쪽을 가리킨다.
+NO_FACES_MESSAGE = (
+    "SAM3: 선택한 이미지에서 얼굴을 찾지 못했습니다 ({model}, 신뢰도 {confidence:.2f}). "
+    "SAM3 Face Detector Confidence 를 낮추거나 'Search inside faces only' 를 끄세요."
+)
 MASK_ONLY_MESSAGE = "SAM3: 마스크는 찾았지만 모드가 Inpaint 가 아니라 이미지는 그대로입니다."
 STOPPED_MESSAGE = "SAM3: 중단했습니다."
 
@@ -37,6 +42,19 @@ def validate_selection(gallery, index, geninfo):
     if len(gallery) > 1 and (index < first or index >= count):
         return "Unable to run SAM3 on grid or control images."
     return None
+
+
+def no_faces_message(face_info):
+    """얼굴 crop 이 얼굴을 하나도 못 찾았으면 그 안내(모델·신뢰도는 HTML 이스케이프), 아니면 None."""
+    if face_info is None or getattr(face_info, "crops", None):
+        return None
+    import html
+
+    try:
+        confidence = float(getattr(face_info, "confidence", 0.0))
+    except (TypeError, ValueError):
+        confidence = 0.0
+    return NO_FACES_MESSAGE.format(model=html.escape(str(getattr(face_info, "model", ""))), confidence=confidence)
 
 
 def force_enabled(args):
@@ -187,7 +205,8 @@ def run_sam3_quick(id_task, request, gallery, gallery_index, generation_info, *a
     if state.interrupted or state.skipped:
         return unchanged(STOPPED_MESSAGE)
     if not getattr(p, "_sam3_mask_found", False):
-        return unchanged(NO_MASK_MESSAGE)   # 미리보기 오버레이가 켜져 있어도 저장하지 않는다
+        no_faces = no_faces_message(getattr(p, "_sam3_face_crop_info", None))
+        return unchanged(no_faces or NO_MASK_MESSAGE)   # 미리보기 오버레이가 켜져 있어도 저장하지 않는다
     result = pp.image
     if result is image:
         return unchanged(MASK_ONLY_MESSAGE)

@@ -361,6 +361,15 @@ class DegridRuntime:
         with self._lock:
             return self._release_locked()
 
+    def unload(self) -> bool:
+        """'모델 내리기' 버튼 — VRAM 에서 내리고(release) RAM 의 NAFNet 과 패처도 놓는다. 다음 실행이 파일에서 다시 읽는다.
+        도는 중이면 끝날 때까지 기다린다. 쥔 것이 있었으면 True."""
+        with self._lock:
+            held = self._model is not None or self._patcher is not None
+            released = self._release_locked()
+            self._model = self._model_key = self._patcher = None
+            return held or released
+
     def _release_locked(self) -> bool:
         released = False
         patcher = self._patcher
@@ -450,3 +459,10 @@ def shared_runtime() -> DegridRuntime:
         if _SHARED is None:
             _SHARED = DegridRuntime()
         return _SHARED
+
+
+def unload_shared_runtime() -> bool:
+    """'모델 내리기' 버튼의 훅(sam3ext/unload_registry.py) — 공용 런타임이 있을 때만(만들지 않는다). 놓은 것이 있으면 True."""
+    with _SHARED_LOCK:
+        runtime = _SHARED
+    return runtime.unload() if runtime is not None else False

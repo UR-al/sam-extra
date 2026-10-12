@@ -49,6 +49,7 @@ __all__ = [
     "apply_hiflow",
     "butterworth_lowpass",
     "butterworth_mask",
+    "clear_mask_cache",
     "resize_latent",
     "step_weight",
 ]
@@ -94,6 +95,13 @@ def butterworth_mask(height: int, width: int, cutoff: float, *, order: int = BUT
         _MASK_CACHE.clear()
     _MASK_CACHE[key] = mask
     return mask
+
+
+def clear_mask_cache() -> bool:
+    """Drops the cached Butterworth masks (the '모델 내리기' button). True when any was cached."""
+    held = bool(_MASK_CACHE)
+    _MASK_CACHE.clear()
+    return held
 
 
 def butterworth_lowpass(t: torch.Tensor, cutoff: float, *, order: int = BUTTERWORTH_ORDER) -> torch.Tensor:

@@ -202,6 +202,17 @@ class TipoRuntime:
             self._empty_cache()
             return True
 
+    def unload(self) -> bool:
+        """'모델 내리기' 버튼 — GPU 에 남은 사본을 내리고(release) RAM 의 모델·토크나이저·패처도 놓는다. 다음 생성이 파일에서
+        다시 읽는다. 돌고 있는 생성이 있으면 끝날 때까지 기다린다. 쥔 것이 있었으면 True."""
+        with self._lock:
+            held = self._model is not None
+            released = self.release()
+            self._model = None
+            self._tokenizer = None
+            self._patcher = None
+            return held or released
+
     def missing_files(self) -> list[str]:
         return missing_files(self.directory)
 
@@ -431,3 +442,9 @@ def shared_runtime() -> TipoRuntime:
     if _SHARED is None:
         _SHARED = TipoRuntime()
     return _SHARED
+
+
+def unload_shared_runtime() -> bool:
+    """'모델 내리기' 버튼의 훅(sam3ext/unload_registry.py) — 공용 런타임이 있을 때만(만들지 않는다). 놓은 것이 있으면 True."""
+    runtime = _SHARED
+    return runtime.unload() if runtime is not None else False

@@ -176,13 +176,16 @@ class _ForgeModel:
 
 
 class _CountingForgeModel(_ForgeModel):
-    """Counts the latent rows Forge evaluates (1 per cond, 1 per uncond at batch 1)."""
+    """Counts the latent rows Forge evaluates (1 per cond, 1 per uncond at batch 1); ``calls``: the rows of
+    each UNet call in order."""
 
     def __init__(self):
         self.rows = 0
+        self.calls = []
 
     def apply_model(self, x, timestep, *, bias, transformer_options):
         self.rows += int(x.shape[0])
+        self.calls.append(int(x.shape[0]))
         return bias.clone()
 
 
@@ -259,9 +262,10 @@ class DcwOriginTestCase(unittest.TestCase):
             args[index] = config[key]
         return args
 
-    def _attach(self, args, *, unet=None, xyz=None, steps=20, **request_fields):
+    def _attach(self, args, *, unet=None, xyz=None, steps=20, log=None, **request_fields):
         """``request_fields`` are StableDiffusionProcessing attributes such as ``cfg_scale``,
-        ``is_hr_pass``/``hr_cfg`` or the refiner fields; omitted, the pass CFG is unknown."""
+        ``is_hr_pass``/``hr_cfg`` or the refiner fields; omitted, the pass CFG is unknown.
+        ``log``: a mock that records the console lines (default: a fresh one per call)."""
         model = type("Anima", (), {})()
         model.forge_objects = types.SimpleNamespace(unet=unet or _ForgeUnet())
         request = types.SimpleNamespace(
@@ -269,15 +273,16 @@ class DcwOriginTestCase(unittest.TestCase):
         )
         if xyz:
             request._anima_safe_pag_xyz = dict(xyz)
-        with mock.patch.object(self.pag, "_log"):
+        with mock.patch.object(self.pag, "_log", mock.DEFAULT if log is None else log):
             self.pag.AnimaSafePAG().process_before_every_sampling(request, *args)
         return request, model.forge_objects.unet
 
     def _forge_step(self, model_options, x, sigma, cond_pred, uncond_pred, cond_scale, cond_extra=None,
-                    model=None):
+                    model=None, forge=None):
         """One Forge model call. ``uncond_pred=None`` is Forge at CFG == 1, which encodes no
-        negative prompt (modules/processing.py:481-483, hires :1606-1608)."""
-        sampler, Condition = self._forge_sampler()
+        negative prompt (modules/processing.py:481-483, hires :1606-1608). ``forge``: another
+        ``(sampling_function module, Condition)`` than the class's cached one (Batch Cond/Uncond off)."""
+        sampler, Condition = self._forge_sampler() if forge is None else forge
         cond = [{"model_conds": {"bias": Condition(cond_pred)}, **(cond_extra or {})}]
         uncond = None if uncond_pred is None else [{"model_conds": {"bias": Condition(uncond_pred)}}]
         with mock.patch.dict(sys.modules, {"backend.sampling.sampling_function": sampler}):
@@ -759,6 +764,174 @@ class AdaptiveGuidanceDcwTests(DcwOriginTestCase):
         self.assertEqual(self.pag._CFG["steps"], 0)
         self.assertIs(self.pag._RUNTIME.smc_prev, previous)
         self.assertIsNone(self.pag._APG["avg"])
+
+    # -- Forge 2.30 "Batch Cond/Uncond" off (Settings → Optimizations) ----------
+
+    def _adg_args(self, enabled=True):
+        args = self._forge_args(dict(dcw_enabled=True))
+        args[17] = enabled   # Adaptive Guidance
+        args[18] = 0.0       # skip from the first step
+        args[19] = 0         # never keep an uncond step
+        return args
+
+    def _fresh_note_state(self):
+        saved = self.pag._ADG["batch_off_warned"]
+        self.addCleanup(self.pag._ADG.__setitem__, "batch_off_warned", saved)
+        self.pag._ADG["batch_off_warned"] = False
+
+    def test_adg_with_batch_cond_uncond_off_skips_nothing_like_adg_off(self):
+        """Batch Cond/Uncond off: Forge 2.30 runs cond and uncond as separate UNet calls
+        (``can_concat_cond``), so ADG has no combined batch to drop the uncond rows from. ADG then
+        installs nothing of its own (no UNet wrapper): the attach is ADG off's and the step is
+        bit-identical to ADG off (plain CFG + DCW)."""
+        self._fresh_note_state()
+        sigma, x, cond, uncond = self._schedule()[3]
+        sampler, condition, _memory = _BASE._load_forge_sampler(batch_cond_uncond=False)   # fresh, never the cached one
+        _request, off_unet = self._attach(self._adg_args(enabled=False))
+        reference = self._forge_step(off_unet.model_options, x, sigma, cond, uncond, 4.0, forge=(sampler, condition))
+
+        self.setUp()
+        with mock.patch.object(self.pag, "shared", types.SimpleNamespace(batch_cond_uncond=False)):
+            _request, unet = self._attach(self._adg_args())
+        model = _CountingForgeModel()
+        out = self._forge_step(unet.model_options, x, sigma, cond, uncond, 4.0, model=model,
+                               forge=(sampler, condition))
+
+        self.assertTrue(self.pag._ADG["on"], "ADG stays on - only the note is new")
+        self.assertTrue(self.pag._STATE["adg_batch_off"])
+        self.assertNotIn("model_function_wrapper", unet.model_options)
+        self.assertEqual(unet.model_options, off_unet.model_options)
+        self.assertTrue(torch.equal(out, reference))
+        self.assertEqual(self.pag._STATE["adg_skipped_steps"], 0)
+        # Forge 2.30+ honours the flag (cond, then uncond); the 2.29.2 file has no such setting and batches.
+        self.assertEqual(model.calls, [1, 1] if _BASE.forge_sampler_honours_batch_flag(sampler) else [2])
+
+    def test_adg_alone_with_batch_cond_uncond_off_keeps_another_extensions_unet_wrapper(self):
+        """The UNet already carries another extension's model_function_wrapper (Spectrum Integrated's
+        ``spectrum_unet_wrapper``). ADG alone with Batch Cond/Uncond off leaves it in place without the
+        takeover warning - like ADG off - and the step is bit-identical to ADG off. With Batch Cond/Uncond
+        on (and on Forge 2.29.2) ADG still needs the slot and takes it, with the warning, as before."""
+        sampler, condition, _memory = _BASE._load_forge_sampler(batch_cond_uncond=False)
+        sigma, x, cond, uncond = self._schedule()[3]
+
+        def spectrum_unet_wrapper(apply_model, args):     # a stand-in with a visible effect of its own
+            return apply_model(args["input"], args["timestep"], **args["c"]) * 0.5
+
+        def run(adg, forge_shared):
+            self.setUp()
+            self._fresh_note_state()
+            args = self._forge_args({})          # nothing else of this suite on: ADG is the only reason
+            args[17], args[18], args[19] = adg, 0.0, 0
+            log = mock.Mock()
+            with mock.patch.object(self.pag, "shared", forge_shared):
+                _request, unet = self._attach(
+                    args, unet=_ForgeUnet({"model_function_wrapper": spectrum_unet_wrapper}), log=log,
+                )
+            out = self._forge_step(unet.model_options, x, sigma, cond, uncond, 4.0, forge=(sampler, condition))
+            takeover = [call.args[0] for call in log.call_args_list if "model_function_wrapper" in call.args[0]]
+            return unet, out, takeover
+
+        batch_off = types.SimpleNamespace(batch_cond_uncond=False)
+        off_unet, reference, off_warn = run(False, batch_off)
+        unet, out, warn = run(True, batch_off)
+        self.assertIs(off_unet.model_options["model_function_wrapper"], spectrum_unet_wrapper)
+        self.assertIs(unet.model_options["model_function_wrapper"], spectrum_unet_wrapper)
+        self.assertEqual((off_warn, warn), ([], []))
+        self.assertTrue(torch.equal(out, reference))
+        torch.testing.assert_close(reference, uncond * 0.5 + 4.0 * (cond * 0.5 - uncond * 0.5))   # its wrapper ran
+
+        unet, _out, warn = run(True, types.SimpleNamespace(batch_cond_uncond=True))   # unchanged default path
+        self.assertIs(unet.model_options["model_function_wrapper"], self.pag._model_wrapper)
+        self.assertEqual(len(warn), 1)
+        self.assertIn("spectrum_unet_wrapper", warn[0])
+        self.assertFalse(self.pag._STATE["adg_batch_off"])
+
+    def test_adg_batch_off_verify_verdict_reads_the_setting(self):
+        """With ADG alone no wrapper counts split calls, so the [VERIFY] verdict reads the setting
+        recorded at attach time; Batch Cond/Uncond on keeps the old verdicts."""
+        cases = (
+            ("2.30, Batch Cond/Uncond off", False, "Adaptive=NO-SKIP(Batch Cond/Uncond off);"),
+            ("2.30 on / 2.29.2", True, "Adaptive=NO-SKIP;"),
+        )
+        for name, flag, expected in cases:
+            with self.subTest(name):
+                self.setUp()
+                self._fresh_note_state()
+                with mock.patch.object(self.pag, "shared", types.SimpleNamespace(batch_cond_uncond=flag)):
+                    self._attach(self._adg_args())
+                self.assertEqual(self.pag._STATE["adg_batch_off"], not flag)
+                with mock.patch.object(self.pag, "guidance_diagnostics_enabled", return_value=True), \
+                        mock.patch.object(self.pag, "_log") as log:
+                    self.pag.AnimaSafePAG().postprocess(None, None)
+                verdicts = [call.args[0] for call in log.call_args_list if "[VERIFY] verdict" in call.args[0]]
+                self.assertEqual(len(verdicts), 1)
+                self.assertIn(expected, verdicts[0])
+                self.assertFalse(self.pag._STATE["adg_batch_off"], "cleared after the generation")
+
+    def test_adg_batch_off_note_in_infotext_every_request_and_console_once(self):
+        self._fresh_note_state()
+        log = mock.Mock()
+        with mock.patch.object(self.pag, "shared", types.SimpleNamespace(batch_cond_uncond=False)):
+            first, _unet = self._attach(self._adg_args(), log=log)
+            self.setUp()
+            second, _unet = self._attach(self._adg_args(), log=log)
+        for request in (first, second):
+            self.assertEqual(request.extra_generation_params[self.pag.INFOTEXT_ADG_STATUS],
+                             "ADG inactive (Batch Cond/Uncond off)")
+            self.assertEqual(request.extra_generation_params["Anima Adaptive Guidance"],
+                             "skip_after=0.00, keep_every=0")
+        notes = [call.args[0] for call in log.call_args_list if "ADG inactive" in call.args[0]]
+        self.assertEqual(len(notes), 1, "console: once per session")
+        self.assertIn("Batch Cond/Uncond", notes[0])
+        self.assertIn(self.pag.INFOTEXT_ADG_STATUS, notes[0])
+        self.assertIn(self.pag.INFOTEXT_ADG_STATUS, self.pag._EXTRA_GENERATION_PARAM_KEYS,
+                      "cleared per pass / XYZ cell like the other guidance keys")
+
+    def test_adg_batch_note_absent_when_forge_batches_or_adg_is_off(self):
+        cases = (
+            ("2.30, Batch Cond/Uncond on", types.SimpleNamespace(batch_cond_uncond=True), True),
+            ("2.29.2 shared (constant True)", types.SimpleNamespace(batch_cond_uncond=True, opts=None), True),
+            ("no batch_cond_uncond attribute", types.SimpleNamespace(), True),
+            ("outside Forge (no shared)", None, True),
+            ("ADG off, Batch Cond/Uncond off", types.SimpleNamespace(batch_cond_uncond=False), False),
+        )
+        for name, forge_shared, adg in cases:
+            with self.subTest(name):
+                self.setUp()
+                self._fresh_note_state()
+                log = mock.Mock()
+                with mock.patch.object(self.pag, "shared", forge_shared):
+                    request, _unet = self._attach(self._adg_args(enabled=adg), log=log)
+                self.assertNotIn(self.pag.INFOTEXT_ADG_STATUS, request.extra_generation_params)
+                self.assertFalse(any("ADG inactive" in call.args[0] for call in log.call_args_list))
+                self.assertFalse(self.pag._ADG["batch_off_warned"])
+
+    def test_adg_status_infotext_is_written_as_documented(self):
+        """Forge writes every infotext value through ``infotext_utils.quote`` (processing.py
+        create_infotext), which JSON-quotes a value containing ',', ':' or a newline. The status value
+        must come out unquoted, so the line in the PNG is the one the docs and the console show."""
+        line = f"{self.pag.INFOTEXT_ADG_STATUS}: {self.pag.INFOTEXT_ADG_BATCH_OFF}"
+        self.assertEqual(line, "Anima Adaptive Guidance status: ADG inactive (Batch Cond/Uncond off)")
+        for doc in ("docs/GUIDANCE.md", "CHANGELOG.md"):
+            with self.subTest(doc=doc):
+                self.assertIn(f"`{line}`", (ROOT / doc).read_text(encoding="utf-8"))
+        self.assertIn(f"`{self.pag.INFOTEXT_ADG_BATCH_OFF}`", (ROOT / "README.md").read_text(encoding="utf-8"))
+
+        import ast
+        import json
+
+        from tests._forge_checkout import require_forge_file
+
+        path = require_forge_file("modules/infotext_utils.py")
+        quote = next(node for node in ast.parse(path.read_text(encoding="utf-8")).body
+                     if isinstance(node, ast.FunctionDef) and node.name == "quote")
+        namespace = {"json": json}
+        exec(compile(ast.Module(body=[quote], type_ignores=[]), str(path), "exec"), namespace)
+        self.assertEqual(namespace["quote"](self.pag.INFOTEXT_ADG_BATCH_OFF), self.pag.INFOTEXT_ADG_BATCH_OFF)
+        self.assertEqual(namespace["quote"]("ADG inactive: Batch Cond/Uncond off"),
+                         '"ADG inactive: Batch Cond/Uncond off"', "the earlier value came out quoted")
+        processing = require_forge_file("modules/processing.py").read_text(encoding="utf-8")
+        self.assertIn("infotext_utils.quote(v)", processing)
 
 
 if __name__ == "__main__":

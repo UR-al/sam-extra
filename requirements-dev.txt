@@ -16,6 +16,9 @@ einops
 gradio<6.0,>=4.0
 pydantic
 numpy
+# Built-in Tag Autocomplete helper (sam3ext/tagcomplete): wildcard YAML, CivitAI trigger-word lookup.
+pyyaml
+requests
 Pillow>=11.1.0
 fastapi
 packaging

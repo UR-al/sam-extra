@@ -30,6 +30,10 @@ except ImportError:
         validator,
     )
 
+# '얼굴 안에서만 찾기' 검출기 기본값의 단일 출처(face_detect 는 torch·ultralytics 를 불러올 때 import 하지 않아 가볍다).
+from .face_detect import DEFAULT_CONFIDENCE as FACE_CROP_DEFAULT_CONFIDENCE
+from .face_detect import DEFAULT_MODEL as FACE_CROP_DEFAULT_MODEL
+
 
 _DEVICE_RE = re.compile(r"^cuda:\d+$")
 
@@ -51,6 +55,7 @@ _NUMERIC_BOUNDS: dict[str, tuple[float, float | None, bool]] = {
     "sam3_cn_guidance_start": (0.0, 1.0, False),
     "sam3_cn_guidance_end": (0.0, 1.0, False),
     "sam3_cn_processor_res": (0, None, True),
+    "sam3_face_crop_confidence": (0.0, 1.0, False),
 }
 
 
@@ -133,6 +138,11 @@ class Sam3Args(BaseModel, extra=Extra.forbid):
     sam3_cn_processor_res: NonNegativeInt = 512
     sam3_cn_threshold_a: float = -1.0
     sam3_cn_threshold_b: float = -1.0
+    # 얼굴 안에서만 찾기: face_yolov8(models/adetailer) 얼굴 상자를 넓힌 정사각 crop 안에서만 SAM3 를 돌린다(sam3ext/
+    # face_crop.py). 맨 뒤에 붙여 예전 API 요청(키 없음 → 꺼짐)·infotext 순서·위젯 순서가 그대로다.
+    sam3_face_crop: bool = False
+    sam3_face_crop_model: str = FACE_CROP_DEFAULT_MODEL
+    sam3_face_crop_confidence: confloat(ge=0.0, le=1.0) = FACE_CROP_DEFAULT_CONFIDENCE
 
     # --- coercing validators -------------------------------------------------
     # These normalise instead of raising: the caller wraps Sam3Args(**payload)
@@ -188,6 +198,11 @@ class Sam3Args(BaseModel, extra=Extra.forbid):
         # Unknown device string → fall back to auto rather than deferring an
         # opaque torch error into model load.
         return "auto"
+
+    @validator("sam3_face_crop_model", pre=True)
+    def _normalise_face_crop_model(cls, value: Any) -> str:
+        # 빈 값(예전 UI 상태·API 의 "")은 기본 모델로. 이름 확인은 실행 때(없는 파일은 그때 알린다 — 받지 않음).
+        return str(value or "").strip() or FACE_CROP_DEFAULT_MODEL
 
     @validator("sam3_seed")
     def _clamp_seed(cls, value: int) -> int:
@@ -276,6 +291,11 @@ class Sam3Args(BaseModel, extra=Extra.forbid):
                 "SAM3 CN Threshold B",
             ],
         )
+        # 얼굴 안에서만 찾기: 꺼져 있으면 모델·신뢰도도 infotext 에서 뺀다(켜져 있으면 셋 다 남긴다).
+        ppop(
+            "SAM3 Face Crop",
+            ["SAM3 Face Crop", "SAM3 Face Crop Model", "SAM3 Face Crop Confidence"],
+        )
         return params
 
 
@@ -330,5 +350,9 @@ ALL_ARGS = ArgsList(
         Arg("sam3_cn_processor_res", "SAM3 CN Processor Res"),
         Arg("sam3_cn_threshold_a", "SAM3 CN Threshold A"),
         Arg("sam3_cn_threshold_b", "SAM3 CN Threshold B"),
+        # 맨 뒤 — 새 인자는 여기에만 붙인다(위젯·state·infotext 순서가 예전 그대로).
+        Arg("sam3_face_crop", "SAM3 Face Crop"),
+        Arg("sam3_face_crop_model", "SAM3 Face Crop Model"),
+        Arg("sam3_face_crop_confidence", "SAM3 Face Crop Confidence"),
     ]
 )

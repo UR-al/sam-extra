@@ -14,13 +14,21 @@ several scripts install hooks when imported. Checked here:
 * ``scripts/list_order.py`` sorts both lists by family in ``on_before_ui`` (after every script has
   registered), Forge's first entries stay first, and a reload sorts nothing differently;
 * XYZ axis labels are unique (Forge's built-in ones included) and a reload neither duplicates nor drops
-  any — with a reloaded XYZ grid and with one a host kept;
+  any — with a reloaded XYZ grid and with one a host kept; the SAM3 axes (face crop included) and the
+  ``[Modules] Text Encoder`` / replaced ``VAE`` axes are there together;
 * settings keys are unique, each section id has one title (and each title one id);
 * the HTTP routes are registered once, also when app start fires again on the same app;
 * every always-on script that puts itself in the ANIMA section has an ``anima`` lane in
   ``layout_lanes.REGISTRY``. Fixed here: Anima Optimal Scale was missing, so the notebook layout
   treated it as "도구·실험" — hidden under "더 보기" while closed, below the ANIMA items when open —
-  instead of right above Colorcraft, whose sorting priority places it under Optimal Scale.
+  instead of right above Colorcraft, whose sorting priority places it under Optimal Scale;
+* the built-in Tag Autocomplete (``scripts/builtin_tagcomplete.py``) starts its helper with the other
+  scripts: its note and switch, then the 57 ``tac_*`` settings in the one "Tag Autocomplete" section,
+  the 15 ``/tacapi/v1/*`` routes once each (also after Reload UI and a second app start on the same app),
+  the loader's start-up information as the one hidden setting ``sam3_tac_builtin_boot`` (no route of its own —
+  nothing the page needs waits for app start), and every file it writes in the probe's sandbox.
+
+The Forge checkout is next to the extension, else ``$SAM3_FORGE_ROOT`` (tests/_extra_schedulers_support.forge_root).
 """
 
 from __future__ import annotations
@@ -44,6 +52,10 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from sam3ext import layout_lanes  # noqa: E402
+from tests import _tagcomplete_support as tac  # noqa: E402
+from tests._extra_schedulers_support import forge_root  # noqa: E402
+
+FORGE = forge_root() or FORGE
 
 NEW_SCRIPTS = ("colorcraft.py", "anima_speed.py", "anima_extra_samplers.py", "anima_extra_schedulers.py",
                "appearance_progress_bar.py", "mcp_settings.py")
@@ -62,7 +74,8 @@ OUR_SAMPLER_ALIASES = (
 )
 OUR_SCHEDULERS = ("Cosine", "CosineExponential blend", "Phi", "Laplace", "Karras Dynamic", "custom",
                   "React Cosinusoidal DynSF", "Flow Cosmos rho7", "Flow Cosmos Dynamic")
-NEW_XYZ_PREFIXES = {"[Colorcraft]": 14, "[Anima SPEED]": 6, "[Extra Samplers]": 3, "[Extra Schedulers (sam-extra)]": 7}
+NEW_XYZ_PREFIXES = {"[Colorcraft]": 14, "[Anima SPEED]": 6, "[Extra Samplers]": 3, "[Extra Schedulers (sam-extra)]": 7,
+                    "[Modules]": 1}
 # The probe's Forge stand-in (DPM++ 2M, Euler a, Euler, ER SDE / Automatic, Karras, Exponential) plus ours,
 # after scripts/list_order.py (sam3ext/list_order.py: the families of the table, Forge's first entry first).
 FAMILY_ORDER_SAMPLERS = (
@@ -166,6 +179,14 @@ class LoadOrderTests(unittest.TestCase):
         for key in ("scheduler_map", "reload_scheduler_map"):
             self.assertEqual(r[key], r["scheduler_map_at_load"], key)
 
+    def test_forges_vae_axis_is_replaced_in_place(self):
+        """scripts/modules_xyz_text_encoder.py puts its copy of Forge's "VAE" axis at Forge's index - also after a
+        reload and on a kept XYZ grid, always wrapping Forge's apply."""
+        r = self.report
+        index = r["forge_xyz"].index("VAE")
+        for key in ("vae_axis", "reload_vae_axis", "kept_vae_axis"):
+            self.assertEqual(r[key], {"index": index, "wraps_forge": True}, key)
+
     def test_xyz_axes_are_unique_across_reloads(self):
         r = self.report
         labels = r["xyz"]
@@ -186,6 +207,19 @@ class LoadOrderTests(unittest.TestCase):
                 if a != b:
                     self.assertFalse(b.startswith(a), (a, b))   # no prefix guard swallows another
 
+    def test_face_crop_and_text_encoder_axes_coexist(self):
+        """v0.34.0: the "[SAM3] …" axes scripts/!sam3.py adds in before_ui (with the three face crop axes last) and the
+        "[Modules] Text Encoder" axis and replaced "VAE" axis of scripts/modules_xyz_text_encoder.py are each there once
+        — also after Reload UI and on a kept XYZ grid."""
+        for key in ("xyz", "reload_xyz", "kept_xyz"):
+            labels = self.report[key]
+            sam3 = [label for label in labels if label.startswith("[SAM3] ")]
+            self.assertEqual(len(sam3), 40, key)
+            self.assertEqual(sam3[-3:], ["[SAM3] Face Crop", "[SAM3] Face Crop Model", "[SAM3] Face Crop Confidence"], key)
+            for label in ("[Modules] Text Encoder", "VAE", *sam3):
+                self.assertEqual(labels.count(label), 1, (key, label))
+            self.assertEqual(labels.index("VAE"), self.report["forge_xyz"].index("VAE"), key)
+
     def test_settings_keys_and_sections_are_unique(self):
         r = self.report
         keys = [key for key, _section, _label in r["options"]]
@@ -201,7 +235,7 @@ class LoadOrderTests(unittest.TestCase):
             self.assertEqual(len(names), 1, (section_id, names))
         for title, section_ids in titles.items():
             self.assertEqual(len(section_ids), 1, (title, section_ids))
-        for section_id in ("sam3_colorcraft", "sam3_speed", "sam3_progress", "sam3_mcp"):
+        for section_id in ("sam3_colorcraft", "sam3_speed", "sam3_progress", "sam3_mcp", "tac"):
             self.assertIn(section_id, ids)
 
     def test_routes_are_registered_once(self):
@@ -222,6 +256,24 @@ class LoadOrderTests(unittest.TestCase):
             with self.subTest(script=script["file"]):
                 self.assertTrue(script["registered"], script)
                 self.assertEqual(script["lane"], "anima", script)
+
+    def test_builtin_tagcomplete_starts_with_the_other_scripts(self):
+        r = self.report
+        self.assertLess(r["order"].index("builtin_tagcomplete.py"), r["order"].index("negpip.py"))
+        for key in ("tagcomplete", "reload_tagcomplete"):
+            self.assertEqual(r[key]["state"], {"enabled": True, "code": "ok", "reason": None, "source": None}, key)
+        for key in ("options", "reload_options"):
+            in_section = [option[0] for option in r[key] if option[1] == tac.SECTION]
+            self.assertEqual(in_section, ["sam3_tac_builtin_note", "sam3_builtin_tagcomplete_enabled", *tac.TAC_KEYS], key)
+            boot = [option for option in r[key] if option[0] == "sam3_tac_builtin_boot"]
+            self.assertEqual([option[1] for option in boot], [[None, "Hidden Options"]], key)
+        for key in ("routes", "reload_routes"):
+            pairs = [(path, method) for path, methods in r[key] for method in methods]
+            self.assertEqual([pair for pair in pairs if pair[0].startswith("/tacapi/")], list(tac.TACAPI_ROUTES), key)
+            self.assertNotIn(("/sam3-tagcomplete/boot", "GET"), pairs, key)
+        # the helper ran (temp files, database) — inside the probe's sandbox, not in tags/ or a Forge install
+        for path in ("forge/tmp/tagAutocompletePath.txt", "tags/tag_frequency.db", "tags/temp/wc.txt"):
+            self.assertIn(path, r["sandbox_files"])
 
     def test_lane_registry_and_short_names(self):
         keys = {layout_lanes.slot_key(name) for name in self.report["order"]}

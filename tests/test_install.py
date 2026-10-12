@@ -68,6 +68,11 @@ class RequirementsFileTests(unittest.TestCase):
         for needed in ("sam3", "safetensors", "opencv-python", "timm", "einops", "huggingface-hub", "iopath"):
             self.assertIn(needed, names)
 
+    def test_requirements_cover_the_builtin_tag_autocomplete(self):
+        """내장 Tag Autocomplete 헬퍼(sam3ext/tagcomplete)가 import 하는 yaml — 따로 설치하던 확장은 install.py 로 깔았다."""
+        names = {install._canonical(req.name) for req in install.read_requirements()}
+        self.assertIn("pyyaml", names)
+
     def test_the_tile_repair_vendor_pure_python_dep_is_auto_installed(self):
         """Anima vendor(kohya sd-scripts)가 불러올 때 import 하는 imagesize — 순수 파이썬이라 requirements 로
         자동 설치한다. 판은 벤더 requirements.txt 와 같은 1.4.1(2.x 는 EXIF 회전을 반영한 크기를 준다)."""
@@ -429,7 +434,7 @@ class DevRequirementsTests(unittest.TestCase):
     def test_dev_requirements_cover_the_test_suite_imports(self):
         names, _ = self._dev_names()
         for needed in ("pytest", "safetensors", "transformers", "gradio", "pydantic", "numpy", "pillow",
-                       "fastapi", "packaging", "opencv-python-headless"):
+                       "fastapi", "packaging", "opencv-python-headless", "pyyaml", "requests"):
             self.assertIn(needed, names)
 
     def test_dev_requirements_leave_torch_to_the_cpu_index(self):

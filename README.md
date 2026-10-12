@@ -38,6 +38,7 @@ speckle↓·skin/hair 정리(`scripts/anima_vae_2x.py`). Qwen/Wan VAE latent 공
   [6 Character Reference](#워크플로-6-anima-character-reference--restyler) ·
   [7 Anima 3.8B](#워크플로-7-anima-38b--qwen35--semantic-connector-v2-편입)
 - SAM3 공통: [ControlNet 통합](#controlnet-통합) · [VRAM 절약](#vram-절약) · [마스크 후처리](#마스크-후처리) ·
+  [얼굴 안에서만 찾기](#얼굴-안에서만-찾기-face-crop) ·
   [진행률 / 검증](#진행률--검증) · [XYZ Plot 축](#xyz-plot-축) · [Settings 저장](#settings-저장)
 - 별도 기능: [ANIMA LoRA 블록 호환 변환](#별도-기능-anima-lora-블록-호환-변환) ·
   [DoRA 추론 방식](#별도-기능-dora-추론-방식) · [Anima VAE DeGrid](#별도-기능-anima-vae-degrid-nafnet) ·
@@ -48,7 +49,8 @@ speckle↓·skin/hair 정리(`scripts/anima_vae_2x.py`). Qwen/Wan VAE latent 공
   [Anima Guidance Suite](#별도-기능-anima-guidance-suite) ·
   [txt2img 화면 정리](#txt2img-화면-정리-) · [진행 막대](#별도-기능-진행-막대-smooth-progress) ·
   [TIPO 프롬프트 확장](#별도-기능-tipo-프롬프트-확장-) · [구도 · 카메라](#별도-기능-구도--카메라-프롬프트로-시점-잡기) ·
-  [NegPiP (내장)](#별도-기능-negpip-내장) · [MCP 서버 (에이전트 연결)](#별도-기능-mcp-서버--에이전트-연결)
+  [NegPiP (내장)](#별도-기능-negpip-내장) · [Tag Autocomplete (내장)](#별도-기능-tag-autocomplete-내장-태그-자동완성) ·
+  [MCP 서버 (에이전트 연결)](#별도-기능-mcp-서버--에이전트-연결)
 - 참고: [출처 / 크레딧](#출처--크레딧-credits)
 
 ---
@@ -59,6 +61,11 @@ speckle↓·skin/hair 정리(`scripts/anima_vae_2x.py`). Qwen/Wan VAE latent 공
 cd <sd-webui-forge-neo>/extensions
 git clone https://github.com/UR-al/sam-extra.git forge_sam3_extension
 ```
+
+**호환 Forge**: Forge Neo **2.29.2**(`d70373eb`)와 **2.30**(2.30-2 `45f41b81`, 2.30-6 `ede60e1a`) — 세 판 모두 CPU 테스트
+전체로 확인했고, 이 판들에서 GPU 생성은 따로 확인하지 않았습니다. 2.30 에서 달라진 점(Batch Cond/Uncond 설정, Spectrum 예측기,
+Extras 의 DeGrid, 2.30-6 의 VAE / Text Encoder 드롭다운 표기)과 이 확장의 대응은 [CHANGELOG](CHANGELOG.md) 의 'Forge 2.30 호환'
+절에 있습니다.
 
 **폴더명은 반드시 `forge_sam3_extension`** 으로 둡니다. Forge 는 확장 폴더명을 확장 이름으로 쓰는데
 `metadata.ini` 의 콜백 순서 지정(`[callbacks/forge_sam3_extension/…]`)이 이 이름에 묶여 있어, 다른 이름(예: 기본
@@ -114,6 +121,8 @@ t2i가 끝나면 SAM3가 마스킹 → 인페인트 → 결과가 원본 이미�
 - Detect Prompt: `face` (또는 `eyes, hair / hand`)
 - **Exclude Prompt** (v0.7.3+): 두 번째 SAM3 detect로 보호 영역을 잡아 메인 마스크에서 차감. 예: Detect=`clothes`, Exclude=`face, eyes, hand`
 - Inpaint Prompt: 비워두면 메인 t2i prompt 사용
+- **얼굴 안에서만 찾기** (Search inside faces only): 켜면 Detect · Exclude 를 face_yolov8 얼굴 상자 안에서만 찾음 — 작은 얼굴의
+  눈 · 입 · 머리카락을 얼굴마다 따로. 아래 [얼굴 안에서만 찾기](#얼굴-안에서만-찾기-face-crop) 참고
 - Inpaint 아코디언에서 denoising, mask blur, sampler/scheduler/seed/steps 등 별도 지정 가능 (각 "Use separate ..." 토글)
 - ControlNet 아코디언에서 인페인트 패스에 CN 유닛 1개 주입 가능
 
@@ -198,6 +207,7 @@ Refine 은 Forge Generate 와 같은 대기열(`queue_lock`)에서 돌므로 txt
 | Threshold / Mask Dilation / Mask Blur / Mask Processing | 검출 임계값·확장·가장자리 흐림, `Individual`(`/` 그룹마다 따로) / `Combined`(한 번에, 기본) |
 | Convex Hull / Outline expand (edge-aware px) | 마스크 후처리 — 아래 [마스크 후처리](#마스크-후처리) 참고 |
 | Unload SAM3 from VRAM after detection | (기본 OFF — In-flight 쪽은 ON) 인페인트 동안 SAM3 VRAM 해제 — CPU RAM 에 약 3.4 GB 로 남겨 두고 다음 검출은 GPU 로 옮기기만 함 (VRAM 16 GB 이하 권장) |
+| SAM3 Refine Face Crop (얼굴 안에서만 찾기) · Face Detector · Confidence | (기본 OFF) Target · Exclude 를 얼굴 상자 안에서만 찾음 — [얼굴 안에서만 찾기](#얼굴-안에서만-찾기-face-crop). 얼굴을 못 찾으면 상태 줄에 알림 |
 | Seed (-1 = random) · 🎲 · 🎯 Pull from selected | 🎲 는 -1, 🎯 는 선택한 갤러리 이미지의 시드를 가져옴. 갤러리가 바뀌면(새 생성·Refine 결과) 마지막 이미지의 시드를 자동으로 채움 |
 | Resize mode | Just Resize / Crop and Resize / Resize and Fill (img2img 와 같은 뜻) |
 | Mask mode: inpaint not-masked (invert) | 마스크 바깥을 인페인트 |
@@ -290,7 +300,8 @@ SAM3 체크포인트는 \~3.5 GB. 한번 로드되면 번들 하나가 캐시에
 1. **"Unload SAM3 from VRAM after detection"** 체크 (SAM3 패널 + Refine 패널 양쪽 모두 옵션 있음 — 기본값은 SAM3 패널(In-flight) 켜짐, Refine 패널 꺼짐). 검출(\~2초) 끝나면 번들을 CPU RAM 으로 옮기고 `cuda.empty_cache()` → 인페인트 사이클이 풀 VRAM 활용. 다음 검출은 재빌드 없이 GPU 로 다시 옮기기만 함(추정 0.4\~1.6초). 대신 RAM 에 약 3.4 GB 가 남으며, SAM3 체크포인트·장치 변경이나 Reload UI 때 해제됩니다. RAM 이 빠듯하면 Settings → **SAM Extra SAM3** → "'Unload after' 뒤 SAM3 모델을 CPU RAM 에 보관 (약 3.4 GB)"(`sam3_unload_keep_in_ram`, 기본 켬)을 끄세요 — 예전처럼 완전히 해제하고 다음 검출 때 새로 빌드합니다(이미지당 2.5\~5 초 추가 추정). 끄고 Apply 하면 보관 중인 번들도 곧바로 해제되며, 결과 이미지는 같습니다.
 2. webui 실행 인자에 `--reserve-vram 2` 추가 — 모델 매니저가 헤드룸 2 GB 확보.
 
-둘 같이 쓰면 가장 안정적.
+둘 같이 쓰면 가장 안정적. 생성하지 않는 동안 GPU 를 통째로 비우려면 txt2img 탭 줄의 [모델 내리기](#모델-내리기-버튼) 버튼을
+누르세요(Forge 의 체크포인트 · 업스케일러 · 얼굴 복원 모델과 SAM3 를 포함해 sam-extra 가 쥔 모델을 모두 내림).
 
 ---
 
@@ -307,7 +318,72 @@ SAM3 체크포인트는 \~3.5 GB. 한번 로드되면 번들 하나가 캐시에
 
 적용 순서(`sam3ext/core.py`): 검출 마스크(`/` 그룹마다) → Convex Hull → Outline expand → Dilation →
 Manual Mask 교집합(Refine, 칠했을 때) → Exclude 영역 차감. Mask Blur 는 이 마스크를 넘겨받은 인페인트(img2img)
-단계에서 Forge 가 적용합니다.
+단계에서 Forge 가 적용합니다. [얼굴 안에서만 찾기](#얼굴-안에서만-찾기-face-crop)를 켜면 검출 마스크만 얼굴 crop 에서
+찾아 원래 자리에 붙인 것(그룹 × 얼굴마다)이 되고, 나머지 단계는 같은 순서로 이미지 픽셀 단위에서 합니다.
+
+---
+
+## 얼굴 안에서만 찾기 (Face crop)
+
+SAM3 Mask 아코디언의 **Search inside faces only** 와 Refine 패널의 **SAM3 Refine Face Crop
+(얼굴 안에서만 찾기)** — Detect(Target) · Exclude 프롬프트를 이미지 전체가 아니라 **얼굴 상자 안에서만** 찾습니다. SAM3 는 이미지
+전체를 1008×1008 로 줄여 보므로 작은 얼굴의 눈 · 입 · 눈썹 · 머리카락을 놓치거나 배경의 비슷한 것(옷의 눈 무늬 등)을 같이 잡는데,
+얼굴마다 잘라 그 작업 크기로 늘려 보면 얼굴 부위만, 더 크게 봅니다.
+
+1. ADetailer 가 쓰는 `models/adetailer` 의 YOLO 얼굴 모델로 얼굴 상자를 찾습니다 — 기본 `face_yolov8n.pt`, 신뢰도 0.3
+   (ADetailer 의 모델 · 신뢰도와 같은 뜻, `face_yolov8s.pt` 도 애니 얼굴을 잡음). ADetailer 설정의 추가 모델 폴더
+   (`ad_extra_models_dir`)도 봅니다. 목록에는 같은 폴더의 다른 YOLO 상자 모델(`hand_yolov8n.pt` 등)도 나와 그 상자 안에서
+   찾게 할 수 있습니다(클래스 이름이 필요한 YOLO-World 는 뺌). 한 얼굴에 상자가 둘 남으면(IoU 0.3 이상이거나 한 상자의 중심이
+   다른 상자 안 — ultralytics 의 NMS 는 IoU 0.7 미만이면 둘 다 둠) 점수가 높은 하나만 씁니다(그 얼굴의 부위가 두 패스로 갈리지 않게).
+2. 상자를 옆 · 아래로 20 %, 위로 40 %(이마 · 머리카락) 넓히고, 중심을 지킨 정사각형으로 만들어 이미지 안으로 밉니다(잘라 내지
+   않음). 한 변이 이미지보다 길면 그 축만 이미지 크기가 되고, 아주 작은 얼굴도 한 변 32 px 이상을 봅니다.
+3. crop 마다 지금 SAM3 설정(Detect · Exclude 프롬프트, Threshold, 체크포인트, 장치)을 그대로 돌리고 마스크를 원래 자리에 붙입니다
+   (crop 은 크기를 바꾸지 않고 잘라만 내므로 픽셀 단위로 같은 자리). crop 이 겹치면 찾은 조각마다 무게중심에서 가장 가까운
+   얼굴(얼굴 크기로 나눈 거리)의 것으로 셉니다 — 옆 얼굴의 눈이 이 얼굴의 패스에 섞이지 않고, 합친 마스크는 그대로입니다.
+   crop 의 안쪽 가장자리(이미지 테두리가 아닌 변)에 잘린 조각은 그 너머에서 이어지는 옆 crop 의 조각과 한 물체로 묶어 묶음 전체의
+   무게중심으로 정합니다 — 옆 얼굴의 머리카락 끝이 작은 얼굴의 crop 에 잘려 들어와도 옆 얼굴의 패스로 갑니다. (두 얼굴의 같은
+   부위가 crop 가장자리에서 맞닿아 SAM3 가 한 덩어리로 내면 그 덩어리는 한 얼굴의 패스로 같이 갑니다 — 합친 마스크는 같음.)
+4. 그 뒤는 예전과 같습니다: Convex Hull → Outline expand → Dilation(이미지 픽셀 단위 — crop 밖으로도 번짐) → Manual Mask
+   교집합(Refine) → Exclude 차감 → 인페인트 · ControlNet · 시드. Exclude 는 crop 마다 찾되 Outline expand + Dilation px 만큼
+   넓힌 정사각 영역에서 찾아, crop 밖으로 번진 마스크도 그 바로 밖의 보호 대상을 먹지 않습니다(둘 다 0 이면 crop 그대로 — 백본을
+   한 번 더 돌리지 않음).
+
+- **Mask Processing**: `Individual` 은 `/` 그룹 × 얼굴마다 패스 하나(그룹 순서, 그 안에서 얼굴은 왼쪽 → 오른쪽), `Combined` 는
+  모두 합친 마스크로 한 번. 그 부위가 없는 얼굴의 패스는 생기지 않습니다.
+- **얼굴이 없으면** SAM3 를 불러오지 않고 '검출 없음' 과 같게 끝납니다 — 이미지는 그대로, 콘솔에
+  `[-] SAM3: face crop — no faces found by face_yolov8n.pt (confidence 0.30); nothing to mask.`, Refine 은 상태 줄에
+  `얼굴을 찾지 못했습니다 (모델, 신뢰도)`, 🎯 빠른 버튼도 같은 안내(얼굴 검출 신뢰도를 낮추거나 Search inside faces only 를 끄라고).
+  Refine 에서 Manual Mask 를 칠했으면 '검출 없음' 의 규칙대로 칠한 마스크를 그대로 인페인트합니다(찾을 crop 이 없어 Exclude 는
+  찾지 않음).
+- **받지 않습니다**: 모델 파일이나 `ultralytics`(ADetailer 가 Forge venv 에 깔아 둠)가 없으면 넣을 곳을 알려 주는 오류로 멈춥니다
+  (In-flight 는 infotext `SAM3 Error` 와 콘솔, Refine 은 상태 줄). ultralytics 가 이름을 바꿔 GitHub 에서 받으려는 모델 이름
+  (`yolov5s.pt` 꼴)도 거절합니다.
+- 얼굴 검출 장치: SAM3 Device 가 `cpu` 면 CPU, 아니면 ADetailer 처럼 지금 CUDA 장치(`cuda:1` 이어도 장치 번호는 주지 않음 —
+  ultralytics 가 프로세스 기본 장치를 바꾸므로). 얼굴 모델은 이미지마다 불러오고(약 6\~22 MB) 끝나면 놓습니다.
+- ultralytics 자체 설정이 그대로 적용됩니다: 검출할 때마다 ultralytics 가 익명 사용 통계 이벤트를 쌓아 Google Analytics 로
+  보냅니다(많아야 30 초에 한 번, 설정 `sync` 가 켜져 있고 온라인일 때 — ADetailer 도 같음). 끄려면 Forge venv 에서
+  `yolo settings sync=False`. 이 확장은 그 설정을 바꾸지 않습니다(받는 것은 여전히 없음).
+- 오버레이(Replace output with overlay preview · 아티팩트)에 얼굴 crop 테두리(주황)와 얼굴 점수가 그려지고, 아티팩트 meta JSON 에
+  `face_crop`(모델 · 신뢰도 · 얼굴 상자 · 점수 · crop)이 남습니다.
+
+**기록 · API · XYZ** (In-flight)
+
+| UI | state / API 키 | 기본값 | infotext (붙여 넣기) | XYZ 축 |
+|---|---|---|---|---|
+| Search inside faces only | `sam3_face_crop` | `false` | `SAM3 Face Crop` | `[SAM3] Face Crop` |
+| SAM3 Face Detector (models/adetailer) | `sam3_face_crop_model` | `face_yolov8n.pt` | `SAM3 Face Crop Model` | `[SAM3] Face Crop Model` |
+| SAM3 Face Detector Confidence | `sam3_face_crop_confidence` | `0.3` | `SAM3 Face Crop Confidence` | `[SAM3] Face Crop Confidence` |
+
+- 세 인자는 SAM3 인자 목록(위젯 · state · infotext 순서)의 **맨 뒤**에 붙었습니다. 키가 없는 예전 API 요청 · UI 상태는 꺼짐으로
+  전과 똑같이 돕니다(꺼져 있으면 검출 함수도 예전과 같은 인자로 부름). 신뢰도는 0\~1 로 자르고, 빈 모델 이름은 기본 모델입니다.
+- infotext 의 세 키는 켰을 때만 남고 붙여 넣기로 되살아납니다(다른 SAM3 켬/끔 키처럼, 키가 없는 infotext 를 붙여 넣으면 체크박스는
+  그대로). 결과 기록으로 `SAM3 Face Crop Faces: N`(그 이미지에서 쓴 얼굴 수, 0 = 못 찾음)이 붙습니다 — 붙여 넣기 대상은 아닙니다.
+  Refine 결과 PNG 에는 `SAM3 Refine Face Crop` · `SAM3 Refine Face Crop Model` · `SAM3 Refine Face Crop Confidence` ·
+  `SAM3 Refine Face Crop Faces` 가 남습니다.
+
+```json
+"alwayson_scripts": {"SAM3 Mask": {"args": [{"sam3_enable": true, "sam3_prompt": "eyes / mouth", "sam3_mask_mode": "Individual", "sam3_face_crop": true, "sam3_face_crop_model": "face_yolov8n.pt", "sam3_face_crop_confidence": 0.3}]}}
+```
 
 ---
 
@@ -327,10 +403,93 @@ Manual Mask 교집합(Refine, 칠했을 때) → Exclude 영역 차감. Mask Blu
 
 기존 SAM3 항목 + ControlNet 통합 + 신규 v0.6.0 항목:
 
-`Enable, Checkpoint, Mode, Mask Mode, Device, Detect Prompt, Exclude Prompt, Inpaint Prompt, Negative Prompt, Prompt S/R (2종), Threshold, Mask Dilation, Mask Hull, Mask Outline Expand, Mask Blur, Denoising, Inpainting Fill, CFG, Steps, Inpaint Only Masked, Padding, Inpaint Width/Height, Sampler, Scheduler, Seed, Noise Multiplier, Restore Face, Unload After, CN Enable, CN Override, CN Model, CN Module, CN Weight, CN Guidance Start/End` (모두 `[SAM3]` 접두어)
+`Enable, Checkpoint, Mode, Mask Mode, Device, Detect Prompt, Exclude Prompt, Inpaint Prompt, Negative Prompt, Prompt S/R (2종), Threshold, Mask Dilation, Mask Hull, Mask Outline Expand, Mask Blur, Denoising, Inpainting Fill, CFG, Steps, Inpaint Only Masked, Padding, Inpaint Width/Height, Sampler, Scheduler, Seed, Noise Multiplier, Restore Face, Unload After, CN Enable, CN Override, CN Model, CN Module, CN Weight, CN Guidance Start/End, Face Crop, Face Crop Model, Face Crop Confidence` (모두 `[SAM3]` 접두어)
 
 `[SAM3] Checkpoint`·`[SAM3] Device` 축은 값이 바뀔 때마다 SAM3 를 다시 빌드하므로(3\~5 초) cost 를 줘서 바깥 루프로
 돌립니다 — 칸 결과는 같고 격자를 도는 순서만 바뀝니다.
+
+### `[Modules] Text Encoder` — 텍스트 인코더를 바꿔 가며 뽑기
+
+Forge 기본 XYZ 에는 VAE 를 바꾸는 `VAE` 축은 있지만 텍스트 인코더 축은 없습니다. sam-extra 가 `[Modules] Text Encoder` 축을
+더합니다(txt2img · img2img 둘 다). 칸마다 **VAE / Text Encoder 드롭다운에서 그 파일을 고른 것과 같은 모델로** 생성합니다.
+
+- **값**: `Use Forge current`(지금 드롭다운 선택 그대로 — 기본 `VAE` 축처럼 `None` 이라고 써도 됨), 또는 인코더 파일. 파일은
+  드롭다운에 보이는 이름 그대로 쓰면 되고, 하위 폴더 경로나 확장자를 뺀 이름(`qwen_3_06b_base_full_fp32`)도 됩니다. 인코더가
+  둘인 모델(Flux 의 CLIP-L + T5)은 텍스트 입력에서 `clip_l + t5xxl_fp16` 처럼 `+` 로 이어 쓰거나, 이 축을 두 축에 둡니다(아래).
+- **드롭다운 후보**: 모델이 이미 가진 **자리(slot)** 를 채우는 파일만 나옵니다 — 지금 선택에 든 인코더의 자리와 체크포인트에
+  들어 있는 인코더의 자리. Anima 선택이면 Qwen3 0.6B 파일, Krea2 면 Qwen3-VL 4B, 인코더가 체크포인트에 든 SDXL 이면 CLIP-L ·
+  CLIP-G 파일입니다(둘 다 없으면 알아보는 인코더 전부). 자리는 Forge 로더(`backend/loader.py` `replace_state_dict`)와 같은 규칙으로
+  파일 **헤더만** 읽어 정합니다(가중치는 읽지 않음). safetensors 는 JSON 헤더를, GGUF 는 텐서 표(이름 · 모양)를 Forge 의
+  `gguf_remapping` 처럼 이름을 바꿔 읽으므로 GGUF 인코더도 safetensors 와 똑같이 다룹니다.
+- **동작**: 지금 선택에서 그 자리의 인코더만 바꾼 목록으로 칸을 만듭니다(VAE 등 나머지는 그대로). 그 자리의 인코더가 목록에는
+  없고 체크포인트에 들어 있으면 고른 파일을 더해 체크포인트 것을 대신하게 합니다(드롭다운에서 고를 때와 같음). 목록은 기본
+  `Checkpoint name` 축이 체크포인트를 넣는 곳 — 다음 모델 로드가 읽는 값(Forge 의 loading parameters) — 에만 넣고 Forge 설정에는
+  쓰지 않습니다. 그래서 그리드 도중 WebUI 를 열거나 새로 고치고 설정을 저장해도 config.json 에는 사용자의 선택이 남고, 드롭다운도
+  그대로입니다. 그리드 도중 드롭다운을 바꾸면 그 선택이 그대로 남고, 남은 칸은 새 선택에서 만듭니다. 인코더가 바뀌면 Forge 가
+  모델을 다시 불러오므로 체크포인트 축처럼 칸마다 시간이 듭니다. 칸이 끝나면 — 오류 · 중단으로 끝나도 — 원래 값으로 돌아갑니다.
+  그리드가 다른 인코더로 끝났으면 다음 일반 생성이 원래 모델을 한 번 다시 불러옵니다(체크포인트 축 뒤와 같음).
+- **기록**: 각 이미지 infotext 의 `Module 1`, `Module 2` … 에 그 칸에서 실제로 쓴 목록이 남아, PNG Info 붙여 넣기(VAE/TE)로 그
+  칸을 다시 만들 수 있습니다(기본 `VAE` 축과 함께면 바꾼 VAE 까지). 그리드 이미지의 `Module N` 은 원래 선택입니다(기본 `VAE` 축과
+  같음). 칸 라벨은 `Text Encoder: <파일 이름>`, `Use Forge current` 는 `Text Encoder: current (<지금 인코더>)` 입니다.
+- **다른 축과 함께**: `Checkpoint name`(cost 1.0) → 이 축(0.9) → `VAE`(0.7) 순으로 바깥 루프가 됩니다. `VAE` 축과 섞으면 바뀐
+  인코더 모델 위에서 VAE 를 바꿉니다(그 모델의 VAE 와 형식이 다른 VAE 는 VAE 까지 바꾼 목록으로 한 번 불러옴 — 아래 `VAE` 절).
+  `Checkpoint name` 축과 섞을 때 계열이 다른 체크포인트(Anima · Krea2)를 비교하려면 두
+  계열의 인코더를 모두 VAE / Text Encoder 목록에 넣어 두세요 — 모델마다 자기 자리만 쓰고, 이 축은 고른 파일의 자리만 바꿉니다.
+  자리 확인에 쓰는 체크포인트는 Checkpoint 드롭다운의 것(API 면 `override_settings` 의 것)입니다.
+- **축 둘**: 이 축을 X · Y 처럼 두 축에 둘 수 있습니다 — Flux 면 X 에 CLIP-L 파일들, Y 에 T5 파일들. 두 번째 축은 첫 축이 만든
+  목록 위에서 자기 자리만 바꾸고, 한쪽의 `Use Forge current` 는 다른 쪽 파일을 그대로 둡니다. 두 축이 같은 자리를 고르면 그리드를
+  시작하기 전에 막습니다.
+- **Hires · Refiner**: Hires 체크포인트나 Refiner 로 모델이 바뀌어도 Hires 의 VAE / Text Encoder 가 `Use same choices` 면 그 칸의
+  인코더를 씁니다. Hires 의 모듈을 따로 골라 두었으면 2패스는 그 목록을 쓰고, 다음 배치는 다시 칸의 인코더입니다.
+- **Anima 3.8B**: 0.6B 쪽(Qwen3 0.6B) 인코더를 바꿉니다. Qwen3.5 4B 는 3.8B 런타임이 `models/text_encoder` 에서 알아서 찾으므로
+  이 축의 대상이 아닙니다.
+- **그리드를 시작하기 전에 막는 값**(영어 오류): 목록에 없는 파일(`Default` · `Automatic` · `Built-in` 은 `Use Forge current` 를
+  안내), VAE, Qwen3.5 파일, Anima 3.8B 어댑터, Forge 가 인코더로 읽지 못하는 파일, **모델이 가진 자리가 아닌 인코더**(예: Anima
+  선택에 Qwen3-VL 4B, 인코더가 체크포인트에 든 SDXL 에 T5 — 이 축은 모델이 이미 가진 인코더만 바꿈), 체크포인트 계열이 받지 않는
+  CLIP(SD1 의 CLIP-G, Anima 같은 계열의 CLIP-L · CLIP-G — Forge 가 버림), 같은 자리를 채우는 두 파일. 목록에도 체크포인트에도
+  인코더가 보이지 않으면(체크포인트를 읽을 수 없는 `.ckpt` 등) 고른 인코더를 더합니다 — 드롭다운에서 고를 때와 같습니다.
+- **Forge 2.29.2**: 자리 판정은 2.30 의 로더를 따릅니다. Qwen3-VL 8B 인코더(Qwen-Image 2.1 용 자리)는 2.30 에서 생겨 2.29.2 의
+  Forge 는 읽지 못하는데, 그 판에는 이 자리를 가진 모델 계열이 없어 위의 "모델이 가진 자리가 아닌 인코더" 로 막힙니다(목록에도
+  체크포인트에도 인코더가 보이지 않을 때만 위 규칙대로 더해져, 그 칸은 Forge 의 로더 오류로 끝납니다). 드롭다운을 하위 폴더
+  경로로 보이는 설정(과 Forge 의 `main_entry.module_map`)은 2.30-6 에서 생겨, 2.29.2 · 2.30-2 에서는 이 축의 후보도 그 판의
+  드롭다운처럼 파일 이름입니다(하위 폴더 경로로 쓴 값도 그대로 받음).
+- **pickle 인코더**(`.pt` · `.bin` 등): 불러오지 않고는 자리를 알 수 없어 드롭다운 후보에는 없고, 텍스트 입력으로 쓰면 지금 선택의
+  인코더가 **하나**일 때 그것을 바꿉니다. 선택에 pickle 인코더가 있어 다른 인코더를 고를 수 없을 때는 그 자리의 safetensors · GGUF
+  인코더를 목록에 넣으라고 안내합니다. GGUF 는 Forge 가 여는 버전 2 · 3 파일만 읽습니다(바이트 순서가 반대인 파일은 Forge 도
+  NumPy 2 에서 열지 못함).
+- **API**: `override_settings` 에 `forge_additional_modules` 를 주면 그 목록이, `sd_model_checkpoint` 를 주면 그 체크포인트가
+  출발점입니다(이 둘은 호출자의 값이라 Forge 가 그 요청 동안 설정에 넣었다 되돌립니다).
+
+### `VAE` (Forge 기본 축) — 형식이 다른 VAE 를 섞어도 검은 칸 없이
+
+Forge 기본 `VAE` 축은 칸마다 VAE 가중치를 **이미 만들어진 모델의 VAE 에 그대로 덮어씁니다**(`sd_vae.reload_vae_weights` → 엄격한
+`load_state_dict`). 그런데 Forge 는 VAE 의 **형식(클래스)** 을 모델을 만들 때 VAE / Text Encoder 드롭다운의 VAE 파일로 정합니다 —
+Anima · Qwen-Image · Wan 계열이면 `post_quant_conv.weight` 가 있는 파일은 2D `Qwen2DVAE`(`qwen_image_vae_2dHDR_fp32`,
+`Qwen2D-Anime-dense…` 같은 Qwen2D 내보내기), 없는 파일은 3D `WanVAE`(`qwen_image_vae`, `qwen_image_vae_HDR_fp32`). 그래서 3D VAE 로
+만든 모델에 2D VAE 를 넣는 칸(또는 그 반대)은 텐서 이름이 맞지 않아 오류가 나고, xyz_grid 는 그 칸을 샘플링 없이 **검은 이미지**로
+채웁니다. 드롭다운에서 고르면 되는 것은 그때 Forge 가 모델을 다시 만들기 때문입니다.
+
+sam-extra 는 이 축을 **같은 자리에서 바꿔 끼웁니다** — 이름 `VAE`, 목록 위치, 값 후보와 `None`, cost 0.7, 칸 라벨 `VAE: <파일>` 은
+그대로라 저장해 둔 XYZ 설정과 infotext 의 `Y Type: VAE` 도 그대로 맞습니다. 칸마다:
+
+- **같은 형식**(파일의 텐서 이름 · 모양이 모델의 VAE 와 똑같음): Forge 의 방식 그대로 — 모델은 그대로 두고 VAE 만 바꿉니다(Forge
+  함수 호출 하나하나까지 기본 축과 같음).
+- **다른 형식**(2D 와 3D, 또는 그 VAE 가 그대로는 받지 못하는 파일): 그 칸만 VAE 를 바꾼 모듈 목록으로 **모델을 다시 불러옵니다** —
+  드롭다운에서 그 파일을 고른 것과 같은 결과입니다. `[Modules] Text Encoder` 축과 같은 방법이라 Forge 설정(config.json · 드롭다운)은
+  건드리지 않고, 칸이 끝나면(오류 · 중단으로 끝나도) 원래 값으로 돌아갑니다. 콘솔에 `[XYZ VAE] <파일> is a 2D Qwen2D VAE (16 ch) and
+  the loaded model's VAE is a 3D Wan / Qwen-Image VAE (16 ch) …` 처럼 이유가 한 줄 남습니다.
+- **판정**: 파일 **헤더만** 읽습니다(가중치는 읽지 않음, 결과는 경로 · 크기 · 수정 시각으로 캐시). 지금 불러온 모델이 그 칸의 모델이면
+  그 VAE 를 직접 보고, 아니면(체크포인트 · 인코더 축이 모델을 바꾸는 칸, 첫 생성 전) 모델이 만들어질 VAE — 선택 목록의 마지막 VAE
+  파일, 없으면 체크포인트에 든 VAE — 의 헤더와 비교합니다. 헤더로 알 수 없을 때 — 고른 파일이 `.pt` 같은 pickle 이거나 읽을 수 없을
+  때, 또는 불러온 모델이 그 칸의 모델이 아니고 모델이 만들어질 VAE 가 pickle 이거나 Forge 가 먼저 형식을 바꾸는 diffusers · Flux 2 형식
+  파일일 때 — 는 Forge 기본 동작 그대로입니다. **고른** 파일이 diffusers · Flux 2 형식이면 텐서 이름이 모델의 VAE 와 달라 Forge 의
+  교체가 실패하므로, 다른 형식의 VAE 처럼 그 칸만 그 파일로 모델을 다시 불러옵니다(Forge 의 로더가 형식을 바꿈).
+- **기록**: 각 이미지 infotext 의 `Module N` 은 그 칸에서 실제로 쓴 목록(바꾼 VAE 포함)입니다. 그리드 이미지의 `Module N` 은 원래
+  선택입니다(기본 축과 같음).
+- **다른 축과 함께**: `[Modules] Text Encoder` 축과 X · Y · Z 어디에 두든 칸마다 두 값이 함께 적용됩니다(형식이 다른 VAE 면 인코더를
+  바꾼 목록에서 VAE 까지 바꿔 한 번 불러옴). `Checkpoint name` 축과도 섞을 수 있습니다.
+- **시간**: 형식이 다른 칸은 모델을 다시 불러오므로 체크포인트 축의 칸처럼 시간이 듭니다(같은 VAE 가 이어지는 칸은 다시 불러오지
+  않음). 그리드가 다른 VAE 로 끝났으면 다음 일반 생성이 원래 모델을 한 번 다시 불러옵니다.
 
 ---
 
@@ -359,7 +518,8 @@ Settings에서 선택 후 **Apply settings**를 누르면 현재 페이지에 �
 ## 의존성
 
 `requirements.txt` — Forge launch 시 `install.py` 가 빠진 것만 설치(위 [설치](#설치) 참고, `--sam3-no-auto-install`
-로 끔). SAM3 본체는 `sam3` PyPI 패키지 필요. torch 는 Forge 가 관리하므로 목록에 없습니다.
+로 끔). SAM3 본체는 `sam3` PyPI 패키지 필요. torch 는 Forge 가 관리하므로 목록에 없습니다. 내장 Tag Autocomplete 는 `pyyaml`
+(따로 설치하던 확장의 `install.py` 가 깔던 것 — Forge Neo 에 이미 있음)과 Forge 의 `requests` 를 씁니다.
 
 개발·테스트: `pip install -r requirements-dev.txt`(CPU torch 는 따로:
 `pip install torch --index-url https://download.pytorch.org/whl/cpu`) 뒤 확장 폴더에서
@@ -373,6 +533,9 @@ JS 테스트는 Node 24(앱 원본 `.ts` 를 그대로 불러오는 대조에 No
 (= `node --test tests/js/*.test.mjs`)입니다. CI 는 이를 `node --check javascript/*.js` 와 함께 Python 과 따로 `frontend` 잡으로 돌립니다.
 
 ControlNet 통합은 `sd_forge_controlnet` 익스텐션에 lazy import 의존. 없으면 해당 UI/로직만 비활성화.
+
+[얼굴 안에서만 찾기](#얼굴-안에서만-찾기-face-crop)는 `ultralytics`(ADetailer 가 Forge venv 에 설치)와 `models/adetailer` 의 얼굴 모델을
+켰을 때만 lazy import 합니다 — `requirements.txt` 에 넣지 않았고 아무것도 받지 않습니다. 없으면 그 기능만 오류로 알립니다.
 
 ---
 
@@ -721,6 +884,10 @@ Anima(Qwen·Wan VAE)로 만든 이미지에 생기는 **VAE 격자 무늬**를
 - Settings → Postprocessing 에서 Extras 의 Upscale 을 txt2img·img2img 탭에 켰다면 DeGrid 가 그보다 **먼저** 돕니다
   (`metadata.ini` 콜백 순서 — 확대하면 격자 간격이 달라짐). Extras 항목의 이름은 **Anima VAE DeGrid (NAFNet, Extras)** 로
   생성 탭 아코디언과 달라 API 이름이 겹치지 않지만, 그것을 메인 탭에도 켜면 두 번 적용되니 켜지 마세요.
+- Forge 2.30 의 Extras 에는 Forge 자체 **DeGrid**(`scripts/degrid.py`, NAFNet 이 아닌 픽셀 격자 필터, **기본 켬**)가 따로
+  있습니다. Extras 에서 둘 다 켜면 격자 제거가 두 번 적용되고, 이 확장의 항목이 먼저 돕니다(둘 다 순서 900 이라 Forge 가 이름순으로
+  정함). Settings → Postprocessing 에서 Forge 의 DeGrid 를 txt2img·img2img 에도 켜면 생성 탭에서도 두 번 적용됩니다. 한쪽만 쓰려면
+  다른 쪽을 끄세요.
 - img2img 인페인트('Inpaint only masked' 포함)는 합성한 전체 이미지에 적용합니다 — 마스크 밖 원본도 지나가지만, 격자가
   없는 부분은 거의 바뀌지 않습니다.
 - Anima Tile & Repair·캐릭터 레퍼런스 결과는 Forge 생성 파이프라인 밖의 별도 잡이라 이 아코디언이 붙지 않습니다 —
@@ -1011,7 +1178,8 @@ Forge·reForge 의 이름입니다(ComfyUI 이름 `ipndm`·`ipndm_v`·`deis`·`c
   보조 스텝은 자기 스텝으로 세어 Forge 의 스텝 카운터를 늘리지 않으므로 프롬프트 편집·Skip Early CFG·리파이너 스텝 전환이
   Euler (CFG++) 와 같은 스텝에서 일어납니다.
 - **보조 스텝을 쓰지 않는 경우**: Forge 의 **Spectrum Integrated** 가 켜져 있을 때(그 예측기가 해상도 변화를 따라가지 못해,
-  보조 스텝을 그대로 돌리면 기본 설정에서 Euler Dy 가 오류로 멈춤), Wan 2.2 I2V(`concat_latent`)·PiD(`lq_latent`)·다른 확장의
+  보조 스텝을 그대로 돌리면 Forge 2.29.2 는 기본 설정에서 Euler Dy 가 오류로 멈추고, 2.30 은 크기가 바뀐 뒤 모델을 다시 돌려
+  멈추지는 않지만 Spectrum 의 절약이 사라짐 — CPU 측정), Wan 2.2 I2V(`concat_latent`)·PiD(`lq_latent`)·다른 확장의
   `extra_concat_condition` 이 있을 때. 이때 Dy 네 항목은 보조 스텝 없이 일반 스텝(CFG++ 판은 Euler CFG++, 일반 판은 Euler)으로
   돌고, 콘솔에 이유를 한 번 남기며 infotext 에 `Extra Samplers status: dy sub-steps skipped (Spectrum)` 처럼 기록합니다.
 - **가이던스와 함께**: 보조 평가(`transformer_options["sam_extra_substep"]` 표시)는 HiFlow 기록·정렬, Momentum·HiGS 이력, SMC 의
@@ -1141,7 +1309,8 @@ Manual sigma `0.7` · Scales `0.5,1.0` · 샘플러 Euler 입니다. 앱 노드�
 latent(Anima Edit·img2img 참조 — `anima_do_reference` 를 끄면 씀), 다른 모델의 레퍼런스 latent(Flux Kontext·Flux.2 Klein·
 Qwen-Image-Edit·Krea 2 — 원래 크기 그대로 토큰 뒤에 붙어 저해상도 격자와 위치가 맞지 않음), Wan 2.2 I2V 조건 latent(concat_latent),
 PiD 의 저화질 입력 latent(lq_latent), ControlNet(Anima LLLite 포함), flow 가 아닌 모델, Forge 내장
-**Spectrum Integrated**(멈춤 지점이 스텝 수에서 나와 크기가 바뀌는 순간 저해상도 텐서를 예측할 수 있음), Restart·UniPC(Extra
+**Spectrum Integrated**(멈춤 지점이 스텝 수에서 나오고, 크기가 바뀌는 순간 Forge 2.29.2 는 저해상도 텐서를 예측할 수 있으며 2.30 은
+모델을 다시 돌려 예측 기록을 새로 시작함), Restart·UniPC(Extra
 Samplers 의 UniPC bh2 포함)·σ 목록이 없는 샘플러, 저해상도 스텝이 없는 패스(img2img·Hires 가 전환 σ 이하에서 시작 — 원본은 이때 시작 latent 의 고주파를 노이즈로 바꾸고
 σ 를 올렸음), 마지막 전환이 스케줄 안에 없을 때(원본은 작은 latent 를 냄), Hires 패스(체크 꺼짐).
 
@@ -1373,6 +1542,45 @@ txt2img 탭 줄(Generation · 임베딩 · 체크포인트 · 로라 · Manage)�
 - 저장하는 동안 버튼 옆에 `저장 중…` 이 보이고, 다시 눌러도 한 번만 저장합니다. 키보드로 눌렀으면 포커스는 버튼에 그대로 남습니다.
 - notebook 레이아웃(txt2img 3열)일 때만 보입니다.
 
+### 모델 내리기 버튼
+
+`기본값 저장` 바로 오른쪽의 `모델 내리기` 를 한 번 누르면 확인 없이 메모리에 올라간 모델을 모두 내리고 GPU 캐시를 비운 뒤, 버튼
+아래에 결과를 한 줄로 보여 줍니다(예: `VRAM 사용 19.6 GB → 3.1 GB (Forge 모델 · SAM3 · Anima 3.8B) · 이 프로세스 예약 15.2 → 0.0 GB`).
+앞의 숫자는 GPU 전체의 사용량(같은 GPU 를 쓰는 다른 프로그램 — 학습 등 — 의 몫 포함), 뒤의 숫자는 이 Forge 프로세스가 PyTorch 로
+잡아 둔 양입니다(GB 는 1024³ 바이트). 괄호에는 실제로 무언가를 내린 것만 나오고(`Forge 모델` 은 체크포인트가 올라 있었을 때만),
+결과 글에 마우스를 올리면 쥔 것이 없던 항목과 실패한 항목(이유와 함께)이 보입니다. 결과 줄은 버튼 아래에 따로 나오므로 창이 좁아도
+버튼 자리는 그대로이고, 두 버튼은 늘 붙어 있습니다(줄이 모자라면 둘이 함께 다음 줄로).
+
+1. **Forge 의 모델** — Settings 의 `Unload All Models` 버튼과 같은 Forge 함수(`sd_models.unload_model_weights`)를 그대로 부릅니다.
+   고른 체크포인트 · VAE / Text Encoder · Diffusion in Low Bits 는 그대로라 다음 생성 때 Forge 가 같은 설정으로 다시 읽습니다(그 첫
+   생성은 모델을 읽는 만큼 느립니다). 갤러리 이미지의 ✨(고해상도) 버튼은 Forge 가 모델 다시 읽기를 건너뛰는 길이라, 체크포인트가
+   내려가 있으면 sam-extra 가 그 앞에서 먼저 읽습니다(내리지 않았으면 Forge 의 동작 그대로).
+2. **Forge 가 그 밖에 쥔 모델** — Forge 의 `Unload All Models` 는 Forge 의 메모리 목록에 있는 모델만 내립니다. 그 밖에서 GPU 에 남는
+   업스케일러 모델(hires fix · Extras 의 ESRGAN 계열, 최근 4개까지 캐시), TAESD · VAE Approx 미리보기 디코더, 얼굴 복원(GFPGAN ·
+   CodeFormer — Settings 의 `Move the model to CPU after restoration` 이 꺼져 있으면 GPU 에 남음)도 버립니다. 다음에 쓸 때 Forge 가
+   파일에서 다시 읽습니다.
+3. **sam-extra 가 쥔 모델** — SAM3(`Unload after` 가 CPU RAM 에 보관한 사본까지), 얼굴 안에서만 찾기의 얼굴 검출기(캐시하지 않아
+   보통 없음 — 놓은 뒤에도 메모리에 남은 검출기만), Anima 3.8B(Qwen3.5 4B · 커넥터 · 특징 캐시),
+   캐릭터 레퍼런스의 IP-Adapter(SigLIP2 인코더 포함), DeGrid(NAFNet), TIPO, Modulation CLIP-L, Colorcraft 벡터 · 앵커, VAE 2x
+   디코더, 샘플링에 쓰는 작은 장치 행렬과 예외로 끝난 생성이 남긴 가이던스 텐서. VRAM 뿐 아니라 RAM 에서도 놓으며, 다음에 그 기능을
+   쓸 때 파일에서 다시 읽습니다.
+4. Python 의 쓰레기 수거 뒤 PyTorch 의 CUDA 캐시를 비웁니다(`empty_cache` · `ipc_collect`).
+
+- **생성 중에는 동작하지 않고** `생성 중에는 내릴 수 없습니다` 를 보여 줍니다 — txt2img/img2img · Extras · API 생성 · Refine 같은
+  sam-extra 작업이 Forge 의 작업 잠금을 쥐고 있을 때. 내리는 동안 누른 Generate 는 끝날 때까지 기다렸다가 시작합니다.
+- 잠금은 비었는데 Forge 에 끝나지 않은 작업 기록이 남아 있으면(예: 예외로 끝난 Extras API 호출은 Forge 가 기록을 지우지 않음)
+  `Forge 에 끝나지 않은 작업 기록(extras)이 남아 있습니다 — 생성 중이 아니면 한 번 더 누르세요` 를 보여 줍니다. 생성 중이 아니면 한 번
+  더 누르면 내립니다(그사이 새 작업이 시작됐으면 다시 묻습니다).
+- 한 항목이 실패해도 나머지는 그대로 내리고, 결과 글 끝에 `실패: …` 로 그 이름을 적습니다(이유는 툴팁과 Forge 콘솔).
+- Forge 의 `POST /sdapi/v1/unload-checkpoint` API 는 **Forge 의 체크포인트만** 내립니다. 업스케일러 · 얼굴 복원 모델과 sam-extra 가
+  쥔 모델까지 내리는 것은 이 버튼입니다.
+- CUDA 컨텍스트처럼 프로세스가 살아 있는 동안 남는 몫이 있어 GPU 사용량이 0 이 되지는 않습니다. Forge 의 다른 확장이 따로 쥔
+  모델(예: ControlNet 모델 캐시)은 Forge 가 GPU 에서 내리는 데까지만 따릅니다.
+- notebook 레이아웃(txt2img 3열)일 때만 보입니다. 확장을 업데이트한 뒤에는 Forge 를 완전히 다시 시작하세요(Reload UI 만 하면 일부
+  항목이 "Forge 를 다시 시작하세요" 로 실패합니다).
+- 새 기능이 모델을 쥐게 되면 해제 함수를 `sam3ext/unload_registry.py` 에 등록합니다(`BUILTIN_HOOKS` 한 줄, 또는 스크립트에서
+  `register(key, 이름, 함수)`).
+
 ---
 
 ## 워크플로 6: Anima Character Reference / ReStyler
@@ -1490,7 +1698,7 @@ SAM3 처리와 분리된 opt-in 기능 모음입니다. Forge Neo 코어 파일�
 | **DAVE** | Anima block 출력의 token/spatial DC 성분 감쇠 | 실제 block hit 확인, 다양성/권장 block은 추가 A/B 필요 |
 | **CNS-inspired** | 기존 seeded/Brownian noise를 live x_t 에너지로 재색칠 | Euler a noise call 확인. deterministic sampler에서는 inert |
 | **Anima Modulation Guidance** | 보조 CLIP-L 방향을 공개 어댑터로 block AdaLN에 가산 | 실제 CLIP/어댑터 로드·투영·주입 검증. 이미지 품질 A/B는 추가 필요 |
-| **Adaptive Guidance** | combined batch의 후반 uncond row 생략 | low-VRAM 분리 호출에서는 생략/속도 이득 없음 |
+| **Adaptive Guidance** | combined batch의 후반 uncond row 생략 | low-VRAM 분리 호출·Forge 2.30 Batch Cond/Uncond 끔에서는 생략/속도 이득 없음. 끔이면 ADG를 끈 것과 같게 돌고 UNet 래퍼도 걸지 않음(infotext `ADG inactive (Batch Cond/Uncond off)`) |
 | **Skimmed CFG** | 과포화를 만드는 성분만 낮은 CFG로 되돌림(anti-burn) | 원본 노드와 σ 구간·결과가 비트 단위로 같음(원본 수식 편입). **CFG>1 전용**, pre-CFG가 아닌 post-CFG 맨 앞에서 재구성 |
 | **Detail Daemon** | sigma schedule로 디테일 강도 조절 | 별도 opt-in 기능 |
 
@@ -1754,8 +1962,8 @@ txt2img 도구 줄(붙여넣기·지우기·스타일 적용 버튼)의 **🪄**
 - 문장(쉼표가 들어간 문장 포함)은 TIPO 에 태그로 넘기지 않습니다.
 - 토큰 한도에서 멈춰 끝이 잘렸으면 잘린 태그와 끝나지 않은 문장은 버리고, 상태 줄에 그렇게 알려 줍니다.
 - 적어 둔 품질(`masterpiece` 등)·`year 2025`(→ 시대)·등급(`explicit` → `nsfw, explicit`, 여럿이면 가장 센 것)·`@작가`·캐릭터·
-  작품·메타는 TIPO 에 조건으로 넘깁니다. 캐릭터·작품·메타 구분은 tagcomplete 확장의 danbooru CSV 를 씁니다(없으면 `@작가` 만
-  알아봅니다).
+  작품·메타는 TIPO 에 조건으로 넘깁니다. 캐릭터·작품·메타 구분은 내장 Tag Autocomplete 의 danbooru CSV(`tags/danbooru_2025.csv`,
+  없으면 `tags/danbooru.csv`)를 씁니다(둘 다 없으면 `@작가` 만 알아봅니다).
 - 확장은 Forge 생성 대기열 안에서 돕니다 — 생성 중에 누르면 그 생성이 끝난 뒤 돕니다. 기다리는 동안 프롬프트를 고쳤으면
   결과를 넣지 않고 상태 줄에 알려 줍니다(고친 내용을 덮어쓰지 않게).
 - **모델 받기**는 한 번에 하나만 돕니다 — 받는 중에 다른 창에서 또 누르면 바로 알려 주고 다시 받지 않습니다. 새로 고친 뒤
@@ -1784,7 +1992,8 @@ txt2img·img2img 의 스타일 줄 아래에 접힌 칸 **구도 · 카메라** 
   가리지 않고 알아봅니다(`(From_Above:1.2)` 가 있으면 `from above` 를 붙이지 않음). 붙인 뒤 커서는 프롬프트 끝에 있고 **Ctrl+Z
   한 번**에 되돌아갑니다. 다 들어 있으면 버튼이 **이미 포함된 구도** 로 꺼집니다.
 - **태그 자동완성과 함께**: 붙인 글자를 타이핑으로 알리지 않아(Forge 의 붙여넣기 버튼처럼 `updateInput` 으로 Gradio 에 알림)
-  tagcomplete 의 추천 목록이 뜨지 않습니다 — 목록이 떠 있으면 Enter/Tab 이 방금 붙인 마지막 단어를 추천어로 바꿀 수 있어서입니다.
+  태그 자동완성(내장 Tag Autocomplete, 따로 설치한 tagcomplete 도 같음)의 추천 목록이 뜨지 않습니다 — 목록이 떠 있으면 Enter/Tab 이
+  방금 붙인 마지막 단어를 추천어로 바꿀 수 있어서입니다.
 - **충돌 경고**: 반대 태그(`from below` ↔ `from above`, `facing viewer` ↔ `from behind`, 크롭끼리, 화면 위치끼리)가 이미 있으면
   알려 주고 버튼이 **기존 구도 유지하고 추가** 로 바뀝니다. 기존 태그는 지우지 않습니다. 미리보기와 경고는 프롬프트를 칠 때마다
   바뀝니다.
@@ -1834,6 +2043,77 @@ txt2img·img2img 의 스타일 줄 아래에 접힌 칸 **구도 · 카메라** 
 - Anima 3.8B(워크플로 7)·Safe PAG·캐릭터 레퍼런스 IP-Adapter 와 함께 돕니다. 3.8B 가 NegPiP 보다 위에 설치되는 순서에서는 3.8B 런타임이
   같은 마스크를 대신 적용합니다. 아래에 깔린 것이 따로 설치한 sd-forge-negpip 여도 내장 규칙을 쓰므로, 새 Forge 의 emphasis
   `None`·`Ignore` 에서는 그 판(`0585496`) 단독과 결과가 다릅니다(내장은 뒤집는 행 없음).
+
+## 별도 기능: Tag Autocomplete (내장 태그 자동완성)
+
+프롬프트를 칠 때 danbooru·e621 태그, 와일드카드, LoRA·임베딩, 스타일 이름을 추천합니다.
+[eduardoabreu81/sd-webui-tagcomplete-neo](https://github.com/eduardoabreu81/sd-webui-tagcomplete-neo)(Forge Neo 포크, commit `8e0d81f`;
+원본 [DominikDoom/a1111-sd-webui-tagcomplete](https://github.com/DominikDoom/a1111-sd-webui-tagcomplete), MIT)를 이 확장에 넣은 것이라
+따로 설치할 필요가 없습니다. 추천 규칙·단축키·색·번역·사용 횟수 정렬·CivitAI 트리거 단어 등 사용법은
+[상류 README](https://github.com/eduardoabreu81/sd-webui-tagcomplete-neo/blob/8e0d81fd0e25fd2cf98fb4d34d097df9f71a082b/README.md) 와 같습니다.
+
+- **설정은 그대로**: Settings → **Tag Autocomplete** 의 `tac_*` 설정 57개는 키·이름·섹션이 따로 설치하던 확장과 같아
+  (기본값은 `tac_tagFile` 하나만 다름 — 아래 **기본 태그 목록**), config.json 에 남아 있는 값이 그대로 쓰입니다. 맨 위에 안내 줄과
+  **내장 Tag Autocomplete 사용 (sam-extra)** 스위치(기본 켬, 바꾸면 Forge 재시작)가 더해졌습니다. 끄면 `tac_*` 설정은 화면에서만
+  사라지고 config.json 의 값은 그대로 남습니다.
+- **태그 파일**: `extensions/forge_sam3_extension/tags/` 에서 읽습니다. 저장소에는 여섯 개만 들어 있습니다 —
+  `danbooru_2026-10-01_pt20-ia-dd.csv`(기본 태그 파일), `danbooru.csv`(상류의 기본이던 목록), `danbooru_2025.csv`(TIPO 가 먼저 읽는
+  목록), `danbooru_e621_merged.csv`, `extra-quality-tags.csv`, `demo-chants.json`.
+  상류의 다른 목록(`e621.csv`·`e621_sfw.csv`·`derpibooru.csv`·`EnglishDictionary.csv`·`noob_characters-chants.json`)은
+  [상류 tags 폴더](https://github.com/eduardoabreu81/sd-webui-tagcomplete-neo/tree/8e0d81fd0e25fd2cf98fb4d34d097df9f71a082b/tags) 에서 받아
+  같은 폴더에 두면 목록에 나타납니다. 직접 만든 목록, 사용 횟수(`tags/tag_frequency.db`), 시작할 때마다 다시 만드는 `tags/temp/` 는
+  git 에 들어가지 않습니다.
+- **기본 태그 목록**: 2026-10-01 에 만든 Danbooru 목록 `danbooru_2026-10-01_pt20-ia-dd.csv` 입니다 — 게시물 수 20 이상인 태그
+  220,510개(별칭 포함). 출처는 [DraconicDragon/dbr-e621-lists-archive](https://github.com/DraconicDragon/dbr-e621-lists-archive) 의
+  `tag-lists/danbooru/` 이고 라이선스는 The Unlicense 입니다(파일은 그대로, `THIRD_PARTY_NOTICES.md`). 상류의 기본값은 `danbooru.csv`
+  였습니다. config.json 에 예전에 고른 값이 있으면 그 값이 계속 쓰입니다 — 한국어 설명이 붙은 목록(`KR_danbooru_tags_with_description-…csv`
+  같은 사용자 목록)도 `tags/` 에 있으면 Settings → **Tag Autocomplete** → **Tag filename** 에서 그대로 고를 수 있습니다. 저장된 값을
+  새 기본 목록으로 바꾸려면 그 칸에서 고르거나, Forge 를 끈 채로 Forge 폴더에서:
+
+  ```
+  venv\Scripts\python.exe -I extensions\forge_sam3_extension\tools\migrate_tagcomplete.py --set-tagfile danbooru_2026-10-01_pt20-ia-dd.csv --config config.json
+  venv\Scripts\python.exe -I extensions\forge_sam3_extension\tools\migrate_tagcomplete.py --set-tagfile danbooru_2026-10-01_pt20-ia-dd.csv --config config.json --apply --forge-stopped
+  ```
+
+  첫 줄은 바뀔 값(`'예전' -> '새것'`)만 보여 줍니다. 둘째 줄은 `config.json.bak-tagfile-<시각>` 백업을 먼저 쓰고(덮어쓰지 않음,
+  내용 확인) `tac_tagFile` 값만 바꿉니다 — 다른 설정·키 순서·들여쓰기·줄끝은 바이트까지 그대로입니다. Forge 가 떠 있으면
+  (`127.0.0.1:7860` 이 응답하면 — 다른 포트로 띄우면 `--forge-port <포트>` 를 포트마다) 아무것도 쓰지 않고 멈춥니다. 떠 있는 Forge 는
+  설정을 저장할 때 메모리의 값을 config.json 에 다시 쓰기 때문입니다.
+- **따로 설치한 확장에서 옮기기**: 예전 `extensions/sd-webui-tagcomplete-neo/tags/` 의 사용자 목록·상류 목록·사용 횟수·LoRA 해시
+  캐시는 `tools/migrate_tagcomplete.py` 로 한 번 옮긴 뒤 그 확장 폴더를 extensions 밖으로 옮기세요(지우는 것보다 안전 — 아래
+  **둘이 함께 돌지 않음**). Forge 를 끈 채로, Forge 폴더에서:
+
+  ```
+  venv\Scripts\python.exe -I extensions\forge_sam3_extension\tools\migrate_tagcomplete.py --src extensions\sd-webui-tagcomplete-neo
+  venv\Scripts\python.exe -I extensions\forge_sam3_extension\tools\migrate_tagcomplete.py --src extensions\sd-webui-tagcomplete-neo --apply
+  ```
+
+  첫 줄은 옮길 목록만 보여 줍니다(절대 경로·크기·SHA-256). `--apply` 로 복사하며, 이미 있는 파일은 덮어쓰지 않고(같은 내용이면
+  건너뜀, 다르면 충돌로 알리고 그대로 둠) 복사본마다 SHA-256 을, 사용 횟수 DB 는 무결성·스키마·행 수를 확인합니다. 원래 폴더는 바꾸지
+  않습니다. 예전 확장을 먼저 끄고 Forge 를 한 번 켜서 내장이 빈 `tag_frequency.db`(0 행)·빈 `temp/known_lora_hashes.txt` 를 만들어
+  두었으면, 그 빈 파일은 지우지 않고 옆으로 치운 뒤(`<이름>.empty-<시각>.bak`) 옮깁니다. 행이 있는 DB 는 그대로 두고 충돌로
+  알리며, 예전 기록을 쓰려면 어떻게 하는지 그 줄에 적습니다. 내용이 다른 LoRA 해시 캐시는 다시 만들어지는 캐시라 그대로 두고 알리기만
+  합니다(충돌 아님).
+- **둘이 함께 돌지 않음**: 다른 tagcomplete 확장(폴더에 상류 파일 `javascript/tagAutocomplete.js` 나 `scripts/tag_autocomplete_helper.py`
+  가 있는 것 — 이름은 상관없음)이 켜져 있으면 내장은 쉬고, 콘솔에 `[sam-extra] Tag Autocomplete: built-in copy not started` 를 한 번
+  남기며 설정 안내 줄에도 이유가 나옵니다. 두 곳 모두 그 폴더를 넣은 옮기기 명령을 그대로 알려 줍니다 — Forge 를 끄고 **먼저 위
+  도구로 옮긴 뒤** 그 확장 폴더를 extensions 밖으로 옮기거나(지우는 것보다 안전) Extensions 탭에서 끄고 재시작하면 내장이 돕니다.
+  옮기기 전에 지우면 git 에 없는 사용자 목록·사용 횟수가 사라집니다. 페이지에서도 `javascript/tagcomplete_loader.js` 가 다른 사본의
+  전역(`TAC_CFG`·`addAutocompleteToArea`)을 보면 내장 JS 를 붙이지 않습니다.
+- **다른 확장과**: 상류와 같은 전역 이름(`TAC_CFG`·`addAutocompleteToArea`·`hideResults` 등), 요소 클래스(`.autocompleteParent` 등),
+  `/tacapi/v1/*` 경로 15개를 그대로 써서 prompt-all-in-one 같은 확장이 예전처럼 붙습니다. 구도 · 카메라 칸이 붙인 글자에는 추천
+  목록이 뜨지 않습니다(위 절).
+- **상류와 다른 점**: `/tacapi/v1/wildcard-contents` 는 와일드카드 폴더(`scripts/wildcards`, 확장들의 `wildcards/`) 안의 `.txt` 만
+  돌려줍니다 — 상류는 쿼리로 준 아무 파일이나 로그인 없이 돌려줘, `--listen` 으로 띄우면 같은 망의 누구나 PC 의 파일을 읽을 수
+  있었습니다. 같은 앱에 경로가 두 번 붙지 않고, 의존성 `pyyaml` 은 상류 `install.py` 대신 `requirements.txt` 에 있습니다. 상류의
+  JS 15개는 바꾸지 않았고 `sam3ext/tagcomplete/javascript/` 에 있습니다(Forge 가 자동으로 싣지 않는 하위 폴더라 로더가 붙임).
+  로더는 켜졌는지와 파일 목록을 Forge 설정(`opts`)의 숨은 키 `sam3_tac_builtin_boot`(화면에 없고 저장되지 않음)에서 읽어, Forge 가
+  막 떠서 확장들의 시작 작업이 끝나기 전에 열린 페이지(자동으로 여는 브라우저, Reload UI 뒤 새로 고침)에서도 상류처럼 시작합니다.
+- **고른 파일이 없을 때**: `tac_*` 가 고른 파일이 `tags/` 에 없으면(이름이 바뀐 파일 등) 상류는 브라우저 콘솔에 404 만 남기고 그
+  목록을 통째로 건너뜁니다 — 태그 파일이 없으면 extra 파일도 읽지 않습니다. 내장은 Forge 를 시작할 때 콘솔
+  (`... is not in ...`)과 설정 안내 줄에 그 이름을 알려 줍니다. `tac_tagFile` 이면 그동안 기본 목록
+  (`danbooru_2026-10-01_pt20-ia-dd.csv`)으로 추천합니다 — 페이지가 읽는 값만 바꾸고 config.json 과 Settings 의 값은 그대로라,
+  Settings 에서 있는 파일을 다시 고르면 그 파일을 씁니다. 다른 설정(extra·번역·chant 파일)은 다시 고를 때까지 비어 있습니다.
 
 ## 별도 기능: MCP 서버 — 에이전트 연결
 
@@ -1923,6 +2203,8 @@ claude mcp add --scope user -e FORGE_URL=http://127.0.0.1:7861 -e SAM_EXTRA_MCP_
 | **Anima Tile-Repair** (워크플로 3) | [kohya-ss/sd-scripts](https://github.com/kohya-ss/sd-scripts) (`anima_minimal_inference*`) | Apache-2.0 | `anima_vendor/` |
 | **Anima Character Reference / ReStyler** (워크플로 6) | [Anima ReStyler workflow](https://civitai.com/models/2803070/anima-restyler) · [원 아이디어 Reddit 게시물](https://www.reddit.com/r/StableDiffusion/s/0Az0DgoaKj) | 워크플로 페이지 조건 참고 | 동작을 Forge 네이티브 img2img/reference로 재구현 (vendor·코드 복사 없음) |
 | **NegPiP** (별도 기능) | [Haoming02/sd-forge-negpip](https://github.com/Haoming02/sd-forge-negpip) (commit `0585496`, 2026-09-30 보관) · 원작 hako-mikan | AGPL-3.0-or-later | `sam3ext/negpip/`·`scripts/negpip.py` 에 편입 (라이선스 전문 `sam3ext/negpip/LICENSE`, 수정 사항은 `THIRD_PARTY_NOTICES.md`) |
+| **Tag Autocomplete** (별도 기능) | [eduardoabreu81/sd-webui-tagcomplete-neo](https://github.com/eduardoabreu81/sd-webui-tagcomplete-neo) (commit `8e0d81f`, Forge Neo 포크) · 원본 [DominikDoom/a1111-sd-webui-tagcomplete](https://github.com/DominikDoom/a1111-sd-webui-tagcomplete) (Dominik Reh) | MIT | `sam3ext/tagcomplete/`·`tags/` 에 편입 (라이선스 전문 `sam3ext/tagcomplete/LICENSE`, 수정 사항은 `THIRD_PARTY_NOTICES.md`) |
+| **Tag Autocomplete 기본 태그 목록** (별도 기능) | [DraconicDragon/dbr-e621-lists-archive](https://github.com/DraconicDragon/dbr-e621-lists-archive) (`tag-lists/danbooru/danbooru_2026-10-01_pt20-ia-dd.csv`, Danbooru 태그 데이터) | The Unlicense | `tags/danbooru_2026-10-01_pt20-ia-dd.csv` 에 그대로 (출처·git blob 은 `THIRD_PARTY_NOTICES.md`) |
 | **Anima 3.8B (Qwen3.5 / v2)** (워크플로 7) | [GumGum10/forge-anima-3.8B](https://github.com/GumGum10/forge-anima-3.8B) (commit `59c27e5`) | MIT | `sam3ext/anima38/` 에 편입 (저장소에 포함, 수정 사항은 `THIRD_PARTY_NOTICES.md`) |
 | **TIPO 프롬프트 확장** (별도 기능) | [KBlueLeaf/TIPO-v2.1-1B-A200M](https://huggingface.co/KBlueLeaf/TIPO-v2.1-1B-A200M) · 모델 코드 [KohakUwULLM](https://github.com/KohakuBlueleaf/KohakUwULLM) | 가중치 Kohaku License 1.0 · 코드 Apache-2.0 | `sam3ext/tipo/kohaku/` 에 모델 코드만 편입, 가중치는 사용자가 받을 때 HF 에서 |
 | **Anima Safe PAG** (별도 기능) | [iljung1106/comfyui-anima-safe-pag](https://github.com/iljung1106/comfyui-anima-safe-pag) (commit `905b0107`) | MIT | Anima 배치·블록 선택을 이식, σ 적용 구간·번호 파싱 편입(`sam3ext/guidance/sigma_window.py`) |
@@ -1984,7 +2266,9 @@ LoRA Manager(GPL-3.0)는 vendor 그대로 실행하되, `lora_manager_core.py`�
 
 - 저장소에 함께 들어 있는 제3자 코드·자산(`sam3ext/anima38/` 의 MIT 코드, `mcp_server/sam_extra_mcp/forgeneo/` 의
   forgeneo-mcp 코드(MIT), `sam3ext/colorcraft/` 의 Colorcraft 코드·색 벡터(MIT), `sam3ext/speed/` 의 SPEED 코드(MIT),
-  진행 막대의 Smooth Progress 코드(MIT), `sam3ext/extra_samplers/` 의 DPM++ 4M SDE 코드(BSD-3-Clause)·Euler (SMEA) Dy
+  진행 막대의 Smooth Progress 코드(MIT), `sam3ext/tagcomplete/` 의 Tag Autocomplete 코드와 `tags/` 의 태그 목록(MIT — 기본 목록
+  `danbooru_2026-10-01_pt20-ia-dd.csv` 는 The Unlicense),
+  `sam3ext/extra_samplers/` 의 DPM++ 4M SDE 코드(BSD-3-Clause)·Euler (SMEA) Dy
   코드(Apache-2.0), TIPO 모델 코드(Apache-2.0), `assets/` 의 Qwen3.5 토크나이저(Apache-2.0)·CLIP BPE 어휘(MIT))는 원래 고지를
   그대로 유지합니다 — 목록과 조건은 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) 참고.
 - 편입한 NegPiP(`sam3ext/negpip/` 의 `__init__.py`·`anima.py`·`sd.py`·`utils.py`·`mask.py`, `scripts/negpip.py`)는

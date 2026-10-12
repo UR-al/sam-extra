@@ -54,6 +54,7 @@ __all__ = [
     "ROLE_SKIP",
     "apply_higs",
     "apply_mg",
+    "clear_dct_cache",
     "dct_highpass",
     "higs_weight",
     "noise_level",
@@ -160,6 +161,13 @@ def _dct_matrix(n: int, device, dtype) -> torch.Tensor:
         _DCT_CACHE.clear()
     _DCT_CACHE[key] = matrix
     return matrix
+
+
+def clear_dct_cache() -> bool:
+    """Drops the cached DCT matrices (the '모델 내리기' button). True when any was cached."""
+    held = bool(_DCT_CACHE)
+    _DCT_CACHE.clear()
+    return held
 
 
 def dct_highpass(t: torch.Tensor, cutoff: float, sharpness: float = HIGS_SHARPNESS) -> torch.Tensor:

@@ -49,9 +49,14 @@ class TagIndexTests(unittest.TestCase):
         index = tp.load_tag_index([Path("C:/nope/a.csv")])
         self.assertEqual(index.category("hatsune miku"), "general")
 
-    def test_default_paths_point_at_tagcomplete(self):
-        paths = tp.default_tag_csv_paths(Path("C:/forge/extensions"))
-        self.assertEqual(paths[0], Path("C:/forge/extensions/sd-webui-tagcomplete-neo/tags/danbooru_2025.csv"))
+    def test_default_paths_point_at_the_builtin_tagcomplete(self):
+        from sam3ext.tagcomplete import paths as tac_paths
+
+        self.assertEqual(tp.default_tag_csv_paths(),
+                         [tac_paths.TAGS_DIR / "danbooru_2025.csv", tac_paths.TAGS_DIR / "danbooru.csv"])
+        self.assertEqual(tac_paths.TAGS_DIR.resolve(), (ROOT / "tags").resolve())
+        paths = tp.default_tag_csv_paths(Path("C:/somewhere/tags"))
+        self.assertEqual(paths[0], Path("C:/somewhere/tags/danbooru_2025.csv"))
 
 
 class AnalyzeTests(unittest.TestCase):

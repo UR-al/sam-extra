@@ -1,17 +1,22 @@
 """When Euler (SMEA) Dy CFG++ runs without its sub-steps, and how the infotext and the console say so.
 
 The Dy/SMEA sub-steps evaluate the model at another resolution (half, ×1.25). Some full-resolution
-machinery of Forge Neo 2.29.2 cannot follow that, so on such a request the two samplers run their
-plain CFG++ Euler steps (``euler_dy(substeps=False)``) instead of failing:
+machinery of Forge Neo (2.29.2, 2.30) cannot follow that, so on such a request the Dy samplers run their
+plain (CFG++) Euler steps (``euler_dy(substeps=False)``) instead of failing:
 
 * **Spectrum Integrated** — Forge's built-in ``extensions-builtin/sd_forge_spectrum``. Its
   ``spectrum_unet_wrapper`` (``lib_spectrum/forecaster.py``, set as the UNet's
   ``model_function_wrapper`` in ``process_before_every_sampling``) counts model calls and keeps one
-  output shape: a sub-step resets its buffers to the sub-step's resolution and the next *forecast*
-  call returns that shape for a full-resolution input — a shape-mismatch error (Euler Dy for
-  warm-up ≤ 6, Spectrum's default; Euler SMEA Dy for warm-up ≤ 4). Detected the way the SPEED port
-  does (``sam3ext/speed/forge_host.py`` ``_spectrum_wrapper``): the wrapper's ``__qualname__``
-  contains ``spectrum_unet_wrapper`` or its module is ``lib_spectrum…``.
+  output shape: a sub-step resets its buffers to the sub-step's resolution. On Forge 2.29.2 the next
+  *forecast* call returns that shape for a full-resolution input — a shape-mismatch error (Euler Dy for
+  warm-up ≤ 6, Spectrum's default; Euler SMEA Dy for warm-up ≤ 4). Forge 2.30 (45f41b81) re-runs the
+  model when a forecast has the wrong shape, so nothing fails there — but both sub-steps and the step
+  after each are then real evaluations and the forecaster restarts at every size change: measured on
+  CPU (tests/test_extra_samplers_forge_path.py, 10 steps), the unguarded sub-steps leave no fewer UNet
+  evaluations than the plain steps without Spectrum, while the plain steps keep Spectrum's saving. So the
+  guard stays on both versions. Detected the way the SPEED port does (``sam3ext/speed/forge_host.py``
+  ``_spectrum_wrapper``): the wrapper's ``__qualname__`` contains ``spectrum_unet_wrapper`` or its
+  module is ``lib_spectrum…``.
 * **Wan 2.2 I2V** — ``dynamic_args.concat_latent`` (``backend/diffusion_engine/wan.py``
   ``encode_first_stage`` → ``image_to_video``) is concatenated with the latent on the channel axis at
   full size whenever the DiT's ``in_dim`` exceeds its latent channels ``out_dim`` (``backend/nn/wan.py``).
@@ -63,8 +68,9 @@ REASON_EXTRA_CONCAT = "extra_concat_condition"
 
 _EXPLANATION = {
     REASON_SPECTRUM: (
-        "Forge's Spectrum Integrated is on - its forecaster keeps one output shape and would hand the "
-        "sub-step's resolution back to a full-resolution step"
+        "Forge's Spectrum Integrated is on - its forecaster follows one output size, so the sub-steps "
+        "would crash it (Forge 2.29.2) or cancel its saving (Forge 2.30 re-runs the model after each "
+        "size change)"
     ),
     REASON_WAN: "Wan 2.2 I2V concatenates its full-size concat_latent with the latent on every forward",
     REASON_PID: "PiD conditions every forward on its full-size lq_latent",
