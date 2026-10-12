@@ -12,7 +12,20 @@ from typing import Any, Callable
 import numpy as np
 from PIL import Image
 
-from .face_crop import FaceCropInfo, assign_owners, box_to_image, grow_crop, paste_mask, plan_face_crops
+from .face_crop import (
+    GROW_ROUNDS,
+    SIDES,
+    CropBox,
+    CropGrowth,
+    FaceCropInfo,
+    assign_owners,
+    box_to_image,
+    enclosing_crop,
+    grow_crop,
+    growth_requests,
+    paste_mask,
+    plan_face_crops,
+)
 from .face_detect import DEFAULT_CONFIDENCE as FACE_CROP_DEFAULT_CONFIDENCE
 from .face_detect import DEFAULT_MODEL as FACE_CROP_DEFAULT_MODEL
 from .face_detect import detect_faces
@@ -917,6 +930,9 @@ def run_sam3_on_pil(
     crop 마다, Outline + Dilation px 만큼 넓힌 영역(마스크가 번질 수 있는 곳)에서 찾아 모든 마스크에서 뺀다.
     Hull·Outline·Dilation·Manual Mask·Exclude 는 이미지 좌표에서 예전과 같은 순서로 한다. 얼굴이 없으면 SAM3 를
     불러오지 않고 검출 없음과 같게 끝낸다 — 빈 마스크, Manual Mask 가 있으면 그것 그대로.
+    검출 토큰의 마스크(그 얼굴이 주인인 조각)가 crop 의 안쪽 가장자리에 잘렸으면(머리카락) 그 얼굴 · 토큰만 crop 을 닿은 쪽으로
+    키워 다시 돌린다(``face_crop.growth_requests``, 얼굴 × 토큰마다 ``GROW_ROUNDS`` 번까지) — 키운 얼굴의 Exclude 는 키운
+    영역에서도 찾는다. 닿은 것이 없으면 SAM3 호출 · 마스크가 키우기 전과 같다.
     """
     # Target empty + no Exclude means the user requested their drawn mask.
     # Branch before Torch import/device checks/checkpoint download or load.
@@ -1060,8 +1076,34 @@ def run_sam3_on_pil(
         face_boxes = face_info.boxes
         crops = face_info.crops
         n_crops = len(crops)
-        found: list[list[tuple[list[np.ndarray], list[int]]]] = [[([], []) for _ in tokens] for tokens in groups]
+        # (그룹, 토큰, 얼굴)마다 그 얼굴 crop 에서 찾은 결과(조각 — 이미지 좌표, 상자 — 이미지 좌표, 점수)와 그 결과를 낸 crop.
+        # 처음엔 얼굴 crop, 그 토큰의 마스크가 crop 가장자리에 잘려 키웠으면 키운 crop(그 결과로 바꾼다).
+        runs: list[list[list[tuple[list[np.ndarray], list[np.ndarray], list[float]]]]] = [
+            [[([], [], []) for _ in crops] for _ in tokens] for tokens in groups
+        ]
+        token_crops = [[list(crops) for _ in tokens] for tokens in groups]
         face_exclude_pieces = []
+
+        def _run_token(sub_prompt: str, region: int) -> tuple[list[np.ndarray], list[np.ndarray], list[float]]:
+            crop = regions[region][0]
+            split, boxes_np, scores_np = _run_prompt(sub_prompt, region)
+            pieces = [paste_mask(piece, crop, (h, w)) for piece in split if np.any(piece)]
+            boxes = []
+            if boxes_np.size:
+                for box in boxes_np:
+                    boxes.append(np.asarray(box_to_image(box.astype(float).tolist(), crop), dtype=float))
+            scores = [float(score) for score in scores_np.tolist()] if scores_np.size else []
+            return pieces, boxes, scores
+
+        def _token_pieces(group_index: int, token_index: int) -> tuple[list[np.ndarray], list[int]]:
+            """한 토큰의 모든 얼굴 조각(얼굴 순서)과 찾은 얼굴 번호 — assign_owners · growth_requests 의 입력."""
+            pieces: list[np.ndarray] = []
+            sources: list[int] = []
+            for face, (face_pieces, _, _) in enumerate(runs[group_index][token_index]):
+                pieces.extend(face_pieces)
+                sources.extend([face] * len(face_pieces))
+            return pieces, sources
+
         exclude_tokens = [t for ex in _split_prompt_groups(exclude_text) for t in ex] if exclude_text else []
         # Exclude 는 마스크가 번질 수 있는 곳까지 찾는다: Outline · Dilation 은 crop 밖으로 최대 그 px 합만큼 번지므로
         # crop 을 그만큼 넓힌 영역에서(0 이면 crop 그대로 — 같은 백본 특징을 쓴다). 넓힌 영역은 regions 의 뒤쪽 칸.
@@ -1076,27 +1118,102 @@ def run_sam3_on_pil(
         for region, crop in enumerate(crops):
             for group_index, group_tokens in enumerate(groups):
                 for token_index, sub_prompt in enumerate(group_tokens):
-                    split, boxes_np, scores_np = _run_prompt(sub_prompt, region)
-                    pieces, sources = found[group_index][token_index]
-                    for piece in split:
-                        if np.any(piece):
-                            pieces.append(paste_mask(piece, crop, (h, w)))
-                            sources.append(region)
-                    if boxes_np.size:
-                        for box in boxes_np:
-                            all_boxes.append(np.asarray(box_to_image(box.astype(float).tolist(), crop), dtype=float))
-                    if scores_np.size:
-                        for score in scores_np.tolist():
-                            all_scores.append(float(score))
+                    runs[group_index][token_index][region] = _run_token(sub_prompt, region)
             exclude_crop = regions[exclude_region[region]][0]
             for sub_prompt in exclude_tokens:
                 split, _, _ = _run_prompt(sub_prompt, exclude_region[region])
                 face_exclude_pieces.extend(paste_mask(piece, exclude_crop, (h, w)) for piece in split)
+
+        # crop 키우기 — 그 얼굴이 주인인 조각이 그 crop 의 안쪽 가장자리에 잘린 (토큰, 얼굴)만 닿은 쪽으로 키운 crop 에서 그
+        # 토큰을 다시 돌려 결과를 바꾼다(라운드마다 주인을 다시 정한다). 닿은 것이 없으면 SAM3 를 더 부르지 않는다.
+        grown_rounds = [[[0] * n_crops for _ in tokens] for tokens in groups]
+        grown_sides: dict[tuple[int, int, int], set[str]] = {}
+        settled: set[tuple[int, int, int]] = set()   # 키운 crop 에서 아무것도 못 찾음 — 앞 결과를 지키고 더 키우지 않는다
+        region_of: dict[CropBox, int] = {}
+        for round_index in range(1, GROW_ROUNDS + 1):
+            jobs: dict[CropBox, list[tuple[int, int, int, tuple[str, ...]]]] = {}
+            for group_index, group_tokens in enumerate(groups):
+                for token_index in range(len(group_tokens)):
+                    pieces, sources = _token_pieces(group_index, token_index)
+                    if not pieces:
+                        continue
+                    open_faces = {f for f in range(n_crops) if (group_index, token_index, f) not in settled}
+                    requests = growth_requests(
+                        pieces, sources, face_boxes, token_crops[group_index][token_index], (w, h), faces=open_faces
+                    )
+                    for face, (sides, grown) in requests.items():
+                        jobs.setdefault(grown, []).append((group_index, token_index, face, sides))
+            if not jobs:
+                break
+            for grown, items in jobs.items():   # 같은 crop 으로 키운 토큰들은 백본을 한 번만
+                if grown not in region_of:
+                    region_of[grown] = len(regions)
+                    regions.append((grown, pil_image.crop(grown.as_tuple())))
+                for group_index, token_index, face, sides in items:
+                    sub_prompt = groups[group_index][token_index]
+                    where = f"{grown.width}x{grown.height}@{grown.x0},{grown.y0}"
+                    result = _run_token(sub_prompt, region_of[grown])
+                    key = (group_index, token_index, face)
+                    if not result[0]:
+                        settled.add(key)
+                        print(
+                            f"[-] SAM3: face crop — face {face + 1} {sub_prompt!r}: nothing found in the grown crop "
+                            f"{where}; keeping the face crop result",
+                            file=sys.stderr,
+                        )
+                        continue
+                    runs[group_index][token_index][face] = result
+                    token_crops[group_index][token_index][face] = grown
+                    grown_rounds[group_index][token_index][face] = round_index
+                    grown_sides.setdefault(key, set()).update(sides)
+                    print(
+                        f"[-] SAM3: face crop — face {face + 1} {sub_prompt!r} reached the crop edge "
+                        f"({', '.join(sides)}); SAM3 again on {where} (round {round_index}/{GROW_ROUNDS})",
+                        file=sys.stderr,
+                    )
+        for (group_index, token_index, face), sides in grown_sides.items():
+            face_info.growth.append(
+                CropGrowth(
+                    face=face,
+                    prompt=groups[group_index][token_index],
+                    crop=token_crops[group_index][token_index][face],
+                    rounds=grown_rounds[group_index][token_index][face],
+                    sides=tuple(side for side in SIDES if side in sides),
+                )
+            )
+        face_info.growth.sort(key=lambda g: (g.face, g.prompt, g.crop.as_tuple()))
+        # 키운 얼굴의 Exclude 는 마스크가 닿을 수 있는 곳(그 얼굴이 쓴 crop 들을 모두 품는 영역 + Outline · Dilation)에서도 찾는다.
+        if exclude_tokens and grown_sides:
+            for face in range(n_crops):
+                used: list[CropBox] = []
+                for group_crops in token_crops:
+                    for face_crops in group_crops:
+                        if face_crops[face] != crops[face] and face_crops[face] not in used:
+                            used.append(face_crops[face])
+                if not used:
+                    continue
+                area = grow_crop(enclosing_crop(used, (w, h)), growth, (w, h))
+                if area == regions[exclude_region[face]][0]:
+                    continue
+                if area not in region_of:
+                    region_of[area] = len(regions)
+                    regions.append((area, pil_image.crop(area.as_tuple())))
+                for sub_prompt in exclude_tokens:
+                    split, _, _ = _run_prompt(sub_prompt, region_of[area])
+                    face_exclude_pieces.extend(paste_mask(piece, area, (h, w)) for piece in split)
         image_state = None
-        for group_index, tokens in enumerate(found):
+        # 상자 · 점수는 예전처럼 얼굴(영역) → 그룹 → 토큰 순서로(키운 토큰은 키운 crop 의 것).
+        for face in range(n_crops):
+            for group_runs in runs:
+                for face_runs in group_runs:
+                    all_boxes.extend(face_runs[face][1])
+                    all_scores.extend(face_runs[face][2])
+        for group_index, group_tokens in enumerate(groups):
             per_face: list[list[np.ndarray]] = [[] for _ in crops]
-            for pieces, sources in tokens:
-                for piece, owner in zip(pieces, assign_owners(pieces, sources, face_boxes, crops)):
+            for token_index in range(len(group_tokens)):
+                pieces, sources = _token_pieces(group_index, token_index)
+                owners = assign_owners(pieces, sources, face_boxes, token_crops[group_index][token_index])
+                for piece, owner in zip(pieces, owners):
                     per_face[owner].append(piece)
             for owned in per_face:
                 if owned:
@@ -1218,6 +1335,10 @@ def _assemble_result(
                 1,
                 cv2.LINE_AA,
             )
+        # crop 가장자리에 잘려 키운 crop — 같은 색, 가는 선(키운 것이 없으면 그리지 않아 예전 오버레이와 같다).
+        for crop in dict.fromkeys(g.crop for g in getattr(face_info, "growth", ())):
+            overlay = np.ascontiguousarray(overlay)
+            cv2.rectangle(overlay, (crop.x0, crop.y0), (crop.x1 - 1, crop.y1 - 1), _FACE_CROP_OVERLAY_COLOR, 1)
 
     for idx, box in enumerate(boxes_out):
         x1, y1, x2, y2 = [int(round(v)) for v in box.tolist()]

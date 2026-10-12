@@ -296,6 +296,169 @@ class GrowCropTests(unittest.TestCase):
                 self.assertEqual(grown.width, grown.height, "이미지에 들어가면 정사각형")
 
 
+class TouchingSidesTests(unittest.TestCase):
+    """crop 키우기의 방아쇠 — 마스크가 crop 의 안쪽 가장자리(이미지 테두리가 아닌 변)에 충분히 닿았나."""
+
+    SHAPE = (300, 400)   # (높이, 폭)
+    CROP = fc.CropBox(100, 50, 200, 150)   # 한 변 100 → 닿은 길이 기준 max(4, 2) = 4 px
+
+    def test_constants(self):
+        self.assertEqual((fc.GROW_FACTOR, fc.GROW_ROUNDS), (1.5, 2))
+        self.assertEqual((fc.TOUCH_BAND, fc.TOUCH_MIN_PX, fc.TOUCH_MIN_FRACTION), (2, 4, 0.02))
+        self.assertEqual(fc.SIDES, ("left", "top", "right", "bottom"))
+
+    def test_inside_the_crop_does_not_touch(self):
+        self.assertEqual(fc.touching_sides(_box_mask(self.SHAPE, 110, 60, 190, 140), self.CROP), ())
+        self.assertEqual(fc.touching_sides(np.zeros(self.SHAPE, bool), self.CROP), ())
+
+    def test_each_side(self):
+        cases = {
+            "left": (100, 80, 110, 90), "top": (130, 50, 140, 60),
+            "right": (190, 80, 200, 90), "bottom": (130, 140, 140, 150),
+        }
+        for side, box in cases.items():
+            with self.subTest(side=side):
+                self.assertEqual(fc.touching_sides(_box_mask(self.SHAPE, *box), self.CROP), (side,))
+        everything = _box_mask(self.SHAPE, *self.CROP.as_tuple())
+        self.assertEqual(fc.touching_sides(everything, self.CROP), fc.SIDES, "변 순서는 SIDES")
+
+    def test_band_is_two_pixels(self):
+        near = _box_mask(self.SHAPE, 198, 80, 199, 90)      # 오른쪽 변 1 px 안쪽(띠 안)
+        self.assertEqual(fc.touching_sides(near, self.CROP), ("right",))
+        far = _box_mask(self.SHAPE, 196, 80, 198, 90)       # 2 px 안쪽(띠 밖)
+        self.assertEqual(fc.touching_sides(far, self.CROP), ())
+        self.assertEqual(fc.touching_sides(far, self.CROP, band=4), ("right",))
+
+    def test_a_few_pixels_on_the_edge_do_not_count(self):
+        self.assertEqual(fc.touching_sides(_box_mask(self.SHAPE, 195, 80, 200, 83), self.CROP), (), "3 px < 4 px")
+        self.assertEqual(fc.touching_sides(_box_mask(self.SHAPE, 195, 80, 200, 84), self.CROP), ("right",), "4 px")
+        big = fc.CropBox(0, 0, 300, 300)    # 한 변 300 → max(4, 6) = 6 px
+        self.assertEqual(fc.touching_sides(_box_mask(self.SHAPE, 290, 80, 300, 85), big), ())
+        self.assertEqual(fc.touching_sides(_box_mask(self.SHAPE, 290, 80, 300, 86), big), ("right",))
+        scattered = np.zeros(self.SHAPE, bool)
+        scattered[60:140:10, 199] = True     # 띠를 따라 흩어진 8 점 — 길이로 센다
+        self.assertEqual(fc.touching_sides(scattered, self.CROP), ("right",))
+
+    def test_image_edges_never_trigger(self):
+        corner = fc.CropBox(0, 0, 100, 100)
+        hair = _box_mask(self.SHAPE, 0, 0, 60, 30) | _box_mask(self.SHAPE, 0, 0, 30, 60)   # 위 · 왼쪽 변 = 이미지 테두리
+        self.assertEqual(fc.touching_sides(hair, corner), ())
+        self.assertEqual(fc.touching_sides(hair | _box_mask(self.SHAPE, 60, 90, 70, 100), corner), ("bottom",))
+        whole = fc.CropBox(0, 0, 400, 300)
+        self.assertEqual(fc.touching_sides(np.ones(self.SHAPE, bool), whole), (), "이미지 전체 crop 은 닿을 변이 없다")
+
+
+class GrowTowardTests(unittest.TestCase):
+    SIZE = (400, 300)   # (폭, 높이)
+
+    def test_grows_toward_the_touched_side_only(self):
+        crop = fc.CropBox(100, 50, 200, 150)
+        self.assertEqual(fc.grow_toward(crop, ("bottom",), self.SIZE), fc.CropBox(75, 50, 225, 200), "아래로, 옆은 양쪽 반씩")
+        self.assertEqual(fc.grow_toward(crop, ("right",), self.SIZE), fc.CropBox(100, 25, 250, 175))
+        self.assertEqual(fc.grow_toward(crop, ("left", "top"), self.SIZE), fc.CropBox(50, 0, 200, 150))
+        self.assertEqual(fc.grow_toward(crop, ("left", "right"), self.SIZE), fc.CropBox(75, 25, 225, 175),
+                         "두 변 = 중심 유지")
+        self.assertEqual(fc.grow_toward(crop, (), self.SIZE), fc.CropBox(75, 25, 225, 175))
+        self.assertEqual(fc.grow_toward(crop, ("right",), self.SIZE, factor=2.0), fc.CropBox(100, 0, 300, 200))
+
+    def test_pushed_inside_and_keeps_the_crop(self):
+        crop = fc.CropBox(300, 200, 380, 280)
+        grown = fc.grow_toward(crop, ("right",), self.SIZE)      # 120 → 오른쪽 끝(400)에 걸려 왼쪽으로 밀림
+        self.assertEqual(grown, fc.CropBox(280, 180, 400, 300))
+        self.assertEqual((grown.width, grown.height), (120, 120))
+
+    def test_long_side_is_clamped_to_the_image_then_whole_image(self):
+        crop = fc.CropBox(100, 0, 300, 200)
+        grown = fc.grow_toward(crop, ("left", "bottom"), self.SIZE)   # 300 ≥ 높이 300 → 세로는 이미지 전체
+        self.assertEqual(grown, fc.CropBox(0, 0, 300, 300))
+        whole = fc.grow_toward(grown, ("right",), self.SIZE)            # 450 → 이미지 전체
+        self.assertEqual(whole, fc.CropBox(0, 0, 400, 300))
+        self.assertEqual(fc.grow_toward(whole, ("right",), self.SIZE), whole, "더 키울 수 없으면 그대로")
+
+    def test_tiny_crop_grows_at_least_a_pixel(self):
+        self.assertEqual(fc.grow_toward(fc.CropBox(10, 10, 11, 11), ("right",), self.SIZE), fc.CropBox(10, 10, 12, 12))
+
+    def test_random_growth_is_square_inside_and_contains_the_crop(self):
+        rng = np.random.default_rng(5)
+        for _ in range(500):
+            width, height = int(rng.integers(40, 500)), int(rng.integers(40, 500))
+            crop = fc.face_crop_box([float(rng.uniform(0, width)), float(rng.uniform(0, height)),
+                                     float(rng.uniform(0, width)), float(rng.uniform(0, height))], (width, height))
+            if crop is None:
+                continue
+            sides = tuple(s for s in fc.SIDES if rng.random() < 0.5)
+            grown = fc.grow_toward(crop, sides, (width, height))
+            self.assertTrue(0 <= grown.x0 <= crop.x0 and crop.x1 <= grown.x1 <= width, (crop, grown))
+            self.assertTrue(0 <= grown.y0 <= crop.y0 and crop.y1 <= grown.y1 <= height, (crop, grown))
+            want = max(max(crop.width, crop.height) + 1, int(np.ceil(max(crop.width, crop.height) * fc.GROW_FACTOR)))
+            self.assertEqual(grown.width, min(want, width))
+            self.assertEqual(grown.height, min(want, height))
+
+    def test_enclosing_crop(self):
+        a, b = fc.CropBox(10, 10, 60, 60), fc.CropBox(40, 30, 120, 110)
+        self.assertIs(fc.enclosing_crop([a], self.SIZE), a)
+        both = fc.enclosing_crop([a, b], self.SIZE)
+        self.assertEqual(both, fc.CropBox(10, 5, 120, 115), "둘을 감싼 상자(10, 10, 120, 110)의 정사각형 — 중심 유지")
+        self.assertEqual(fc.enclosing_crop([fc.CropBox(0, 0, 400, 10), fc.CropBox(0, 290, 10, 300)], self.SIZE),
+                         fc.CropBox(0, 0, 400, 300))
+
+
+class GrowthRequestTests(unittest.TestCase):
+    """어느 얼굴의 crop 을 키우나 — 그 얼굴이 주인이고 그 crop 에서 찾은 조각이 그 crop 가장자리에 닿았을 때만."""
+
+    SHAPE = (300, 400)
+    SIZE = (400, 300)
+
+    def setUp(self):
+        self.faces = [[100, 100, 200, 200], [238, 150, 262, 174]]
+        self.crops = [fc.face_crop_box(box, self.SIZE) for box in self.faces]   # A x < 230, B x ≥ 230
+
+    def test_no_touch_no_request(self):
+        inside = _box_mask(self.SHAPE, 120, 120, 180, 180)
+        self.assertEqual(fc.growth_requests([inside], [0], self.faces, self.crops, self.SIZE), {})
+        self.assertEqual(fc.growth_requests([], [], self.faces, self.crops, self.SIZE), {})
+
+    def test_own_cut_piece_grows_its_face(self):
+        a = self.crops[0]
+        hair = _box_mask(self.SHAPE, 120, 150, 200, a.y1)    # A 의 crop 아래 가장자리에 잘림
+        requests = fc.growth_requests([hair], [0], self.faces, self.crops, self.SIZE)
+        self.assertEqual(requests, {0: (("bottom",), fc.grow_toward(a, ("bottom",), self.SIZE))})
+
+    def test_a_neighbours_piece_cut_at_this_edge_does_not_grow_this_face(self):
+        a, b = self.crops
+        hair_a = np.zeros(self.SHAPE, dtype=bool)
+        hair_a[70:100, 95:234] = True
+        hair_a[70:180, 200:234] = True                       # A 의 머리카락 — A 의 crop 오른쪽 끝을 넘어 B 의 crop 으로
+        seen_a = hair_a & _box_mask(self.SHAPE, *a.as_tuple())
+        seen_b = hair_a & _box_mask(self.SHAPE, *b.as_tuple())   # B 의 crop 왼쪽 끝에 잘린 띠 — 주인은 A
+        requests = fc.growth_requests([seen_a, seen_b], [0, 1], self.faces, self.crops, self.SIZE)
+        self.assertEqual(set(requests), {0}, "B 의 crop 은 키우지 않는다")
+        self.assertEqual(requests[0][0], ("right",))
+
+    def test_faces_filter_and_whole_image(self):
+        a = self.crops[0]
+        hair = _box_mask(self.SHAPE, 120, 150, 200, a.y1)
+        self.assertEqual(fc.growth_requests([hair], [0], self.faces, self.crops, self.SIZE, faces={1}), {})
+        whole = [fc.CropBox(0, 0, 400, 300), self.crops[1]]
+        self.assertEqual(fc.growth_requests([np.ones(self.SHAPE, bool)], [0], self.faces, whole, self.SIZE), {})
+
+    def test_status_and_meta_record_the_growth(self):
+        info = fc.plan_face_crops([[100, 100, 200, 200]], [0.8], self.SIZE, model="m.pt", confidence=0.3)
+        before_status, before_meta = info.status(), info.as_meta()
+        self.assertNotIn("grown", before_status)
+        self.assertNotIn("grown", before_meta["faces"][0])
+        grown = fc.grow_toward(info.crops[0], ("bottom",), self.SIZE)
+        info.growth.append(fc.CropGrowth(face=0, prompt="hair", crop=grown, rounds=1, sides=("bottom",)))
+        self.assertEqual(
+            info.status(),
+            before_status + f"; grown where the mask reached the crop edge: face 1 'hair' → "
+            f"{grown.width}x{grown.height}@{grown.x0},{grown.y0} (1 round)",
+        )
+        self.assertEqual(info.as_meta()["faces"][0]["grown"],
+                         [{"prompt": "hair", "crop": list(grown.as_tuple()), "rounds": 1, "sides": ["bottom"]}])
+        self.assertEqual(info.as_meta()["faces"][0]["crop"], before_meta["faces"][0]["crop"], "원래 crop 은 그대로")
+
+
 class DuplicateBoxTests(unittest.TestCase):
     def test_iou(self):
         self.assertAlmostEqual(fc.box_iou((40, 70, 80, 110), (48, 66, 92, 112)), 0.546, places=3)
