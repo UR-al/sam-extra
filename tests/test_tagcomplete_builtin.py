@@ -510,5 +510,37 @@ class TipoTagIndexTests(unittest.TestCase):
         self.assertNotIn("sd-webui-tagcomplete-neo", source)
 
 
+class SettingsNoteWrapTests(unittest.TestCase):
+    """The v0.34.0 live check: in Settings → Tag Autocomplete the long migration command (a path with no break
+    opportunity) ran past the edge of the note's box. Every note is one wrapper that style.css lets wrap anywhere; the
+    rendered box is tests/js/tagcomplete_settings_note_layout.test.mjs."""
+
+    LONG = Path("C:/Users/someone/AppData/Local/Temp/a-long-folder-name-0123456789abcdef0123456789abcdef"
+                "/forge_data/extensions/forge_sam3_extension/tags")
+
+    def test_every_note_is_one_wrapper_the_css_lets_wrap(self):
+        from sam3ext.tagcomplete import coexist
+
+        old = str(self.LONG.parent.parent / "sd-webui-tagcomplete-neo")
+        notes = {
+            "ok": coexist.note_html({"code": "ok"}, self.LONG),
+            "ok, missing": coexist.note_html({"code": "ok"}, self.LONG, [("tac_tagFile", MISSING)], FALLBACK),
+            "standalone": coexist.note_html({"code": "standalone", "reason": "x", "source": old}, self.LONG),
+            "off": coexist.note_html({"code": "off"}, self.LONG),
+            "error": coexist.note_html({"code": "error", "reason": "boom"}, self.LONG),
+        }
+        prefix, suffix = f'<div class="{coexist.NOTE_CLASS}">', "</div>"
+        for name, note in notes.items():
+            with self.subTest(name):
+                self.assertTrue(note.startswith(prefix) and note.endswith(suffix), note[:80])
+                self.assertEqual(note.count("<div"), 1)
+                self.assertEqual(note.count("</div>"), 1)
+        self.assertIn(html.escape(coexist.migration_command(None)), notes["ok, missing"])
+        self.assertIn(html.escape(coexist.migration_command(old)), notes["standalone"])
+        css = (ROOT / "style.css").read_text(encoding="utf-8")
+        start = css.index(f".{coexist.NOTE_CLASS} {{")
+        self.assertRegex(css[start:css.index("}", start)], r"overflow-wrap: anywhere;")
+
+
 if __name__ == "__main__":
     unittest.main()

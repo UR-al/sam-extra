@@ -1655,3 +1655,10 @@ html:not([data-sam3-theme]) .dark .sam3-progress[data-state="interrupted"]:is([d
     white-space: nowrap;
 }
 /* samextra-colorcraft:end */
+
+/* Settings → Tag Autocomplete 맨 위의 안내(sam3ext/tagcomplete/coexist.py note_html, Forge 의 .settings-info 상자 안).
+ * 태그 폴더 경로와 옮기기 명령(tools/migrate_tagcomplete.py)은 끊을 자리가 없는 긴 글이라 상자 밖으로 넘쳤다 — 이 안에서는
+ * 넘칠 때만 아무 데서나 줄을 바꾼다(다른 글은 원래 자리에서 바뀐다). 모양은 그대로다. */
+.sam3-tac-note {
+    overflow-wrap: anywhere;
+}
