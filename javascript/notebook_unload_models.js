@@ -219,12 +219,13 @@
         var save = row.querySelector(":scope > #" + SAVE_WRAP_ID);
         var saveButton = save && save.querySelector(":scope > button");
         if (saveButton) {
-            // 기본값 저장 묶음 안, 저장 버튼 바로 뒤(탭 순서도 그 다음) — 저장 결과 글은 두 버튼 뒤로 밀린다
+            // 기본값 저장 묶음 안, 저장 버튼 바로 뒤(탭 순서도 그 다음) — 저장 결과 글은 묶음 밖의 줄 항목이다
             if (wrap.previousElementSibling !== saveButton) saveButton.after(wrap);
         } else if (wrap.parentElement !== row) {
             row.appendChild(wrap);   // 기본값 저장이 아직 없으면 줄 끝 — 생기면 다음 확인 때 그 안으로 옮긴다
         }
-        // 결과 글: 버튼 묶음 바로 뒤의 줄 항목(style.css 가 버튼 아래 한 줄로 둔다)
+        // 결과 글: 버튼 묶음 바로 뒤의 줄 항목(style.css 가 버튼 아래 한 줄로 둔다). 기본값 저장의 결과 글은 이 뒤에 붙는다
+        // (notebook_save_defaults.js ensureButton)
         var anchor = wrap.parentElement === row ? wrap : save;
         if (status.previousElementSibling !== anchor) anchor.after(status);
         return true;

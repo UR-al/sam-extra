@@ -1,8 +1,12 @@
 /* SAM Extra '기본값 저장' — notebook 레이아웃 탭 줄(Generation · 임베딩 · 체크포인트 · 로라 · Manage)의 오른쪽 끝 버튼 하나.
  *
- * 한 번 누르면 확인 없이 두 가지를 하고, 버튼 옆에 짧은 결과를 보여 준다
+ * 한 번 누르면 확인 없이 두 가지를 하고, 버튼 아래에 짧은 결과 한 줄을 보여 준다
  * (예: "기본값 + anima 프리셋 저장됨 · 바뀐 항목: 기본값 3개, 프리셋 2개", 또는 오류 — 두 파일의 개수를 따로 적는다:
- * 한 칸이 두 파일에 다 들어가므로 더하면 한 번 바꾼 것이 두 번 세어진다):
+ * 한 칸이 두 파일에 다 들어가므로 더하면 한 번 바꾼 것이 두 번 세어진다).
+ * 결과 글(#sam3_save_defaults_status)은 버튼 묶음 밖, 탭 줄의 따로 된 항목이다: style.css 가 한 줄을 통째로 주어(flex-basis
+ * 100%) 버튼 아래 오른쪽에 둔다 — '모델 내리기' 의 결과 글과 같은 자리라, 결과가 길어도 버튼은 그 자리다(묶음 안에 두면 긴
+ * 결과가 두 버튼을 왼쪽으로 밀었다). 모델 내리기의 결과 글이 묶음 바로 뒤에 있으면 그 뒤에 붙는다.
+ * 두 가지는:
  *
  * 1. Forge 의 Settings → Defaults 'Apply' — Forge 가 만든 #ui_defaults_apply 를 그대로 누른다
  *    (modules/ui_loadsave.py ui_apply: 화면의 모든 추적 컴포넌트 값을 ui-config 파일에 쓴다). 결과는 Forge 가 그 아래
@@ -27,6 +31,7 @@
 
     var WRAP_ID = "sam3_save_defaults";
     var STATUS_ID = "sam3_save_defaults_status";
+    var UNLOAD_STATUS_ID = "sam3_unload_models_status";   // javascript/notebook_unload_models.js 의 결과 글
     var RUN_ID = "sam3_save_defaults_run";
     var RESULT_ID = "sam3_save_defaults_result";
     var LABEL = "기본값 저장";
@@ -364,24 +369,34 @@
         button.title = TITLE;
         button.setAttribute("aria-describedby", STATUS_ID);
         button.addEventListener("click", function () { saveDefaults(); });
+        wrap.appendChild(button);
+        return wrap;
+    }
+
+    function buildStatus() {
         var status = document.createElement("span");
         status.id = STATUS_ID;
         status.className = "sam3-save-defaults-status";
         status.setAttribute("role", "status");
         status.setAttribute("aria-live", "polite");
         status.setAttribute("data-tone", "normal");
-        wrap.appendChild(button);
-        wrap.appendChild(status);
-        return wrap;
+        return status;
     }
 
     function ensureButton() {
         var row = tabRow();
         if (!row) return false;
         var wrap = find("#" + WRAP_ID);
-        if (wrap && wrap.parentElement === row) return true;
         if (!wrap) wrap = build();
-        row.appendChild(wrap);       // CSS 의 order 가 Forge 의 검색·정렬 칸보다 뒤(오른쪽 끝)에 둔다
+        if (wrap.parentElement !== row) {
+            row.appendChild(wrap);   // CSS 의 order 가 Forge 의 검색·정렬 칸보다 뒤(오른쪽 끝)에 둔다
+        }
+        // 결과 글: 버튼 묶음 뒤의 줄 항목(style.css 가 버튼 아래 한 줄로 둔다). 모델 내리기의 결과 글이 묶음 바로 뒤에
+        // 있으면 그 뒤 — 그 스크립트는 자기 결과 글을 묶음 바로 뒤에 두므로, 둘이 서로 자리를 빼앗지 않는다.
+        var status = find("#" + STATUS_ID) || buildStatus();
+        var next = wrap.nextElementSibling;
+        var anchor = next && next !== status && next.id === UNLOAD_STATUS_ID ? next : wrap;
+        if (status.previousElementSibling !== anchor) anchor.after(status);
         return true;
     }
 
