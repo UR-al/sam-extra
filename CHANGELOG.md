@@ -11,7 +11,7 @@
 버튼**, **Forge Neo 2.30 호환**(Batch Cond/Uncond · Spectrum · DeGrid · 2.30-6 드롭다운)입니다. 얼굴 crop 은 기본 꺼짐, 새 XYZ 축은 고를
 때만, 버튼은 누를 때만 돌아 쓰지 않으면 결과가 그대로이고, `VAE` 축은 형식이 같은 VAE 끼리면 Forge 의 교체 그대로입니다. Forge 2.30
 대응으로 바뀌는 것은 Batch Cond/Uncond 를 끈 경우뿐입니다. CPU 테스트 전체가 Forge 2.29.2 · 2.30-2 · 2.30-6 에서 실패 없이
-통과합니다(아래 **문서 · 테스트**). 실제 모델로 GPU 생성은 하지 않았습니다.
+통과합니다(아래 **문서 · 테스트**). 릴리스 전에 실제 Forge 2.30-6 의 GPU 에서도 확인했습니다(아래 **GPU 확인**).
 
 **업그레이드할 때**
 
@@ -42,7 +42,7 @@ SAM3 Mask 아코디언과 Refine 패널에 **얼굴 안에서만 찾기**를 더
 `SAM3 Face Crop Confidence`(켰을 때만, 붙여 넣기 됨)와 결과 기록 `SAM3 Face Crop Faces`, 새 XYZ 축은 `[SAM3] Face Crop` ·
 `[SAM3] Face Crop Model` · `[SAM3] Face Crop Confidence` 입니다. Forge 를 재시작하세요(Reload UI 만 하면 옛 모듈이 남아 얼굴 crop 은
 나오지 않고 SAM3 는 예전처럼 돕니다 — 옛 인자 검증기에는 새 키를 넘기지 않고, 기본값 표도 얼굴 키를 따로 가짐). 실제
-얼굴 모델 · SAM3 로 본 화질은 확인하지 않았습니다(GPU 미사용, 가짜 검출기 · 가짜 SAM3 로 CPU 테스트만).
+얼굴 모델 · SAM3 결과는 아래 **GPU 확인** — 작은 얼굴의 입이 가장 크게 나아지고, crop 밖으로 뻗은 머리카락은 crop 경계에서 잘립니다.
 
 - **흐름** (`sam3ext/face_crop.py` 순수 기하 · `sam3ext/face_detect.py` 검출기 · `sam3ext/core.py` `run_sam3_on_pil(face_crop=…)`):
   얼굴 상자를 옆 · 아래 20 %, 위 40 % 넓혀 중심을 지킨 정사각형으로 만들고 이미지 안으로 밉니다(이미지보다 크면 그 축만 이미지
@@ -125,8 +125,8 @@ sam-extra 에 넣었습니다(README 의 **Tag Autocomplete (내장 태그 자�
 Forge 기본 XYZ 에는 `VAE` 축만 있고 텍스트 인코더를 바꿔 가며 뽑는 축이 없어, **`[Modules] Text Encoder`** 축을 더합니다
 (txt2img · img2img). 칸마다 VAE / Text Encoder 드롭다운에서 그 파일을 고른 것과 같은 모델로 생성하고, Forge 설정(config.json ·
 드롭다운)에는 쓰지 않습니다. 새 스크립트 인자 · 설정 · infotext 키는 없습니다(각 이미지의 `Module N` 이 실제 목록을 적음). 다른
-기능의 결과는 그대로입니다. Forge 를 재시작하세요(새 스크립트 파일). 실제 모델로 뽑아 보지는 않았습니다(GPU 미사용 — Forge 의
-설정 · 재로딩 · 복원 · Hires · Refiner 코드를 가짜 로더 위에서 돌린 CPU 테스트만).
+기능의 결과는 그대로입니다. Forge 를 재시작하세요(새 스크립트 파일). 실제 GPU 결과는 아래
+**GPU 확인**에 있습니다.
 
 - **값**: `Use Forge current`(`None` 도 같음), 인코더 파일(드롭다운의 이름 · 하위 폴더 경로 · 확장자 뺀 이름), 텍스트 입력의
   `a + b`(Flux 의 CLIP-L + T5 처럼 인코더가 둘인 모델). `Default` · `Automatic` · `Built-in` 은 `Use Forge current` 를 안내하는
@@ -256,7 +256,7 @@ notebook 레이아웃 탭 줄의 `기본값 저장` 바로 오른쪽에 **`모�
 ### Forge 2.30 호환
 
 Forge Neo 2.30 에서 달라진 것에 맞춥니다. CPU 테스트 전체가 2.29.2(`d70373eb`), 2.30-2(`45f41b81`), 2.30-6(`ede60e1a`, 2026-10-11
-에 설치된 Forge) 셋에서 통과합니다. 이 판들에서 GPU 생성은 따로 확인하지 않았습니다. **Batch Cond/Uncond 가 켜진 기본 설정의 결과는
+에 설치된 Forge) 셋에서 통과합니다. GPU 생성은 2.30-6 에서 확인했습니다(아래 **GPU 확인**). **Batch Cond/Uncond 가 켜진 기본 설정의 결과는
 그대로**입니다(같은 경로를 그대로 지남). 바뀐 것은 Batch Cond/Uncond 를 끈 2.30 에서 Anima 3.8B 의 VRAM 여유 판단, Adaptive Guidance
 가 UNet 래퍼를 걸지 않는 것, 안내 문구입니다. Forge 를 재시작하세요(바뀐 Python 파일).
 
@@ -341,6 +341,30 @@ Forge Neo 2.30 에서 달라진 것에 맞춥니다. CPU 테스트 전체가 2.2
 - **문서**: README · THIRD_PARTY_NOTICES.md 는 다섯 갈래를 그대로 합쳤습니다(재구현 표에 얼굴 검출 · crop 행 뒤로 XYZ 두 행). README 의
   태그 자동완성 옮기기 안내를 콘솔 · 설정 안내 줄과 같게 "옮긴 뒤 그 폴더를 extensions 밖으로"로 맞추고, 모델 내리기 절의 목록에 얼굴
   검출기를 더했습니다.
+
+### GPU 확인 (2026-10-12, Forge 2.30-6)
+
+릴리스 전에 따로 띄운 시험용 Forge(neo 2.30-6-`ede60e1a`, 사용자 시작 설정 `--use-ck-attention` 그대로, Anima-3.8B-v1.1)에서 실제로
+돌렸습니다. 두 번 시작해 확장 오류 0건, XYZ 축 목록(txt2img · img2img 의 X/Y/Z)에 `[Modules] Text Encoder` · `VAE` · `[SAM3] Face Crop`
+축 셋이 하나씩만 있습니다.
+
+- **태그 자동완성 내장**: 기본 목록 `danbooru_2026-10-01_pt20-ia-dd.csv`(220,510개)로 "long_ha" → `long_hair`, "1gi" → `1girl`, Tab 으로
+  "1girl, " 이 들어가고 한국어 입력(IME 포함)도 그대로입니다. 설정의 `tac_tagFile` 이 없는 파일이면 안내 줄과 함께 기본 목록으로 추천합니다.
+- **모델 내리기**: 생성 뒤 GPU 전체 사용 20,743 → 4,315 MiB(9.5 초). 다시 생성하면 같은 모델을 불러 26.8 초에 sha256 까지 같은 이미지.
+- **XYZ `VAE` 축**: 검은 칸이 나오던 2D/3D 혼합 격자 둘(3D 기준 · 2D 기준, 10칸)이 모두 실제 이미지이고, 칸마다 그 칸의 VAE 가
+  `Module` 줄에 적힙니다. 같은 VAE 는 두 격자에서 픽셀이 같고(5/5), VAE 를 직접 고른 생성과도 같습니다.
+- **XYZ `[Modules] Text Encoder` 축**: 인코더 3칸과 인코더 × VAE 4칸이 각각 그 설정을 직접 고른 생성과 같습니다(대조 16/16).
+  `qwen_3_06b_base_fp32_uncensored` 의 흐린 그림은 직접 골라도 같아 파일의 성질입니다.
+- **결과가 그대로인지**: 앱이 보낸 요청과 확장에 직접 보낸 요청이 7쌍 모두 같고, 같은 Forge 에서 v0.33.1 과 픽셀까지 같습니다(7/7).
+  2026-10-05 의 기준 이미지와는 다릅니다(0/16) — v0.33.1 도 똑같이 다르고, Forge 2.29.2 → 2.30 업데이트와 시작 설정의 attention
+  변경(Sage → Comfy-Kitchen)이 원인입니다.
+- **얼굴 안에서만 찾기**(Anima 그림 10장 · 얼굴 16개, 그중 작은 얼굴 6개): 입은 작은 얼굴에서 전체 이미지 1/6 → crop 6/6(5개는 자리도
+  정확), 눈 · 얼굴은 같고(16/16), 얼굴마다 마스크가 따로 나옵니다. crop 밖으로 뻗은 머리카락은 crop 경계에서 직선으로 잘리고(포니테일 ·
+  긴 머리에서 잃는 비율 최대 46.5 %), 검출기가 놓친 얼굴은 건너뜁니다 — 머리카락에는 끄고 쓰세요. SAM3 호출 80회 모두 성공(0.6–0.9 초).
+
+**알려진 문제**: 기본값 저장을 누른 뒤 같은 페이지에서 Settings 의 **Apply settings** 를 누르면 방금 저장한 값이 예전 값으로 돌아갑니다
+(저장 뒤 페이지를 새로 고친 다음 Apply 를 쓰세요). 기본값 저장 메시지가 길면 두 버튼이 왼쪽으로 밀리고, Settings → Tag Autocomplete
+안내 상자에서 긴 옮기기 명령이 상자 밖으로 넘칩니다.
 
 ### 문서 · 테스트
 
