@@ -15,11 +15,16 @@ numpy 와 ``face_detect`` 의 기본값만 쓴다(torch·ultralytics·Forge 없�
    조각을 버리지는 않으므로 모든 얼굴을 합친(Combined) 마스크는 주인을 정하지 않은 합집합과 같다.
 5. 한 얼굴에 검출기 상자가 둘 남으면(ultralytics NMS 는 IoU 0.7 미만이면 둘 다 둔다) 부위가 두 패스로 갈린다 — 계획에서
    ``same_face`` 인 상자는 점수가 높은 하나만 남긴다(``dedupe_faces``).
+6. 얼굴 밖으로 나가는 부위(머리카락)는 crop 의 안쪽 가장자리에서 잘려 직선 모서리가 남는다 — 검출 토큰마다, 그 얼굴이 주인인
+   조각이 그 얼굴 crop 의 안쪽 가장자리에 충분히 닿았으면(``touching_sides``) 그 얼굴의 crop 을 닿은 쪽으로 키워
+   (``grow_toward`` — 정사각·이미지 안으로 밂은 그대로) 그 토큰만 SAM3 를 다시 돌린다(``growth_requests``, 얼굴 × 토큰마다
+   ``GROW_ROUNDS`` 번까지). 키운 crop 의 결과는 앞 결과와 겹치는 조각만 쓴다(``continuing_pieces`` — 키운 crop 에 새로 들어온,
+   얼굴 쪽 마스크와 끊긴 것은 버린다). 닿지 않으면 SAM3 호출도 마스크도 키우기 전과 같다.
 """
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Collection, Mapping, Sequence
 
 import numpy as np
@@ -36,6 +41,17 @@ MIN_CROP_SIDE = 32
 # 같은 얼굴로 볼 두 검출기 상자의 IoU 하한(또는 한 상자의 중심이 다른 상자 안). 서로 다른 두 얼굴의 상자가 이만큼
 # 겹치는 일은 드물고, 겹치더라도 crop 이 거의 같아 부위를 나눌 근거가 없다.
 SAME_FACE_IOU = 0.3
+# crop 키우기(위 6.) — 한 번에 한 변을 GROW_FACTOR 배로, 얼굴 × 검출 토큰마다 GROW_ROUNDS 번까지 SAM3 를 더 돌린다.
+GROW_FACTOR = 1.5
+GROW_ROUNDS = 2
+# '닿았다' 의 기준: crop 의 안쪽 가장자리에서 TOUCH_BAND px 안쪽 띠에 걸친 마스크를 변을 따라 투영한 길이가
+# max(TOUCH_MIN_PX, 변 길이 × TOUCH_MIN_FRACTION) 이상. 잘린 머리카락은 변을 따라 길게 걸치고, 눈·입은 crop 안쪽에 있어
+# 띠에 닿지 않는다(v0.34.0 실측 마스크로 정함 — README 참고).
+TOUCH_BAND = 2
+TOUCH_MIN_PX = 4
+TOUCH_MIN_FRACTION = 0.02
+# 변 이름(이 순서로 돌려준다).
+SIDES = ("left", "top", "right", "bottom")
 
 Box = Sequence[float]   # (x0, y0, x1, y1) — 이미지 픽셀 좌표, x1·y1 은 끝(포함하지 않음)
 
@@ -323,6 +339,134 @@ def assign_owners(
     return owners
 
 
+def touching_sides(
+    mask: np.ndarray,
+    crop: CropBox,
+    *,
+    band: int = TOUCH_BAND,
+    min_px: int = TOUCH_MIN_PX,
+    min_fraction: float = TOUCH_MIN_FRACTION,
+) -> tuple[str, ...]:
+    """이미지 좌표의 bool 마스크가 충분히 닿은 crop 의 안쪽 가장자리들(``SIDES`` 순서, 없으면 빈 튜플).
+
+    안쪽 가장자리 = 이미지 테두리가 아닌 crop 의 변(그 너머에 이어질 것이 있는 변). 변마다 가장자리에서 ``band`` px 안쪽 띠의
+    마스크를 변을 따라 투영해, 마스크가 걸친 자리 수(닿은 길이)가 ``max(min_px, ceil(변 길이 × min_fraction))`` 이상이면
+    닿은 것이다 — 가장자리를 스친 점 몇 개로는 키우지 않는다. crop 이 이미지 전체면 늘 빈 튜플.
+    """
+    piece = np.asarray(mask, dtype=bool)
+    height, width = piece.shape
+    b = max(1, int(band))
+    strips = []   # (변 이름, 띠를 변 방향으로 투영한 bool 줄, 변 길이)
+    if crop.x0 > 0:
+        strips.append(("left", piece[crop.y0:crop.y1, crop.x0:min(crop.x1, crop.x0 + b)].any(axis=1), crop.height))
+    if crop.y0 > 0:
+        strips.append(("top", piece[crop.y0:min(crop.y1, crop.y0 + b), crop.x0:crop.x1].any(axis=0), crop.width))
+    if crop.x1 < width:
+        strips.append(("right", piece[crop.y0:crop.y1, max(crop.x0, crop.x1 - b):crop.x1].any(axis=1), crop.height))
+    if crop.y1 < height:
+        strips.append(("bottom", piece[max(crop.y0, crop.y1 - b):crop.y1, crop.x0:crop.x1].any(axis=0), crop.width))
+    touched = set()
+    for side, line, length in strips:
+        need = max(int(min_px), int(math.ceil(length * float(min_fraction) - 1e-9)))
+        if int(np.count_nonzero(line)) >= max(1, need):
+            touched.add(side)
+    return tuple(side for side in SIDES if side in touched)
+
+
+def _grow_axis(start: int, end: int, size: int, low: bool, high: bool, limit: int) -> tuple[int, int]:
+    """한 축 ``[start, end)`` 을 길이 ``size`` 로 — 닿은 쪽(낮은 쪽 ``low`` / 높은 쪽 ``high``)으로만, 둘 다거나 둘 다
+    아니면 양쪽으로 반씩 늘린 뒤 이미지 안으로 민다(``_fit_axis``). 늘 원래 구간을 품는다."""
+    extra = max(0, size - (end - start))
+    if low and not high:
+        begin = start - extra
+    elif high and not low:
+        begin = start
+    else:
+        begin = start - extra // 2
+    return _fit_axis(begin, size, limit)
+
+
+def grow_toward(
+    crop: CropBox,
+    sides: Collection[str],
+    image_size: tuple[int, int],
+    *,
+    factor: float = GROW_FACTOR,
+) -> CropBox:
+    """crop 을 닿은 변(``sides``) 쪽으로 키운 정사각 crop — 한 변 = ceil(지금 한 변 × ``factor``)(적어도 1 px 더).
+
+    축마다 닿은 쪽으로만 늘리고(두 변 다 닿았거나 그 축에 닿은 변이 없으면 중심을 지켜 양쪽으로), ``square_crop`` 처럼
+    이미지 안으로 민다 — 한 변이 이미지보다 길면 그 축은 이미지 크기. 키운 crop 은 늘 원래 crop 을 품는다. 더 키울 수 없으면
+    (이미지 전체) 원래 crop 그대로.
+    """
+    width, height = (int(v) for v in image_size)
+    side = max(crop.width, crop.height)
+    size = max(side + 1, int(math.ceil(side * float(factor) - 1e-9)))
+    touched = set(sides)
+    x0, x1 = _grow_axis(crop.x0, crop.x1, size, "left" in touched, "right" in touched, width)
+    y0, y1 = _grow_axis(crop.y0, crop.y1, size, "top" in touched, "bottom" in touched, height)
+    return CropBox(x0, y0, x1, y1)
+
+
+def enclosing_crop(crops: Sequence[CropBox], image_size: tuple[int, int]) -> CropBox:
+    """여러 crop 을 모두 품는 정사각 영역(중심 유지, 이미지 안으로 밂) — 키운 얼굴의 Exclude 를 찾을 곳. crop 이 하나면 그대로."""
+    if len(crops) == 1:
+        return crops[0]
+    box = (min(c.x0 for c in crops), min(c.y0 for c in crops), max(c.x1 for c in crops), max(c.y1 for c in crops))
+    grown = square_crop(box, image_size, min_side=1)
+    return grown if grown is not None else crops[0]
+
+
+def growth_requests(
+    pieces: Sequence[np.ndarray],
+    sources: Sequence[int],
+    face_boxes: Sequence[Box],
+    crops: Sequence[CropBox],
+    image_size: tuple[int, int],
+    *,
+    faces: Collection[int] | None = None,
+) -> dict[int, tuple[tuple[str, ...], CropBox]]:
+    """한 검출 토큰의 조각들(``assign_owners`` 와 같은 모양) → crop 을 키울 얼굴마다 (닿은 변, 키운 crop).
+
+    얼굴 k 를 키우는 조건: 얼굴 k 의 crop(``crops[k]`` — 이 토큰이 지금 그 얼굴에서 쓰는 crop)에서 찾았고 주인도 얼굴 k 인
+    조각들의 합이 그 crop 의 안쪽 가장자리에 닿았다(``touching_sides``). 옆 얼굴이 주인인 조각(옆 얼굴의 머리카락이 이 crop
+    가장자리에 잘려 들어온 것)으로는 키우지 않는다 — 그 나머지는 옆 얼굴의 crop 이 본다. ``faces`` 를 주면 그 얼굴들만 본다.
+    키워도 같으면(이미 이미지 전체) 빠진다.
+    """
+    owners = assign_owners(pieces, sources, face_boxes, crops)
+    requests: dict[int, tuple[tuple[str, ...], CropBox]] = {}
+    for face in range(len(crops)):
+        if faces is not None and face not in faces:
+            continue
+        own = [piece for piece, source, owner in zip(pieces, sources, owners) if source == face and owner == face]
+        if not own:
+            continue
+        mask = own[0] if len(own) == 1 else np.any(np.stack(own, axis=0), axis=0)
+        sides = touching_sides(mask, crops[face])
+        if not sides:
+            continue
+        grown = grow_toward(crops[face], sides, image_size)
+        if grown != crops[face]:
+            requests[face] = (sides, grown)
+    return requests
+
+
+def continuing_pieces(pieces: Sequence[np.ndarray], earlier: Sequence[np.ndarray]) -> list[bool]:
+    """키운 crop 에서 찾은 조각마다(이미지 좌표) 앞 결과(``earlier`` — 그 얼굴 · 토큰이 앞 crop 에서 찾은 조각들)와 한 픽셀이라도
+    겹치는지 — 겹치는 조각만 쓴다.
+
+    키운 crop 은 앞 crop 이 본 것(가장자리에 잘린 머리카락)을 더 넓게 보려는 것이다. 앞 결과와 겹치지 않는 조각은 키운 crop 에 새로
+    들어온, 얼굴 쪽 마스크와 끊긴 것(얼굴이 검출되지 않은 사람의 머리카락 등)이라 버린다 — 그런 조각으로 마스크가 늘거나 crop 을
+    그쪽으로 더 키우지 않게. ``earlier`` 가 비면 모두 False.
+    """
+    if not earlier:
+        return [False] * len(pieces)
+    seen = np.asarray(earlier[0], dtype=bool)
+    if len(earlier) > 1:
+        seen = np.any(np.stack([np.asarray(piece, dtype=bool) for piece in earlier], axis=0), axis=0)
+    return [bool(np.any(np.logical_and(np.asarray(piece, dtype=bool), seen))) for piece in pieces]
+
+
 def order_faces(boxes: Sequence[Box]) -> list[int]:
     """얼굴 번호를 왼쪽 → 오른쪽(같으면 위 → 아래) 순서로 — Individual 패스 순서가 검출기 점수에 따라 바뀌지 않게."""
     def key(index: int) -> tuple[float, float, int]:
@@ -332,11 +476,28 @@ def order_faces(boxes: Sequence[Box]) -> list[int]:
     return sorted(range(len(boxes)), key=key)
 
 
+@dataclass(frozen=True)
+class CropGrowth:
+    """한 얼굴 · 한 검출 토큰의 crop 을 키운 기록 — 마스크가 crop 의 안쪽 가장자리(``sides``)에 잘려 ``rounds`` 번 키웠고,
+    그 토큰의 결과는 마지막 crop(``crop``)에서 찾은 것이다. ``face`` 는 ``FaceCropInfo`` 의 얼굴 번호(0부터)."""
+
+    face: int
+    prompt: str
+    crop: CropBox
+    rounds: int
+    sides: tuple[str, ...]
+
+
+def _crop_text(crop: CropBox) -> str:
+    return f"{crop.width}x{crop.height}@{crop.x0},{crop.y0}"
+
+
 @dataclass
 class FaceCropInfo:
     """한 이미지의 얼굴 crop 계획과 결과 요약 — ``Sam3Result.face_crop`` 에 실려 상태 줄·infotext·아티팩트 meta 가 된다.
 
-    ``boxes``·``scores``·``crops`` 는 같은 순서(왼쪽 → 오른쪽)이고, 이미지 밖·빈 상자는 이미 뺐다.
+    ``boxes``·``scores``·``crops`` 는 같은 순서(왼쪽 → 오른쪽)이고, 이미지 밖·빈 상자는 이미 뺐다. ``growth`` 는 crop
+    가장자리에 잘려 crop 을 키운 (얼굴, 토큰)들 — 키운 것이 없으면 비어 있고, 그때 상태 줄 · meta 는 키우기 전과 같다.
     """
 
     model: str
@@ -344,6 +505,7 @@ class FaceCropInfo:
     boxes: list[list[float]]
     scores: list[float]
     crops: list[CropBox]
+    growth: list[CropGrowth] = field(default_factory=list)
 
     @property
     def count(self) -> int:
@@ -354,17 +516,34 @@ class FaceCropInfo:
         where = f"{self.model} (confidence {float(self.confidence):.2f})"
         if not self.crops:
             return f"face crop — no faces found by {where}; nothing to mask."
-        sizes = ", ".join(f"{c.width}x{c.height}@{c.x0},{c.y0}" for c in self.crops)
-        return f"face crop — {self.count} face(s) by {where}; SAM3 runs on each crop: {sizes}"
+        sizes = ", ".join(_crop_text(c) for c in self.crops)
+        text = f"face crop — {self.count} face(s) by {where}; SAM3 runs on each crop: {sizes}"
+        if self.growth:
+            grown = ", ".join(
+                f"face {g.face + 1} {g.prompt!r} → {_crop_text(g.crop)} "
+                f"({g.rounds} round{'s' if g.rounds != 1 else ''})"
+                for g in self.growth
+            )
+            text += f"; grown where the mask reached the crop edge: {grown}"
+        return text
 
     def as_meta(self) -> dict:
+        faces = [
+            {"box": [float(v) for v in box], "score": float(score), "crop": list(crop.as_tuple())}
+            for box, score, crop in zip(self.boxes, self.scores, self.crops)
+        ]
+        for g in self.growth:
+            if 0 <= g.face < len(faces):
+                faces[g.face].setdefault("grown", []).append({
+                    "prompt": g.prompt,
+                    "crop": list(g.crop.as_tuple()),
+                    "rounds": int(g.rounds),
+                    "sides": list(g.sides),
+                })
         return {
             "model": self.model,
             "confidence": float(self.confidence),
-            "faces": [
-                {"box": [float(v) for v in box], "score": float(score), "crop": list(crop.as_tuple())}
-                for box, score, crop in zip(self.boxes, self.scores, self.crops)
-            ],
+            "faces": faces,
         }
 
 

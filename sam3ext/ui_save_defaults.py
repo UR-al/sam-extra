@@ -16,6 +16,16 @@ elem_id "footer")를 만들고, 그 뒤에 main_entry.forge_main_entry() 로 같
 on_after_component 에서 — 모든 컴포넌트가 demo 에 등록된 뒤, 같은 demo 컨텍스트 안에서 — 숨은 버튼을 만들고
 연결한다. loadsave.setup_ui() 뒤라 이 숨은 컴포넌트들은 ui-config 에 들어가지 않는다.
 
+Settings 탭의 칸: 프리셋 설정은 Settings 탭(과 빠른 설정 줄)의 칸이기도 하다(modules/ui_settings.py — Forge 가 페이지를
+열 때 demo.load 로 그 칸들에 설정 값을 넣는다). 저장한 뒤에도 그 칸들이 옛 값을 들고 있으면, 같은 페이지에서 누른
+Apply settings 가 그 옛 값을 다시 써서 방금 저장한 값을 되돌린다. 그래서 숨은 버튼의 click 뒤에 ``.then`` 을 하나 더
+걸어, 결과 JSON 의 ``written_keys`` 에 든 키의 칸만 Forge 가 페이지를 열 때 넣는 그대로(ui_settings.get_value_for_setting)
+새 값으로 바꾸고 나머지 칸은 그대로 둔다(gr.update()). 출력은 ``shared.settings_components``(Forge 의 키 → 칸 표) 중
+버튼이 쓸 수 있는 모든 프리셋의 키 — 누를 때 어느 프리셋이 활성일지 모른다. Settings 의 칸은 서버가 보낸 값을 Gradio
+가 페이지의 상태에 넣으므로 Settings 탭을 한 번도 열지 않았어도 Apply settings 가 새 값을 보낸다. 칸이 없는 키(숨긴
+설정 · Settings 탭을 숨긴 화면)는 출력에 넣지 않는다. 이 연결이 실패해도 저장 버튼은 그대로 연결한다.
+연결 시점(footer)에는 Settings 의 칸이 모두 있다: create_ui 가 settings.create_ui 와 빠른 설정 줄을 footer 보다 먼저 만든다.
+
 Reload UI 는 새 demo 를 만든다 — 만든 화면은 약한 참조로 기억한다(sam3ext/ui_dock.py DockState 와 같은 이유).
 """
 from __future__ import annotations
@@ -108,16 +118,78 @@ def find_inputs():
     return [component for _name, component in named]
 
 
-def build_bridge(inputs):
-    """숨은 [요청 id · 실행 버튼 · 결과] 묶음을 지금 컨텍스트(demo)에 만들고 연결한다."""
+def find_settings_outputs(root):
+    """[(설정 키, Settings 칸)] — 버튼이 쓸 수 있는 프리셋 키 중 이 화면에 칸이 있는 것(Settings 탭 · 빠른 설정 줄)."""
+    from modules import shared
+    from modules_forge.presets import PresetArch
+
+    components = getattr(shared, "settings_components", None) or {}
+    blocks = root.default_config.blocks
+    found = []
+    for key in save_defaults.preset_option_keys(PresetArch.choices()):
+        component = components.get(key)
+        # 칸이 없는 키(숨긴 설정 — Forge 는 체크포인트 · 모듈 · Low Bits 를 숨긴다), 값을 보이지 않는 gr.State 자리,
+        # 이 화면에 없는 칸(Settings 탭을 숨긴 화면)은 넣지 않는다
+        if component is None or getattr(component, "stateful", False) or getattr(component, "_id", None) not in blocks:
+            continue
+        found.append((key, component))
+    return found
+
+
+def settings_value(key):
+    """Forge 가 페이지를 열 때 Settings 칸에 넣는 것 그대로(modules/ui_settings.py get_value_for_setting — 값과 선택지 ·
+    슬라이더 범위). 그 함수가 없는 Forge 면 값만."""
+    from modules import shared, ui_settings
+
+    get_value = getattr(ui_settings, "get_value_for_setting", None)
+    if get_value is not None:
+        return get_value(key)
+    import gradio as gr
+
+    return gr.update(value=getattr(shared.opts, key))
+
+
+def settings_updates(result_text, keys, value_for=None):
+    """저장 click 의 ``.then`` — ``keys``(출력 칸의 키, 같은 순서) 중 이번에 쓴 키의 칸만 새 값, 나머지는 그대로(gr.update()).
+
+    저장이 실패했거나 결과 글이 다른 모양이면 아무 칸도 바꾸지 않는다. 칸 하나의 값을 못 만들면 그 칸만 그대로 둔다.
+    출력이 하나면 Gradio 는 돌려준 것을 그 칸의 값으로 읽으므로 목록이 아니라 그 하나를 돌려준다."""
+    import gradio as gr
+
+    value_for = value_for or settings_value
+    written = set(save_defaults.written_keys_of(result_text))
+    updates = []
+    for key in keys:
+        update = None
+        if key in written:
+            try:
+                update = value_for(key)
+            except Exception:
+                _log(f"{LOG_PREFIX}: Settings field {key} not refreshed (reload the page before Apply settings)\n"
+                     f"{traceback.format_exc()}", error=True)
+        updates.append(update if update is not None else gr.update())
+    return updates[0] if len(updates) == 1 else updates
+
+
+def build_bridge(inputs, settings_outputs=()):
+    """숨은 [요청 id · 실행 버튼 · 결과] 묶음을 지금 컨텍스트(demo)에 만들고 연결한다. ``settings_outputs`` 는
+    find_settings_outputs 의 [(키, 칸)] — 있으면 저장 뒤 같은 클릭에서 쓴 키의 칸을 새 값으로 바꾼다."""
     import gradio as gr
 
     with gr.Group(visible=False, elem_id=BRIDGE_ELEM_ID):
         request = gr.Textbox(value="", show_label=False, elem_id=REQUEST_ELEM_ID)
         run = gr.Button(value="sam3_save_defaults", elem_id=RUN_ELEM_ID)
         result = gr.Textbox(value="", show_label=False, elem_id=RESULT_ELEM_ID)
-    run.click(fn=handle_save, js=ARGS_JS, inputs=[request, *inputs], outputs=[result],
-              queue=False, show_progress="hidden")
+    saved = run.click(fn=handle_save, js=ARGS_JS, inputs=[request, *inputs], outputs=[result],
+                      queue=False, show_progress="hidden")
+    if settings_outputs:
+        keys = [key for key, _component in settings_outputs]
+
+        def refresh_settings(result_text):
+            return settings_updates(result_text, keys)
+
+        saved.then(fn=refresh_settings, inputs=[result], outputs=[component for _key, component in settings_outputs],
+                   queue=False, show_progress="hidden")
     return request, run, result
 
 
@@ -140,7 +212,13 @@ def on_after_component(component, **kwargs):
         unregistered = [c for c in inputs if c._id not in root.default_config.blocks]
         if unregistered:
             raise LookupError(f"컴포넌트 {len(unregistered)}개가 이 화면에 등록되어 있지 않습니다")
-        build_bridge(inputs)
+        try:
+            settings_outputs = find_settings_outputs(root)
+        except Exception:
+            settings_outputs = []
+            _log(f"{LOG_PREFIX}: Settings fields are not refreshed after a save (reload the page before Apply "
+                 f"settings)\n{traceback.format_exc()}", error=True)
+        build_bridge(inputs, settings_outputs)
     except Exception:
         _log(f"{LOG_PREFIX}: the button is not wired (the page's button reports an error)\n"
              f"{traceback.format_exc()}", error=True)

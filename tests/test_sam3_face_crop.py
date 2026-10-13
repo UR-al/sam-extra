@@ -251,7 +251,11 @@ class RunSam3FaceCropTests(unittest.TestCase):
 
     def test_a_neighbours_part_cut_at_this_crops_edge_stays_with_the_neighbour(self):
         """큰 얼굴 A 의 머리카락(한 덩어리)이 작은 얼굴 B 의 crop 왼쪽 끝으로 들어온다 — B 의 crop 이 본 띠는 잘린 조각이고
-        그 무게중심은 A 의 crop 밖이다. 띠는 A 의 crop 에서 이어지는 조각과 묶여 A 의 패스로 간다."""
+        그 무게중심은 A 의 crop 밖이다. 띠는 A 의 crop 에서 이어지는 조각과 묶여 A 의 패스로 간다.
+
+        A 의 머리카락은 A 의 crop 오른쪽 · 아래 가장자리에도 잘리므로 A 의 crop 만 키워 다시 찾는다(그 결과 A 의 패스는 잘리지
+        않은 머리카락 전체). B 의 crop 가장자리에 잘린 띠는 A 의 것이라 B 의 crop 은 키우지 않는다. 키우기를 끄면(상한 0)
+        v0.34.0 처럼 crop 들 안에서 잘린 마스크다."""
         size = (400, 300)
         face_a, face_b = (100, 100, 200, 200), (238, 150, 262, 174)
         rgb = np.full((size[1], size[0], 3), BACKGROUND, dtype=np.uint8)
@@ -266,13 +270,30 @@ class RunSam3FaceCropTests(unittest.TestCase):
         own_b = np.zeros_like(hair)
         own_b[146:150, 240:260] = True
         own_a = hair & ~own_b
-
-        result = _Run(self, [face_a, face_b])(rgb, "hair", face_crop=True)
-        self.assertEqual(len(result.masks), 2)
         crops = _crops_mask([crop_a, crop_b], hair.shape)
-        np.testing.assert_array_equal(_as_bool(result.masks[0]), own_a & crops, "A 의 머리카락은 B 의 crop 이 본 띠까지 A 의 패스")
-        np.testing.assert_array_equal(_as_bool(result.masks[1]), own_b, "B 의 패스엔 B 의 머리카락만")
-        np.testing.assert_array_equal(_as_bool(result.mask), hair & crops, "Combined 는 그대로")
+
+        with mock.patch.object(core, "GROW_ROUNDS", 0):
+            cut = _Run(self, [face_a, face_b])(rgb, "hair", face_crop=True)
+        self.assertEqual(len(cut.masks), 2)
+        np.testing.assert_array_equal(_as_bool(cut.masks[0]), own_a & crops, "A 의 머리카락은 B 의 crop 이 본 띠까지 A 의 패스")
+        np.testing.assert_array_equal(_as_bool(cut.masks[1]), own_b, "B 의 패스엔 B 의 머리카락만")
+        np.testing.assert_array_equal(_as_bool(cut.mask), hair & crops, "Combined 는 그대로")
+        self.assertEqual(cut.face_crop.growth, [])
+
+        run = _Run(self, [face_a, face_b])
+        result = run(rgb, "hair", face_crop=True)
+        grown = fc.grow_toward(crop_a, ("right", "bottom"), size)
+        self.assertEqual(
+            [(g.face, g.prompt, g.crop, g.rounds, g.sides) for g in result.face_crop.growth],
+            [(0, "hair", grown, 1, ("right", "bottom"))],
+            "A 만 키운다 — B 의 crop 가장자리의 띠는 A 의 것",
+        )
+        self.assertEqual(run.processor.images, [(crop_a.width, crop_a.height), (crop_b.width, crop_b.height),
+                                                (grown.width, grown.height)])
+        self.assertEqual(len(result.masks), 2)
+        np.testing.assert_array_equal(_as_bool(result.masks[0]), own_a, "A 의 머리카락은 잘리지 않고 A 의 패스")
+        np.testing.assert_array_equal(_as_bool(result.masks[1]), own_b, "키운 A 의 crop 이 본 B 의 머리카락도 B 의 패스")
+        np.testing.assert_array_equal(_as_bool(result.mask), hair)
 
     def test_two_detector_boxes_on_one_face_make_one_pass(self):
         face, duplicate = (40, 70, 80, 110), (48, 66, 92, 112)   # IoU 0.55 — ultralytics NMS(0.7)가 둘 다 남긴다
@@ -291,7 +312,8 @@ class RunSam3FaceCropTests(unittest.TestCase):
         face = (0, 0, 40, 40)
         crop = fc.face_crop_box(face, SIZE)
         rgb = np.full((SIZE[1], SIZE[0], 3), BACKGROUND, dtype=np.uint8)
-        rgb[10:14, crop.x1 - 4:crop.x1] = COLORS["eye"]               # 대상 — crop 오른쪽 끝에 닿음
+        # 대상 — crop 오른쪽 끝 2 px 안쪽(가장자리 띠 TOUCH_BAND 밖이라 crop 을 키우지 않는다 — 닿으면 FaceCropGrowthTests)
+        rgb[10:14, crop.x1 - 6:crop.x1 - 2] = COLORS["eye"]
         rgb[6:18, crop.x1 + 1:crop.x1 + 6] = COLORS["mouth"]           # 보호할 것 — crop 밖 1 px
         protect = _color(rgb, "mouth")
         for kwargs in ({"mask_dilation": 4}, {"mask_outline_px": 2, "mask_dilation": 2}):
@@ -393,7 +415,404 @@ class RunSam3FaceCropTests(unittest.TestCase):
             meta = json.loads(Path(paths["meta"]).read_text(encoding="utf-8"))
         self.assertEqual(meta["face_crop"]["model"], "face_yolov8n.pt")
         self.assertEqual(meta["face_crop"]["faces"][0]["crop"], list(self.crop_a.as_tuple()))
+        self.assertNotIn("grown", meta["face_crop"]["faces"][0], "키운 것이 없으면 meta 도 예전 그대로")
         self.assertEqual(meta["mask_count"], 1)
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# crop 키우기 — 마스크가 crop 의 안쪽 가장자리에 잘리면 그 얼굴 · 토큰만 키운 crop 에서 다시
+# ---------------------------------------------------------------------------------------------------------------------
+
+PONY_FACE = (100, 40, 140, 80)       # crop (88, 24, 152, 88) — 한 변 64
+
+
+def _whole_image(rgb, prompt, **kwargs):
+    """얼굴 crop 을 끈 같은 설정의 결과(비교 기준)."""
+    processor = ColorProcessor()
+    with mock.patch.object(core, "resolve_checkpoint_path", return_value=None), \
+            mock.patch.object(core, "_get_model_bundle", return_value=(None, processor)), \
+            contextlib.redirect_stderr(io.StringIO()):
+        return core.run_sam3_on_pil(Image.fromarray(rgb), prompt, 0.4, "", "cpu", **kwargs)
+
+
+def _pony_image(bottom):
+    """얼굴 하나와, 이마에서 아래로 y ``bottom`` 까지 내려가는 머리카락 한 줄기(x 140..149)."""
+    rgb = np.full((SIZE[1], SIZE[0], 3), BACKGROUND, dtype=np.uint8)
+    _draw_face(rgb, PONY_FACE)
+    rgb[30:bottom, 140:150] = COLORS["hair"]
+    return rgb
+
+
+class FaceCropGrowthTests(unittest.TestCase):
+    def setUp(self):
+        self.crop = fc.face_crop_box(PONY_FACE, SIZE)
+        self.assertEqual(self.crop, fc.CropBox(88, 24, 152, 88))
+
+    def test_no_touch_keeps_the_v034_calls_and_masks(self):
+        """어느 마스크도 crop 의 안쪽 가장자리에 닿지 않으면 SAM3 호출 · 마스크 · 상자 · 오버레이가 키우기를 끈 것과 같다."""
+        rgb = _two_faces_image()
+        crop_a, crop_b = fc.face_crop_box(FACE_A, SIZE), fc.face_crop_box(FACE_B, SIZE)
+        for kwargs in ({}, {"exclude_prompt": "mouth", "mask_dilation": 2}, {"mask_hull": True}):
+            with self.subTest(**kwargs):
+                with mock.patch.object(core, "GROW_ROUNDS", 0):
+                    off = _Run(self, [FACE_B, FACE_A])
+                    want = off(rgb, "eye, mouth / skin", face_crop=True, **kwargs)
+                on = _Run(self, [FACE_B, FACE_A])
+                got = on(rgb, "eye, mouth / skin", face_crop=True, **kwargs)
+                self.assertEqual(got.face_crop.growth, [])
+                self.assertEqual(on.processor.images, off.processor.images)
+                self.assertEqual(on.processor.prompts, off.processor.prompts)
+                self.assertEqual(len(got.masks), len(want.masks))
+                for a, b in zip(got.masks, want.masks):
+                    np.testing.assert_array_equal(np.asarray(a), np.asarray(b))
+                np.testing.assert_array_equal(np.asarray(got.mask), np.asarray(want.mask))
+                np.testing.assert_array_equal(np.asarray(got.overlay), np.asarray(want.overlay))
+                self.assertEqual((got.boxes, got.scores), (want.boxes, want.scores))
+                self.assertEqual(got.face_crop.status(), want.face_crop.status())
+                self.assertEqual(got.face_crop.as_meta(), want.face_crop.as_meta())
+                self.assertNotIn("crop edge", on.stderr)
+        self.assertEqual(on.processor.images[0], (crop_a.width, crop_a.height))
+        self.assertEqual(on.processor.prompts, ["eye", "mouth", "skin", "eye", "mouth", "skin"])
+        self.assertEqual(crop_b.width, 64)
+
+    def test_hair_cut_at_the_crop_edge_is_found_again_in_a_grown_crop(self):
+        rgb = _pony_image(bottom=115)          # 줄기가 crop 아래(y 88)를 넘어 y 114 까지
+        run = _Run(self, [PONY_FACE])
+        result = run(rgb, "hair, eye", face_crop=True)
+        grown = fc.CropBox(72, 24, 168, 120)   # 아래로 1.5 배(96), 옆은 양쪽 반씩
+        self.assertEqual(fc.grow_toward(self.crop, ("bottom",), SIZE), grown)
+        self.assertEqual(run.processor.images, [(64, 64), (96, 96)], "키운 crop 의 백본 한 번")
+        self.assertEqual(run.processor.prompts, ["hair", "eye", "hair"], "닿은 토큰(hair)만 다시 — 눈은 그대로")
+        np.testing.assert_array_equal(_as_bool(result.mask), _color(rgb, "hair") | _color(rgb, "eye"))
+        np.testing.assert_array_equal(_as_bool(result.mask), _as_bool(_whole_image(rgb, "hair, eye").mask))
+        self.assertEqual(result.face_crop.crops, [self.crop], "얼굴 crop 계획은 그대로")
+        self.assertEqual(result.face_crop.growth, [fc.CropGrowth(0, "hair", grown, 1, ("bottom",))])
+        self.assertIn("face 1 'hair' reached the crop edge (bottom); SAM3 again on 96x96@72,24 (round 1/2)", run.stderr)
+        self.assertIn("grown where the mask reached the crop edge: face 1 'hair' → 96x96@72,24 (1 round)",
+                      core.describe_face_crop(result))
+        boxes = [list(map(int, b)) for b in result.boxes]
+        self.assertIn([140, 30, 150, 115], boxes, "키운 crop 에서 찾은 상자(이미지 좌표)")
+        self.assertNotIn([140, 30, 150, 88], boxes, "잘린 상자는 바뀐다")
+        overlay = np.asarray(result.overlay)
+        np.testing.assert_array_equal(overlay[grown.y1 - 1, grown.x0 + 5], core._FACE_CROP_OVERLAY_COLOR, "키운 crop 테두리")
+
+        import json
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(core, "DEFAULT_OUTPUT_DIR", Path(tmp)):
+            meta = json.loads(Path(core.write_artifacts(result, 7, label="hair")["meta"]).read_text(encoding="utf-8"))
+        face = meta["face_crop"]["faces"][0]
+        self.assertEqual(face["crop"], list(self.crop.as_tuple()))
+        self.assertEqual(face["grown"],
+                         [{"prompt": "hair", "crop": list(grown.as_tuple()), "rounds": 1, "sides": ["bottom"]}])
+
+    def test_growth_rounds_are_bounded(self):
+        rgb = _pony_image(bottom=SIZE[1])      # 이미지 아래 끝까지 — 두 번 키워도 닿는다
+        run = _Run(self, [PONY_FACE])
+        result = run(rgb, "hair", face_crop=True)
+        last = fc.CropBox(48, 24, 192, 168)
+        self.assertEqual(run.processor.images, [(64, 64), (96, 96), (144, 144)], f"상한 {fc.GROW_ROUNDS} 번")
+        self.assertEqual(result.face_crop.growth, [fc.CropGrowth(0, "hair", last, 2, ("bottom",))])
+        np.testing.assert_array_equal(_as_bool(result.mask), _color(rgb, "hair") & _crops_mask([last], rgb.shape[:2]),
+                                      "상한에서 멈추면 마지막 crop 에서 찾은 것")
+        with mock.patch.object(core, "GROW_ROUNDS", 3):
+            more = _Run(self, [PONY_FACE])
+            result = more(rgb, "hair", face_crop=True)
+        self.assertEqual(len(more.processor.images), 4)
+        self.assertEqual(result.face_crop.growth[0].crop, fc.CropBox(12, 0, 228, 192))
+        np.testing.assert_array_equal(_as_bool(result.mask), _color(rgb, "hair"))
+
+    def test_contact_with_the_image_edge_does_not_grow(self):
+        face = (0, 0, 40, 40)
+        crop = fc.face_crop_box(face, SIZE)
+        self.assertEqual(crop, fc.CropBox(0, 0, 64, 64))
+        rgb = np.full((SIZE[1], SIZE[0], 3), BACKGROUND, dtype=np.uint8)
+        _draw_face(rgb, face)
+        rgb[0:20, 0:50] = COLORS["hair"]       # 위 · 왼쪽 변 = 이미지 테두리 — 그 너머는 없다
+        rgb[0:50, 0:10] = COLORS["hair"]
+        run = _Run(self, [face])
+        result = run(rgb, "hair", face_crop=True)
+        self.assertEqual(result.face_crop.growth, [])
+        self.assertEqual(run.processor.images, [(64, 64)])
+        np.testing.assert_array_equal(_as_bool(result.mask), _color(rgb, "hair"))
+        rgb[50:70, 0:10] = COLORS["hair"]       # 아래(안쪽 가장자리, y 64)를 넘으면 키운다
+        run = _Run(self, [face])
+        result = run(rgb, "hair", face_crop=True)
+        self.assertEqual([g.sides for g in result.face_crop.growth], [("bottom",)])
+        np.testing.assert_array_equal(_as_bool(result.mask), _color(rgb, "hair"))
+
+    def test_whole_image_is_the_last_crop(self):
+        size = (96, 96)
+        face = (30, 30, 60, 60)
+        rgb = np.full((size[1], size[0], 3), BACKGROUND, dtype=np.uint8)
+        _draw_face(rgb, face, eyes=False, mouth=False)
+        rgb[60:96, 0:96] = COLORS["hair"]       # 얼굴 아래 이미지 끝까지 — 왼쪽 · 오른쪽 · 아래에 잘린다
+        self.assertEqual(fc.face_crop_box(face, size), fc.CropBox(21, 18, 69, 66))
+        with mock.patch.object(core, "GROW_ROUNDS", 5):
+            run = _Run(self, [face])
+            result = run(rgb, "hair", face_crop=True)
+        self.assertEqual(run.processor.images, [(48, 48), (72, 72), (96, 96)], "이미지 전체가 되면 상한 전에 멈춘다")
+        self.assertEqual(result.face_crop.growth,
+                         [fc.CropGrowth(0, "hair", fc.CropBox(0, 0, 96, 96), 2, ("left", "right", "bottom"))])
+        np.testing.assert_array_equal(_as_bool(result.mask), _color(rgb, "hair"))
+
+    def test_neighbours_cut_pieces_do_not_grow_a_face(self):
+        """두 얼굴의 머리카락 줄기가 각자 crop 아래로 잘려 둘 다 키운다. 키운 crop 이 옆 얼굴의 앞머리를 crop 가장자리에서
+        잘라 보지만 그 조각의 주인은 옆 얼굴이라 더 키우지 않고(상한을 늘려도 두 번에서 멈춤), 얼굴마다 제 머리카락만 남는다."""
+        face_a, face_b = (40, 70, 80, 110), (110, 70, 150, 110)
+        rgb = np.full((SIZE[1], SIZE[0], 3), BACKGROUND, dtype=np.uint8)
+        _draw_face(rgb, face_a)
+        _draw_face(rgb, face_b)
+        rgb[60:70, 40:80] = COLORS["hair"]      # A 의 앞머리
+        rgb[100:170, 60:70] = COLORS["hair"]    # A 의 줄기 — A 의 crop 아래(y 118)를 넘는다
+        rgb[60:70, 110:150] = COLORS["hair"]    # B 의 앞머리
+        rgb[100:170, 120:130] = COLORS["hair"]  # B 의 줄기
+        hair = _color(rgb, "hair")
+        own_a = hair.copy()
+        own_a[:, 95:] = False
+        with mock.patch.object(core, "GROW_ROUNDS", 3):
+            run = _Run(self, [face_b, face_a])
+            result = run(rgb, "hair", face_crop=True)
+        self.assertEqual(
+            [(g.face, g.crop, g.rounds) for g in result.face_crop.growth],
+            [(0, fc.CropBox(0, 48, 144, 192), 2), (1, fc.CropBox(58, 48, 202, 192), 2)],
+        )
+        self.assertEqual(len(run.processor.images), 6, "얼굴마다 crop + 두 번")
+        self.assertEqual(len(result.masks), 2)
+        np.testing.assert_array_equal(_as_bool(result.masks[0]), own_a, "A 의 패스엔 A 의 머리카락만")
+        np.testing.assert_array_equal(_as_bool(result.masks[1]), hair & ~own_a, "B 의 패스엔 B 의 머리카락만")
+        np.testing.assert_array_equal(_as_bool(result.mask), hair)
+
+    def test_a_grown_crop_that_finds_nothing_keeps_the_face_crop_result(self):
+        class SmallOnly(ColorProcessor):
+            def set_text_prompt(self, prompt, state):
+                state = super().set_text_prompt(prompt, state)
+                if state["backbone_out"]["rgb"].shape[0] > 64:
+                    h, w = state["backbone_out"]["rgb"].shape[:2]
+                    state["masks"] = np.zeros((0, 1, h, w), dtype=bool)
+                    state["boxes"] = np.zeros((0, 4), dtype=np.float32)
+                    state["scores"] = np.zeros((0,), dtype=np.float32)
+                return state
+
+        rgb = _pony_image(bottom=115)
+        run = _Run(self, [PONY_FACE])
+        run.processor = SmallOnly()
+        result = run(rgb, "hair", face_crop=True)
+        self.assertEqual(run.processor.images, [(64, 64), (96, 96)], "못 찾으면 더 키우지 않는다")
+        self.assertEqual(run.processor.prompts, ["hair", "hair"], "다음 라운드에 같은 crop 으로 다시 묻지도 않는다")
+        self.assertEqual(result.face_crop.growth, [])
+        np.testing.assert_array_equal(_as_bool(result.mask),
+                                      _color(rgb, "hair") & _crops_mask([self.crop], rgb.shape[:2]))
+        self.assertEqual([list(map(int, b)) for b in result.boxes], [[140, 30, 150, 88]])
+        self.assertIn("nothing found in the grown crop 96x96@72,24; keeping the result from 64x64@88,24", run.stderr)
+
+    def test_an_empty_second_growth_keeps_the_first_grown_result(self):
+        """두 번째로 키운 crop 에서 아무것도 못 찾으면 한 번 키운 crop 의 결과를 지킨다(얼굴 crop 의 결과가 아니라) — 콘솔도 그 crop 을 댄다."""
+        class UpTo96(ColorProcessor):
+            def set_text_prompt(self, prompt, state):
+                state = super().set_text_prompt(prompt, state)
+                if state["backbone_out"]["rgb"].shape[0] > 96:
+                    h, w = state["backbone_out"]["rgb"].shape[:2]
+                    state["masks"] = np.zeros((0, 1, h, w), dtype=bool)
+                    state["boxes"] = np.zeros((0, 4), dtype=np.float32)
+                    state["scores"] = np.zeros((0,), dtype=np.float32)
+                return state
+
+        rgb = _pony_image(bottom=SIZE[1])
+        run = _Run(self, [PONY_FACE])
+        run.processor = UpTo96()
+        result = run(rgb, "hair", face_crop=True)
+        first = fc.CropBox(72, 24, 168, 120)
+        self.assertEqual(run.processor.images, [(64, 64), (96, 96), (144, 144)])
+        self.assertEqual(result.face_crop.growth, [fc.CropGrowth(0, "hair", first, 1, ("bottom",))])
+        np.testing.assert_array_equal(_as_bool(result.mask), _color(rgb, "hair") & _crops_mask([first], rgb.shape[:2]))
+        self.assertIn("face 1 'hair': nothing found in the grown crop 144x144@48,24; keeping the result from 96x96@72,24",
+                      run.stderr)
+
+    @staticmethod
+    def _stranger_image(stranger):
+        """얼굴 하나(머리카락이 crop 오른쪽 x 202 에 잘림)와, 얼굴 쪽 머리카락과 끊긴 다른 사람의 머리카락(얼굴은 검출되지 않음)."""
+        size = (400, 300)
+        face = (150, 100, 190, 140)
+        rgb = np.full((size[1], size[0], 3), BACKGROUND, dtype=np.uint8)
+        _draw_face(rgb, face, eyes=False, mouth=False)
+        rgb[100:130, 180:215] = COLORS["hair"]
+        own = _color(rgb, "hair")
+        y0, y1, x0, x1 = stranger
+        rgb[y0:y1, x0:x1] = COLORS["hair"]
+        return rgb, face, own, size
+
+    def test_a_grown_crop_keeps_only_what_continues_the_earlier_result(self):
+        """키운 crop 에 새로 들어온, 얼굴 쪽 마스크와 끊긴 조각은 쓰지 않는다 — 마스크에도 상자 · 점수에도. 잘린 머리카락은 이어 찾는다."""
+        rgb, face, own, size = self._stranger_image((70, 80, 220, 232))
+        crop = fc.face_crop_box(face, size)
+        grown = fc.CropBox(138, 68, 234, 164)
+        self.assertEqual((crop, fc.grow_toward(crop, ("right",), size)), (fc.CropBox(138, 84, 202, 148), grown))
+        for hull in (False, True):
+            with self.subTest(mask_hull=hull):
+                run = _Run(self, [face])
+                result = run(rgb, "hair", face_crop=True, mask_hull=hull)
+                np.testing.assert_array_equal(_as_bool(result.mask), own, "끊긴 머리카락(x 220..231)은 넣지 않는다")
+                self.assertEqual([_as_bool(m).sum() for m in result.masks], [own.sum()])
+                self.assertEqual(result.face_crop.growth, [fc.CropGrowth(0, "hair", grown, 1, ("right",))])
+                self.assertEqual([list(map(int, b)) for b in result.boxes], [[180, 100, 215, 130]], "버린 조각의 상자도 뺀다")
+                self.assertEqual(len(result.scores), 1)
+                self.assertIn("SAM3 again on 96x96@138,68 (round 1/2); left out 1 piece(s) not overlapping the earlier result",
+                              run.stderr)
+
+    def test_growth_does_not_follow_a_piece_it_did_not_continue(self):
+        """끊긴 조각이 키운 crop 의 가장자리에 걸려도 그쪽으로 더 키우지 않는다."""
+        rgb, face, own, _ = self._stranger_image((150, 160, 225, 275))   # 키운 crop 오른쪽(x 234)을 넘는다
+        run = _Run(self, [face])
+        result = run(rgb, "hair", face_crop=True)
+        self.assertEqual(run.processor.images, [(64, 64), (96, 96)], "한 번만 키운다")
+        self.assertEqual([g.rounds for g in result.face_crop.growth], [1])
+        np.testing.assert_array_equal(_as_bool(result.mask), own)
+
+    def test_a_grown_crop_that_finds_only_unconnected_pieces_keeps_the_earlier_result(self):
+        class FaceCropAreaBlanked(ColorProcessor):
+            """키운 crop(96x96@72,24)에선 얼굴 crop 자리(x 16..79, y 0..63)를 비우고 찾는다 — 줄기의 아래 끝만 끊긴 조각으로."""
+
+            def set_text_prompt(self, prompt, state):
+                rgb = state["backbone_out"]["rgb"]
+                if rgb.shape[0] == 96:
+                    rgb = rgb.copy()
+                    rgb[0:64, 16:80] = BACKGROUND
+                    state = dict(state)
+                    state["backbone_out"] = {"rgb": rgb}
+                return super().set_text_prompt(prompt, state)
+
+        rgb = _pony_image(bottom=115)
+        run = _Run(self, [PONY_FACE])
+        run.processor = FaceCropAreaBlanked()
+        result = run(rgb, "hair", face_crop=True)
+        self.assertEqual(run.processor.images, [(64, 64), (96, 96)])
+        self.assertEqual(result.face_crop.growth, [])
+        np.testing.assert_array_equal(_as_bool(result.mask),
+                                      _color(rgb, "hair") & _crops_mask([self.crop], rgb.shape[:2]))
+        self.assertEqual([list(map(int, b)) for b in result.boxes], [[140, 30, 150, 88]])
+        self.assertIn("face 1 'hair': no piece of the grown crop 96x96@72,24 overlaps the earlier result; "
+                      "keeping the result from 64x64@88,24", run.stderr)
+
+    def test_a_neighbours_part_seen_only_in_a_grown_crop_stays_out_of_this_face(self):
+        """큰 얼굴의 crop 을 키우면 작은 얼굴 턱 아래의 끊긴 머리카락이 보이지만(작은 얼굴의 crop 밖) 큰 얼굴의 패스에 넣지 않는다 —
+        Convex Hull 로 큰 얼굴의 패스가 그쪽으로 늘지도 않는다. 작은 얼굴의 패스는 키우지 않은 것과 같다."""
+        big, small = (30, 40, 110, 120), (150, 60, 180, 90)
+        rgb = np.full((SIZE[1], SIZE[0], 3), BACKGROUND, dtype=np.uint8)
+        _draw_face(rgb, big, eyes=False, mouth=False)
+        _draw_face(rgb, small, eyes=False, mouth=False)
+        rgb[30:45, 30:110] = COLORS["hair"]      # 큰 얼굴의 앞머리
+        rgb[40:170, 30:40] = COLORS["hair"]      # 큰 얼굴의 줄기 — crop 아래(y 136)를 넘는다
+        rgb[52:62, 150:180] = COLORS["hair"]     # 작은 얼굴의 앞머리
+        rgb[98:110, 155:175] = COLORS["hair"]    # 작은 얼굴 턱 아래, 끊긴 머리카락 — 작은 얼굴의 crop(y < 96) 밖
+        hair = _color(rgb, "hair")
+        own_big = hair.copy()
+        own_big[:, 134:] = False
+        self.assertEqual([fc.face_crop_box(b, SIZE) for b in (big, small)],
+                         [fc.CropBox(6, 8, 134, 136), fc.CropBox(141, 48, 189, 96)])
+        for hull in (False, True):
+            with self.subTest(mask_hull=hull):
+                with mock.patch.object(core, "GROW_ROUNDS", 0):
+                    off = _Run(self, [big, small])(rgb, "hair", face_crop=True, mask_hull=hull)
+                run = _Run(self, [big, small])
+                on = run(rgb, "hair", face_crop=True, mask_hull=hull)
+                self.assertEqual(on.face_crop.growth, [fc.CropGrowth(0, "hair", fc.CropBox(0, 0, 192, 192), 1, ("bottom",))])
+                want_big = np.asarray(core._convex_hull_mask(own_big)) if hull else own_big
+                np.testing.assert_array_equal(_as_bool(on.masks[0]), want_big, "큰 얼굴의 패스엔 큰 얼굴의 머리카락만")
+                np.testing.assert_array_equal(_as_bool(on.masks[1]), _as_bool(off.masks[1]))
+                self.assertIn("left out 2 piece(s) not overlapping the earlier result", run.stderr)
+
+    def test_each_face_grows_up_to_the_limit_and_records_its_own_count(self):
+        """상한은 얼굴 × 토큰마다 — 옆 얼굴을 키워 주인이 바뀐 뒤에야 처음 닿는 얼굴도 제 몫(2 번)만큼 키우고, 기록 · 상태 줄 · 콘솔의
+        횟수는 그 얼굴 · 토큰을 키운 횟수다."""
+        rgb = np.full((SIZE[1], SIZE[0], 3), BACKGROUND, dtype=np.uint8)
+        rgb[115:160, 50:130] = COLORS["hair"]
+        run = _Run(self, [(58, 55, 110, 107), (105, 85, 140, 120)])
+        result = run(rgb, "hair", face_crop=True)
+        np.testing.assert_array_equal(_as_bool(result.mask), _color(rgb, "hair"), "직선으로 잘린 곳이 남지 않는다")
+        self.assertEqual(result.face_crop.growth, [
+            fc.CropGrowth(0, "hair", fc.CropBox(0, 3, 189, 192), 2, ("bottom",)),
+            fc.CropGrowth(1, "hair", fc.CropBox(66, 71, 150, 155), 1, ("left", "bottom")),
+        ])
+        lines = [line.split("face crop — ")[1] for line in run.stderr.splitlines() if "reached the crop edge" in line]
+        self.assertEqual(lines, [
+            "face 2 'hair' reached the crop edge (left, bottom); SAM3 again on 84x84@66,71 (round 1/2)",
+            "face 1 'hair' reached the crop edge (bottom); SAM3 again on 126x126@21,33 (round 1/2)",
+            "face 1 'hair' reached the crop edge (bottom); SAM3 again on 189x189@0,3 (round 2/2)",
+        ])
+        self.assertIn("face 1 'hair' → 189x189@0,3 (2 rounds), face 2 'hair' → 84x84@66,71 (1 round)",
+                      result.face_crop.status())
+
+        rgb = np.full((SIZE[1], SIZE[0], 3), BACKGROUND, dtype=np.uint8)
+        rgb[50:117, 218:238] = COLORS["hair"]   # 얼굴 1 은 얼굴 2 를 키운 뒤에야 처음 닿는다 — 한 번 키움
+        run = _Run(self, [(174, 54, 218, 98), (200, 18, 252, 70)])
+        result = run(rgb, "hair", face_crop=True)
+        np.testing.assert_array_equal(_as_bool(result.mask), _color(rgb, "hair"))
+        self.assertEqual([(g.face, g.rounds) for g in result.face_crop.growth], [(0, 1), (1, 1)])
+        self.assertIn("face 1 'hair' reached the crop edge (right, bottom); SAM3 again on 107x107@149,36 (round 1/2)",
+                      run.stderr)
+        self.assertEqual([g["rounds"] for g in result.face_crop.as_meta()["faces"][0]["grown"]], [1])
+
+    def test_exclude_without_outline_or_dilation_reuses_the_grown_crops_backbone(self):
+        """Outline · Dilation 이 0 이면 키운 얼굴의 Exclude 를 그 crop 의 백본이 칸에 있을 때 찾는다 — 백본을 다시 돌리지 않는다."""
+        rgb = _pony_image(bottom=115)
+        rgb[105:115, 110:150] = COLORS["hair"]    # 줄기 아래 끝에서 왼쪽으로 꺾인 ㄴ 자
+        rgb[95:100, 128:134] = COLORS["mouth"]    # 보호할 것 — 얼굴 crop(y < 88) 밖, ㄴ 자의 Hull 안
+        patch = np.zeros(rgb.shape[:2], bool)
+        patch[95:100, 128:134] = True
+        self.assertTrue(_as_bool(_whole_image(rgb, "hair", mask_hull=True).mask)[patch].all(), "Hull 이 덮는 자리")
+        run = _Run(self, [PONY_FACE])
+        result = run(rgb, "hair", face_crop=True, exclude_prompt="mouth", mask_hull=True)
+        self.assertEqual(run.processor.images, [(64, 64), (96, 96)], "얼굴 crop · 키운 crop — 백본 두 번")
+        self.assertEqual(run.processor.prompts, ["hair", "mouth", "hair", "mouth"])
+        self.assertFalse((_as_bool(result.mask) & patch).any())
+        whole = _whole_image(rgb, "hair", exclude_prompt="mouth", mask_hull=True)
+        np.testing.assert_array_equal(_as_bool(result.mask), _as_bool(whole.mask), "얼굴 crop 을 끈 결과와 같다")
+
+        size = SIZE   # 두 얼굴이 따로 한 번씩 키움 — 키운 crop 마다 백본 한 번
+        rgb = np.full((size[1], size[0], 3), BACKGROUND, dtype=np.uint8)
+        _draw_face(rgb, (40, 70, 80, 110))
+        _draw_face(rgb, (150, 70, 190, 110))
+        rgb[100:140, 60:70] = COLORS["hair"]
+        rgb[100:140, 170:180] = COLORS["hair"]
+        run = _Run(self, [(40, 70, 80, 110), (150, 70, 190, 110)])
+        result = run(rgb, "hair", face_crop=True, exclude_prompt="mouth")
+        self.assertEqual(run.processor.images, [(64, 64), (64, 64), (96, 96), (96, 96)])
+        self.assertEqual(run.processor.prompts, ["hair", "mouth"] * 4)
+        np.testing.assert_array_equal(_as_bool(result.mask), _color(rgb, "hair"))
+
+    def test_faces_grown_to_the_same_crop_ask_sam3_once(self):
+        """두 얼굴이 같은 crop 으로 키우면 그 crop 에서 그 토큰 · Exclude 를 한 번만 묻고, 상자도 한 번씩이다."""
+        size = (128, 128)
+        a, b = (10, 40, 50, 80), (78, 40, 118, 80)
+        rgb = np.full((size[1], size[0], 3), BACKGROUND, dtype=np.uint8)
+        _draw_face(rgb, a, eyes=False, mouth=False)
+        _draw_face(rgb, b, eyes=False, mouth=False)
+        rgb[35:128, 20:26] = COLORS["hair"]      # 두 얼굴의 줄기 — 이미지 아래 끝까지
+        rgb[35:128, 102:108] = COLORS["hair"]
+        run = _Run(self, [a, b])
+        result = run(rgb, "hair", face_crop=True, exclude_prompt="mouth")
+        whole = fc.CropBox(0, 0, 128, 128)
+        self.assertEqual([(g.face, g.crop, g.rounds) for g in result.face_crop.growth], [(0, whole, 2), (1, whole, 2)])
+        self.assertEqual(run.processor.images, [(64, 64), (64, 64), (96, 96), (96, 96), (128, 128)])
+        self.assertEqual(run.processor.prompts, ["hair", "mouth", "hair", "mouth", "hair", "hair", "hair", "mouth"])
+        self.assertEqual([list(map(int, box)) for box in result.boxes], [[20, 35, 26, 128], [102, 35, 108, 128]])
+        np.testing.assert_array_equal(_as_bool(result.mask), _color(rgb, "hair"))
+
+    def test_exclude_is_also_searched_in_the_grown_crop(self):
+        """키운 crop 에서 찾은 머리카락이 Dilation 으로 번져도, 원래 crop 밖(키운 crop 안)의 보호 대상은 먹지 않는다."""
+        rgb = _pony_image(bottom=115)
+        rgb[105:115, 151:156] = COLORS["mouth"]    # 보호할 것 — 원래 crop(y < 88) 밖, 줄기 오른쪽 1 px 옆
+        protect = np.zeros(rgb.shape[:2], bool)
+        protect[105:115, 151:156] = True
+        run = _Run(self, [PONY_FACE])
+        on = run(rgb, "hair", face_crop=True, exclude_prompt="mouth", mask_dilation=3)
+        self.assertFalse((_as_bool(on.mask) & protect).any())
+        self.assertEqual(run.processor.images, [(64, 64), (70, 70), (96, 96), (102, 102)],
+                         "crop · Exclude(crop + 3) · 키운 crop · Exclude(키운 crop + 3)")
+        self.assertEqual(run.processor.prompts, ["hair", "mouth", "hair", "mouth"])
+        off = _whole_image(rgb, "hair", exclude_prompt="mouth", mask_dilation=3)
+        np.testing.assert_array_equal(_as_bool(on.mask), _as_bool(off.mask), "얼굴 crop 을 끈 결과와 같다")
 
 
 # ---------------------------------------------------------------------------------------------------------------------

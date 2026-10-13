@@ -30,6 +30,12 @@ Defaults Apply 가 ui-config 에 저장한다 — 화면 값으로 바꿔 쓰면
 CFG·Shift 가 없는 sd/klein/qwen 의 ``{p}_*_dcfg``)는 건너뛴다 — on_preset_change 는 그 값을 쓰지 않거나(슬라이더를
 숨김) 기본값으로 읽는다. 하나라도 검사를 통과하지 못하면 아무것도 쓰지 않는다. 쓰는 도중(opts.set / opts.save)에
 실패하면 메모리의 값도 되돌린다.
+
+Settings 탭: 그 22개 중 화면이 있는 설정(스텝·샘플러·스케줄러·크기·CFG·Shift·배치 — Forge 는 체크포인트·모듈·Low Bits 를
+"Forge Hidden Options" 로 숨긴다)은 Settings 의 칸이기도 하다. 그 칸들은 페이지를 열 때의 값을 들고 있어서, 저장 뒤 같은
+페이지에서 Settings 의 Apply settings 를 누르면 화면의 옛 값이 방금 쓴 값을 되돌려 쓴다. 그래서 결과에 쓴 키 목록
+(``written_keys``)을 넣고, sam3ext/ui_save_defaults.py 가 같은 클릭에서 그 키의 Settings 칸만 새 값으로 바꾼다
+(``written_keys_of`` · ``preset_option_keys``).
 """
 from __future__ import annotations
 
@@ -310,6 +316,7 @@ def save_preset(request_id: Any, preset: Any, values: Sequence[Any], host: Host)
         "request": request,
         "preset": result.preset,
         "written": len(result.changes),
+        "written_keys": [change.key for change in result.changes],     # 바뀌지 않은 값도 — config 에 쓴 키 전부
         "changed": len(changed),
         "changes": [{"key": c.key, "label": c.label, "old": _jsonable(c.old), "new": _jsonable(c.new)} for c in changed],
         "skipped": list(result.skipped),
@@ -319,3 +326,22 @@ def save_preset(request_id: Any, preset: Any, values: Sequence[Any], host: Host)
 
 def to_json(payload: dict) -> str:
     return json.dumps(payload, ensure_ascii=False, allow_nan=False)
+
+
+def preset_option_keys(presets: Sequence[str]) -> list[str]:
+    """버튼이 쓸 수 있는 설정 키 전부(프리셋마다 ``FIELDS`` 순서) — 누를 때 어느 프리셋이 활성일지 모르므로 모든 프리셋."""
+    return [template.format(p=preset) for preset in presets for template, _kind, _label in FIELDS]
+
+
+def written_keys_of(result_text: Any) -> list[str]:
+    """``save_preset`` 결과 JSON 글에서 이번에 config 에 쓴 키 — 실패 · 다른 모양 · 깨진 글이면 빈 목록(아무것도 바꾸지 않음)."""
+    try:
+        payload = json.loads(result_text) if isinstance(result_text, str) else None
+    except ValueError:
+        return []
+    if not isinstance(payload, dict) or payload.get("ok") is not True:
+        return []
+    keys = payload.get("written_keys")
+    if not isinstance(keys, list):
+        return []
+    return [key for key in keys if isinstance(key, str)]

@@ -28,6 +28,8 @@ from pathlib import Path
 
 OPT_ENABLED = "sam3_builtin_tagcomplete_enabled"
 OPT_NOTE = "sam3_tac_builtin_note"
+# the note's wrapper — style.css lets its long paths and the migration command wrap inside Forge's .settings-info box
+NOTE_CLASS = "sam3-tac-note"
 # hidden, never saved: the loader's start-up information (boot.manifest_json()) — it reaches the page in Forge's `opts`
 OPT_BOOT = "sam3_tac_builtin_boot"
 # upstream's section (tag_autocomplete_helper.on_ui_settings TAC_SECTION) — the switch and the note sit on top of it
@@ -259,7 +261,8 @@ def note_html(state: dict, tags_dir, missing=(), fallback=None) -> str:
         else:
             text += "(그 전까지 그 목록은 비어 있습니다)."
         text += f" 예전 tagcomplete 폴더에 있던 목록이면 Forge 를 끄고 먼저 옮기세요: {_migration_html(source)}"
-    return text
+    # 경로 · 명령은 끊을 자리가 없는 긴 글이라 상자 밖으로 넘쳤다 — 이 묶음 안에서는 아무 데서나 줄을 바꾼다(style.css)
+    return f'<div class="{NOTE_CLASS}">{text}</div>'
 
 
 def boot_option(shared, fallback=None):
