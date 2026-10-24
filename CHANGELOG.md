@@ -8,7 +8,7 @@
 아직 버전을 올리지 않은 변경입니다. LyCORIS `algo=tsm` 으로 학습한 LoRA(`ss_saved_format=tsm-native`)를 Anima 에서 학습과
 같은 식으로 돌립니다. 지금까지 Forge 는 이 파일의 키를 몰라 'LoRA mismatch' 로 통째로 건너뛰었습니다. 기존 스크립트 인자 ·
 infotext · 설정 키 · XYZ 축은 그대로이고, TSM 파일이 없는 생성은 바뀌지 않습니다. CPU 에서 학습 쪽 LyCORIS(+ sd-scripts 포크의
-패치)와의 일치를 확인했고, `algo=tsm` 파일은 2026-10-23~24 시험용 Forge 의 GPU 에서도 생성 · 속도 · 하이레스 해제를
+패치)와의 일치를 확인했고, `algo=tsm` 파일은 2026-10-23\~24 시험용 Forge 의 GPU 에서도 생성 · 속도 · 하이레스 해제를
 확인했습니다(TSM 없는 생성 대비 비용 1단계 약 −11%, 2단계 약 −19%). TSM-LoKr 의 GPU 생성은 아직 확인하지 않았습니다.
 
 **업그레이드할 때**
