@@ -30,6 +30,11 @@
 #   preset, a false warning on every sam-extra 3.8B setup.
 # - The Qwen-Image VAE requirement also matches the Qwen2D family by its "qwen2d" prefix
 #   (e.g. Qwen2D-Anime builds), not only the "qwen2d_vae" spelling.
+# - (2026-10-24) Entries for Forge's "qwen21" preset (Qwen-Image-2.1: Qwen3-VL 8B and its own VAE,
+#   as the wiki lists them) and its "moss" preset (MOSS-Image, Forge 2.31: Qwen3.5 9B and the
+#   Flux.2 VAE, as Comfy-Org/MOSS-Image repackages them - the wiki has no MOSS row yet).
+#   ModuleRequirement.excludes keeps the Qwen-Image-2.1 prompt-rewriting models
+#   (qwen3.5_9b_qwen_image_2.1_pe_*, also Qwen3.5 9B) from passing as the MOSS encoder.
 
 """Which VAE and text encoders each architecture needs.
 
@@ -70,6 +75,8 @@ class ModuleRequirement:
     optional: bool = False
     # For extras: what the module is for, reported next to it.
     note: str = ""
+    # Substrings that rule a name out even when a pattern matches it.
+    excludes: tuple[str, ...] = ()
 
     def matches(self, name: str) -> bool:
         """Substring match, or anchored with "^" where a substring is too loose.
@@ -78,6 +85,8 @@ class ModuleRequirement:
         "*vae*" on disk, so it has to be anchored or it claims all of them.
         """
         lowered = name.lower()
+        if any(exclude in lowered for exclude in self.excludes):
+            return False
         for pattern in self.patterns:
             if pattern.startswith("^"):
                 if lowered.startswith(pattern[1:]):
@@ -238,6 +247,37 @@ ARCH_MODULES: dict[str, ArchModules] = {
         note=(
             'a VAE is still required - the wiki lists it as "Model Dependent", meaning the '
             "checkpoint decides which one, so it has to be confirmed rather than assumed"
+        ),
+    ),
+    "qwen21": ArchModules(
+        requirements=(
+            ModuleRequirement(
+                VAE, "Qwen-Image-2.1 VAE", ("qwen_image_2.1_vae", "qwen_image_21_vae", "qwen-image-2.1-vae"),
+            ),
+            ModuleRequirement(TEXT_ENCODER, "Qwen3-VL 8B", ("qwen3vl_8b", "qwen3_vl_8b", "qwen3-vl-8b")),
+        ),
+        note=(
+            "Qwen-Image-2.1 and its Turbo share these; the Qwen-Image VAE of the older qwen preset "
+            "does not fit here. The qwen3.5_9b_qwen_image_2.1_pe_* files in the same repository are "
+            "prompt-rewriting models, not this encoder"
+        ),
+    ),
+    "moss": ArchModules(
+        requirements=(
+            ModuleRequirement(VAE, "Flux.2 VAE", ("flux2-vae", "flux2_vae")),
+            ModuleRequirement(
+                TEXT_ENCODER, "Qwen3.5 9B",
+                ("qwen3.5_9b", "qwen3_5_9b", "qwen35_9b", "qwen3.5-9b"),
+                # Qwen-Image-2.1's prompt-rewriting models are Qwen3.5 9B fine-tunes with this name.
+                excludes=("qwen_image", "qwen-image"),
+            ),
+        ),
+        note=(
+            "MOSS-Image SFT and Base share these (Forge 2.31 and later). Forge reads the Qwen3.5 9B "
+            "encoder only in the model.language_model.* key layout (Comfy-Org/MOSS-Image's "
+            "text_encoders); a merge of OpenMOSS's own text_encoder shards keeps bare "
+            "language_model.* / visual.* keys, which Forge files under another encoder and the "
+            "load then fails. A name match here does not check the layout"
         ),
     ),
 }

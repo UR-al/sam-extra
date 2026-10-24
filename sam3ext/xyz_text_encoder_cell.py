@@ -4,15 +4,21 @@ place - while Forge renders it: the Forge-facing half (the pure logic is ``sam3e
 
 A cell's module list comes from the Text Encoder axis (the selection with an encoder replaced), from the VAE axis
 (``sam3ext/xyz_vae_cell.py``: the selection - or the Text Encoder axis's list - with the VAE replaced, only when Forge's
-own in-place swap would fail), or from both; it is loaded the same way whichever axis made it.
+own in-place swap would fail), or from both; it is loaded the same way whichever axis made it. "The selection" is the
+one the cell has when it starts (``before_process``, after every axis of the cell): from Forge 2.31 the stock VAE axis
+puts the cell's VAE list into the cell's ``override_settings`` and the stock Checkpoint axis its checkpoint, and either
+may be applied after the Text Encoder axis.
 
 The cell's module list never goes into Forge's settings (``shared.opts``). Forge writes those to config.json whenever a
 page loads (``main_entry.on_preset_change``), the VAE / Text Encoder dropdown changes or Settings are applied - which
-can happen while a grid runs - and loads what it saved on the next start. Instead the list goes:
+can happen while a grid runs - and loads what it saved on the next start. (From Forge 2.31 the stock Checkpoint and
+VAE axes do put their own values into the settings for the cell - ``process_images``' ``set_config`` - with or without
+sam-extra; the Text Encoder axis's encoders still never go there.) Instead the list goes:
 
-* into the loading parameters the next model load reads (``sd_models.model_data.forge_loading_parameters``), where the
-  stock ``Checkpoint name`` axis puts its checkpoint (xyz_grid ``refresh_loading_params_for_xyz_grid``); the checkpoint
-  already there (the dropdown's, or the Checkpoint axis's) stays;
+* into the loading parameters the next model load reads (``sd_models.model_data.forge_loading_parameters``), where
+  Forge 2.30's stock ``Checkpoint name`` axis puts its checkpoint (xyz_grid ``refresh_loading_params_for_xyz_grid``);
+  the checkpoint already there (the dropdown's, or the Checkpoint axis's) stays - and the one 2.31's ``set_config``
+  rebuilds with (the Checkpoint axis's) is kept too;
 * into the ``Module N`` infotext list (``processing._overridden_modules``, the list Forge's own VAE override uses). When
   the stock VAE axis rebuilds that list from the settings, ``process`` swaps the cell's encoders back in.
 
@@ -126,8 +132,12 @@ def _owner(p) -> Cell | None:
 # The hook's calls
 # ---------------------------------------------------------------------------------------------------------------------
 
-def before_process(p) -> bool:
+def before_process(p, build=None) -> bool:
     """End a cell that is over, start this one; ``True`` when the cell's list was handed to Forge.
+
+    ``build(p, cell)`` makes the Text Encoder cell's list now that every axis of the cell has been applied (the script's
+    ``_build_cell``: the selection and checkpoint the cell has at this moment); once per cell, the list is kept in the
+    mark (``xte.BUILT``), so a pass inside the cell (a copy of p) uses it. Without ``build``: the list ``apply`` made.
 
     A no-op (a few attribute reads) for a generation that is not a cell of either axis while no cell runs."""
     has_attr = any(hasattr(p, attr) for attr in MARK_ATTRS)
@@ -139,7 +149,10 @@ def before_process(p) -> bool:
         _, _, shared, _ = _forge()
         if has_attr or _task(shared) != _STATE.task:
             finish()                      # the next cell, or a new task after a cell that failed
-    modules = list(cell["modules"]) if cell else None
+    if cell and build is not None and not cell.get(xte.BUILT):
+        cell["modules"] = build(p, cell)
+        cell[xte.BUILT] = True
+    modules = list(cell["modules"]) if cell and cell["modules"] is not None else None
     planned = None
     if isinstance(vae, dict) and not vae.get(xvae.SEEN):
         vae[xvae.SEEN] = True             # decided once: a pass inside the cell (a copy of p) is not decided again

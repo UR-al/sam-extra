@@ -23,6 +23,13 @@ GGUF reader and cache; whether a file is a VAE at all is that axis's ``classify_
 
 ``sam3ext/xyz_vae_cell.py`` makes the call for a cell; a cell Forge cannot swap is loaded like the [Modules] Text
 Encoder axis's cells (``sam3ext/xyz_text_encoder_cell.py``).
+
+Forge Neo 2.31 changed the axis: ``apply_vae`` writes the cell's whole module list into
+``p.override_settings["forge_additional_modules"]`` (the dropdown's list without the axis's own values, plus the value)
+and the model is loaded with it - every family renders, nothing is swapped in place, and nothing writes ``sd_vae`` any
+more (that is the new ``VAE ("state_dict" only)`` axis, 2.30's swap, not replaced). A VAE of the selection that is not
+one of the values stays in that list, and the loader takes the last VAE of the sorted list; ``axis_cell_modules`` is
+the list with exactly the value as the VAE, which the replaced axis writes instead.
 """
 from __future__ import annotations
 
@@ -32,7 +39,7 @@ import re
 from . import xyz_text_encoder as xte
 
 AXIS_LABEL = "VAE"                 # Forge's axis, replaced in place (scripts/modules_xyz_text_encoder.py)
-OVERRIDE_KEY = "sd_vae"            # where xyz_grid's apply_vae puts the file
+OVERRIDE_KEY = "sd_vae"            # where xyz_grid's apply_vae puts the file (Forge 2.30; 2.31: its state_dict axis)
 # Set on the cell's copy of ``p`` by the replaced axis (``{"value": x}``); the hook marks it ``SEEN`` when it has
 # decided the cell, so a pass inside the cell (a copy of the cell's ``p``) is not decided again.
 CELL_ATTR = "_sam_extra_xyz_vae"
@@ -221,6 +228,39 @@ def replace_vae(entries, vae, classify, vae_names=()) -> list:
     drop = vae_entries(entries, classify, vae_names)
     kept = [entry for entry in entries or () if entry not in drop and not same_file(entry, vae)]
     return sorted(dict.fromkeys([*kept, str(vae)]))
+
+
+class CellModules(list):
+    """Forge 2.31's ``VAE`` axis cell: the module list sam-extra writes into the cell's ``override_settings`` (a plain
+    list to Forge's ``set_config``). That dict is shared by every cell, so the next cell finds this list there;
+    ``start`` is the list the grid started from - an API caller's own, or the dropdown's as the grid's first cell read
+    it - which the next cell's VAE replaces (or, for "None", keeps)."""
+
+    def __init__(self, entries=(), start=None):
+        super().__init__(entries)
+        self.start = None if start is None else list(start)
+
+
+def axis_cell_modules(before, value_path, selection, *, module_list, classify, vae_names=()) -> CellModules:
+    """The list of a Forge 2.31 ``VAE`` axis cell, written over the one the stock axis wrote (the dropdown's selection
+    without the axis's own values, plus the value: a VAE of the selection that is not one of the values stays, and the
+    loader takes the last VAE of the sorted list). ``before``: what the cell's ``override_settings`` held before the
+    stock axis wrote (an API caller's list, a ``CellModules`` of the previous cell, or nothing); ``value_path``: the
+    picked file (``None`` for the value "None": the selection's own VAE); ``selection``: the dropdown's list now. The
+    result is the grid's starting list with exactly the value as its VAE - what choosing the file in the "VAE / Text
+    Encoder" dropdown loads, as the 2.30 axis rendered it.
+
+    ``selection`` counts at the grid's first cell only (no list in ``before``): the start it gives the grid is carried
+    to the later cells. Forge 2.31 leaves a cell's list in its settings - in the dropdown's list the next
+    cell reads - when config.json has no module list (``process_images`` puts back only the keys the settings had) or
+    the caller sent ``override_settings_restore_afterwards=False``."""
+    start = before.start if isinstance(before, CellModules) else before
+    if not isinstance(start, (list, tuple)):
+        start = selection                  # the grid's first cell: the dropdown's list, kept for the later cells
+    start = list(start or ())
+    base = xte.normalise(start, module_list)
+    modules = base if value_path is None else replace_vae(base, value_path, classify, vae_names)
+    return CellModules(modules, start)
 
 
 def predicted_shapes(entries, checkpoint_shapes, *, classify, read=file_shapes, vae_names=()) -> dict | None:

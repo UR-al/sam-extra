@@ -17,6 +17,9 @@ the cell has been applied and before ``process_images`` loads the model:
   ``override_settings`` (Forge's swap would raise and leave a black cell), so the cell renders what choosing the file
   in the "VAE / Text Encoder" dropdown renders.
 
+Forge 2.31's ``VAE`` axis writes no ``sd_vae`` (it loads the model with the VAE in the cell's module list itself), so
+``plan`` finds nothing to decide there; it still serves 2.30.
+
 When the headers cannot tell, the cell is left to Forge, as before: the picked file is a pickle or unreadable, or the
 VAE the cell's model is built with cannot be read - that model is not the loaded one, and its VAE file (the module
 list's last) is a pickle, unreadable or in a format Forge's loader converts first (diffusers, Flux 2's

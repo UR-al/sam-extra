@@ -21,7 +21,10 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 #
-# Changes in sam-extra: none - the code below is upstream's, byte for byte.
+# Changes in sam-extra (2026-10-24):
+# - CATALOGUE gains "qwen21" (Qwen-Image-2.1: the wiki's qwen3vl_8b builds and VAE) and "moss"
+#   (MOSS-Image, Forge 2.31: not on the wiki yet, so the files come from Comfy-Org/MOSS-Image, the
+#   repackage whose Qwen3.5 9B key layout Forge reads). Everything else is upstream's, byte for byte.
 
 """Where to obtain the VAE and text encoders each architecture needs.
 
@@ -230,6 +233,37 @@ CATALOGUE: dict[str, tuple[Download, ...]] = {
             "Qwen3 4B", TEXT_ENCODER,
             "https://huggingface.co/Comfy-Org/z_image_turbo/blob/main/split_files/text_encoders/qwen_3_4b.safetensors",
             "also works here, and is a single file that can be fetched directly",
+        ),
+    ),
+    "qwen21": (
+        _hf(
+            "Qwen-Image-2.1 VAE (bf16)", VAE,
+            "https://huggingface.co/Comfy-Org/Qwen-Image-2.1/blob/main/vae/qwen_image_2.1_vae_bf16.safetensors",
+        ),
+        _hf(
+            "Qwen3-VL 8B (int8_convrot)", TEXT_ENCODER,
+            "https://huggingface.co/Comfy-Org/Qwen-Image-2.1/blob/main/text_encoders/qwen3vl_8b_int8_convrot.safetensors",
+            "the wiki lists this build and w4a8; not the qwen3.5_9b_qwen_image_2.1_pe_* prompt rewriters",
+        ),
+        _hf(
+            "Qwen3-VL 8B (w4a8)", TEXT_ENCODER,
+            "https://huggingface.co/Comfy-Org/Qwen-Image-2.1/blob/main/text_encoders/qwen3vl_8b_w4a8.safetensors",
+        ),
+    ),
+    "moss": (
+        _hf(
+            "Flux.2 VAE", VAE,
+            "https://huggingface.co/Comfy-Org/MOSS-Image/blob/main/vae/flux2-vae.safetensors",
+        ),
+        _hf(
+            "Qwen3.5 9B (bf16)", TEXT_ENCODER,
+            "https://huggingface.co/Comfy-Org/MOSS-Image/blob/main/text_encoders/qwen3.5_9b_bf16.safetensors",
+            "Comfy-Org's repackage (model.language_model.* keys, the layout Forge reads); a merge of "
+            "OpenMOSS's own text_encoder shards does not load in Forge",
+        ),
+        _hf(
+            "Qwen3.5 9B (int8_convrot)", TEXT_ENCODER,
+            "https://huggingface.co/Comfy-Org/MOSS-Image/blob/main/text_encoders/qwen3.5_9b_int8_convrot.safetensors",
         ),
     ),
     "pid": (

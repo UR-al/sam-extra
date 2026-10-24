@@ -1,4 +1,5 @@
-"""XYZ ``VAE`` axis (Forge's, replaced in place) against Forge's own code (Forge Neo 2.30; skipped without a Forge checkout).
+"""XYZ ``VAE`` axis (Forge's, replaced in place) against Forge's own code (Forge Neo 2.30 / 2.31; skipped without a
+Forge checkout).
 
 1. **A grid through Forge's code, on CPU** — Forge's ``modules/sd_vae.py`` (the whole file: ``refresh_vae_list``, the
    strict in-place swap ``reload_vae_weights`` / ``_load_vae_dict`` and its restore), ``processing.process_images`` /
@@ -12,10 +13,13 @@
    ``post_quant_conv.weight``, else the 3D ``WanVAE`` layout; the stand-in for ``process_images_inner`` "decodes" by
    reading which file's weights the VAE holds. Driven like xyz_grid's ``cell`` (a failing cell is an empty image).
    The user's grid (Anima, base 3D ``qwen_image_vae``, Y = 3D / 2D / 3D / 2D / 2D) leaves three black cells with
-   Forge's axis and none with the replacement, also in another order and on a 2D base; cells Forge can swap take
+   Forge 2.30's axis and none with the replacement, also in another order and on a 2D base; cells Forge can swap take
    Forge's path call for call; restore after a failing cell, a failing load, an interrupt; labels and ``Module N``;
    the [Modules] Text Encoder and Checkpoint axes in every position; an API caller's module list; a VAE built into the
-   checkpoint.
+   checkpoint. Forge 2.31's axis loads the model with the VAE in the cell's module list (no black cell, nothing
+   swapped in place) - the same images, other loads; the replacement then only makes the value the cell's one VAE
+   (Forge's own list keeps a VAE of the selection that is not one of the values, and its "None" can lose the
+   selection's VAE).
 2. **Forge's real VAE classes** (a subprocess, CPU, ``--cpu``): tiny ``WanVAE`` / ``Qwen2DVAE`` - ``vae_family`` matches
    the class Forge's loader picks, and ``swappable`` is exactly whether Forge's ``_load_vae_dict`` loads a file into a
    model; the same for the checkout's own ``models/VAE`` files (headers only, full-size models on the meta device).
@@ -56,6 +60,7 @@ from tests import _xyz_text_encoder_support as tfx  # noqa: E402
 from tests import _xyz_vae_support as fx  # noqa: E402
 from tests._extra_schedulers_support import forge_function, forge_root, forge_source  # noqa: E402
 from tests._forge_checkout import require_forge_file  # noqa: E402
+from tests.test_xyz_text_encoder_origin import forge_axes_write_settings  # noqa: E402
 from tests.test_xyz_text_encoder_script import load_script  # noqa: E402
 
 V3 = "qwen_image_vae.safetensors"
@@ -181,6 +186,7 @@ class VaeGrid:
         self.ckpt = {info.name: info for info in infos}
         self.loads, self.cells, self.nested, self.reported, self.errors = [], [], [], [], []
         self.swaps, self.grid_module_n, self.settings_seen, self.labels = [], [], [], []
+        self.applied, self.seen_axes, self.current_axes = [], [], {}   # {axis label: value} per cell / settings_seen
         self.fail_cells, self.events = set(), {}
         self.stderr = io.StringIO()
         self.ui_modules = self.paths(*ui)
@@ -277,7 +283,8 @@ class VaeGrid:
         xyz = self.xyz = types.ModuleType("xyz_grid.py")
         xyz.__dict__.update(modules=modules, opts=self.opts, shared=shared, select_checkpoint=sd_models.select_checkpoint,
                             model_data=sd_models.model_data, sd_vae=sd_vae, StableDiffusionProcessing=object, T=Any,
-                            os=os)
+                            os=os, get_closet_checkpoint_match=sd_models.get_closet_checkpoint_match,
+                            checkpoints_list=sd_models.checkpoints_list)
         for name in ("format_value_add_label", "do_nothing", "format_nothing", "format_remove_path",
                      "refresh_loading_params_for_xyz_grid", "find_vae", "apply_vae", "apply_checkpoint",
                      "AxisOption"):
@@ -285,7 +292,10 @@ class VaeGrid:
         xyz_source = forge_source("scripts/xyz_grid.py")
         self.nothing = eval(_forge_axis_option(xyz_source, "Nothing"), xyz.__dict__)
         self.stock_vae_axis = eval(_forge_axis_option(xyz_source, "VAE"), xyz.__dict__)
-        self.ckpt_axis = xyz.AxisOption("Checkpoint name", str, xyz.apply_checkpoint, cost=1.0,
+        # Forge's cost for it (1.0 on 2.30, 2.0 from 2.31 - AxisOption reads opts.xyz_use_cost there)
+        cost = next(ast.literal_eval(k.value) for k in ast.parse(_forge_axis_option(xyz_source, "Checkpoint name"),
+                                                                 mode="eval").body.keywords if k.arg == "cost")
+        self.ckpt_axis = xyz.AxisOption("Checkpoint name", str, xyz.apply_checkpoint, cost=cost,
                                         format_value=xyz.format_remove_path)
         xyz.axis_options = [self.nothing, self.stock_vae_axis]
 
@@ -350,6 +360,7 @@ class VaeGrid:
         self.runner.process(p)
         if not p.nested:
             self.settings_seen.append(self.settings())
+            self.seen_axes.append(dict(self.current_axes))
             for event in self.events.get(index, ()):
                 event(self, p)
         self.runner.postprocess_image(p, None)
@@ -399,6 +410,8 @@ class VaeGrid:
                 if self.shared.state.interrupted:
                     self.cells.append({"skipped": True})       # xyz_grid's cell returns an empty Processed
                     return
+                self.current_axes = {opt.label: v for opt, v in ((x_opt, xv), (y_opt, yv), (z_opt, zv))}
+                self.applied.append(self.current_axes)
                 pc = copy.copy(p)
                 pc.styles = pc.styles[:]
                 x_opt.apply(pc, xv, xs)
@@ -432,8 +445,33 @@ class VaeGrid:
                         cell(picked["x"], picked["y"], picked["z"])
             self.xyz.refresh_loading_params_for_xyz_grid()    # after the grid
 
+    def stock_writes(self, axes, base_modules) -> dict:
+        """What Forge 2.31's stock Checkpoint / VAE axes put into the cell's ``override_settings`` (and, through
+        ``set_config``, into Forge's settings for the cell) - the VAE as the replaced axis writes it: exactly the value
+        on ``base_modules``. Nothing on 2.30."""
+        out = {}
+        if not forge_axes_write_settings():
+            return out
+        if axes.get("Checkpoint name"):
+            out["sd_model_checkpoint"] = self.sd_models.get_closet_checkpoint_match(axes["Checkpoint name"]).name
+        if "VAE" in axes:
+            vae = axes["VAE"]
+            kept = [m for m in base_modules if vae in (None, "None") or os.path.basename(m) not in FAMILY]
+            out["forge_additional_modules"] = sorted(set(kept + ([] if vae in (None, "None") else
+                                                                 [self.module_list[vae]])))
+        return out
+
+    def settings_during(self, axes) -> dict:
+        """Forge's settings while the cell with ``axes`` renders: the user's (2.31: with the stock axes' values)."""
+        out = {k: v for k, v in self.initial_settings.items() if k != "sd_checkpoint_hash"}
+        for key, value in self.stock_writes(axes, out.get("forge_additional_modules") or []).items():
+            if out.get(key) != value:      # set_config skips an unchanged value
+                out[key] = copy.deepcopy(value)
+        return out
+
     def generate(self, p=None):
         """A generation outside a grid (txt2img without a script); its record."""
+        self.current_axes = {}
         with (mock.patch.dict(sys.modules, self.sys_modules), contextlib.redirect_stdout(io.StringIO()),
               contextlib.redirect_stderr(self.stderr)):
             self.proc.process_images(p or P(self.runner))
@@ -495,15 +533,23 @@ class GridCase(unittest.TestCase):
         self.tmp.cleanup()
 
     def assertRestored(self, parent_settings=None):
+        """Forge's settings and loading parameters are the user's again, config.json was not saved, nothing of the
+        hook is left. During each cell a page load would save the user's settings - from Forge 2.31 with the stock
+        Checkpoint / VAE axes' values in them (Forge's own ``set_config``), and the last cell's stay in the parent's
+        ``override_settings`` (every cell shares that dict)."""
         g = self.grid
         initial = {k: v for k, v in g.initial_settings.items() if k != "sd_checkpoint_hash"}
         self.assertEqual(g.settings(), initial, "Forge's settings are the user's")
-        for seen in g.settings_seen:
-            self.assertEqual(seen, initial, "a page load during a cell saves these")
+        self.assertEqual(len(g.seen_axes), len(g.settings_seen))
+        for seen, axes in zip(g.settings_seen, g.seen_axes):
+            self.assertEqual(seen, g.settings_during(axes), "a page load during a cell saves these")
         self.assertEqual(g.opts.saved, [], "config.json is never saved")
         self.assertEqual(g.describe(g.params), g.ui_loading)
         self.assertIs(self.p.override_settings, self.parent_settings)
-        self.assertEqual(self.p.override_settings, parent_settings or {})
+        parent = dict(parent_settings or {})
+        if g.applied:
+            parent.update(g.stock_writes(g.applied[-1], initial.get("forge_additional_modules") or []))
+        self.assertEqual({k: list(v) if isinstance(v, list) else v for k, v in self.p.override_settings.items()}, parent)
         for attr in (xte.CELL_ATTR, xvae.CELL_ATTR):
             self.assertFalse(hasattr(self.p, attr))
         self.assertEqual(g.reported, [])
@@ -531,11 +577,18 @@ class UsersGridTests(GridCase):
         self.grid.loads.clear()
         self.grid.cells.clear()
 
-    def test_forges_axis_leaves_the_2d_cells_black(self):
-        """The bug, reproduced through Forge's code: strict load_state_dict of a 2D file into the 3D VAE raises,
-        xyz_grid draws an empty image for the cell."""
+    def test_forges_own_axis_on_the_users_grid(self):
+        """The bug, reproduced through Forge 2.30's code: strict load_state_dict of a 2D file into the 3D VAE raises,
+        xyz_grid draws an empty image for the cell. Forge 2.31's axis loads the model with each VAE instead: every
+        cell renders (the selection's VAE is one of the values here)."""
         g = self.grid
         g.run(self.p, y=(g.stock_vae_axis, list(fx.USER_ORDER)))
+        if forge_axes_write_settings():
+            self.assertEqual(cells_of(g), [made(name) for name in fx.USER_ORDER])
+            self.assertEqual(g.errors, [])
+            self.assertEqual(g.loads, [(CKPT_A, tuple(sorted((name, TE)))) for name in fx.USER_ORDER[1:]])
+            self.assertEqual(g.swaps, [])
+            return
         self.assertEqual(cells_of(g), [made(V3), "black", made(V3HDR), "black", "black"])
         self.assertEqual([type(e).__name__ for e in g.errors], ["RuntimeError"] * 3)
         self.assertIn("Missing key(s) in state_dict", str(g.errors[0]))
@@ -546,6 +599,17 @@ class UsersGridTests(GridCase):
         g.run(self.p, y=(g.vae_axis, list(fx.USER_ORDER)))
         self.assertEqual(cells_of(g), [made(V3), made(V2HDR), made(V3HDR), made(V2D), made(V2E)])
         self.assertEqual(g.errors, [])
+        log = g.stderr.getvalue()
+        if forge_axes_write_settings():
+            # Forge 2.31: every VAE loads the model with it (the first is the loaded model's), nothing is swapped
+            self.assertEqual(g.loads, [(CKPT_A, tuple(sorted((name, TE)))) for name in fx.USER_ORDER[1:]])
+            self.assertEqual(g.swaps, [])
+            self.assertEqual([cell["model"] for cell in g.cells],
+                             [(CKPT_A, tuple(sorted((name, TE)))) for name in fx.USER_ORDER])
+            self.assertEqual(log, "")
+            self.assertRestored()
+            self.assertNextGenerationIsTheUsers()
+            return
         # the 2D cells load the model with their VAE; the 3D HDR cell is Forge's in-place swap on the user's model
         self.assertEqual(g.loads, [(CKPT_A, tuple(sorted((V2HDR, TE)))), (CKPT_A, tuple(sorted((V3, TE)))),
                                    (CKPT_A, tuple(sorted((V2D, TE)))), (CKPT_A, tuple(sorted((V2E, TE))))])
@@ -553,7 +617,6 @@ class UsersGridTests(GridCase):
         self.assertEqual([cell["model"] for cell in g.cells],
                          [(CKPT_A, tuple(sorted(m))) for m in ((V3, TE), (V2HDR, TE), (V3, TE), (V2D, TE), (V2E, TE))])
         # the console says why, naming both families (the first 2D cell against the loaded model)
-        log = g.stderr.getvalue()
         self.assertIn(f"[XYZ VAE] {V2HDR} is a 2D Qwen2D VAE ({fx.Z} ch) and the loaded model's VAE is a 3D Wan / "
                       f"Qwen-Image VAE ({fx.Z} ch)", log)
         self.assertIn(f"[XYZ VAE] {V2E} is a 2D Qwen2D VAE ({fx.Z} ch) and the VAE the model is built with is a 3D",
@@ -568,7 +631,7 @@ class UsersGridTests(GridCase):
         order = [V3, V2HDR, V2D, V3HDR, V2E]
         g.run(self.p, y=(g.vae_axis, order))
         self.assertEqual(cells_of(g), [made(name) for name in order])
-        self.assertEqual(g.swaps, [None, V3HDR])
+        self.assertEqual(g.swaps, [] if forge_axes_write_settings() else [None, V3HDR])
         self.assertRestored()
         self.assertNextGenerationIsTheUsers()
 
@@ -597,9 +660,10 @@ class UsersGridTests(GridCase):
         g.fail_cells = {4}
         g.run(self.p, y=(g.vae_axis, list(fx.USER_ORDER)))
         self.assertEqual(cells_of(g)[4], "black")
-        # xyz_grid rebuilt the loading parameters after the grid; the Module N list waits for the next task
+        # xyz_grid rebuilt the loading parameters after the grid; the Module N list waits for the next task (2.30:
+        # the 2D cell went to the loader through the hook; 2.31 loads it without the hook)
         self.assertEqual(g.describe(g.params), g.ui_loading)
-        self.assertIsNotNone(cell_runtime.state())
+        self.assertEqual(cell_runtime.state() is None, forge_axes_write_settings())
         g.shared.state.time_start, g.shared.state.job = 2.0, "task(2)"
         self.assertNextGenerationIsTheUsers()
         self.assertIsNone(cell_runtime.state())
@@ -634,7 +698,10 @@ class UsersGridTests(GridCase):
     def test_same_family_cells_take_forges_path_call_for_call(self):
         """Values Forge can swap: the run with the replaced axis is the run with Forge's axis - the same loads, swaps,
         images, Module N lists, settings and override_settings at every step."""
-        values = [V3HDR, "None", V3, V3HDR]
+        forge_231 = forge_axes_write_settings()
+        # Forge 2.31: values whose list Forge's own axis gets right (its "None" drops the selection's VAE when that VAE
+        # is one of the values - test_exactly_the_value_unlike_forges_own_axis)
+        values = [V3HDR, V3, V3HDR] if forge_231 else [V3HDR, "None", V3, V3HDR]
         traces = []
         for axis in ("stock_vae_axis", "vae_axis"):
             self.tearDown()
@@ -643,13 +710,44 @@ class UsersGridTests(GridCase):
             g.run(self.p, y=(getattr(g, axis), values))
             traces.append(portable({
                 "cells": g.cells, "loads": g.loads, "swaps": g.swaps, "grid_module_n": g.grid_module_n,
-                "settings": g.settings_seen, "errors": g.errors, "parent": dict(self.p.override_settings),
+                "settings": g.settings_seen, "errors": g.errors,
+                # (2.31: the last cell's module list stays there - Forge's own unsorted, the replacement's sorted as
+                # modules_change keeps it)
+                "parent": {k: sorted(v) if isinstance(v, list) else v for k, v in self.p.override_settings.items()},
                 "log": g.stderr.getvalue(), "labels": g.labels, "saved": g.opts.saved, "after": g.settings(),
                 "loading": g.describe(g.params), "hash": g.sd_models.model_data.forge_hash}, g.models_path))
         self.assertEqual(traces[0], traces[1])
-        self.assertEqual(traces[0]["swaps"], [V3HDR, "None", None, V3HDR])
-        self.assertEqual(traces[0]["loads"], [])
+        if forge_231:
+            self.assertEqual(traces[0]["swaps"], [])
+            self.assertEqual(traces[0]["loads"], [(CKPT_A, tuple(sorted((name, TE)))) for name in values])
+        else:
+            self.assertEqual(traces[0]["swaps"], [V3HDR, "None", None, V3HDR])
+            self.assertEqual(traces[0]["loads"], [])
         self.assertEqual(traces[0]["log"], "")
+        self.assertRestored()
+
+    def test_exactly_the_value_unlike_forges_own_axis(self):
+        """Forge 2.31's own axis drops from the selection only the files that are values of the axis: its "None" cell
+        loses the selection's VAE when that VAE is one of the values (no VAE file: the checkpoint has none, the load
+        fails). The replaced axis renders the selection's VAE there, as "None" does on 2.30."""
+        values = [V3HDR, "None", V3]
+        cells, errors = {}, {}
+        for axis in ("stock_vae_axis", "vae_axis"):
+            self.tearDown()
+            self.setUp()
+            g = self.grid
+            g.run(self.p, y=(getattr(g, axis), values))
+            cells[axis], errors[axis] = cells_of(g, "family", "vae"), [str(e) for e in g.errors]
+            module_n = [cell.get("module_n") for cell in g.cells]
+        rendered = [{"family": FAMILY[name], "vae": VALUE[name]} for name in (V3HDR, V3, V3)]
+        self.assertEqual(cells["vae_axis"], rendered)
+        self.assertEqual(errors["vae_axis"], [])
+        if forge_axes_write_settings():
+            self.assertEqual(module_n, [stems(V3HDR, TE), stems(V3, TE), stems(V3, TE)])
+            self.assertEqual(cells["stock_vae_axis"], [rendered[0], "black", rendered[2]])
+            self.assertEqual(errors["stock_vae_axis"], ["You do not have VAE state dict!"])
+        else:      # (2.30's Module N of a "None" cell leaves the selection's VAE out - Forge's own)
+            self.assertEqual(cells["stock_vae_axis"], cells["vae_axis"])
         self.assertRestored()
 
     def test_with_the_text_encoder_axis_in_every_position(self):
@@ -681,19 +779,27 @@ class UsersGridTests(GridCase):
         self.assertNextGenerationIsTheUsers()
 
     def test_an_api_callers_module_list(self):
-        """An API request's own override_settings["forge_additional_modules"] (2D) is the cell's base; Forge applies
-        and restores it (set_config), the cell's list stands in for it."""
+        """An API request's own override_settings["forge_additional_modules"] (2D VAE, another encoder) is the cell's
+        base; Forge applies and restores it (set_config), the cell's list stands in for it. Forge 2.31's own axis
+        builds every cell on the dropdown's list instead (and writes it over the caller's in that dict); the replaced
+        axis keeps the caller's list as the base of every cell."""
         g = self.grid
-        api = {"forge_additional_modules": [V2HDR, TE]}
+        api = {"forge_additional_modules": [V2HDR, TE_FP32]}
         self.p = P(g.runner, api)
         self.parent_settings = api
         g.run(self.p, y=(g.vae_axis, [V3, V2D]))
-        self.assertEqual(cells_of(g), [made(V3), made(V2D)])
-        self.assertEqual(g.swaps, [V2D])
-        self.assertEqual([cell["model"] for cell in g.cells],
-                         [(CKPT_A, tuple(sorted((V3, TE)))), (CKPT_A, tuple(sorted((V2HDR, TE))))])
+        self.assertEqual(cells_of(g), [made(V3, TE_FP32), made(V2D, TE_FP32)])
         self.assertEqual(g.settings(), {k: v for k, v in g.initial_settings.items() if k != "sd_checkpoint_hash"})
-        self.assertEqual(api, {"forge_additional_modules": [V2HDR, TE]})
+        if forge_axes_write_settings():
+            self.assertEqual(g.swaps, [])
+            self.assertEqual([cell["model"] for cell in g.cells],
+                             [(CKPT_A, tuple(sorted((V3, TE_FP32)))), (CKPT_A, tuple(sorted((V2D, TE_FP32))))])
+            self.assertEqual(api, {"forge_additional_modules": g.paths(V2D, TE_FP32)}, "the last cell's list")
+        else:
+            self.assertEqual(g.swaps, [V2D])
+            self.assertEqual([cell["model"] for cell in g.cells],
+                             [(CKPT_A, tuple(sorted((V3, TE_FP32)))), (CKPT_A, tuple(sorted((V2HDR, TE_FP32))))])
+            self.assertEqual(api, {"forge_additional_modules": [V2HDR, TE_FP32]})
         self.assertEqual(g.describe(g.params), g.ui_loading)
         self.assertIsNone(cell_runtime.state())
 
@@ -709,23 +815,56 @@ class TwoDimensionalBaseTests(GridCase):
         g.cells.clear()
         g.run(self.p, y=(g.vae_axis, list(fx.USER_ORDER)))
         self.assertEqual(cells_of(g), [made(V3), made(V2HDR), made(V3HDR), made(V2D), made(V2E)])
-        self.assertEqual(g.loads, [(CKPT_A, tuple(sorted((V3, TE)))), (CKPT_A, tuple(sorted((V2HDR, TE)))),
-                                   (CKPT_A, tuple(sorted((V3HDR, TE)))), (CKPT_A, tuple(sorted((V2HDR, TE))))])
-        self.assertEqual(g.swaps, [None, V2D, V2E])
+        if forge_axes_write_settings():     # each VAE loads the model with it
+            self.assertEqual(g.loads, [(CKPT_A, tuple(sorted((name, TE)))) for name in fx.USER_ORDER])
+            self.assertEqual(g.swaps, [])
+        else:
+            self.assertEqual(g.loads, [(CKPT_A, tuple(sorted((V3, TE)))), (CKPT_A, tuple(sorted((V2HDR, TE)))),
+                                       (CKPT_A, tuple(sorted((V3HDR, TE)))), (CKPT_A, tuple(sorted((V2HDR, TE))))])
+            self.assertEqual(g.swaps, [None, V2D, V2E])
         self.assertRestored()
         self.assertNextGenerationIsTheUsers()
 
-    def test_forges_axis_leaves_the_3d_cells_black(self):
+    def test_forges_own_axis_on_a_2d_base(self):
+        """Forge 2.30's axis leaves the 3D cells black; 2.31's renders them (the selection's VAE is one of the values)."""
         g = self.grid
         g.run(self.p, y=(g.stock_vae_axis, list(fx.USER_ORDER)))
-        self.assertEqual(cells_of(g), ["black", made(V2HDR), "black", made(V2D), made(V2E)])
+        if forge_axes_write_settings():
+            self.assertEqual(cells_of(g), [made(name) for name in fx.USER_ORDER])
+        else:
+            self.assertEqual(cells_of(g), ["black", made(V2HDR), "black", made(V2D), made(V2E)])
+
+    def test_a_selection_vae_that_is_not_a_value(self):
+        """3D values on the 2D selection, which is not one of them: every cell renders its value. Forge 2.31's own axis
+        keeps the selection's 2D VAE in each cell's list and the loader takes the last VAE of the sorted list: the
+        qwen_image_vae cell renders the 2D selection's VAE ("." < "_"), the HDR one its value ("2" < "H"). (2.30's own
+        axis cannot swap a 3D file into the 2D VAE.)"""
+        g = self.grid
+        g.run(self.p, y=(g.vae_axis, [V3, V3HDR]))
+        self.assertEqual(cells_of(g), [made(V3), made(V3HDR)])
+        self.assertRestored()
+        self.tearDown()
+        self.setUp()
+        g = self.grid
+        g.run(self.p, y=(g.stock_vae_axis, [V3, V3HDR]))
+        if forge_axes_write_settings():
+            self.assertEqual(cells_of(g, "family", "vae"), [{"family": "2d", "vae": VALUE[V2HDR]},
+                                                            {"family": "3d", "vae": VALUE[V3HDR]}])
+            self.assertEqual([cell["model"] for cell in g.cells],
+                             [(CKPT_A, tuple(sorted((V2HDR, name, TE)))) for name in (V3, V3HDR)])
+        else:
+            self.assertEqual(cells_of(g), ["black", "black"])
 
     def test_first_cell_before_any_model_is_loaded(self):
-        """Nothing loaded yet: the VAE the model will be built with comes from the headers."""
+        """Nothing loaded yet: the VAE the model will be built with comes from the headers (2.30; 2.31 loads the
+        model with the VAE whatever it is)."""
         g = self.grid
         g.run(self.p, y=(g.vae_axis, [V3, V2D]))
         self.assertEqual(cells_of(g), [made(V3), made(V2D)])
-        self.assertIn("the VAE the model is built with is a 2D Qwen2D VAE", g.stderr.getvalue())
+        if forge_axes_write_settings():
+            self.assertEqual(g.stderr.getvalue(), "")
+        else:
+            self.assertIn("the VAE the model is built with is a 2D Qwen2D VAE", g.stderr.getvalue())
         self.assertRestored()
 
 
@@ -747,9 +886,15 @@ class CheckpointVaeTests(GridCase):
         g.run(self.p, y=(g.vae_axis, [V2HDR, V3HDR, "None"]))
         self.assertEqual(cells_of(g), [made(V2HDR), {"family": "3d", "vae": VALUE[V3HDR], "module_n": stems(TE, V3HDR)},
                                        {"family": "3d", "vae": AIO_VALUE, "module_n": stems(TE)}])
-        self.assertEqual([cell["model"] for cell in g.cells],
-                         [(CKPT_AIO, tuple(sorted((V2HDR, TE)))), (CKPT_AIO, (TE,)), (CKPT_AIO, (TE,))])
-        self.assertEqual(g.swaps, [V3HDR, "None"])
+        if forge_axes_write_settings():     # each file loads the model with it; "None": the checkpoint's own VAE
+            self.assertEqual([cell["model"] for cell in g.cells],
+                             [(CKPT_AIO, tuple(sorted((V2HDR, TE)))), (CKPT_AIO, tuple(sorted((V3HDR, TE)))),
+                              (CKPT_AIO, (TE,))])
+            self.assertEqual(g.swaps, [])
+        else:
+            self.assertEqual([cell["model"] for cell in g.cells],
+                             [(CKPT_AIO, tuple(sorted((V2HDR, TE)))), (CKPT_AIO, (TE,)), (CKPT_AIO, (TE,))])
+            self.assertEqual(g.swaps, [V3HDR, "None"])
         self.assertRestored()
 
 
@@ -920,9 +1065,11 @@ class SourceGuardTests(unittest.TestCase):
 
     def test_process_images_swaps_after_the_model_load(self):
         segment = _function(forge_source("modules/processing.py"), "process_images")
+        # 2.30 skips the swap for the selection's own VAE (``override = None``); 2.31 swaps the override as it is
+        override = "override" if "if sd_vae.reload_vae_weights(override):" in segment else "_vae_override"
         _in_order(self, segment, "p.scripts.before_process(p)", '_vae_override = p.override_settings.pop("sd_vae", None)',
                   "manage_model_and_prompt_cache(p)", "if _vae_override is not None:",
-                  "if sd_vae.reload_vae_weights(override):", "_overridden_modules.append(override)",
+                  f"if sd_vae.reload_vae_weights({override}):", f"_overridden_modules.append({override})",
                   "res = process_images_inner(p)", "finally:", "sd_vae.restore_vae_weights()")
 
     def test_the_model_is_reloaded_only_when_the_loading_parameters_change(self):
@@ -965,7 +1112,20 @@ class SourceGuardTests(unittest.TestCase):
         self.assertEqual(_forge_axis_option(source, "VAE"),
                          'AxisOption("VAE", str, apply_vae, cost=0.7, choices=lambda: ["None", '
                          '*sorted(sd_vae.vae_dict.keys())])')
-        self.assertIn('p.override_settings["sd_vae"] = find_vae(x)', _function(source, "apply_vae"))
+        apply_vae = _function(source, "apply_vae")
+        if forge_axes_write_settings():
+            # 2.31: the cell's module list (the dropdown's without the axis's values, plus find_vae's file - "None" for
+            # "None"), which the replaced axis writes again; its old swap is the "state_dict" axis, not replaced
+            self.assertIn("modules: list[str] = [m for m in opts.forge_additional_modules if not to_replace(m)]",
+                          apply_vae)
+            self.assertIn('p.override_settings["forge_additional_modules"] = modules + [find_vae(x)]', apply_vae)
+            self.assertNotIn("sd_vae", apply_vae)
+            self.assertIn('p.override_settings["sd_vae"] = find_vae(x)', _function(source, "apply_vae_fast"))
+            self.assertIn("AxisOption('VAE (\"state_dict\" only)', str, apply_vae_fast, cost=0.3", source)
+        else:
+            self.assertIn('p.override_settings["sd_vae"] = find_vae(x)', apply_vae)
+        self.assertIn('return "None"', _function(source, "find_vae"))
+        self.assertIn("return sd_vae.vae_dict[name]", _function(source, "find_vae"))
         labels = re.findall(r'AxisOption(?:Txt2Img|Img2Img)?\("VAE"', source)
         self.assertEqual(len(labels), 1, "one VAE axis to replace")
 

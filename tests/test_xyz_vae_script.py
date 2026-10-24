@@ -35,6 +35,7 @@ from tests.test_xyz_text_encoder_script import AxisOption, Forge, P, load_script
 V3 = "qwen_image_vae.safetensors"
 V3HDR = "qwen_image_vae_HDR_fp32.safetensors"
 V2HDR = "qwen_image_vae_2dHDR_fp32.safetensors"
+V2D = "Qwen2D-Anime-dense_epoch_1.safetensors"
 TE = "qwen_3_06b_base.safetensors"
 TE_FP32 = "qwen_3_06b_base_full_fp32.safetensors"
 
@@ -52,6 +53,24 @@ def stock_apply_vae(calls):
 STOCK_VAE_DICT: dict = {}
 
 
+def stock_apply_vae_231(calls):
+    """xyz_grid's apply_vae as Forge 2.31 has it: the cell's module list - the dropdown's without the files whose name
+    ends with one of the axis's values, plus ``find_vae``'s file ("None" for "None") - into override_settings."""
+
+    def apply(p, x, xs):
+        calls.append((p, x, list(xs)))
+        from modules import shared
+
+        def to_replace(v):
+            return any(v.endswith(value) for value in xs)
+
+        modules = [m for m in shared.opts.forge_additional_modules if not to_replace(m)]
+        vae = "None" if x in (None, "None") else STOCK_VAE_DICT[x]
+        p.override_settings["forge_additional_modules"] = modules + [vae]
+
+    return apply
+
+
 class AxisOptionTxt2Img(AxisOption):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -64,6 +83,14 @@ def forge_xyz(calls, cls=AxisOption):
     vae = cls("VAE", str, stock_apply_vae(calls), format_value=label, cost=0.7, choices=choices)
     return types.SimpleNamespace(AxisOption=AxisOption, axis_options=[
         AxisOption("Nothing", str, None), AxisOption("Seed", int, None), vae, AxisOption("Clip skip", int, None)])
+
+
+def forge_xyz_231(calls):
+    """Forge 2.31's axes: "VAE" writes the cell's module list; 'VAE ("state_dict" only)' is 2.30's swap."""
+    xyz = forge_xyz(calls)
+    xyz.axis_options[2].apply = stock_apply_vae_231(calls)
+    xyz.axis_options.insert(3, AxisOption('VAE ("state_dict" only)', str, stock_apply_vae(calls), cost=0.3))
+    return xyz
 
 
 class RegistrationTests(unittest.TestCase):
@@ -357,6 +384,134 @@ class HookTests(HookCase):
             self.assertEqual(pc.override_settings["sd_vae"], STOCK_VAE_DICT[V3HDR])
             self.hook.postprocess(pc, None)
         self.assertIsNone(cell_runtime.state())
+
+
+class Forge231AxisTests(HookCase):
+    """Forge 2.31's VAE axis writes the cell's whole module list into override_settings (the model is loaded with it,
+    nothing is swapped in place); the replaced axis writes it again with exactly the value as the VAE, on the grid's
+    starting list. The hook hands nothing over for a VAE-only cell, and a Text Encoder cell builds on that list
+    whichever axis was applied first."""
+    UI = (V3HDR, TE)
+
+    def setUp(self):
+        super().setUp()
+        self.calls = []
+        self.xyz = forge_xyz_231(self.calls)
+        self.module.replace_vae_axis(self.xyz)
+        self.vae_axis = self.xyz.axis_options[2]
+
+    def apply(self, parent, value, xs):
+        pc = copy.copy(parent)
+        with self.forge.installed(), mock.patch.dict(sys.modules, {"modules.sd_vae": types.SimpleNamespace(
+                vae_dict=dict(STOCK_VAE_DICT))}):
+            self.vae_axis.apply(pc, value, xs)
+        return pc
+
+    def test_exactly_the_value(self):
+        xs = [V3, "None"]
+        pc = self.apply(P(), V3, xs)
+        # Forge's own list would be the selection's HDR VAE, the value and the encoder (HDR sorted last: it wins)
+        self.assertEqual(pc.override_settings["forge_additional_modules"], self.forge.paths(V3, TE))
+        self.assertIsInstance(pc.override_settings["forge_additional_modules"], xvae.CellModules)
+        self.assertEqual(getattr(pc, xvae.CELL_ATTR), {"value": V3})
+        self.assertNotIn("sd_vae", pc.override_settings)
+        self.assertEqual(len(self.calls), 1, "Forge's apply runs once")
+        pc = self.apply(P(), "None", xs)
+        self.assertEqual(pc.override_settings["forge_additional_modules"], self.forge.paths(V3HDR, TE))
+        # Forge's KeyError for an unknown file stops the grid as before, with no mark
+        r = P()
+        with self.assertRaises(KeyError):
+            self.apply(r, "missing.safetensors", xs)
+        self.assertFalse(hasattr(r, xvae.CELL_ATTR))
+
+    def test_none_keeps_the_selections_vae_when_it_is_a_value(self):
+        # Forge's own "None" cell drops the selection's VAE when that VAE is one of the values (it ends with it)
+        xs = [V3HDR, "None", V2HDR]
+        parent = P()
+        self.apply(parent, V2HDR, xs)
+        pc = self.apply(parent, "None", xs)
+        self.assertEqual(pc.override_settings["forge_additional_modules"], self.forge.paths(V3HDR, TE))
+
+    def test_the_grids_start_is_carried_from_cell_to_cell(self):
+        """The dict every cell shares holds the previous cell's list; an API caller's own list is the start of every
+        cell, not the previous cell's VAE (nor the dropdown's list)."""
+        api = [V2HDR, TE_FP32]
+        parent = P({"forge_additional_modules": list(api)})
+        xs = [V3, "None", V2D]
+        self.assertEqual(self.apply(parent, V3, xs).override_settings["forge_additional_modules"],
+                         self.forge.paths(V3, TE_FP32))
+        self.assertEqual(self.apply(parent, "None", xs).override_settings["forge_additional_modules"],
+                         self.forge.paths(V2HDR, TE_FP32))
+        self.assertEqual(self.apply(parent, V2D, xs).override_settings["forge_additional_modules"],
+                         self.forge.paths(V2D, TE_FP32))
+        self.assertEqual(parent.override_settings["forge_additional_modules"].start, api)
+
+    def test_the_dropdowns_list_is_read_at_the_grids_first_cell(self):
+        """Forge 2.31 leaves a cell's list in its settings (the dropdown's list) when config.json has no module list -
+        ``process_images`` puts back only the keys it had - or the caller sent
+        ``override_settings_restore_afterwards=False``. The first cell's dropdown list stays the start of every cell,
+        so "None" after a VAE is still the selection's own VAE (with no list: the checkpoint's)."""
+        xs = [V2HDR, "None"]
+        for fresh in (False, True):
+            with self.subTest(fresh_config=fresh):
+                if fresh:
+                    del self.forge.opts.data["forge_additional_modules"]       # config.json without the key
+                    want = []
+                else:
+                    want = self.forge.paths(V3HDR, TE)
+                parent = P()
+                first = self.apply(parent, V2HDR, xs)
+                self.assertEqual(first.override_settings["forge_additional_modules"],
+                                 self.forge.paths(V2HDR) if fresh else self.forge.paths(V2HDR, TE))
+                # what Forge 2.31 leaves in its settings after that cell
+                self.forge.opts.forge_additional_modules = list(first.override_settings["forge_additional_modules"])
+                cell = self.apply(parent, "None", xs).override_settings["forge_additional_modules"]
+                self.assertEqual(cell, want)
+                self.assertEqual(cell.start, want)
+
+    def test_a_failing_rewrite_leaves_forges_list(self):
+        stderr = io.StringIO()
+        with mock.patch.object(xvae, "axis_cell_modules", side_effect=RuntimeError("boom")), \
+                contextlib.redirect_stderr(stderr):
+            pc = self.apply(P(), V3, [V3])
+        self.assertEqual(pc.override_settings["forge_additional_modules"], [*self.forge.paths(V3HDR, TE),
+                                                                            STOCK_VAE_DICT[V3]])
+        self.assertEqual(getattr(pc, xvae.CELL_ATTR), {"value": V3})
+        self.assertIn("[XYZ VAE] setting the cell's VAE failed - Forge's own list is used", stderr.getvalue())
+
+    def test_the_hook_hands_nothing_over_for_a_vae_cell(self):
+        self.load(fx.tiny_3d())
+        before = self.forge.params
+        pc = self.apply(P(), V2HDR, [V2HDR])
+        with self.forge.installed(), contextlib.redirect_stderr(io.StringIO()) as stderr:
+            self.assertFalse(cell_runtime.before_process(pc))
+        self.assertIs(self.forge.params, before, "Forge's set_config loads the list itself")
+        self.assertIsNone(cell_runtime.state())
+        self.assertEqual(stderr.getvalue(), "")
+
+    def test_a_text_encoder_cell_builds_on_the_cells_vae_list(self):
+        """The Text Encoder axis applied before the VAE axis (TE on X, VAE on Y): the previous cell's list in the
+        shared dict is not the base - the hook builds the cell's list when the cell starts."""
+        parent = P()
+        with self.forge.installed(), mock.patch.dict(sys.modules, {"modules.sd_vae": types.SimpleNamespace(
+                vae_dict=dict(STOCK_VAE_DICT))}), contextlib.redirect_stderr(io.StringIO()):
+            self.te_axis.confirm(parent, ["qwen_3_06b_base_full_fp32"])
+            for vae in (V2HDR, V3):
+                pc = copy.copy(parent)
+                self.te_axis.apply(pc, "qwen_3_06b_base_full_fp32", ["qwen_3_06b_base_full_fp32"])
+                self.vae_axis.apply(pc, vae, [V2HDR, V3])
+                self.hook.before_process(pc)
+                self.assertEqual(self.forge.params["additional_modules"], self.forge.paths(vae, TE_FP32), vae)
+                self.assertEqual(self.forge.processing._overridden_modules, self.forge.paths(vae, TE_FP32), vae)
+                self.hook.postprocess(pc, None)
+        self.assertIsNone(cell_runtime.state())
+        self.assertEqual(self.forge.opts.forge_additional_modules, self.forge.paths(V3HDR, TE),
+                         "the hook writes no setting")
+
+    def test_the_state_dict_axis_is_not_replaced(self):
+        option = self.xyz.axis_options[3]
+        self.assertEqual(option.label, 'VAE ("state_dict" only)')
+        self.assertFalse(hasattr(option, self.module.VAE_STOCK_APPLY))
 
 
 class TwoDimensionalSelectionTests(HookCase):

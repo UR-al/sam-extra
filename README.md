@@ -436,6 +436,12 @@ SAM3 Mask 아코디언의 **Search inside faces only** 와 Refine 패널의 **SA
 `[SAM3] Checkpoint`·`[SAM3] Device` 축은 값이 바뀔 때마다 SAM3 를 다시 빌드하므로(3\~5 초) cost 를 줘서 바깥 루프로
 돌립니다 — 칸 결과는 같고 격자를 도는 순서만 바뀝니다.
 
+Forge 2.31 은 기본 축의 cost 를 바꿨습니다 — `Checkpoint name` 1.0 → 2.0, Prompt S/R · Prompt order · Styles 0 → 0.1, 새
+`VAE ("state_dict" only)` 축 0.3. Settings → UI Alternatives → **Enable the cost system for X/Y/Z Plot**(`xyz_use_cost`, 기본 켬,
+재시작 필요)을 끄면 sam-extra 의 축까지 모든 축의 cost 가 0 이라 화면 순서대로 돕니다. 어느 쪽이든 칸 결과는 같습니다. 2.31 은
+`VAE` 바로 뒤에 축을 하나 넣어 그 뒤 축들(sam-extra 의 축 포함)의 번호가 하나씩 밀리므로, 축을 번호(`x_type` 등의 정수)로 고르는
+저장된 API 요청은 다시 확인하세요(notebook 의 XYZ 프리셋은 이름으로 고름).
+
 ### `[Modules] Text Encoder` — 텍스트 인코더를 바꿔 가며 뽑기
 
 Forge 기본 XYZ 에는 VAE 를 바꾸는 `VAE` 축은 있지만 텍스트 인코더 축은 없습니다. sam-extra 가 `[Modules] Text Encoder` 축을
@@ -445,7 +451,7 @@ Forge 기본 XYZ 에는 VAE 를 바꾸는 `VAE` 축은 있지만 텍스트 인�
   드롭다운에 보이는 이름 그대로 쓰면 되고, 하위 폴더 경로나 확장자를 뺀 이름(`qwen_3_06b_base_full_fp32`)도 됩니다. 인코더가
   둘인 모델(Flux 의 CLIP-L + T5)은 텍스트 입력에서 `clip_l + t5xxl_fp16` 처럼 `+` 로 이어 쓰거나, 이 축을 두 축에 둡니다(아래).
 - **드롭다운 후보**: 모델이 이미 가진 **자리(slot)** 를 채우는 파일만 나옵니다 — 지금 선택에 든 인코더의 자리와 체크포인트에
-  들어 있는 인코더의 자리. Anima 선택이면 Qwen3 0.6B 파일, Krea2 면 Qwen3-VL 4B, 인코더가 체크포인트에 든 SDXL 이면 CLIP-L ·
+  들어 있는 인코더의 자리. Anima 선택이면 Qwen3 0.6B 파일, Krea2 면 Qwen3-VL 4B, MOSS-Image(Forge 2.31)면 Qwen3.5 9B, 인코더가 체크포인트에 든 SDXL 이면 CLIP-L ·
   CLIP-G 파일입니다(둘 다 없으면 알아보는 인코더 전부). 자리는 Forge 로더(`backend/loader.py` `replace_state_dict`)와 같은 규칙으로
   파일 **헤더만** 읽어 정합니다(가중치는 읽지 않음). safetensors 는 JSON 헤더를, GGUF 는 텐서 표(이름 · 모양)를 Forge 의
   `gguf_remapping` 처럼 이름을 바꿔 읽으므로 GGUF 인코더도 safetensors 와 똑같이 다룹니다.
@@ -453,17 +459,27 @@ Forge 기본 XYZ 에는 VAE 를 바꾸는 `VAE` 축은 있지만 텍스트 인�
   없고 체크포인트에 들어 있으면 고른 파일을 더해 체크포인트 것을 대신하게 합니다(드롭다운에서 고를 때와 같음). 목록은 기본
   `Checkpoint name` 축이 체크포인트를 넣는 곳 — 다음 모델 로드가 읽는 값(Forge 의 loading parameters) — 에만 넣고 Forge 설정에는
   쓰지 않습니다. 그래서 그리드 도중 WebUI 를 열거나 새로 고치고 설정을 저장해도 config.json 에는 사용자의 선택이 남고, 드롭다운도
-  그대로입니다. 그리드 도중 드롭다운을 바꾸면 그 선택이 그대로 남고, 남은 칸은 새 선택에서 만듭니다. 인코더가 바뀌면 Forge 가
-  모델을 다시 불러오므로 체크포인트 축처럼 칸마다 시간이 듭니다. 칸이 끝나면 — 오류 · 중단으로 끝나도 — 원래 값으로 돌아갑니다.
+  그대로입니다(Forge 2.31 에서는 기본 `Checkpoint name` · `VAE` 축의 값만은 Forge 가 그 칸 동안 설정에 넣습니다 — sam-extra 와
+  무관한 Forge 의 동작이라, 그 축을 함께 쓰는 그리드 도중 페이지를 열면 그 값이 config.json 에 저장될 수 있습니다. 인코더는
+  들어가지 않습니다). 그리드 도중 드롭다운을 바꾸면 그 선택이 그대로 남고, 남은 칸은 새 선택에서 만듭니다(Forge 2.31 에서 `VAE`
+  축과 함께 쓰면 예외 — 남은 칸도 그리드가 시작한 목록에서 만듭니다, 아래 `VAE` 절). 인코더가 바뀌면 Forge 가 모델을 다시
+  불러오므로 체크포인트 축처럼 칸마다 시간이 듭니다. 칸이 끝나면 — 오류 · 중단으로 끝나도 — 원래 값으로 돌아갑니다.
   그리드가 다른 인코더로 끝났으면 다음 일반 생성이 원래 모델을 한 번 다시 불러옵니다(체크포인트 축 뒤와 같음).
 - **기록**: 각 이미지 infotext 의 `Module 1`, `Module 2` … 에 그 칸에서 실제로 쓴 목록이 남아, PNG Info 붙여 넣기(VAE/TE)로 그
   칸을 다시 만들 수 있습니다(기본 `VAE` 축과 함께면 바꾼 VAE 까지). 그리드 이미지의 `Module N` 은 원래 선택입니다(기본 `VAE` 축과
   같음). 칸 라벨은 `Text Encoder: <파일 이름>`, `Use Forge current` 는 `Text Encoder: current (<지금 인코더>)` 입니다.
-- **다른 축과 함께**: `Checkpoint name`(cost 1.0) → 이 축(0.9) → `VAE`(0.7) 순으로 바깥 루프가 됩니다. `VAE` 축과 섞으면 바뀐
-  인코더 모델 위에서 VAE 를 바꿉니다(그 모델의 VAE 와 형식이 다른 VAE 는 VAE 까지 바꾼 목록으로 한 번 불러옴 — 아래 `VAE` 절).
+- **다른 축과 함께**: `Checkpoint name`(cost 1.0, Forge 2.31 부터 2.0) → 이 축(0.9) → `VAE`(0.7) 순으로 바깥 루프가 됩니다. `VAE`
+  축과 섞으면 X · Y · Z 어디에 두든 칸마다 두 값이 함께 들어가고, 바뀐 인코더 모델 위에서 VAE 를 바꿉니다(아래 `VAE` 절).
   `Checkpoint name` 축과 섞을 때 계열이 다른 체크포인트(Anima · Krea2)를 비교하려면 두
   계열의 인코더를 모두 VAE / Text Encoder 목록에 넣어 두세요 — 모델마다 자기 자리만 쓰고, 이 축은 고른 파일의 자리만 바꿉니다.
-  자리 확인에 쓰는 체크포인트는 Checkpoint 드롭다운의 것(API 면 `override_settings` 의 것)입니다.
+  그리드를 시작하기 전의 값 확인은 그때의 Checkpoint 드롭다운의 체크포인트(API 면 `override_settings` 의 것)로 합니다 — 그것이 받지
+  않는 값은 첫 칸 전에 막습니다. 칸마다 축을 적용할 때도 이 시작 체크포인트로 확인합니다: Forge 2.31 은 config.json 에
+  `sd_model_checkpoint` 가 없는 API 전용 시작(UI 의 체크포인트 드롭다운이 이 키를 넣음)이나 `override_settings_restore_afterwards`
+  가 `False` 인 API 요청에서 앞 칸의 체크포인트를 드롭다운에 남기는데, 그것으로는 확인하지 않습니다. 칸의 목록은 그 칸의 모든 축이
+  적용된 뒤(칸이 시작할 때) 만듭니다. Forge 2.31 은 `Checkpoint name` 축의 값을 칸의 `override_settings` 에 적으므로 그 칸의
+  체크포인트로 만들고, 그 체크포인트가 고른 인코더를 받지 않는 칸(계열이 다른 체크포인트를 섞은 그리드, 그리드 도중 드롭다운을 다른
+  계열로 바꾼 칸)은 시작 체크포인트로 만든 목록으로 그리며 콘솔에 `[XYZ Text Encoder] … as the axis did before Forge 2.31` 을
+  남깁니다(그리드는 멈추지 않음). 2.30 은 늘 드롭다운 체크포인트 기준입니다.
 - **축 둘**: 이 축을 X · Y 처럼 두 축에 둘 수 있습니다 — Flux 면 X 에 CLIP-L 파일들, Y 에 T5 파일들. 두 번째 축은 첫 축이 만든
   목록 위에서 자기 자리만 바꾸고, 한쪽의 `Use Forge current` 는 다른 쪽 파일을 그대로 둡니다. 두 축이 같은 자리를 고르면 그리드를
   시작하기 전에 막습니다.
@@ -471,6 +487,11 @@ Forge 기본 XYZ 에는 VAE 를 바꾸는 `VAE` 축은 있지만 텍스트 인�
   인코더를 씁니다. Hires 의 모듈을 따로 골라 두었으면 2패스는 그 목록을 쓰고, 다음 배치는 다시 칸의 인코더입니다.
 - **Anima 3.8B**: 0.6B 쪽(Qwen3 0.6B) 인코더를 바꿉니다. Qwen3.5 4B 는 3.8B 런타임이 `models/text_encoder` 에서 알아서 찾으므로
   이 축의 대상이 아닙니다.
+- **MOSS-Image (Forge 2.31)**: Qwen3.5 9B 인코더는 Forge 처럼 `model.language_model.*` 키 형식(Comfy-Org/MOSS-Image 의
+  `text_encoders/qwen3.5_9b_*`)만 그 자리로 봅니다. OpenMOSS 공식 저장소의 `text_encoder` 조각을 합친 파일(`language_model.*` ·
+  `visual.*` 키, `model.` 없음)은 Forge 가 Qwen2.5-VL 7B 자리로 읽어 MOSS 가 쓰지 못하므로(드롭다운에서 고르면 Forge 가 파일을 다
+  읽은 뒤 `You do not have Qwen3.5 state dict!` 로 멈춤) 이 축에서도 MOSS 의 인코더 자리를 채우지 않습니다. 2.30.1 에는 이 자리를
+  읽는 모델 계열이 없어, Qwen3.5 9B 파일은 아래의 "모델이 가진 자리가 아닌 인코더" 로 막힙니다.
 - **그리드를 시작하기 전에 막는 값**(영어 오류): 목록에 없는 파일(`Default` · `Automatic` · `Built-in` 은 `Use Forge current` 를
   안내), VAE, Qwen3.5 파일, Anima 3.8B 어댑터, Forge 가 인코더로 읽지 못하는 파일, **모델이 가진 자리가 아닌 인코더**(예: Anima
   선택에 Qwen3-VL 4B, 인코더가 체크포인트에 든 SDXL 에 T5 — 이 축은 모델이 이미 가진 인코더만 바꿈), 체크포인트 계열이 받지 않는
@@ -486,19 +507,28 @@ Forge 기본 XYZ 에는 VAE 를 바꾸는 `VAE` 축은 있지만 텍스트 인�
   인코더를 목록에 넣으라고 안내합니다. GGUF 는 Forge 가 여는 버전 2 · 3 파일만 읽습니다(바이트 순서가 반대인 파일은 Forge 도
   NumPy 2 에서 열지 못함).
 - **API**: `override_settings` 에 `forge_additional_modules` 를 주면 그 목록이, `sd_model_checkpoint` 를 주면 그 체크포인트가
-  출발점입니다(이 둘은 호출자의 값이라 Forge 가 그 요청 동안 설정에 넣었다 되돌립니다).
+  출발점입니다(이 둘은 호출자의 값이라 Forge 가 그 요청 동안 설정에 넣었다 되돌립니다). Forge 2.31 의 기본 `VAE` ·
+  `Checkpoint name` 축은 칸의 값을 이 dict 에 쓰므로 그리드가 끝난 뒤 거기에는 마지막 칸의 목록 · 체크포인트가 남습니다(Forge 의
+  동작) — 칸마다의 출발점은 그래도 처음 준 값입니다.
 
-### `VAE` (Forge 기본 축) — 형식이 다른 VAE 를 섞어도 검은 칸 없이
+### `VAE` (Forge 기본 축) — 형식이 다른 VAE 를 섞어도 검은 칸 없이, 고른 VAE 그대로
 
-Forge 기본 `VAE` 축은 칸마다 VAE 가중치를 **이미 만들어진 모델의 VAE 에 그대로 덮어씁니다**(`sd_vae.reload_vae_weights` → 엄격한
+Forge 2.30 의 기본 `VAE` 축은 칸마다 VAE 가중치를 **이미 만들어진 모델의 VAE 에 그대로 덮어씁니다**(`sd_vae.reload_vae_weights` → 엄격한
 `load_state_dict`). 그런데 Forge 는 VAE 의 **형식(클래스)** 을 모델을 만들 때 VAE / Text Encoder 드롭다운의 VAE 파일로 정합니다 —
 Anima · Qwen-Image · Wan 계열이면 `post_quant_conv.weight` 가 있는 파일은 2D `Qwen2DVAE`(`qwen_image_vae_2dHDR_fp32`,
 `Qwen2D-Anime-dense…` 같은 Qwen2D 내보내기), 없는 파일은 3D `WanVAE`(`qwen_image_vae`, `qwen_image_vae_HDR_fp32`). 그래서 3D VAE 로
 만든 모델에 2D VAE 를 넣는 칸(또는 그 반대)은 텐서 이름이 맞지 않아 오류가 나고, xyz_grid 는 그 칸을 샘플링 없이 **검은 이미지**로
 채웁니다. 드롭다운에서 고르면 되는 것은 그때 Forge 가 모델을 다시 만들기 때문입니다.
 
-sam-extra 는 이 축을 **같은 자리에서 바꿔 끼웁니다** — 이름 `VAE`, 목록 위치, 값 후보와 `None`, cost 0.7, 칸 라벨 `VAE: <파일>` 은
-그대로라 저장해 둔 XYZ 설정과 infotext 의 `Y Type: VAE` 도 그대로 맞습니다. 칸마다:
+**Forge 2.31** 의 기본 `VAE` 축은 VAE 를 제자리에서 바꾸지 않고 칸의 모듈 목록(`override_settings["forge_additional_modules"]`)에
+넣어 **모델을 다시 불러옵니다** — 형식이 다른 VAE 도 Forge 자체로 검은 칸 없이 그려지고, 칸마다 모델 로딩만큼 시간이 듭니다. 다만
+Forge 의 목록은 드롭다운 선택에서 이름이 축의 값 중 하나로 끝나는 모듈만 빼므로, 선택의 VAE 가 값 목록에 없으면 그 VAE 가 남고
+이름순으로 마지막 VAE 가 이겨 고른 VAE 가 무시될 수 있습니다(거꾸로 선택의 VAE 가 값 중 하나면 `None` 칸에서 그 VAE 마저 빠짐).
+2.30 의 제자리 교체는 새 축 **`VAE ("state_dict" only)`**(cost 0.3 — 같은 계열 VAE 를 빨리 바꿀 때)로 옮겨 갔습니다.
+
+sam-extra 는 기본 `VAE` 축을 **같은 자리에서 바꿔 끼웁니다** — 이름 `VAE`, 목록 위치, 값 후보와 `None`, cost 0.7, 칸 라벨
+`VAE: <파일>` 은 그대로라 저장해 둔 XYZ 설정과 infotext 의 `Y Type: VAE` 도 그대로 맞습니다. 어느 판의 동작인지는 Forge 의 축이
+무엇을 쓰는지(`sd_vae` 인지, 모듈 목록인지)로 알아봅니다. Forge 2.30 에서는 칸마다:
 
 - **같은 형식**(파일의 텐서 이름 · 모양이 모델의 VAE 와 똑같음): Forge 의 방식 그대로 — 모델은 그대로 두고 VAE 만 바꿉니다(Forge
   함수 호출 하나하나까지 기본 축과 같음).
@@ -512,12 +542,24 @@ sam-extra 는 이 축을 **같은 자리에서 바꿔 끼웁니다** — 이름 
   때, 또는 불러온 모델이 그 칸의 모델이 아니고 모델이 만들어질 VAE 가 pickle 이거나 Forge 가 먼저 형식을 바꾸는 diffusers · Flux 2 형식
   파일일 때 — 는 Forge 기본 동작 그대로입니다. **고른** 파일이 diffusers · Flux 2 형식이면 텐서 이름이 모델의 VAE 와 달라 Forge 의
   교체가 실패하므로, 다른 형식의 VAE 처럼 그 칸만 그 파일로 모델을 다시 불러옵니다(Forge 의 로더가 형식을 바꿈).
+- **Forge 2.31**: Forge 가 칸의 목록을 쓰고 나면 그 목록을 **그리드가 시작한 목록에서 VAE 만 그 값으로 바꾼 것**으로 다시 씁니다
+  — VAE / Text Encoder 드롭다운에서 그 파일을 고른 것과 같고, 고른 VAE 가 그 칸의 유일한 VAE 입니다. `None` 은 선택의 VAE
+  그대로입니다(선택에 VAE 가 없으면 체크포인트에 든 VAE). 그리드가 시작한 목록은 API 호출자가 `override_settings` 에 준 목록, 없으면
+  첫 칸에서 읽은 드롭다운 목록이고, 모든 칸의 출발점으로 남습니다 — Forge 2.31 은 config.json 에 모듈 목록이 아직 없을 때(VAE / Text
+  Encoder 를 한 번도 고르지 않은 경우)나 API 호출자가 `override_settings_restore_afterwards=False` 를 보냈을 때 앞 칸의 목록을 설정에
+  남기지만, 뒤 칸은 그 목록에서 출발하지 않습니다. 그래서 그리드 도중 드롭다운을 바꿔도 이 축의 남은 칸에는 반영되지 않습니다(보통은
+  Forge 2.31 도 칸이 끝날 때 칸 전의 목록을 설정에 되돌려 놓습니다). 다시 쓰다 실패하면 Forge 의 목록 그대로 그리고 콘솔에
+  `[XYZ VAE] setting the cell's VAE failed - Forge's own list is used` 를 남깁니다. 위의 판정 · 제자리 교체는 2.31 에서는 할 일이
+  없습니다.
+- **`VAE ("state_dict" only)`**(Forge 2.31): sam-extra 는 이 축을 바꿔 끼우지 않습니다. 같은 계열 VAE 전용이라, 모델의 VAE 와
+  형식이 다른 VAE 는 Forge 의 엄격한 로드가 실패해 2.30 의 기본 축처럼 검은 칸이 됩니다. `[Modules] Text Encoder` 축과는 그대로
+  섞입니다.
 - **기록**: 각 이미지 infotext 의 `Module N` 은 그 칸에서 실제로 쓴 목록(바꾼 VAE 포함)입니다. 그리드 이미지의 `Module N` 은 원래
   선택입니다(기본 축과 같음).
 - **다른 축과 함께**: `[Modules] Text Encoder` 축과 X · Y · Z 어디에 두든 칸마다 두 값이 함께 적용됩니다(형식이 다른 VAE 면 인코더를
   바꾼 목록에서 VAE 까지 바꿔 한 번 불러옴). `Checkpoint name` 축과도 섞을 수 있습니다.
 - **시간**: 형식이 다른 칸은 모델을 다시 불러오므로 체크포인트 축의 칸처럼 시간이 듭니다(같은 VAE 가 이어지는 칸은 다시 불러오지
-  않음). 그리드가 다른 VAE 로 끝났으면 다음 일반 생성이 원래 모델을 한 번 다시 불러옵니다.
+  않음). Forge 2.31 의 기본 축은 Forge 가 칸마다 모델을 다시 불러옵니다. 그리드가 다른 VAE 로 끝났으면 다음 일반 생성이 원래 모델을 한 번 다시 불러옵니다.
 
 ---
 
@@ -766,6 +808,9 @@ adapter를 설치합니다. 현재 선택한 ANIMA 체크포인트의 실제 DiT
 - 강도(`<lora:x:0.7>`)는 네 방식 모두 Forge 처럼 `W₀ + s·(W_dora − W₀)` 로 섞습니다(0 이면 LoRA 없음). LyCORIS
   라이브러리 자체의 multiplier 는 ΔW 를 늘 100% 넣고 크기 보정만 보간해서 강도 0 에서도 ΔW 가 남는데, 이 동작은
   따르지 않습니다.
+- **MOSS-Image (Forge 2.31)**: 이 아코디언은 모델을 가리지 않아 MOSS LoRA(LoKr + DoRA 등)에도 걸립니다. 출력 축 DoRA 파일
+  (`wd_on_output=True`)은 순정이 `‖W₀‖` 로 나눠 레이어마다 LoRA 변화량의 약 1\~3 % 가 학습 식과 다르고(CPU fp32 측정),
+  **LyCORIS** 가 학습 식입니다. 입력 축 파일은 정밀도만 다릅니다.
 
 ### 끼워 넣은 블록 (상향 블록 변환)
 
@@ -828,6 +873,10 @@ adapter를 설치합니다. 현재 선택한 ANIMA 체크포인트의 실제 DiT
   잡에서는 돌지 않습니다).
 - fp32 계산은 레이어 하나씩 잠깐 fp32 사본을 만듭니다(8192×2048 레이어 기준 약 200 MB). 일반 경로에서는 결과를
   fp32 로 넘겨 Forge 가 저장 dtype 으로 한 번만 반올림합니다. fp32 계산이 OOM 이면 그 레이어만 순정으로 합칩니다.
+- 오프셋 패치(한 가중치의 일부 행에만 거는 LoRA — 합쳐진 qkv 를 가진 MOSS 체크포인트(Forge 2.31), Flux · Chroma · Z-Image 의
+  diffusers 형식 q/k/v, Qwen-Image 2.1 의 `gate_up`)는 Forge 가 반환값을 버리므로 결과를 그 조각에 제자리로 씁니다. v0.35.0
+  까지는 LyCORIS · Forge fp32 에서 이 조각의 DoRA 가 통째로 빠졌습니다(Forge 는 `torch.inference_mode` 안에서
+  합치는데, v0.35.0 의 조각 판별이 그 안에서는 조각을 일반 버퍼로 잘못 봄). 이제는 조각을 저장소로 알아보고, 결과를 늘 버퍼에도 제자리로 써 둡니다.
 - Low VRAM·온라인 LoRA(GGUF 등) 경로는 매 forward 마다 합치므로 fp32 방식의 비용이 스텝마다 들고, ΔW 는 이미
   bf16/fp16 으로 계산된 채 넘어와 노름·스케일만 fp32 입니다. 콘솔에 레이어 수와 합친 횟수가 따로 나옵니다.
 - infotext 에 `DoRA mode: LyCORIS` / `Forge fp32` / `No magnitude`, `DoRA inserted: additive` / `skip` / `weak 0.12 attn` 을 남기고 PNG Info 붙여
@@ -1052,8 +1101,8 @@ Anima(Qwen·Wan VAE)로 만든 이미지에 생기는 **VAE 격자 무늬**를
 - Settings → Postprocessing 에서 Extras 의 Upscale 을 txt2img·img2img 탭에 켰다면 DeGrid 가 그보다 **먼저** 돕니다
   (`metadata.ini` 콜백 순서 — 확대하면 격자 간격이 달라짐). Extras 항목의 이름은 **Anima VAE DeGrid (NAFNet, Extras)** 로
   생성 탭 아코디언과 달라 API 이름이 겹치지 않지만, 그것을 메인 탭에도 켜면 두 번 적용되니 켜지 마세요.
-- Forge 2.30 의 Extras 에는 Forge 자체 **DeGrid**(`scripts/degrid.py`, NAFNet 이 아닌 픽셀 격자 필터, **기본 켬**)가 따로
-  있습니다. Extras 에서 둘 다 켜면 격자 제거가 두 번 적용되고, 이 확장의 항목이 먼저 돕니다(둘 다 순서 900 이라 Forge 가 이름순으로
+- Forge 2.30 부터 Extras 에는 Forge 자체 **DeGrid**(`scripts/degrid.py`, NAFNet 이 아닌 픽셀 격자 필터 — Forge 2.30.x 는
+  **기본 켬**, 2.31 부터 **기본 끔**)가 따로 있습니다. Extras 에서 둘 다 켜면 격자 제거가 두 번 적용되고, 이 확장의 항목이 먼저 돕니다(둘 다 순서 900 이라 Forge 가 이름순으로
   정함). Settings → Postprocessing 에서 Forge 의 DeGrid 를 txt2img·img2img 에도 켜면 생성 탭에서도 두 번 적용됩니다. 한쪽만 쓰려면
   다른 쪽을 끄세요.
 - img2img 인페인트('Inpaint only masked' 포함)는 합성한 전체 이미지에 적용합니다 — 마스크 밖 원본도 지나가지만, 격자가
@@ -1531,7 +1580,7 @@ API: `alwayson_scripts["Anima SPEED"] = {"args": [true, "transition", "neo_shift
 |---|---|---|
 | krea2 | Wan21 | Anima, Qwen-Image, Krea 2, Wan 2.1 |
 | zimage | Flux | Flux, Chroma, Lumina 2, Z-Image |
-| flux2 (포크) | Flux2 | Flux 2 Klein 4B/9B, ERNIE-Image |
+| flux2 (포크) | Flux2 | Flux 2 Klein 4B/9B, ERNIE-Image, MOSS-Image(Forge 2.31 — 생성은 확인하지 않음) |
 | 없음 | SD15, SDXL 등 | **Contrast 와 Color Shift 만** — 나머지(노출·색·디테일·Chroma Plus·마스크)는 꺼지고 status 에 이유 |
 
 ### 사용
@@ -1880,6 +1929,14 @@ Modulation Guidance를 쓰려면 768차원 CLIP-L safetensors를
 `Anzhc Noobai11 CLIP L Anime.safetensors`). CLIP 파일 자체는 자동 다운로드하지 않으며,
 공식 `yresearch/cosmos-pooled` 어댑터만 첫 활성화 때
 `models/anima_modulation_guidance/`로 자동 다운로드·무결성 검증합니다.
+
+**MOSS-Image 에서 (Forge 2.31)**: Forge 2.31 은 MOSS 전용 **Skip Layer Guidance** 를 늘 켜진 내장 스크립트로 둡니다
+(Settings → Stable Diffusion → "[Moss-Image] Enable Skip Layer Guidance", **기본 켬**, 레이어 22, 처음 0\~50 % — infotext
+`Skip Layer Guidance`). 그 구간에서는 uncond 를 22번 블록을 건너뛰고 따로 돌리므로, MOSS 에서도 켜지는 이 확장의 CFG 쪽 기능 —
+Skimmed CFG · APG/SMC/CWM · Colorcraft · CFG++ 샘플러 — 은 **SLG 로 바뀐 uncond** 위에서 계산됩니다. 효과를 비교할 때는 Forge 의
+SLG 를 끈 결과와도 보세요. Adaptive Guidance 는 cond · uncond 가 한 호출에 있어야 uncond 를 뺄 수 있어 그 구간에서는 아무것도
+생략하지 못합니다(메시지 없음 — 기본 `Skip after=0.5` 에서는 겹치는 스텝이 거의 없고, 더 일찍 시작하게 하면 그만큼 절약이 줄어듦).
+이 확장의 PAG · SEG · SLG 는 Anima 에서만 돌므로 레이어 건너뛰기가 겹치지 않습니다.
 
 ### 오케스트레이터 순서
 
@@ -2347,6 +2404,11 @@ claude mcp add --scope user -e FORGE_URL=http://127.0.0.1:7861 -e SAM_EXTRA_MCP_
   (`masterpiece, best quality`, `score_*`) 때문에 Illustrious · Pony 로 읽히지 않습니다. 공백으로 쓴 Anima 태그
   (`short hair, black hair, 1boy`)도 태그 프롬프트로 셉니다.
 - Anima 3.8B 의 `qwen35_4b`·`Anima-3.8B-expanded_adapter` 를 모듈 목록에 넣어 둬도 '다른 프리셋에서 남은 모듈'로 경고하지 않습니다.
+- Forge 의 `qwen21`(Qwen-Image-2.1) · `moss`(MOSS-Image, Forge 2.31) 프리셋을 압니다 — Forge 와 같은 기본값(`moss`: Euler · Simple ·
+  50 스텝 · CFG 3 · shift 5, `qwen21`: Euler · Simple · 32 스텝 · CFG 2.5), 자연어 방언(`moss` 는 Forge 의 JSON Builder 탭이 쓰는 JSON
+  레이아웃 프롬프트도), 필요 모듈과 내려받기(`moss`: Comfy-Org/MOSS-Image 의 Flux.2 VAE · Qwen3.5 9B). MOSS 의 Qwen3.5 9B 는 Forge
+  가 `model.language_model.*` 키 형식만 읽는데 모듈 확인은 파일 이름만 보므로, OpenMOSS 공식 `text_encoder` 를 합친 파일도 '있음'
+  으로 나옵니다 — 그 파일은 Forge 에서 불러오지 못합니다(XYZ Plot 축의 `[Modules] Text Encoder` 절).
 - 내려받기는 받은 크기와(허깅페이스가 알려 주면) SHA256 이 맞을 때만 파일을 남기고, 있는 파일은 덮어쓰지 않습니다.
 - `/sdapi/v1/cmd-flags`(실행 인자 — `--api-auth` 비밀번호 포함)는 부르지 않습니다.
 - img2img 의 `init_image` 는 이 PC 의 파일만 받습니다. `\\서버\공유\...` 같은 네트워크 공유·장치 경로는 파일을 건드리기 전에
