@@ -3,18 +3,20 @@
 버전 태그는 GitHub Releases에도 발행됩니다. 아래는 요약이며, guidance/속도 기능의
 상세는 [docs/GUIDANCE.md](docs/GUIDANCE.md)를 참고하세요.
 
-## Unreleased — TSM LoRA (시간 단계 전문가) 읽기
+## v0.35.0 — TSM LoRA (시간 단계 전문가 · 실험) · TSM-LoKr 읽기 · 가벼운 LoRA 목록 (/sam3-lora/lite)
 
-아직 버전을 올리지 않은 변경입니다. LyCORIS `algo=tsm` 으로 학습한 LoRA(`ss_saved_format=tsm-native`)를 Anima 에서 학습과
-같은 식으로 돌립니다. 지금까지 Forge 는 이 파일의 키를 몰라 'LoRA mismatch' 로 통째로 건너뛰었습니다. 기존 스크립트 인자 ·
-infotext · 설정 키 · XYZ 축은 그대로이고, TSM 파일이 없는 생성은 바뀌지 않습니다. CPU 에서 학습 쪽 LyCORIS(+ sd-scripts 포크의
-패치)와의 일치를 확인했고, `algo=tsm` 파일은 2026-10-23\~24 시험용 Forge 의 GPU 에서도 생성 · 속도 · 하이레스 해제를
-확인했습니다(TSM 없는 생성 대비 비용 1단계 약 −11%, 2단계 약 −19%). TSM-LoKr 의 GPU 생성은 아직 확인하지 않았습니다.
+2026-10-24. 시간 단계 전문가 LoRA 를 Forge 에서 쓰는 판입니다. LyCORIS `algo=tsm` 으로 학습한 LoRA(`ss_saved_format=tsm-native`)와
+sd-scripts 포크(UR-al/sd-scripts `moss-image`)의 `algo=tsm-lokr` 파일을 Anima 에서 학습과 같은 식으로 돌립니다 — 지금까지 Forge 는
+이 파일의 키를 몰라 'LoRA mismatch' 로 통째로 건너뛰었습니다. 그리고 LoRA 목록을 이름 · 경로 · 트리거 재료만으로 돌려주는 가벼운
+라우트 `GET /sam3-lora/lite` 를 더했습니다(AI Studio Pro 앱과 이 확장의 MCP 서버가 씁니다). 기존 스크립트 인자 · infotext · 설정 키 ·
+XYZ 축은 그대로이고, TSM 파일이 없는 생성은 바뀌지 않습니다. CPU 에서 학습 쪽 LyCORIS(+ sd-scripts 포크의 패치)와의 일치를
+확인했고, `algo=tsm` 파일은 2026-10-23\~24 시험용 Forge 의 GPU 에서도 생성 · 속도 · 하이레스 해제를 확인했습니다(TSM 없는 생성
+대비 비용 1단계 약 −11%, 2단계 약 −19%). TSM-LoKr 의 GPU 생성은 아직 확인하지 않았습니다.
 
 **업그레이드할 때**
 
-- Forge 를 **완전히 다시 시작**하세요 — 새 `sam3ext/tsm_lora/` 패키지와 바뀐 `sam3ext/unload_registry.py` ·
-  `sam3ext/layout_lanes.py` 는 Reload UI 로 읽히지 않습니다.
+- Forge 를 **완전히 다시 시작**하세요 — 새 `sam3ext/tsm_lora/` 패키지 · `sam3ext/lora_lite.py` 와 바뀐 `sam3ext/unload_registry.py` ·
+  `sam3ext/layout_lanes.py` · `scripts/lora_manager.py`(라우트 등록, 앱 시작 때)는 Reload UI 로 읽히지 않습니다.
 - 프롬프트의 `<lora:…>` 에 TSM 파일이 있으면 이제 **아코디언을 꺼 두어도 적용됩니다**(전에는 Forge 가 건너뛰어 아무 효과가
   없었습니다). 빼고 비교하려면 아코디언의 단계 계산을 **끔**으로 두세요.
 
@@ -85,7 +87,7 @@ infotext · 설정 키 · XYZ 축은 그대로이고, TSM 파일이 없는 생�
   비트 단위. `tests/test_tsm_lora_script.py`: 인자 6개 · 붙여 넣기 · 아코디언 TSM-LoKr 파일 적용과 뒷정리.
 - TSM-LoKr 파일의 실제 Forge GPU 생성 · 속도 · VRAM 은 아직 확인하지 않았습니다.
 
-### 문서 · 테스트
+### 문서 · 테스트 — TSM
 
 - README **별도 기능: TSM LoRA (시간 단계 전문가)** 와 목차 링크.
 - `tests/test_tsm_lora.py`: σ→t(float32 곱 · 짝수 쪽 반올림) · 전문가 경계(n = 2 · 4 · 8 · 25 · 50 · 100, t 0\~1000 전부) ·
@@ -105,8 +107,6 @@ infotext · 설정 키 · XYZ 축은 그대로이고, TSM 파일이 없는 생�
   (디스패치 스파이), 평균 재사용은 같은 살아 있는 객체만(복사본 · 제자리 수정 · 풀린 텐서 제외) · 같은 게이트, 스텁 DiT 에서 블록마다
   3번 재사용, release 뒤 장치 참조가 남지 않음, 샘플러 감싸기(중단 · 예외에도 해제). 기준 출력(`SAM3_TSM_REF_DIR`)을 훅 경로로도 대조.
 - `tests/test_layout_lanes.py` · `tests/test_unload_models.py` 에 새 항목.
-
-## Unreleased — 가벼운 LoRA 목록
 
 ### 가벼운 LoRA 목록 — `GET /sam3-lora/lite` (새 라우트)
 
@@ -147,12 +147,7 @@ Forge 의 `GET /sdapi/v1/loras` 는 LoRA 마다 safetensors 헤더의 메타데�
 답이면 예전처럼 `/sdapi/v1/loras` 로 돌아가고, 결과는 어느 쪽이든 같습니다. `loras` · `lora_info` 와 `capabilities` 의 LoRA
 요약은 제목 · 베이스 모델 · network dim · 합산한 태그 개수가 필요해 계속 `/sdapi/v1/loras` 를 읽습니다.
 
-**업그레이드할 때**
-
-- Forge 를 **완전히 다시 시작**하세요 — 새 모듈 `sam3ext/lora_lite.py` 와 라우트 등록(`scripts/lora_manager.py`, 앱 시작 때)은
-  Reload UI 로는 읽히지 않습니다.
-
-### 테스트
+### 테스트 — 가벼운 LoRA 목록
 
 - `tests/test_lora_lite.py`: 필드 규칙(JSON 문자열 · dict · 없는 메타데이터 · 같은 개수 · 32개 제한 · 비교할 수 없는 개수 ·
   글자가 아닌 activation text), 메모와 다시 스캔(동시에 온 `?refresh=1` 은 하나씩), 라우트(`?refresh=1` · 503 · 인증 · 한 번만
