@@ -592,7 +592,7 @@ class RegistryTests(unittest.TestCase):
     def test_builtin_hooks_in_order(self):
         self.assertEqual([row[0] for row in ur.BUILTIN_HOOKS], [
             "sam3", "face_detect", "anima38", "anima_ipa", "vae_degrid", "tipo", "modulation", "colorcraft",
-            "speed_dct", "hiflow_mask", "history_dct"])
+            "speed_dct", "hiflow_mask", "history_dct", "tsm_lora"])
         registry = ur.UnloadRegistry(ur.BUILTIN_HOOKS)
         self.assertEqual([(h.key, h.label) for h in registry.hooks()], [(row[0], row[1]) for row in ur.BUILTIN_HOOKS])
 

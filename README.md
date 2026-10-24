@@ -41,7 +41,8 @@ speckle↓·skin/hair 정리(`scripts/anima_vae_2x.py`). Qwen/Wan VAE latent 공
   [얼굴 안에서만 찾기](#얼굴-안에서만-찾기-face-crop) ·
   [진행률 / 검증](#진행률--검증) · [XYZ Plot 축](#xyz-plot-축) · [Settings 저장](#settings-저장)
 - 별도 기능: [ANIMA LoRA 블록 호환 변환](#별도-기능-anima-lora-블록-호환-변환) ·
-  [DoRA 추론 방식](#별도-기능-dora-추론-방식) · [Anima VAE DeGrid](#별도-기능-anima-vae-degrid-nafnet) ·
+  [DoRA 추론 방식](#별도-기능-dora-추론-방식) · [TSM LoRA (시간 단계 전문가)](#별도-기능-tsm-lora-시간-단계-전문가) ·
+  [Anima VAE DeGrid](#별도-기능-anima-vae-degrid-nafnet) ·
   [Extra Schedulers](#별도-기능-extra-schedulers) · [Extra Samplers](#별도-기능-extra-samplers-샘플러-18종) ·
   [샘플러 · 스케줄러 목록 순서](#별도-기능-샘플러--스케줄러-목록-순서-계열별) ·
   [Anima SPEED (저해상도 선행 샘플링)](#별도-기능-anima-speed-저해상도-선행-샘플링) ·
@@ -827,6 +828,136 @@ adapter를 설치합니다. 현재 선택한 ANIMA 체크포인트의 실제 DiT
 - Forge 본체 파일은 고치지 않습니다. 어댑터 모듈마다 `from .base import weight_decompose` 로 복사된 함수를
   lora·lokr·loha·glora 모듈에서 바꿔 끼웁니다. OFT·BOFT 는 alpha 자리에 OFT 제약을, OFTv2 는 강도를 넘겨서
   제외합니다.
+
+---
+
+## 별도 기능: TSM LoRA (시간 단계 전문가)
+
+> ⚠️ **실험 기능** — CPU 에서 학습 식과의 일치만 확인했습니다. 실제 Forge 의 GPU 생성 확인은 아직 하지 않았습니다.
+
+**TSM**(LyCORIS `algo=tsm`, *TimeStep Master*)은 대상 레이어마다 시간 구간별 LoRA 전문가 여러 개를 두고, 샘플링 스텝의
+σ 로 쓸 전문가를 고르는 LoRA 입니다. 파일(`ss_saved_format=tsm-native`)의 키는 `experts.S.I.up/down`·`router_fc`·
+`timestep_embed` 라서 Forge 의 LoRA 로더가 알아보지 못합니다 — `alpha` 만 읽고 나머지 95% 가 남아 'LoRA mismatch' 로
+파일 전체를 건너뜁니다. sam-extra 가 이 파일을 대신 읽어, 샘플링 스텝마다 대상 Linear 의 출력에 그 스텝의 Δ 를
+더합니다(LyCORIS bypass 와 같은 자리). 전문가가 스텝마다 바뀌어 가중치에 한 번 합칠 수 없기 때문입니다.
+
+### 쓰는 법
+
+- 프롬프트에 다른 LoRA 처럼 `<lora:파일이름:강도>` 로 적으면 됩니다. **TSM LoRA** 아코디언을 꺼 두어도 적용됩니다
+  (켜기 전에는 Forge 가 건너뛰던 파일입니다). TSM 키와 일반 LoRA 키가 섞인 파일은 TSM 키만 떼고 나머지는 Forge 가
+  그대로 읽습니다.
+- 아코디언의 **TSM 파일** 칸은 프롬프트에 적지 않고 하나 더 걸 때 씁니다(🔄 로 목록을 다시 읽음). 목록은 Forge LoRA
+  폴더(`models/Lora` · `--lora-dirs`)에서 메타데이터가 TSM 이라고 하는 파일과, 메타데이터가 없는 파일 중 키가 TSM 인
+  파일입니다. 같은 파일이 프롬프트에도 있으면 프롬프트 쪽 강도만 씁니다.
+- 일반 LoRA 와 함께 써도 됩니다. Forge 의 LoRA 는 가중치에 합쳐지고(온라인·lowvram 이면 Linear 안에서) TSM 은 그 Linear
+  출력에 Δ 를 더하므로, 학습 때처럼 둘이 더해집니다.
+- 하이레스·img2img 패스마다 그 패스의 LoRA 묶음으로 다시 겁니다. img2img 의 부분 잡음 제거는 낮은 σ 에서 시작하므로
+  그 구간의 전문가가 자동으로 쓰입니다.
+
+### 계산 (학습과 같은 식)
+
+```
+t        = round(q(fp32(σ) · 1000))              # 학습기의 timesteps = (sigmas·1000).to(학습 dtype), 파이썬 round, [0, 1000]
+idx_s(t) = clamp(ceil(t / T · n_s), 1, n_s) − 1  # 기본 tsm_n_scales [8, 1]: 코어 8개 + 문맥 1개
+1단계:  Δ = scale · 강도 · Σ_s E_{s, idx_s(t)}(x)
+2단계:  Δ = scale · 강도 · ( E_{0, idx_0(t)}(x) + Σ_j g_j · E_{j, idx_j(t)}(x) )
+        g = router_fc(그 샘플 입력의 평균) + timestep_embed[t − 1]   # 시그모이드 없음
+```
+
+- Forge 의 Anima 는 DiT 에 σ 를 그대로 넘깁니다(`PredictionDiscreteFlow` multiplier 1.0). 그래서 스케줄러의 shift 와
+  상관없이 실제 잡음 세기로 전문가를 고릅니다. 코어 8개의 경계는 t 125 / 250 / … / 875 입니다.
+- σ·1000 은 float32 로 곱합니다(학습기와 같음 — 예: σ 0.1255 는 125, double 로 곱하면 126).
+- 그 값을 학습 때 거친 dtype `q` 로 한 번 더 반올림합니다. sd-scripts 는 timesteps 를 weight_dtype 으로 돌려주므로
+  메타데이터 `ss_mixed_precision` 이 `bf16` 이면 bf16(512 이상에서 4 단위), `fp16` 이면 fp16, 그 밖이면 반올림하지 않습니다.
+  bf16 으로 학습한 2단계 파일은 `timestep_embed` 의 절반쯤 되는 행이 한 번도 학습되지 않고 0 으로 남으므로, 이 반올림을
+  빼면 스텝의 절반가량에서 학습 때 보지 못한 게이트가 나옵니다. 1단계에서도 구간 경계(±2) 근처에서 전문가가 갈립니다.
+- 단계는 메타데이터 `ss_network_args.tsm_stage` 를 따르고, 없으면 라우터가 0 이 아닌 파일만 2단계로 봅니다. 1단계
+  파일의 라우터·시간 임베딩은 정확히 0 이라, 1단계 파일을 2단계 식으로 돌리면 문맥 전문가가 빠집니다(비교용으로
+  아코디언에서 고를 수 있음).
+- 2단계 라우터 평균은 **샘플별**(기본)입니다. 학습은 배치 1 이었으므로, Forge 가 cond·uncond 를 한 배치로 묶어도
+  따로 돌린 것과 같은 값이 나옵니다. **배치 전체**는 LyCORIS forward 가 같은 t 의 샘플을 함께 평균하던 방식입니다
+  (랜덤 입력에서 10\~19% 다름).
+- 계산은 그 구간의 활성 전문가(스케일마다 하나)를 이어 붙인 down·up 한 쌍으로 합니다. 이어 붙인 텐서만 GPU 에
+  올리고 구간이 바뀔 때(전체 스케줄에서 8번) 다시 만듭니다. 2.9B 파일(640 모듈, rank 8)에서 bf16 으로 약 100 MB 이고,
+  Forge 메모리 관리에 그만큼과 Linear 호출 하나의 임시 텐서(중간값, 제자리로 못 더할 때의 새 출력)만큼 더 남겨 두라고
+  알립니다. 이 사본은 새 샘플링 패스가 시작될 때 앞 패스의 것을, 그 패스의 샘플링이 끝나면(샘플러의 `launch_sampling` 이
+  돌아올 때 — 하이레스 패스 안의 디코드, 1차 패스 뒤 업스케일러용 디코드, 마지막 디코드보다 먼저) 남은 것을 놓습니다.
+  하이레스 패스는 다시 만듭니다. DiT forward 가 예외로 끝나도(OOM 등) 그 자리에서 놓습니다.
+- Δ 는 Linear 출력에 제자리로 더합니다(`out.addmm_(x·downᵀ, upᵀ, alpha = scale·강도)` — Δ 텐서를 따로 만들지 않고, GEMM 이
+  fp32 로 모은 값을 한 번만 반올림). 2단계 게이트는 중간값의 문맥 조각에 곱합니다. 라우터 입력 평균은 입력의 fp32 사본을
+  만들지 않고, 같은 입력을 받는 self_attn q·k·v 와 cross_attn k·v 는 평균을 한 번만 냅니다. 시간 구간과 전문가 번호는
+  DiT 호출마다 한 번만 셉니다(호스트 동기화도 DiT 호출마다 timestep 을 읽는 한 번).
+- 강도 0 인 TSM 은 훅을 걸지 않습니다(꺼 둔 것과 같은 결과).
+
+### 2단계 학습
+
+sd-scripts 포크로 1단계 파일을 만든 뒤, 같은 설정(`algo=tsm`, 같은 preset · dim · alpha · `tsm_n_scales`)에
+`network_args` 로 `tsm_stage=2` 를 주고, 1단계 파일을 `--network_weights` 로 넘겨 다시 학습합니다(`--resume` 이
+아님 — 포크가 로그로 알려 줍니다). `--lycoris_algo_fixes` 도 켭니다. 2단계에서는 `router_fc` 와 `timestep_embed` 만
+학습되고 전문가는 고정된 채 그대로 저장됩니다. 라우터가 0 에서 시작하므로 0 스텝의 2단계 샘플은 "코어 전문가만"
+그림입니다.
+
+### TSM-LoKr (전문가가 LoKr + DoRA)
+
+sd-scripts 포크의 `algo=tsm-lokr`(`--lycoris_algo_fixes`) 파일도 같은 방법(프롬프트 `<lora:…>` 또는 아코디언 파일)으로
+겁니다. 시간 구간 전문가가 LoRA 가 아니라 LoKr(크로네커 곱, 예: factor 4 · full matrix)이고, DoRA 크기 `dora_scale`
+(출력 축) 하나를 모든 전문가가 같이 씁니다. 파일은 `ss_lycoris_algo=tsm-lokr` · `ss_saved_format=tsm-lokr-native` 와
+메타데이터 `ss_tsm_lokr`(JSON v1 — 단계 · 시간 dtype · factor · DoRA 축)를 꼭 가져야 합니다. 없거나 맞지 않으면(모르는 버전,
+입력 축 DoRA, bottleneck 라우터, factor 와 다른 인자 모양 …) 한국어 / 영어 이유로 그 파일만 건너뜁니다.
+
+```
+K_e = s_e · kron(w1_e, w2_e)        # s_e = 1 (w1·w2 가 둘 다 꽉 찬 행렬), 아니면 alpha / rank
+D(V) = V · m / (‖V‖_행 + eps)        # fp32, eps = fp32 기계 엡실론, m = dora_scale
+1단계:  W' = D(W + K_코어 + Σ K_문맥)
+2단계:  W'_b = D(W + K_코어 + Σ g_b · K_문맥)   # g_b = 샘플별 라우터 게이트(LoRA 전문가 TSM 과 같은 식)
+강도 μ: W + μ·(W' − W)               # Forge 블렌드 — μ = 0 이면 W 그대로
+```
+
+- DoRA 노름이 병합 가중치 전체에 걸리므로 출력에 Δ 를 더하는 식으로는 계산할 수 없습니다. Forge Linear 의
+  `weight_function`(Forge 가 on-the-fly LoRA 에 쓰는 자리)에 그 구간의 병합 가중치를 만드는 함수를 붙입니다 — 인스턴스
+  목록 끝에만 붙이고 Forge 의 클래스 목록은 건드리지 않으며, 그 패스의 샘플링이 끝나면(VAE 디코드 전) · 생성이 끝나면 뗍니다.
+  노름은 Forge 가 넘긴 가중치(앞에 합쳐진 일반 LoRA 포함)로 학습과 같은 fp32 식으로 셉니다(Forge 순정 DoRA 의 `‖W₀‖` 가 아님).
+  1단계는 이것으로 끝이고, 2단계는 출력 훅이 문맥 전문가 항(가중치를 만들지 않는 크로네커 곱 행렬곱)과 샘플별 행 스케일을
+  더합니다(`‖W + C + gX‖² = a + 2gb + g²c` — a·b·c 는 모듈 · 코어 구간마다 한 번). 출력 쪽 계산은 fp32 로 모아 한 번만
+  반올림합니다. `weight_function` 이 없는 Linear 는 출력 훅만으로 같은 값을 냅니다(어느 길인지 콘솔에 한 줄).
+- GPU 에는 지금 구간의 코어 전문가와 문맥 전문가(파일 dtype)만 둡니다 — 2.9B · factor 4 에서 약 0.7 GB, 2단계는 노름 항이
+  더해집니다. 구간이 바뀌면 코어 전문가를 바꿔 올립니다(스케줄 전체에서 8번).
+- **TSM-LoKr 병합 캐시**(아코디언, 기본 켬 — 프롬프트 `<lora:...>` 만 써도 켜짐): 지금 구간의 병합 가중치를 쥐고 구간이 바뀔 때만 다시 만듭니다. DiT 호출마다의
+  병합을 아끼는 대신 VRAM 을 대상 가중치만큼(2.9B 약 5.2 GB) 더 씁니다. 그 Linear 의 `weight_function` 에 우리 함수만 있을
+  때만 씁니다.
+- 한 Linear 에는 TSM-LoKr 하나만 걸립니다(두 번째 파일은 그 이유로 건너뜀). LoRA 전문가 TSM · 일반 LoRA 와는 함께 쓸 수
+  있습니다. 블록 수가 다른 모델에서 끼워 넣은 블록은 그대로 복제면 DoRA 크기까지 복사하고, 덧셈형 · 약한 복사는 크기 없이
+  `W + μ·ΔW_t` 입니다.
+- 텐서가 없는 Linear(GGUF 처럼 실수 가중치도 `weight_function` 도 없는 것)는 건너뛰고 개수를 콘솔에 남깁니다.
+
+### 블록 수가 다른 모델, 그 밖
+
+- 2.9B 에서 학습한 파일을 3.8B 에, 또는 Base 에 얹으면 **ANIMA LoRA 블록 호환 변환**의 표로 블록을 맞춥니다. 끼워 넣은
+  블록은 **DoRA 추론 방식**의 '끼워 넣은 블록' 정책을 따릅니다(그대로 복제 · 덧셈형은 같음, 넣지 않음, 약한 복사는
+  범위 안 모듈의 Δ 를 강도 배). 부분 파일은 블록 대응을 추측하지 않고 건너뜁니다.
+- Anima(Base · 2.9B · 3.8B) 전용입니다. 다른 모델에서는 콘솔에 남기고 건너뜁니다.
+- **ADetailer** 는 자기 패스에 넣을 always-on 스크립트를 파일 이름으로 고릅니다. ADetailer 패스에도 TSM 을 걸려면
+  ADetailer 설정의 스크립트 이름 목록(`ad_script_names`)에 `lora_tsm` 을 더하세요(이 확장의 SAM3 인페인트 · Refine 패스는
+  바깥 생성의 설정을 그대로 씁니다).
+- Anima Tile-Repair 의 내부 루프처럼 Forge 샘플러를 거치지 않는 DiT 호출에는 걸리지 않습니다. DiT 호출에 timestep 이
+  없으면 LyCORIS 처럼 마지막 전문가로 대신하지 않고 그 호출을 TSM 없이 돌립니다.
+- DiT 를 torch.compile 로 감싼 경우 스텝마다 바뀌는 훅 때문에 다시 컴파일될 수 있습니다(콘솔 경고).
+- **모델 내리기** 버튼이 읽어 둔 TSM 파일(최근 2개, CPU)과 GPU 사본을 놓습니다.
+
+| infotext | 값 | 언제 |
+|---|---|---|
+| `TSM LoRA` | `파일이름:강도` | 아코디언 파일을 썼을 때(붙여 넣으면 그 파일을 다시 고름) |
+| `TSM LoRA info` | `파일이름 s1 8+1 r8 x0.8; …` (TSM-LoKr 는 `s1 8+1 lokr f4 dora`) | TSM 을 적용했을 때(프롬프트 쪽 포함, 읽기용) |
+| `TSM stage` | `1` / `2` / `off` | 단계 계산을 자동에서 바꿨을 때 |
+| `TSM pooling` | `batch` | 라우터 입력 묶음이 배치 전체일 때 |
+| `TSM LoKr merge cache` | `off` | TSM-LoKr 병합 캐시를 끄고(기본은 켬) TSM-LoKr 파일을 썼을 때 |
+
+XYZ 축: `[TSM] Stage`(auto / 1 / 2 / off) · `[TSM] Router pooling`(sample / batch) · `[TSM] Strength`(아코디언 파일의
+강도 — 프롬프트 쪽은 Prompt S/R 로). 가중치를 다시 합치지 않아 값싼 축입니다.
+
+API(`alwayson_scripts["TSM LoRA"]`): 위치 인자 `[enabled, lora, strength, stage, pooling, lokr_merge_cache]` 또는
+`{"args": [{"enabled": true, "lora": "이름", "strength": 0.8, "stage": "auto", "pooling": "sample", "lokr_merge_cache": false}]}`
+(뒤의 인자는 빼도 됨).
 
 ---
 

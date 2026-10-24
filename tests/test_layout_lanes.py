@@ -48,7 +48,8 @@ class RegistryTests(unittest.TestCase):
             "anima-cfg-optimal-scale": "anima",
             "colorcraft": "anima",
             "sam3": "det", "adetailer": "det", "anima-vae-degrid": "det",
-            "lora-block-weight": "lora", "dora-infer-mode": "lora", "controlnet": "lora", "dynamic-prompting": "lora",
+            "lora-block-weight": "lora", "dora-infer-mode": "lora", "lora-tsm": "lora", "controlnet": "lora",
+            "dynamic-prompting": "lora",
             "dynamic-thresholding": "lora",
             "anima-ref-poc": "etc", "api-payload-display": "etc", "compile": "etc",
         }
@@ -56,9 +57,9 @@ class RegistryTests(unittest.TestCase):
             with self.subTest(key=key):
                 self.assertEqual(ll.REGISTRY[key].lane, lane)
 
-    def test_experimental_slots_are_vae_2x_speed_and_optimal_scale(self):
+    def test_experimental_slots_are_vae_2x_speed_optimal_scale_and_tsm(self):
         marked = {key for key, slot in ll.REGISTRY.items() if slot.exp}
-        self.assertEqual(marked, {"anima-vae-2x", "anima-speed", "anima-cfg-optimal-scale"})
+        self.assertEqual(marked, {"anima-vae-2x", "anima-speed", "anima-cfg-optimal-scale", "lora-tsm"})
 
     def test_unknown_extensions_fall_into_tools(self):
         self.assertEqual(ll.lane_for("some-new-extension"), "etc")
