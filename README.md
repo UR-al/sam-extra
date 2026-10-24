@@ -654,6 +654,16 @@ Manage 탭은 txt2img·img2img 의 extra-networks strip 에 하나씩 주입됩�
 `--gradio-auth` 로그인이 켜져 있으면 로그인 쿠키를, Forge 를 `--api`·`--nowebui` 와 `--api-auth` 로
 띄웠으면 그 HTTP Basic 자격 증명도 보내야 합니다(없거나 틀리면 401).
 
+**가벼운 LoRA 목록 `GET /sam3-lora/lite`** (외부 도구용): Forge 의 `/sdapi/v1/loras` 와 같은 LoRA 를 같은 순서로, safetensors
+메타데이터 없이 돌려줍니다 — `{"version": 1, "count": N, "items": [{"name", "alias", "path", "activation_text",
+"tag_frequency_top"}, ...]}`. `name` · `alias` · `path` 는 `/sdapi/v1/loras` 와 같고, `activation_text` 는 메타데이터의
+`activation text`(비었으면 `ss_activation_text`, 없으면 `""`), `tag_frequency_top` 은 `ss_tag_frequency` 를 데이터셋 순서대로
+`dict.update` 로 합쳐 개수 내림차순(같은 개수는 합친 순서)으로 앞 32개를 `[태그, 개수]` 로 담습니다. Forge 가 메모리에 든
+메타데이터로 만들어 LoRA 800개에서도 한 번에 1초 안쪽이고(전체 메타데이터를 싣는 `/sdapi/v1/loras` 는 같은 라이브러리에서
+143 MB · 5초), `?refresh=1` 을 붙이면 먼저 LoRA 폴더를 다시 스캔합니다(`POST /sdapi/v1/refresh-loras` 와 같음). 로그인 가드는
+위 두 라우트와 같지만 `/sdapi/v1/loras` 의 일부만 주므로 `X-SAM3-Notebook` 헤더는 필요 없습니다. MCP 서버는 LoRA 개수를 셀 때
+이 라우트를 먼저 쓰고, 없으면 `/sdapi/v1/loras` 로 돌아갑니다.
+
 ### 의존성 자동 설치
 
 확장 첫 로드 시 `install.py`가:

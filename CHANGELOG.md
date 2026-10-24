@@ -106,6 +106,61 @@ infotext · 설정 키 · XYZ 축은 그대로이고, TSM 파일이 없는 생�
   3번 재사용, release 뒤 장치 참조가 남지 않음, 샘플러 감싸기(중단 · 예외에도 해제). 기준 출력(`SAM3_TSM_REF_DIR`)을 훅 경로로도 대조.
 - `tests/test_layout_lanes.py` · `tests/test_unload_models.py` 에 새 항목.
 
+## Unreleased — 가벼운 LoRA 목록
+
+### 가벼운 LoRA 목록 — `GET /sam3-lora/lite` (새 라우트)
+
+Forge 의 `GET /sdapi/v1/loras` 는 LoRA 마다 safetensors 헤더의 메타데이터를 통째로 돌려줍니다. LoRA 809개(데이터셋 하위
+폴더)인 라이브러리에서 응답이 143 MB(`ss_datasets` 97 MiB · `ss_tag_frequency` 29 MiB)였고, Forge 의 메타데이터 캐시가 데워진
+상태에서 한 번에 5초, 캐시가 빈 새 데이터 폴더에서는 72초가 걸렸습니다(2026-10-24 측정). 이름과 트리거 몇 개만 쓰는
+클라이언트(AI Studio Pro 앱, 이 확장의 MCP 서버)도 그 값을 다 치렀습니다. 새 라우트는 같은 목록을 필요한 필드만으로 돌려줍니다.
+
+```json
+{"version": 1, "count": 1, "items": [
+  {"name": "styleA", "alias": "styleA_v2", "path": "D:/LoRA\\styleA\\styleA.safetensors",
+   "activation_text": "", "tag_frequency_top": [["1girl", 40], ["smile", 12]]}
+]}
+```
+
+- `name` · `alias` · `path` 와 항목 순서는 `/sdapi/v1/loras` 와 같습니다 — 그 라우트가 직렬화하는 바로 그 객체(내장
+  `sd_forge_lora` 의 `networks.available_networks`)를 같은 순서로 읽습니다.
+- `activation_text`: 메타데이터의 `activation text`, 비어 있으면 `ss_activation_text`, 둘 다 없으면 `""`. `/sdapi/v1/loras` 를
+  읽는 클라이언트가 고르는 값(`md.get("activation text", "") or md.get("ss_activation_text", "")`) 그대로이고, 그 값이 글자가
+  아니면(Forge 는 `{` 로 시작하는 값을 객체로 풉니다) `""` 입니다.
+- `tag_frequency_top`: `ss_tag_frequency`(JSON 문자열이든, Forge 가 이미 풀어 둔 dict 든)의 데이터셋별 태그 개수를 순서대로
+  `dict.update` 로 합친 뒤 개수 내림차순(같은 개수는 합친 순서 그대로)으로 앞 32개. 없으면 `[]`.
+- 그 밖의 메타데이터는 싣지 않습니다. 호출마다 파일을 읽지 않고 Forge 가 메모리에 들고 있는 메타데이터로 만들며, 태그 순위는
+  LoRA 마다 기억해 두었다가 Forge 가 다시 스캔해 새 객체를 만들 때만 다시 계산합니다. CPU 측정(가짜 LoRA 809개, 태그 빈도
+  14 MiB): 첫 호출 120 ms, 그다음부터 10 ms 이하 + JSON 인코딩 7 ms, 응답 0.5 MiB.
+- `?refresh=1` 은 먼저 LoRA 폴더를 다시 스캔합니다 — `POST /sdapi/v1/refresh-loras` 가 부르는 `networks.list_available_networks()`.
+  이 라우트에서 온 재스캔은 한 번에 하나씩 돌고(동시에 돌면 Forge 의 표를 비우고 다시 채우는 일이 섞입니다), 각 요청은 자기
+  재스캔이 끝난 목록을 받습니다.
+- 인증은 다른 sam-extra 라우트와 같은 로그인 가드(`--gradio-auth` 로그인, `--api`·`--nowebui` 일 때 `--api-auth`)입니다.
+  `/sdapi/v1/loras` 가 이미 주는 것의 일부만 주므로 `X-SAM3-Notebook: 1` 헤더는 요구하지 않습니다. 다만 Forge 는
+  `/sdapi/v1/loras` 를 로그인 가드 없이 붙이므로 이 라우트가 더 엄격합니다 — `--gradio-auth` 를 켠 Forge 에서 로그인 쿠키가 없는
+  외부 클라이언트(`--api-auth` 면 Basic 자격 증명이 없는 클라이언트)는 401 을 받고 `/sdapi/v1/loras` 로 돌아가야 합니다.
+  Forge 의 내장 LoRA 지원(`sd_forge_lora`)이 없으면 503 입니다.
+
+### MCP 서버 — LoRA 개수는 가벼운 목록에서
+
+`capabilities` 의 `counts.loras` 는 이제 `/sam3-lora/lite` 로 셉니다. 이 라우트가 없는 Forge(이전 sam-extra)나 다른 모양의
+답이면 예전처럼 `/sdapi/v1/loras` 로 돌아가고, 결과는 어느 쪽이든 같습니다. `loras` · `lora_info` 와 `capabilities` 의 LoRA
+요약은 제목 · 베이스 모델 · network dim · 합산한 태그 개수가 필요해 계속 `/sdapi/v1/loras` 를 읽습니다.
+
+**업그레이드할 때**
+
+- Forge 를 **완전히 다시 시작**하세요 — 새 모듈 `sam3ext/lora_lite.py` 와 라우트 등록(`scripts/lora_manager.py`, 앱 시작 때)은
+  Reload UI 로는 읽히지 않습니다.
+
+### 테스트
+
+- `tests/test_lora_lite.py`: 필드 규칙(JSON 문자열 · dict · 없는 메타데이터 · 같은 개수 · 32개 제한 · 비교할 수 없는 개수 ·
+  글자가 아닌 activation text), 메모와 다시 스캔(동시에 온 `?refresh=1` 은 하나씩), 라우트(`?refresh=1` · 503 · 인증 · 한 번만
+  등록), 그리고 Forge 의 실제 `sd_forge_lora` 코드(폴더 스캔 ·
+  `NetworkOnDisk` · `read_metadata_from_safetensors` · `/sdapi/v1/loras` 라우트)를 임시 폴더의 safetensors 헤더로 돌려 두 라우트를
+  항목마다 맞춰 봅니다(Forge 체크아웃이 없으면 그 부분만 건너뜀).
+- `tests/test_mcp_lora_lite.py`: MCP 클라이언트의 가벼운 목록 사용과 되돌아가기, `capabilities` 결과가 두 경우 같은지.
+
 ## v0.34.1 — 기본값 저장 뒤 Apply settings 되돌림 · 얼굴 crop 키우기(잘린 머리카락) · 저장 결과 줄 자리 · Tag Autocomplete 안내 넘침
 
 2026-10-13. v0.34.0 의 실제 확인(시험용 Forge 2.30-6)에서 찾은 네 가지를 고친 판입니다: **기본값 저장** 뒤 같은 페이지에서 누른

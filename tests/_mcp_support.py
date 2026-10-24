@@ -185,6 +185,9 @@ class FakeForge:
             {"model_name": "qwen_3_06b_base.safetensors", "filename": str(models / "text_encoder" / "qwen_3_06b_base.safetensors")},
         ]
         self.loras: list[dict] = []
+        # sam-extra's GET /sam3-lora/lite: None = not served (404, a Forge without it), True = built
+        # from self.loras the way sam3ext/lora_lite.py builds it (name/alias/path), or (status, body).
+        self.lite_loras: object = None
         self.requests: list[tuple[str, str, object]] = []
         self.queries: list[tuple[str, dict]] = []
         self.authorizations: list[str | None] = []  # the Authorization header of each request
@@ -236,6 +239,14 @@ class FakeForge:
             return httpx.Response(200, json=self.sd_modules)
         if route == ("GET", "/sdapi/v1/loras"):
             return httpx.Response(200, json=self.loras)
+        if route == ("GET", "/sam3-lora/lite") and self.lite_loras is not None:
+            if self.lite_loras is True:
+                items = [{"name": item.get("name", ""), "alias": item.get("alias", item.get("name", "")),
+                          "path": item.get("path", ""), "activation_text": "", "tag_frequency_top": []}
+                         for item in self.loras]
+                return httpx.Response(200, json={"version": 1, "count": len(items), "items": items})
+            status, body = self.lite_loras
+            return httpx.Response(status, json=body)
         if route == ("GET", "/sdapi/v1/samplers"):
             return httpx.Response(200, json=[{"name": "ER SDE"}, {"name": "Euler"}])
         if route == ("GET", "/sdapi/v1/schedulers"):

@@ -195,6 +195,8 @@ class LoraIndex:
             self._built_at = self._clock()
             self._history_revision = getattr(self._history, "revision", None)
 
+            # The full list, not client.lora_list(): entries read the title, base model, network dim
+            # and the summed training-tag counts from each header, none of which the light list carries.
             result = self._client.loras()
             if not result.ok:
                 self._error = result.error
