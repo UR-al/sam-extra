@@ -39,6 +39,26 @@ class TeSlotsTests(unittest.TestCase):
                 else:
                     self.assertEqual(xte.te_slots(h), frozenset(expected))
 
+    def test_qwen35_9b(self):
+        """Forge 2.31's Qwen3.5 9B branch (MOSS-Image) comes before the Gemma-2 / Qwen chain and asserts the width."""
+        h = fx.header(fx.CASES["qwen35_9b_with_qwen3_keys"][0])
+        self.assertEqual(xte.classify_header("qwen3.5_9b_moss.safetensors", h), Kind("te", ("qwen35_9b",)))
+        h = fx.header(fx.CASES["qwen35_other_width"][0])
+        kind = xte.classify_header("qwen3.5_4b_hf.safetensors", h)
+        self.assertEqual(kind.kind, "invalid")
+        self.assertIn("not 4096 wide", kind.detail)
+        # Anima 3.8B's Qwen3.5 file (no "model." key) stays what it was
+        self.assertEqual(self.kind_of("qwen35_4b", "qwen35_4b.safetensors").kind, "qwen35")
+        self.assertEqual(xte.slot_name("qwen35_9b"), "Qwen3.5 9B")
+        # an all-in-one MOSS checkpoint: its encoder is built in
+        moss = xte.checkpoint_profile("moss.safetensors", fx.header(fx.CHECKPOINTS["moss_all_in_one"][0]))
+        self.assertEqual(moss.slots, {"qwen35_9b"})
+
+    @staticmethod
+    def kind_of(case, name):
+        shapes, metadata, _ = fx.CASES[case]
+        return xte.classify_header(name, fx.header(shapes, metadata))
+
     def test_order_qwen3vl_before_qwen3(self):
         h = fx.header(fx.CASES["qwen3vl_heretic_with_qwen3_keys"][0])
         self.assertEqual(xte.classify_header("qwen3-vl-4b-heretic.safetensors", h), Kind("te", ("qwen3vl_4b",)))
@@ -650,6 +670,33 @@ class TwoAxesTests(unittest.TestCase):
         self.assertEqual(plan("t5xxl_fp8", first),
                          paths("ae.safetensors", "clip_l_other.safetensors", "t5xxl_fp8.safetensors"))
 
+    def test_plan_values_is_the_axes_one_after_the_other(self):
+        """``plan_values``: the values of a cell's Text Encoder axes, each on the list of the one before, as ``apply``
+        and the hook build the cell's list ("Use Forge current" keeps the list)."""
+        first = plan("clip_l_other", FLUX)
+        added = [entry for entry in first if entry not in FLUX]
+        second = xte.plan("t5xxl_fp8", base=first, module_list=MODULE_LIST, classify=classify, added=added)
+        self.assertEqual(xte.plan_values(("clip_l_other", "t5xxl_fp8"), base=FLUX, module_list=MODULE_LIST,
+                                         classify=classify), second)
+        self.assertEqual(xte.plan_values(("clip_l_other", "Use Forge current"), base=FLUX, module_list=MODULE_LIST,
+                                         classify=classify), first)
+        self.assertIsNone(xte.plan_values(("Use Forge current",), base=FLUX, module_list=MODULE_LIST,
+                                          classify=classify))
+        self.assertIsNone(xte.plan_values((), base=FLUX, module_list=MODULE_LIST, classify=classify))
+        # an empty list: each axis adds its encoder (what the first added is not the selection's)
+        for checkpoint in (None, FLUX_UNET):
+            self.assertEqual(xte.plan_values(("clip_l_other", "t5xxl_fp8"), base=paths("ae.safetensors"),
+                                             module_list=MODULE_LIST, classify=classify, checkpoint=checkpoint),
+                             paths("ae.safetensors", "clip_l_other.safetensors", "t5xxl_fp8.safetensors"))
+        # the base is the selection the cell has (a VAE list another axis wrote, say): its VAE stays
+        hdr = paths("qwen_image_vae_HDR_fp32.safetensors", "qwen_3_06b_base.safetensors")
+        self.assertEqual(xte.plan_values(("qwen_3_06b_base_full_fp32",), base=hdr, module_list=MODULE_LIST,
+                                         classify=classify),
+                         paths("qwen_image_vae_HDR_fp32.safetensors", "qwen_3_06b_base_full_fp32.safetensors"))
+        with self.assertRaisesRegex(xte.AxisValueError, "Forge does not load"):
+            xte.plan_values(("clip_l_other",), base=FLUX, module_list=MODULE_LIST, classify=classify,
+                            checkpoint=ANIMA_CKPT)
+
     def test_what_the_first_axis_added_is_not_the_selections(self):
         # nothing in the list (a checkpoint the axis cannot read, or Flux UNet-only): each axis adds its encoder, as its
         # confirm accepted against the selection
@@ -759,7 +806,8 @@ class ConstantsTests(unittest.TestCase):
     def test_axis(self):
         self.assertEqual(xte.AXIS_LABEL, "[Modules] Text Encoder")
         self.assertEqual(xte.CURRENT, "Use Forge current")
-        self.assertTrue(0.7 < xte.COST < 1.0, "between the stock VAE (0.7) and Checkpoint (1.0) axes")
+        self.assertTrue(0.7 < xte.COST < 1.0, "between the stock VAE (0.7) and Checkpoint (1.0; 2.0 from Forge 2.31) "
+                                              "axes")
 
     def test_slot_names_cover_every_slot(self):
         slots = set()

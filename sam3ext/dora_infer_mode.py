@@ -34,6 +34,13 @@ OFTv2 는 강도를 넘기므로(oft.py:81, oftv2.py:204) 건드리지 않는다
 일반 패치 경로(``patch_weight_to_device``)에서는 결과를 fp32 로 돌려줘서 Forge 가 한 번만 저장 dtype 으로
 반올림하게 한다. 오프셋 패치(narrow 뷰)와 Low VRAM·온라인 LoRA 경로는 원래 함수처럼 제자리에 쓴다 — 뒤의 두
 경로는 ΔW 가 이미 저장 dtype 으로 계산된 채 넘어오고, 매 forward 마다 다시 합친다.
+
+Forge 는 LoRA 를 ``torch.inference_mode`` 안에서 합친다(modules/processing.py ``with torch.inference_mode():``,
+backend/patcher/lora.py ``@torch.inference_mode()`` merge_lora_to_weight). 그 안에서 만든 narrow 뷰는 ``_base`` 가
+None 이라 뷰는 저장소의 시작 위치·크기로 알아본다(``_is_partial_view``). 오프셋 패치는 반환값을 버리므로 이걸 놓치면
+fp32 결과가 버려져 LoRA 가 통째로 빠진다(Forge 2.31 MOSS 합친 qkv, Flux/Chroma/Z-Image diffusers q/k/v, Qwen-Image
+2.1 gate_up). 그래서 fp32 를 돌려주는 일반 경로에서도 원래 함수처럼 버퍼에 결과를 먼저 써 둔다 — 뷰를 못 알아봐도
+결과가 남는다.
 """
 
 from __future__ import annotations
@@ -150,12 +157,14 @@ def take_counters() -> Counters:
 
 # ── 계산 ──
 
-def decompose(dora_scale, weight, lora_diff, alpha, strength, function, *, merged_norm: bool, inplace: bool = True):
+def decompose(dora_scale, weight, lora_diff, alpha, strength, function, *, merged_norm: bool, inplace: bool = True,
+              return_fp32: bool = False):
     """DoRA 를 fp32 로 계산한다.
 
     ``inplace`` 면 결과를 ``weight`` 에 제자리로 쓰고 ``weight`` 를 돌려준다 — 오프셋 패치(합쳐진 qkv 등)는 narrow
     뷰를 넘기고 반환값을 버리기 때문이다(backend/patcher/lora.py:47-65). ``weight`` 는 끝의 ``copy_`` 한 번으로만
-    바뀌므로 도중에 실패하면 손대지 않은 상태로 남는다. ``inplace`` 가 거짓이면 fp32 결과 텐서를 그대로 돌려준다.
+    바뀌므로 도중에 실패하면 손대지 않은 상태로 남는다. ``return_fp32`` 면 제자리로 쓴 뒤 ``weight`` 대신 fp32 결과
+    텐서를 돌려준다. ``inplace`` 가 거짓이면 ``weight`` 는 손대지 않고 fp32 결과 텐서를 그대로 돌려준다.
 
     ``merged_norm`` 이 참이면 출력 축도 ``‖W₀+ΔW‖`` 로 나누고(LyCORIS), 거짓이면 ``‖W₀‖``(Forge/Comfy).
     """
@@ -183,7 +192,26 @@ def decompose(dora_scale, weight, lora_diff, alpha, strength, function, *, merge
     if not inplace:
         return merged
     weight.copy_(merged)
-    return weight
+    return merged if return_fp32 else weight
+
+
+def _is_partial_view(weight) -> bool:
+    """``weight`` 가 더 큰 저장소의 일부(오프셋 패치의 narrow 뷰)인지.
+
+    ``_base`` 만으로는 모른다 — Forge 는 inference mode 안에서 합치고(모듈 설명 참고), inference tensor 의 뷰는
+    ``_base`` 가 None 이다. 그래서 저장소를 본다: 시작 위치가 0 이 아니거나(qkv 의 k·v 조각) 저장소가 텐서보다 크면
+    (q 조각) 뷰다. patch_weight_to_device 의 임시 버퍼(``cast_to_device(..., copy=True)`` = ``.to(copy=True)`` 또는
+    ``empty_like`` + ``copy_``, convert_func 의 dequantize 결과)는 제 저장소를 꼭 채우므로 뷰가 아니다. 저장소를 읽을
+    수 없는 텐서(저장소 없는 하위 클래스)는 뷰로 본다 — 제자리에 쓰는 쪽이 순정과 같다.
+    """
+    if getattr(weight, "_base", None) is not None:
+        return True
+    try:
+        if weight.storage_offset() != 0:
+            return True
+        return weight.untyped_storage().nbytes() != weight.numel() * weight.element_size()
+    except Exception:
+        return True
 
 
 def _can_return_fp32(weight, intermediate_dtype) -> bool:
@@ -191,14 +219,15 @@ def _can_return_fp32(weight, intermediate_dtype) -> bool:
 
     patch_weight_to_device 는 merge_lora_to_weight 를 computation_dtype 없이(= fp32) 부르고 반환값을 저장
     dtype 으로 한 번 반올림한다(base.py:465-468, set_weight 도 입력을 자기 dtype 으로 바꾼다). Low VRAM·온라인
-    LoRA 는 computation_dtype=weight.dtype 이라 여기서 걸러지고, narrow 뷰(오프셋 패치)는 ``_base`` 가 있다.
+    LoRA 는 computation_dtype=weight.dtype 이라 여기서 걸러지고, narrow 뷰(오프셋 패치)는 ``_is_partial_view`` 로
+    거른다 — 반환값을 버리므로 제자리에 써야 한다.
     """
     import torch
 
     return (
-        getattr(weight, "_base", None) is None
-        and intermediate_dtype == torch.float32
+        intermediate_dtype == torch.float32
         and weight.dtype != torch.float32
+        and not _is_partial_view(weight)
     )
 
 
@@ -254,10 +283,11 @@ def _make_wrapper(original: Callable) -> Callable:
         failure: tuple[bool, str] | None = None
         out = None
         try:
+            # 늘 제자리에도 쓴다(순정과 같다). 일반 경로면 fp32 결과를 돌려줘서 Forge 가 한 번만 반올림하게 한다.
             out = decompose(
                 dora_scale, weight, lora_diff, alpha, strength, function,
                 merged_norm=(mode == MODE_LYCORIS),
-                inplace=not _can_return_fp32(weight, intermediate_dtype),
+                return_fp32=_can_return_fp32(weight, intermediate_dtype),
             )
         except Exception as exc:
             failure = (_is_oom(exc), f"{type(exc).__name__}: {exc}")

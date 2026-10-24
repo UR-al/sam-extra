@@ -36,6 +36,8 @@
 #   forge_checkpoint_<preset> record and the name asked for (a title from `models`) can differ in
 #   it, and upstream then lost the registry signal, loading the checkpoint without its preset and
 #   modules. Everything else is upstream's.
+# - (2026-10-24) preset_from_folder() also reads the folder names "moss-image" and "qwen-image-2.1"
+#   as Forge's "moss" (Forge 2.31) and "qwen21" presets.
 
 """What the agent is currently working with, and how to prompt it.
 
@@ -485,7 +487,8 @@ def preset_from_folder(options: dict, checkpoint: str) -> str | None:
         for key in options
         if key.startswith("forge_checkpoint_")
     }
-    aliases = {"z-image": "zit", "zimage": "zit", "krea 2": "krea", "flux.2": "klein"}
+    aliases = {"z-image": "zit", "zimage": "zit", "krea 2": "krea", "flux.2": "klein",
+               "moss-image": "moss", "qwen-image-2.1": "qwen21"}
     for part in reversed(parts):
         candidate = aliases.get(part, part)
         if candidate in known:

@@ -21,7 +21,10 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 #
-# Changes in sam-extra: none - the code below is upstream's, byte for byte.
+# Changes in sam-extra (2026-10-24):
+# - ARCH_DEFAULTS gains Forge's "qwen21" (Qwen-Image-2.1, in modules_forge/presets.py since Forge
+#   2.30) and "moss" (MOSS-Image, Forge 2.31) presets, with Forge's own values; PROMPT_STYLE
+#   describes both. Everything else is upstream's, byte for byte.
 
 """Architecture defaults mirrored from Forge Neo's modules_forge/presets.py.
 
@@ -70,6 +73,8 @@ ARCH_DEFAULTS: dict[str, ArchDefaults] = {
     "ernie": ArchDefaults("Euler", "Simple", 8, 1.0, shift=3.0),
     "pid": ArchDefaults("LCM", "Simple", 4, 1.0, shift=-1.5),
     "krea": ArchDefaults("Euler", "Simple", 8, 1.0, shift=-1.15),
+    "qwen21": ArchDefaults("Euler", "Simple", 32, 2.5),
+    "moss": ArchDefaults("Euler", "Simple", 50, 3.0, shift=5.0),
 }
 
 # How each family expects prompts to be written. Used only as a prior; when the
@@ -85,6 +90,16 @@ PROMPT_STYLE: dict[str, str] = {
     "krea": "natural language, photographic direction",
     "lumina": "natural language",
     "wan": "natural language describing motion",
+    "qwen21": (
+        "natural language, full sentences; Forge wraps the prompt in Qwen3-VL's chat template itself, "
+        "and emphasis weights such as (word:1.2) are not applied"
+    ),
+    "moss": (
+        "natural language, full sentences (a detailed caption), or the JSON layout prompt Forge's "
+        "JSON Builder tab writes ({\"summary\": {\"caption\": ...}, \"items\": [{\"label\", \"caption\", "
+        "\"bbox\"} ...]}); Forge wraps it in Qwen3.5's chat template itself, and emphasis weights "
+        "such as (word:1.2) are not applied"
+    ),
 }
 
 # Lineages that share an architecture but not a prompt dialect. Detected from

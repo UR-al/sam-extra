@@ -7,12 +7,14 @@ slot of the checkpoint (``text_encoders.<slot>.``, CLIP-L / CLIP-G where the che
 family's ``clip_target`` then reads the slot(s) it uses (Anima ``qwen3_06b``, Krea2 ``qwen3vl_4b``, Flux ``clip_l`` +
 ``t5xxl`` …). A file that matches no branch is ignored.
 
-The stock XYZ ``VAE`` axis hot-swaps VAE weights; there is no text-encoder axis. This module decides, from the file's
-header only (no tensor is read: the safetensors JSON header, or a GGUF file's tensor table after Forge's
-``gguf_remapping`` renames), which slot a file fills - ``te_slots`` mirrors replace_state_dict's branches in their order
-(``tests/test_xyz_text_encoder_origin.py`` runs Forge's own functions on the same headers) - and which encoders a
-checkpoint has built in (``checkpoint_profile``). It builds one cell's module list: the current list with the entry of
-the picked file's slot replaced, or the pick added when the checkpoint has that slot built in (``compose``).
+The stock XYZ ``VAE`` axis hot-swaps VAE weights (from Forge 2.31 it puts the VAE into the cell's module list and the
+model is loaded with it; its new ``VAE ("state_dict" only)`` axis is the old swap); there is no text-encoder axis.
+This module decides, from the file's header only (no tensor is read: the safetensors JSON header, or a GGUF file's
+tensor table after Forge's ``gguf_remapping`` renames), which slot a file fills - ``te_slots`` mirrors
+replace_state_dict's branches in their order (``tests/test_xyz_text_encoder_origin.py`` runs Forge's own functions on
+the same headers) - and which encoders a checkpoint has built in (``checkpoint_profile``). It builds one cell's module
+list: the current list with the entry of the picked file's slot replaced, or the pick added when the checkpoint has that
+slot built in (``compose``).
 ``sam3ext/xyz_text_encoder_cell.py`` hands that list to Forge's model loader for the cell without touching Forge's
 settings (config.json and the dropdown stay as they are).
 
@@ -35,15 +37,23 @@ from .vae_degrid_models import read_safetensors_header
 AXIS_LABEL = "[Modules] Text Encoder"
 LABEL = "Text Encoder"
 CURRENT = "Use Forge current"
-# Checkpoint (1.0) stays the outer loop, then this axis, then the stock VAE axis (0.7): a text-encoder change reloads
-# the model like a checkpoint change does.
+# Checkpoint (1.0; 2.0 from Forge 2.31) stays the outer loop, then this axis, then the stock VAE axis (0.7): a
+# text-encoder change reloads the model like a checkpoint change does. (Forge 2.31's "xyz_use_cost" setting off: every
+# axis costs 0, sam-extra's too - AxisOption sets it.)
 COST = 0.9
-# Set on the cell's copy of ``p`` by the axis (``{"value": …, "modules": [...], "slots": frozenset, "origin": [...]}`` -
-# ``origin`` is the selection the first Text Encoder axis of the cell started from; ``None`` for "Use Forge current")
-# and read by the hook.
+# Set on the cell's copy of ``p`` by the axis (``{"value": …, "values": (…), "modules": [...], "slots": frozenset,
+# "origin": [...]}`` - ``values`` are the picks of the cell's Text Encoder axes in the order they were applied,
+# ``origin`` is the selection the first of them started from; ``None`` for "Use Forge current") and read by the hook.
+# ``modules`` is what ``apply`` checked; the hook builds the list again from ``values`` when the cell starts (``BUILT``
+# set then), on the selection and checkpoint the cell has at that moment - Forge 2.31's stock VAE and Checkpoint axes
+# write theirs into the cell's ``override_settings`` (shared by every cell), possibly after this axis was applied.
 CELL_ATTR = "_sam_extra_xyz_text_encoder"
+BUILT = "built"
 # Set on the grid's ``p`` by ``confirm``: the slots each Text Encoder axis picks (two axes may not share one).
 CONFIRMED_ATTR = "_sam_extra_xyz_text_encoder_axes"
+# Set on the grid's ``p`` by the first ``confirm``: its ``override_settings`` module list and checkpoint before the first
+# cell (``{"modules": list | None, "checkpoint": str | None}``) - what ``confirm`` checked the values against.
+GRID_START_ATTR = "_sam_extra_xyz_text_encoder_start"
 MODULES_KEY = "forge_additional_modules"
 CHECKPOINT_KEY = "sd_model_checkpoint"
 SAFETENSORS_EXTENSIONS = (".safetensors", ".sft")
@@ -64,6 +74,7 @@ SLOT_NAMES = {
     "qwen3_4b": "Qwen3 4B",
     "qwen3_8b": "Qwen3 8B",
     "ministral3_3b": "Ministral 3 3B",
+    "qwen35_9b": "Qwen3.5 9B",
 }
 # Words that mean "the selection as it is" elsewhere in Forge (the stock VAE axis's "None", the Hires module dropdown's
 # "Built-in" …). "None" is accepted as "Use Forge current"; the others get a pointer to it.
@@ -80,7 +91,7 @@ class ForgeLoadError(Exception):
 
 
 # ---------------------------------------------------------------------------------------------------------------------
-# Which slot Forge puts a file in — backend/loader.py replace_state_dict (Forge Neo 2.30), branch for branch
+# Which slot Forge puts a file in — backend/loader.py replace_state_dict (Forge Neo 2.30 / 2.31), branch for branch
 # ---------------------------------------------------------------------------------------------------------------------
 
 # CLIP-G / CLIP-L: Forge tries these keys and accepts the first whose shape[0] is 1280 / 768. (Where the weights then
@@ -103,6 +114,10 @@ T5_KEY = "encoder.block.0.layer.0.SelfAttention.k.weight"
 T5_QWEIGHT_KEY = "encoder.block.0.layer.0.SelfAttention.k.qweight"
 T5_SHARED_KEY = "shared.weight"
 UMT5_VOCAB = 256384
+# Forge Neo 2.31 (MOSS-Image): Qwen3.5 9B in the Hugging Face layout, ahead of the Gemma-2 / Qwen elif chain
+QWEN35_9B_KEY = "model.language_model.layers.0.linear_attn.A_log"
+QWEN35_9B_NORM_KEY = "model.language_model.layers.0.input_layernorm.weight"
+QWEN35_9B_WIDTH = 4096
 GEMMA2_KEY = "model.layers.0.post_feedforward_layernorm.weight"
 Q_NORM_KEY = "model.layers.0.self_attn.q_norm.weight"
 QWEN3VL_KEY = "model.visual.deepstack_merger_list.0.norm.weight"
@@ -132,7 +147,9 @@ def te_slots(header: dict) -> frozenset:
     ``header`` is a safetensors header (``{key: {"dtype", "shape", "data_offsets"}, "__metadata__": …}``; a GGUF file's
     comes from ``gguf_header``). The order and the ``if`` / ``elif`` structure are Forge's: a Qwen3-VL file that also
     has the Qwen3 keys is Qwen3-VL. Raises ``ForgeLoadError`` where Forge itself would fail (its asserts, or a key it
-    reads that is missing)."""
+    reads that is missing). The Qwen3.5 9B branch is Forge Neo 2.31's (MOSS-Image); an earlier Forge matches nothing for
+    such a file and no model family of it reads that slot, so the axis refuses the file there as an encoder the model
+    does not have."""
     slots = set()
     if any(key in header and _dim0(header, key) == 1280 for key in CLIP_G_KEYS):
         slots.add("clip_g")
@@ -146,7 +163,11 @@ def te_slots(header: dict) -> frozenset:
     elif T5_QWEIGHT_KEY in header:
         slots.add("t5xxl")
 
-    if GEMMA2_KEY in header:
+    if QWEN35_9B_KEY in header and QWEN35_9B_NORM_KEY in header:
+        if _dim0(header, QWEN35_9B_NORM_KEY) != QWEN35_9B_WIDTH:
+            raise ForgeLoadError(f"a Qwen3.5 encoder that is not {QWEN35_9B_WIDTH} wide (Forge reads only the 9B one)")
+        slots.add("qwen35_9b")
+    elif GEMMA2_KEY in header:
         if Q_NORM_KEY in header:
             raise ForgeLoadError("Gemma-2 keys together with q_norm")
         slots.add("gemma2_2b")
@@ -672,6 +693,22 @@ def plan(value, *, base, module_list, classify, checkpoint=None, added=()):
     if not picks:
         return None
     return compose(base, picks, module_list=module_list, classify=classify, checkpoint=checkpoint, added=added)
+
+
+def plan_values(values, *, base, module_list, classify, checkpoint=None):
+    """The cell's module list for the values of its Text Encoder axes in the order they were applied: each builds on the
+    list of the one before (what an earlier axis put in counts as ``added``); ``None`` when every value is "Use Forge
+    current". Raises AxisValueError."""
+    origin = normalise(base, module_list)
+    modules = None
+    for value in values:
+        current = origin if modules is None else modules
+        added = [entry for entry in current if entry not in origin]
+        planned = plan(value, base=current, module_list=module_list, classify=classify, checkpoint=checkpoint,
+                       added=added)
+        if planned is not None:
+            modules = planned
+    return modules
 
 
 # ---------------------------------------------------------------------------------------------------------------------

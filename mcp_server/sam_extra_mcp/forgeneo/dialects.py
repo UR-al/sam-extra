@@ -21,7 +21,10 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 #
-# Changes in sam-extra: none - the code below is upstream's, byte for byte.
+# Changes in sam-extra (2026-10-24):
+# - NATURAL.architectures gains Forge's "qwen21" (Qwen-Image-2.1) and "moss" (MOSS-Image, Forge
+#   2.31) presets, and a declared base model naming MOSS maps to NATURAL. Everything else is
+#   upstream's, byte for byte.
 
 """Prompt dialects: how each model lineage expects to be addressed.
 
@@ -214,11 +217,12 @@ NATURAL = Dialect(
     structure="full descriptive sentences: subject, action, setting, light, then camera and lens",
     notes=(
         "Do not add quality tags. These models were trained on captions, so 'masterpiece' and "
-        "'best quality' are dead tokens that dilute the description. Guidance usually sits at "
-        "CFG 1, which makes the negative prompt weak or inert - put what you want in the "
-        "positive prompt instead."
+        "'best quality' are dead tokens that dilute the description. Distilled models usually sit "
+        "at CFG 1, which makes the negative prompt weak or inert - put what you want in the "
+        "positive prompt instead. MOSS-Image (CFG 3) and Qwen-Image 2.1 (CFG 2.5) run real CFG, "
+        "so a short negative prompt does work there."
     ),
-    architectures=("flux", "klein", "qwen", "zit", "krea", "lumina", "wan", "ernie", "pid"),
+    architectures=("flux", "klein", "qwen", "zit", "krea", "lumina", "wan", "ernie", "pid", "qwen21", "moss"),
 )
 
 ALL: tuple[Dialect, ...] = (PONY, ILLUSTRIOUS, ANIMAGINE, ANIMA, SD15, SDXL_BASE, NATURAL)
@@ -241,6 +245,7 @@ LINEAGE_MARKERS: tuple[tuple[str, str], ...] = (
     ("krea", "natural"),
     ("flux", "natural"),
     ("qwen", "natural"),
+    ("moss", "natural"),
     ("z-image", "natural"),
     ("zimage", "natural"),
     ("sdxl", "sdxl_base"),

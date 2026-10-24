@@ -475,6 +475,111 @@ class TwoAxesTests(ScriptCase):
                 self.axis.apply(pc, "t5xxl_fp16", [])
 
 
+class CellStartTests(ScriptCase):
+    """What a cell's list is built on. Forge 2.31's stock VAE and Checkpoint axes write their values into the cell's
+    ``override_settings`` - one dict for every cell - so while a cell's axes are applied it may hold the previous
+    cell's. ``apply`` checks the values on the grid's start (``confirm`` keeps it on the grid's ``p``); the hook builds
+    the cell's list when the cell starts, on what the cell has then."""
+
+    VAE = "qwen_image_vae.safetensors"
+    HDR = "qwen_image_vae_HDR_fp32.safetensors"
+    FP32 = "qwen_3_06b_base_full_fp32.safetensors"
+
+    def test_apply_never_reads_a_previous_cells_values(self):
+        forge = Forge(self.models)
+        parent = P()
+        with forge.installed():
+            self.axis.confirm(parent, [self.FP32])
+            self.assertEqual(getattr(parent, xte.GRID_START_ATTR), {"modules": None, "checkpoint": forge.ckpt_a.title})
+            # the previous cell's VAE list and checkpoint, left in the shared dict
+            parent.override_settings.update({
+                "forge_additional_modules": forge.paths(self.HDR, "qwen_3_06b_base.safetensors"),
+                "sd_model_checkpoint": "other.safetensors"})
+            pc = copy.copy(parent)
+            self.axis.apply(pc, self.FP32, [self.FP32])
+            cell = getattr(pc, xte.CELL_ATTR)
+            self.assertEqual(cell["values"], (self.FP32,))
+            self.assertEqual(cell["modules"], forge.paths(self.VAE, self.FP32), "the grid's start: the dropdown's")
+            self.assertNotIn(xte.BUILT, cell)
+            # the cell's own VAE list, written after the Text Encoder axis was applied: the hook builds on it
+            parent.override_settings["forge_additional_modules"] = forge.paths(self.VAE, "qwen_3_06b_base.safetensors")
+            self.hook.before_process(pc)
+            self.assertTrue(cell[xte.BUILT])
+            self.assertEqual(forge.params["additional_modules"], forge.paths(self.VAE, self.FP32))
+            # a pass inside the cell (a copy of its p) is not built again
+            parent.override_settings["forge_additional_modules"] = forge.paths(self.HDR, "qwen_3_06b_base.safetensors")
+            self.hook.before_process(copy.copy(pc))
+            self.assertEqual(forge.params["additional_modules"], forge.paths(self.VAE, self.FP32))
+            self.hook.postprocess(pc, None)
+        self.assertIsNone(cell_runtime.state())
+
+    def test_the_hook_builds_on_the_cells_vae_list(self):
+        forge = Forge(self.models)
+        parent = P()
+        with forge.installed():
+            self.axis.confirm(parent, [self.FP32])
+            for vae in (self.HDR, self.VAE, self.HDR):
+                pc = copy.copy(parent)
+                self.axis.apply(pc, self.FP32, [self.FP32])
+                parent.override_settings["forge_additional_modules"] = forge.paths(vae, "qwen_3_06b_base.safetensors")
+                self.hook.before_process(pc)
+                self.assertEqual(forge.params["additional_modules"], forge.paths(vae, self.FP32), vae)
+                self.assertEqual(forge.processing._overridden_modules, forge.paths(vae, self.FP32), vae)
+                self.hook.postprocess(pc, None)
+        self.assertIsNone(cell_runtime.state())
+
+    def test_the_api_callers_start_is_kept_by_confirm(self):
+        forge = Forge(self.models)
+        parent = P({"forge_additional_modules": [self.HDR, "qwen_3_06b_base.safetensors"]})
+        with forge.installed():
+            self.axis.confirm(parent, [self.FP32])
+            self.axis.confirm(parent, ["Use Forge current"])          # a second Text Encoder axis: the same start
+            self.assertEqual(getattr(parent, xte.GRID_START_ATTR),
+                             {"modules": [self.HDR, "qwen_3_06b_base.safetensors"], "checkpoint": forge.ckpt_a.title})
+            parent.override_settings["forge_additional_modules"] = forge.paths(self.VAE, "qwen_3_06b_base.safetensors")
+            pc = copy.copy(parent)
+            self.axis.apply(pc, self.FP32, [self.FP32])
+        self.assertEqual(getattr(pc, xte.CELL_ATTR)["modules"], forge.paths(self.HDR, self.FP32))
+
+    def test_the_dropdowns_checkpoint_is_kept_by_confirm(self):
+        """Without a checkpoint of the caller's - or with one Forge does not know, which process_images drops - confirm
+        keeps the Checkpoint dropdown's (its title), read before the first cell: Forge 2.31 may leave a cell's
+        checkpoint in the dropdown. A caller's checkpoint Forge knows is kept as it is; a dropdown that cannot be read
+        leaves what the caller sent."""
+        forge = Forge(self.models)
+        with forge.installed():
+            for settings in ({}, {"sd_model_checkpoint": "missing.safetensors"}):
+                parent = P(dict(settings))
+                self.axis.confirm(parent, [self.FP32])
+                self.assertEqual(getattr(parent, xte.GRID_START_ATTR),
+                                 {"modules": None, "checkpoint": forge.ckpt_a.title}, settings)
+                self.assertEqual(parent.override_settings, settings, "the caller's override_settings are not changed")
+            parent = P({"sd_model_checkpoint": forge.ckpt_b.name})
+            self.axis.confirm(parent, [self.FP32])
+            self.assertEqual(getattr(parent, xte.GRID_START_ATTR)["checkpoint"], forge.ckpt_b.name)
+            forge.sd_models.select_checkpoint = lambda: None                  # no checkpoint at all
+            parent = P()
+            self.axis.confirm(parent, [self.FP32])
+            self.assertIsNone(getattr(parent, xte.GRID_START_ATTR)["checkpoint"])
+
+            def unreadable():
+                raise FileNotFoundError("no checkpoints")
+
+            forge.sd_models.select_checkpoint = unreadable
+            parent = P({"sd_model_checkpoint": "missing.safetensors"})
+            self.axis.confirm(parent, [self.FP32])
+            self.assertEqual(getattr(parent, xte.GRID_START_ATTR)["checkpoint"], "missing.safetensors")
+
+    def test_without_confirm_apply_reads_what_p_has(self):
+        forge = Forge(self.models)
+        parent = P({"forge_additional_modules": [self.HDR, "qwen_3_06b_base.safetensors"]})
+        with forge.installed():
+            pc = copy.copy(parent)
+            self.axis.apply(pc, self.FP32, [self.FP32])
+        self.assertEqual(getattr(pc, xte.CELL_ATTR)["modules"], forge.paths(self.HDR, self.FP32))
+        self.assertFalse(hasattr(parent, xte.GRID_START_ATTR))
+
+
 class CheckpointTests(ScriptCase):
     def forge_with(self, case, modules=()):
         path = fx.write_checkpoint(Path(self.tmp.name) / "Stable-diffusion", case)
@@ -511,6 +616,66 @@ class CheckpointTests(ScriptCase):
             with self.assertRaisesRegex(ValueError, "CLIP-L encoder, which Forge does not load"):
                 self.axis.confirm(P(), ["clip_l_other"])
             self.axis.confirm(P({"sd_model_checkpoint": info.title, "forge_additional_modules": []}), ["clip_l_other"])
+
+    def test_the_cells_checkpoint_at_the_start_of_the_cell(self):
+        """Forge 2.31's Checkpoint axis writes the cell's checkpoint into the shared override_settings - possibly after
+        the Text Encoder axis was applied (then it holds the previous cell's). ``apply`` checks against the grid's
+        start, so a previous cell's checkpoint never stops the grid; the hook builds the list for the cell's own
+        checkpoint, and one that does not take the value gets the list ``apply`` checked (2.30's) and a console line."""
+        forge = self.forge_with("flux_unet_only", ("clip_l.safetensors",))
+        anima = fx.write_checkpoint(Path(self.tmp.name) / "Stable-diffusion", "anima_unet_only")
+        info = fx.CheckpointInfo(anima.name, "eeee", str(anima))
+        forge.sd_models.checkpoint_aliases.update({alias: info for alias in info.ids})
+        parent = P()
+        stderr = io.StringIO()
+        with forge.installed(), contextlib.redirect_stderr(stderr):
+            self.axis.confirm(parent, ["clip_l_other"])
+            parent.override_settings["sd_model_checkpoint"] = info.name        # the previous cell's
+            pc = copy.copy(parent)
+            self.axis.apply(pc, "clip_l_other", ["clip_l_other"])              # no error
+            self.hook.before_process(pc)                                       # the cell's own: Anima, no CLIP-L
+            self.assertEqual(forge.params["additional_modules"], forge.paths("clip_l_other.safetensors"))
+            self.hook.postprocess(pc, None)
+            self.assertEqual(stderr.getvalue().count("[XYZ Text Encoder]"), 1)
+            self.assertIn(f'which Forge does not load for the checkpoint "{anima.name}"', stderr.getvalue())
+            self.assertIn(f'made as for the checkpoint "{forge.ckpt_a.name}"', stderr.getvalue())
+            # the dropdown's checkpoint for the cell: no line
+            parent.override_settings["sd_model_checkpoint"] = forge.ckpt_a.name
+            pc = copy.copy(parent)
+            self.axis.apply(pc, "clip_l_other", ["clip_l_other"])
+            self.hook.before_process(pc)
+            self.hook.postprocess(pc, None)
+        self.assertEqual(stderr.getvalue().count("[XYZ Text Encoder]"), 1)
+        self.assertIsNone(cell_runtime.state())
+
+    def test_a_checkpoint_left_in_the_dropdown_is_not_the_grids(self):
+        """Forge 2.31 may leave a cell's checkpoint in the Checkpoint dropdown for the next cells (no key in
+        config.json - an API-only start - or an API caller's override_settings_restore_afterwards=False). ``apply``
+        checks the values against the dropdown's checkpoint as ``confirm`` read it, so a grid mixing families does not
+        stop at a later cell; the hook builds the list for the cell's own checkpoint, or ``apply``'s with a console
+        line."""
+        forge = self.forge_with("flux_unet_only", ("clip_l.safetensors",))
+        anima = fx.write_checkpoint(Path(self.tmp.name) / "Stable-diffusion", "anima_unet_only")
+        info = fx.CheckpointInfo(anima.name, "eeee", str(anima))
+        forge.sd_models.checkpoint_aliases.update({alias: info for alias in info.ids})
+        parent = P()
+        stderr = io.StringIO()
+        with forge.installed(), contextlib.redirect_stderr(stderr):
+            self.axis.confirm(parent, ["clip_l_other"])
+            self.assertEqual(getattr(parent, xte.GRID_START_ATTR)["checkpoint"], forge.ckpt_a.title)
+            forge.sd_models.select_checkpoint = lambda: info     # an Anima cell's checkpoint, left in the dropdown
+            for own in (forge.ckpt_a.name, info.name):           # the cell's own (2.31's Checkpoint axis writes it)
+                pc = copy.copy(parent)
+                self.axis.apply(pc, "clip_l_other", ["clip_l_other"])          # no error
+                parent.override_settings["sd_model_checkpoint"] = own
+                self.hook.before_process(pc)
+                self.assertEqual(forge.params["additional_modules"], forge.paths("clip_l_other.safetensors"), own)
+                self.hook.postprocess(pc, None)
+        log = stderr.getvalue()
+        self.assertEqual(log.count("[XYZ Text Encoder]"), 1, log)                 # the Anima cell
+        self.assertIn(f'which Forge does not load for the checkpoint "{anima.name}"', log)
+        self.assertIn(f'made as for the checkpoint "{forge.ckpt_a.name}"', log)
+        self.assertIsNone(cell_runtime.state())
 
     def test_unreadable_checkpoint_is_unknown(self):
         forge = Forge(self.models, modules=ANIMA_MODULES)   # its checkpoint file does not exist

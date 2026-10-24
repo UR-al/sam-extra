@@ -25,6 +25,8 @@ RAISES = "raises"
 
 QWEN3_LAYER = "model.layers.0.post_attention_layernorm.weight"
 Q_NORM = "model.layers.0.self_attn.q_norm.weight"
+QWEN35_A_LOG = "model.language_model.layers.0.linear_attn.A_log"
+QWEN35_NORM = "model.language_model.layers.0.input_layernorm.weight"
 
 
 def header(shapes: dict, metadata: dict | None = None) -> dict:
@@ -156,6 +158,8 @@ CHECKPOINTS = {
     "zimage_all_in_one": ({"model.diffusion_model.layers.0.attention.qkv.weight": [11520, 3840],
                            "text_encoders.qwen3_4b.transformer.model.layers.0.post_attention_layernorm.weight": [2560]},
                           "-", {"qwen3_4b"}),
+    "moss_all_in_one": ({"model.diffusion_model.shared_block_modulation.weight": [18432, 3072],
+                         "text_encoders.qwen35_9b.transformer." + QWEN35_NORM: [4096]}, "-", {"qwen35_9b"}),
 }
 
 
@@ -208,6 +212,17 @@ CASES = {
     "ministral3_3b": ({QWEN3_LAYER: [3072]}, None, {"ministral3_3b"}),
     "ministral3_wrong_width": ({QWEN3_LAYER: [2048]}, None, RAISES),
     "visual_only": ({"visual.blocks.0.attn.proj.weight": [1280, 1280]}, None, {"qwen25_7b"}),
+    # Forge 2.31's Qwen3.5 9B (MOSS-Image): the Hugging Face layout (model.language_model.*), ahead of the elif chain;
+    # an earlier Forge matches nothing (QWEN35_9B_CASES)
+    "qwen35_9b": ({QWEN35_A_LOG: [32], QWEN35_NORM: [4096], "model.visual.blocks.0.attn.proj.weight": [1152, 1152]},
+                  None, {"qwen35_9b"}),
+    "qwen35_9b_with_qwen3_keys": ({QWEN35_A_LOG: [32], QWEN35_NORM: [4096], QWEN3_LAYER: [1024], Q_NORM: [128]}, None,
+                                  {"qwen35_9b"}),
+    "qwen35_other_width": ({QWEN35_A_LOG: [16], QWEN35_NORM: [2560]}, None, RAISES),
+    # the MOSS encoder as the official shards merge (no "model." prefix): Forge takes its vision tower for Qwen2.5-VL
+    "qwen35_9b_without_model_prefix": ({"language_model.layers.0.linear_attn.A_log": [32],
+                                        "language_model.layers.0.input_layernorm.weight": [4096],
+                                        "visual.blocks.0.attn.proj.weight": [1152, 1152]}, None, {"qwen25_7b"}),
     # the development PC's files (signatures only)
     "qwen32b_two_slots": ({QWEN3_LAYER: [5120], Q_NORM: [128], "visual.blocks.0.attn.proj.weight": [1152, 1152]}, None,
                           {"qwen3_8b", "qwen25_7b"}),
@@ -224,6 +239,8 @@ CASES = {
     "vae_wan": ({"decoder.middle.0.residual.0.gamma": [384]}, None, set()),
     "empty": ({}, None, set()),
 }
+# The cases of Forge 2.31's Qwen3.5 9B branch: a Forge without it ignores these files (no slot, no error)
+QWEN35_9B_CASES = ("qwen35_9b", "qwen35_9b_with_qwen3_keys", "qwen35_other_width")
 
 
 class FakeOpts:
@@ -312,6 +329,8 @@ def write_models(models_path) -> tuple[dict, dict]:
 
 
 DROPDOWN_SHORT_KEY = "sd_modules_dropdown_use_short"
+# Forge 2.31 (f74f60c5): xyz_grid's AxisOption reads it (``cost if opts.xyz_use_cost else 0.0``)
+XYZ_USE_COST_KEY = "xyz_use_cost"
 
 
 def forge_module_lists(main_entry_source: str, module_list: dict, module_map: dict) -> dict:
@@ -331,19 +350,19 @@ def forge_module_lists(main_entry_source: str, module_list: dict, module_map: di
 
 def forge_selection_defaults(shared_options_source: str) -> dict:
     """``FakeOpts`` defaults of the VAE / Text Encoder selection: ``forge_additional_modules`` and, where the Forge
-    whose ``modules/shared_options.py`` is ``shared_options_source`` has it (2.30-6), ``sd_modules_dropdown_use_short``
-    with that Forge's default (``OptionInfo(<default>, ...)``)."""
+    whose ``modules/shared_options.py`` is ``shared_options_source`` has them, ``sd_modules_dropdown_use_short``
+    (2.30-6) and xyz_grid's ``xyz_use_cost`` (2.31) with that Forge's default (``OptionInfo(<default>, ...)``)."""
     defaults = {"forge_additional_modules": []}
     for node in ast.walk(ast.parse(shared_options_source)):
         if not isinstance(node, ast.Dict):
             continue
         for key, value in zip(node.keys, node.values):
-            if not (isinstance(key, ast.Constant) and key.value == DROPDOWN_SHORT_KEY):
+            if not (isinstance(key, ast.Constant) and key.value in (DROPDOWN_SHORT_KEY, XYZ_USE_COST_KEY)):
                 continue
             while isinstance(value, ast.Call) and isinstance(value.func, ast.Attribute):  # .info(...).needs_reload_ui()
                 value = value.func.value
             if isinstance(value, ast.Call) and getattr(value.func, "id", None) == "OptionInfo" and value.args:
-                defaults[DROPDOWN_SHORT_KEY] = ast.literal_eval(value.args[0])
+                defaults[key.value] = ast.literal_eval(value.args[0])
     return defaults
 
 

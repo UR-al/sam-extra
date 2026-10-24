@@ -13,10 +13,16 @@ batching and block selection were originally ported from the ComfyUI node
 
 How it hooks into Forge Neo (no core edits)
 -------------------------------------------
-Forge Neo's real sampling path (``backend/sampling/sampling_function.py``)
-does NOT invoke ``sampler_calc_cond_batch_function`` (the setter exists on the
-patcher but the sampler calls ``calc_cond_uncond_batch`` directly). The two
-hooks it DOES honour are:
+Up to Forge Neo 2.30.x the real sampling path
+(``backend/sampling/sampling_function.py``) does NOT invoke
+``sampler_calc_cond_batch_function`` (the setter exists on the patcher but the
+sampler calls ``calc_cond_uncond_batch`` directly). Since 2.31 Forge's built-in
+``modules/processing_scripts/slg.py`` replaces
+``sampling_function.calc_cond_uncond_batch`` at import with a dispatcher that
+does honour that key — but it is ONE slot, and Forge's MOSS Skip Layer Guidance
+(Settings, on by default for MOSS-Image) clones the UNet last and overwrites it.
+So we do not use it and keep the model-function wrapper + post-CFG design. The
+two hooks every version honours are:
 
   * ``model_options["model_function_wrapper"]`` — wraps ``model.apply_model``
     with ``{"input","timestep","c","cond_or_uncond"}`` (proven by the PoC).
