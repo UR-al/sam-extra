@@ -3,9 +3,9 @@
 버전 태그는 GitHub Releases에도 발행됩니다. 아래는 요약이며, guidance/속도 기능의
 상세는 [docs/GUIDANCE.md](docs/GUIDANCE.md)를 참고하세요.
 
-## Unreleased — Forge Neo 2.31 호환
+## v0.35.1 — Forge Neo 2.31 호환 (XYZ Text Encoder · VAE · Checkpoint 축, DoRA 오프셋 패치, Qwen3.5 9B 칸, MCP moss)
 
-Forge Neo 2.31(2.30.1 `a552980e` 뒤 커밋 13개 — MOSS-Image 지원, XYZ `VAE` · `Checkpoint name` 축과 cost 변경, MOSS 전용 Skip Layer
+2026-10-24. Forge Neo 2.31(2.30.1 `a552980e` 뒤 커밋 13개 — MOSS-Image 지원, XYZ `VAE` · `Checkpoint name` 축과 cost 변경, MOSS 전용 Skip Layer
 Guidance, Extras DeGrid 기본 끔)에서 달라진 것에 맞춘 판입니다. 2.31 에서 실제로 깨진 곳은 XYZ 입니다: **`[Modules] Text Encoder` 축이
 `VAE` 축보다 먼저 적용되는 배치(Text Encoder 가 X, VAE 가 Y 등)에서 칸마다 앞 칸의 VAE 로 그렸고**, `Checkpoint name` 축으로 계열이 다른
 체크포인트를 섞은 그리드는 통째로 멈췄습니다. Forge 의 새 `VAE` 축은 값 목록에 없는 선택의 VAE 를 남겨 고른 VAE 가 무시될 수 있었습니다.
