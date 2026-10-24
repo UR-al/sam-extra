@@ -374,7 +374,11 @@ def extension_auth_dependencies(app: Any) -> list[Any]:
     Every route sam-extra adds to Forge's app takes them — the Notebook, memo
     (sam3ext/notebook_memos.py), Tile & Repair (sam3ext/tile_repair_api.py)
     and LoRA Manager config/spawn (sam3ext/lora_manager_core.py) routes —
-    together with ``require_same_origin_header``.
+    together with ``require_same_origin_header``. The light LoRA list
+    (``GET /sam3-lora/lite``, sam3ext/lora_lite.py) takes these guards only:
+    it answers a subset of ``GET /sdapi/v1/loras`` to external clients, which
+    send no Notebook header. (Forge adds that route with no login guard at
+    all; this one keeps them.)
 
     Gradio's ``/login_check`` (``--gradio-auth``) and Forge's ``--api-auth``
     guard both apply when the host has them. ``--nowebui`` has no Gradio
