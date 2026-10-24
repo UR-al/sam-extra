@@ -82,7 +82,7 @@ _XYZ_DUP_ATTR = "_sam3_dora_dup_xyz"
 _XYZ_WEAK_ATTR = "_sam3_dora_weak_xyz"
 _XYZ_SCOPE_ATTR = "_sam3_dora_scope_xyz"
 # 이 축들의 값이 바뀌면 LoRA 를 다시 읽고 합친다(칸당 1~2 초). xyz_grid 는 cost 가 큰 축을 바깥 루프에 두므로
-# Checkpoint(1.0) 와 VAE(0.7) 사이 값을 줘서 시드·프롬프트 같은 값싼 축보다 덜 자주 바뀌게 한다.
+# Checkpoint(1.0, Forge 2.31 부터 2.0) 와 VAE(0.7) 사이 값을 줘서 시드·프롬프트 같은 값싼 축보다 덜 자주 바뀌게 한다.
 XYZ_AXIS_COST = 0.8
 
 

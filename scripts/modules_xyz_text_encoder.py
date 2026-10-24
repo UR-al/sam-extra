@@ -5,17 +5,20 @@ The logic is ``sam3ext/xyz_text_encoder.py`` (values, slots, the cell's list) an
 
 * ``on_before_ui`` adds the axis to Forge's ``scripts/xyz_grid.py`` (appended; on Reload UI replaced at the same index —
   xyz_grid keeps a chosen axis by its index, see ``scripts/colorcraft.py``). Both tabs. ``confirm`` checks every value
-  before the first cell (and that two Text Encoder axes do not pick the same slot), ``apply`` stores the cell's module
-  list on the cell's copy of ``p`` - built on the list of an earlier Text Encoder axis of the same cell.
+  before the first cell (and that two Text Encoder axes do not pick the same slot), ``apply`` stores the cell's values
+  on the cell's copy of ``p`` (after an earlier Text Encoder axis of the same cell) with the list they make.
 * ``on_before_ui`` also replaces Forge's own ``VAE`` axis in place (same index, label, choices with "None", cost,
-  labels): a copy whose ``apply`` runs Forge's ``apply_vae`` and marks the cell (``sam3ext/xyz_vae.py``), so the hook
-  can send a VAE Forge cannot swap into the loaded model (a 2D Qwen2D VAE on a model built with a 3D Wan VAE, or the
-  reverse - Forge's strict load fails and xyz_grid leaves the cell black) to the model loader instead, like a Text
-  Encoder cell. Cells Forge can swap keep Forge's swap.
-* ``XyzTextEncoderHook`` (always on, no UI, like ``scripts/negpip.py``) — ``before_process`` hands the cell's list to
-  Forge's model loader (the loading parameters, as the stock Checkpoint axis does) and to the ``Module N`` infotext,
-  ``process`` / ``postprocess_image`` keep the infotext list the cell's, ``postprocess`` puts both back. Forge's
-  settings - config.json and the dropdown - are never written.
+  labels): a copy whose ``apply`` runs Forge's ``apply_vae`` and marks the cell (``sam3ext/xyz_vae.py``). Forge 2.30
+  swaps the VAE into the loaded model; the hook sends a VAE Forge cannot swap (a 2D Qwen2D VAE on a model built with a
+  3D Wan VAE, or the reverse - Forge's strict load fails and xyz_grid leaves the cell black) to the model loader
+  instead, like a Text Encoder cell, and cells Forge can swap keep Forge's swap. Forge 2.31's axis loads the model with
+  the VAE in the cell's module list itself; the copy writes that list again so that the value is its only VAE.
+* ``XyzTextEncoderHook`` (always on, no UI, like ``scripts/negpip.py``) — ``before_process`` builds the cell's list from
+  the values (now that every axis of the cell has been applied) and hands it to Forge's model loader (the loading
+  parameters, as the stock Checkpoint axis of Forge 2.30 does) and to the ``Module N`` infotext, ``process`` /
+  ``postprocess_image`` keep the infotext list the cell's, ``postprocess`` puts both back. sam-extra never writes
+  Forge's settings (config.json, the dropdown); from Forge 2.31 the stock Checkpoint and VAE axes put their own values
+  into them for the cell (``set_config`` in ``process_images``), as they do without sam-extra.
 
 The file name sorts before ``negpip.py``, which stays the extension's last script (metadata.ini).
 """
@@ -98,21 +101,59 @@ def _selection() -> list:
     return list(getattr(_opts(), xte.MODULES_KEY, None) or [])
 
 
-def _checkpoint(p=None):
-    """The checkpoint the slot check reads (``xte.Checkpoint``, ``None`` when unknown): an API caller's
-    ``override_settings`` checkpoint, else the Checkpoint dropdown's. A Checkpoint axis's values are not looked at."""
+def _checkpoint_named(name=None):
+    """``xte.Checkpoint`` of the checkpoint ``name`` (an ``override_settings`` value); without one, or for a name Forge
+    does not know (``process_images`` drops such an override), the Checkpoint dropdown's. ``None`` when unknown."""
     try:
         from modules import sd_models
 
-        info = None
-        name = (getattr(p, "override_settings", None) or {}).get(xte.CHECKPOINT_KEY) if p is not None else None
-        if name:
-            info = sd_models.checkpoint_aliases.get(name)
+        info = sd_models.checkpoint_aliases.get(name) if name else None
         if info is None:
             info = sd_models.select_checkpoint()
         return xte.checkpoint_file(getattr(info, "filename", None), getattr(info, "name", None))
     except Exception:
         return None
+
+
+def _checkpoint(p=None):
+    """The checkpoint ``p`` renders with as far as its ``override_settings`` say now (``xte.Checkpoint``, ``None`` when
+    unknown): an API caller's checkpoint - or, from Forge 2.31, the stock Checkpoint axis's once it has been applied to
+    the cell (2.30 loads the axis's checkpoint without writing it there) - else the Checkpoint dropdown's."""
+    name = (getattr(p, "override_settings", None) or {}).get(xte.CHECKPOINT_KEY) if p is not None else None
+    return _checkpoint_named(name)
+
+
+def _start_of(p) -> dict:
+    settings = getattr(p, "override_settings", None) or {}
+    modules = settings.get(xte.MODULES_KEY)
+    return {"modules": list(modules) if isinstance(modules, (list, tuple)) else None,
+            "checkpoint": settings.get(xte.CHECKPOINT_KEY)}
+
+
+def _known_checkpoint(name):
+    """``name`` (an ``override_settings`` value) when Forge knows it, else the Checkpoint dropdown's title read now -
+    the checkpoint ``_checkpoint_named`` gives for either, as a name that does not read the dropdown again. ``name``
+    when the dropdown cannot be read."""
+    try:
+        from modules import sd_models
+
+        if name and sd_models.checkpoint_aliases.get(name) is not None:
+            return name
+        return getattr(sd_models.select_checkpoint(), "title", None) or name
+    except Exception:
+        return name
+
+
+def _grid_start(p) -> dict:
+    """The module list and checkpoint the grid starts from, which ``confirm`` checked the values against (``confirm``
+    keeps them on the grid's ``p`` before its first cell): the module list of the grid's ``override_settings`` (an API
+    caller's; ``None`` - the dropdown's), and the checkpoint of it or else the Checkpoint dropdown's, read then. Every
+    cell shares that dict, and Forge 2.31's stock VAE / Checkpoint axes write their values into it - so while a cell's
+    axes are applied it may hold the previous cell's; 2.31 can also leave a cell's checkpoint in the dropdown
+    (``process_images`` puts back only keys config.json has, and nothing for an API caller's
+    ``override_settings_restore_afterwards=False``). A caller that skips ``confirm``: what ``p`` has now."""
+    start = getattr(p, xte.GRID_START_ATTR, None)
+    return start if isinstance(start, dict) else _start_of(p)
 
 
 def _overlap_error(slots) -> xte.AxisValueError:
@@ -126,7 +167,10 @@ def _overlap_error(slots) -> xte.AxisValueError:
 # ---------------------------------------------------------------------------------------------------------------------
 
 def _apply(p, x, xs):
-    # Raises on a bad value (confirm has already checked them all), which stops the grid like the stock axes do.
+    # Raises on a bad value (confirm has already checked them all), which stops the grid like the stock axes do. The
+    # list is checked on the grid's starting selection and checkpoint - what confirm checked, never a value an earlier
+    # cell left in the shared override_settings or (Forge 2.31) in the Checkpoint dropdown; the hook builds it again when
+    # the cell starts (_build_cell).
     module_list, _ = _module_list()
     classify = _classifier()
     slots = xte.pick_slots(x, module_list, classify)
@@ -136,25 +180,55 @@ def _apply(p, x, xs):
         if not hasattr(p, xte.CELL_ATTR):
             setattr(p, xte.CELL_ATTR, None)
         return
+    start = _grid_start(p)
     if earlier:
         both = xte.overlap(earlier["slots"], slots)
         if both:
             raise _overlap_error(both)
-        origin, base = earlier["origin"], earlier["modules"]
+        origin, values = earlier["origin"], (*earlier["values"], x)
     else:
-        origin = base = xte.normalise(xte.effective_base(getattr(p, "override_settings", None), _selection()),
-                                      module_list)
-    added = [entry for entry in base if entry not in origin]
-    modules = xte.plan(x, base=base, module_list=module_list, classify=classify, checkpoint=_checkpoint(p), added=added)
-    setattr(p, xte.CELL_ATTR, {"value": x, "modules": modules, "origin": origin,
+        origin = xte.normalise(xte.effective_base({xte.MODULES_KEY: start["modules"]}, _selection()), module_list)
+        values = (x,)
+    modules = xte.plan_values(values, base=origin, module_list=module_list, classify=classify,
+                              checkpoint=_checkpoint_named(start["checkpoint"]))
+    setattr(p, xte.CELL_ATTR, {"value": x, "values": values, "modules": modules, "origin": origin,
                                "slots": slots | (earlier["slots"] if earlier else frozenset())})
+
+
+def _build_cell(p, cell):
+    """The cell's list when it starts (the hook's ``before_process``, after every axis of the cell): the values of its
+    Text Encoder axes on the selection the cell has now - with Forge 2.31's stock VAE axis, the cell's VAE list in its
+    ``override_settings`` whichever axis was applied first - and the checkpoint it loads (2.31's Checkpoint axis writes
+    it there too). On Forge 2.30 that is what ``apply`` built. A value that does not fit the cell's checkpoint (a grid
+    mixing model families on 2.31) gets the list ``apply`` checked - the one 2.30 renders - and a console line, rather
+    than stopping the grid."""
+    values = cell.get("values")
+    if not values:
+        return cell["modules"]
+    module_list, _ = _module_list()
+    classify = _classifier()
+    base = xte.effective_base(getattr(p, "override_settings", None), _selection())
+    try:
+        return xte.plan_values(values, base=base, module_list=module_list, classify=classify, checkpoint=_checkpoint(p))
+    except xte.AxisValueError as exc:
+        checked = _checkpoint_named(_grid_start(p)["checkpoint"])
+        modules = xte.plan_values(values, base=base, module_list=module_list, classify=classify, checkpoint=checked)
+        name = f'"{checked.name}"' if checked is not None else "the one the values were checked against"
+        _log(f"{exc} - this cell's list is made as for the checkpoint {name}, as the axis did before Forge 2.31")
+        return modules
 
 
 def _confirm(p, xs):
     module_list, _ = _module_list()
     classify = _classifier()
-    checkpoint = _checkpoint(p)
-    base = xte.effective_base(getattr(p, "override_settings", None), _selection())
+    if not isinstance(getattr(p, xte.GRID_START_ATTR, None), dict):
+        start = _start_of(p)
+        # without a checkpoint of the caller's, the dropdown's now - before a cell can leave its own there
+        start["checkpoint"] = _known_checkpoint(start["checkpoint"])
+        setattr(p, xte.GRID_START_ATTR, start)
+    start = _grid_start(p)
+    checkpoint = _checkpoint_named(start["checkpoint"])
+    base = xte.effective_base({xte.MODULES_KEY: start["modules"]}, _selection())
     axis_slots = frozenset()
     for x in xs:
         xte.plan(x, base=base, module_list=module_list, classify=classify, checkpoint=checkpoint)
@@ -208,11 +282,43 @@ def register_xyz_axes(xyz_grid) -> None:
 VAE_STOCK_APPLY = "_sam_extra_stock_apply"
 
 
+def _vae_cell_modules(settings, x, before) -> None:
+    """Forge 2.31: the cell's list the stock axis wrote, again with exactly ``x`` as the VAE
+    (``xvae.axis_cell_modules``); Forge's list stays when ``x`` is not a file of Forge's VAE list. The dropdown's list
+    (``_selection()``) counts at the grid's first cell only: Forge may leave an earlier cell's list in it."""
+    from modules import sd_vae
+
+    vae_dict = getattr(sd_vae, "vae_dict", None) or {}
+    if x in (None, "None"):
+        path = None
+    elif x in vae_dict:
+        path = vae_dict[x]
+    else:
+        return
+    module_list, _ = _module_list()
+    settings[xte.MODULES_KEY] = xvae.axis_cell_modules(before, path, _selection(), module_list=module_list,
+                                                       classify=xte.classify_file, vae_names=set(vae_dict))
+
+
 def make_vae_apply(stock_apply):
-    """Forge's ``apply_vae`` (``p.override_settings["sd_vae"]``) unchanged, then the mark the hook decides the cell by."""
+    """Forge's ``apply_vae``, then the mark the hook decides the cell by.
+
+    Forge 2.30's writes the file to ``p.override_settings["sd_vae"]`` (swapped into the loaded model in place; the
+    hook sends a file Forge cannot swap to the model loader) - left as it is. Forge 2.31's writes the cell's whole
+    module list to ``override_settings["forge_additional_modules"]`` instead (the model is loaded with it, so both VAE
+    families render); that list keeps a VAE of the selection that is not one of the axis's values, and the last VAE of
+    the sorted list wins, so it is written again with exactly the value as the VAE, on the grid's starting list."""
 
     def apply(p, x, xs):
+        settings = getattr(p, "override_settings", None)
+        before = settings.get(xte.MODULES_KEY) if isinstance(settings, dict) else None
         stock_apply(p, x, xs)
+        if isinstance(settings, dict) and settings.get(xte.MODULES_KEY) is not before:
+            try:
+                _vae_cell_modules(settings, x, before)       # Forge 2.31: the stock axis wrote the cell's list
+            except Exception:
+                print("[XYZ VAE] setting the cell's VAE failed - Forge's own list is used:\n" + traceback.format_exc(),
+                      file=sys.stderr)
         setattr(p, xvae.CELL_ATTR, {"value": x})
 
     return apply
@@ -221,7 +327,11 @@ def make_vae_apply(stock_apply):
 def replace_vae_axis(xyz_grid) -> None:
     """Put a copy of Forge's ``VAE`` axis option at its index - the same object otherwise (label, type, choices with
     "None", cost, labels, confirm, img2img / txt2img class) - whose ``apply`` also marks the cell. Again on a WebUI
-    reload: the copy wraps Forge's apply, never an earlier copy's."""
+    reload: the copy wraps Forge's apply, never an earlier copy's.
+
+    Forge 2.31's ``VAE ("state_dict" only)`` axis (the in-place swap of 2.30's ``VAE`` axis, kept for speed) is not
+    replaced: its values must be VAEs of the family the model was built with - another family fails Forge's strict load
+    and leaves the cell black, as with 2.30's own axis."""
     for index, existing in enumerate(xyz_grid.axis_options):
         if getattr(existing, "label", None) != xvae.AXIS_LABEL:
             continue
@@ -277,7 +387,7 @@ class XyzTextEncoderHook(scripts.Script):
 
     def before_process(self, p, *args):
         try:
-            cell_runtime.before_process(p)
+            cell_runtime.before_process(p, build=_build_cell)
         except Exception:
             # Forge would only log it (errors.report) and render the cell with the dropdown's encoder (a VAE Forge
             # cannot swap then fails in Forge's swap); say so plainly.

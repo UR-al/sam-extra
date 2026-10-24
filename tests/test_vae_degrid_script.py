@@ -36,7 +36,8 @@ from sam3ext import vae_degrid as vd  # noqa: E402
 from sam3ext import vae_degrid_models as vdm  # noqa: E402
 from sam3ext import vae_degrid_runtime as vdr  # noqa: E402
 
-FORGE_ROOT = ROOT.parents[1]
+# 다른 테스트처럼 $SAM3_FORGE_ROOT 가 있으면 그 Forge(예: 2.31 소스)를, 없으면 확장 옆(extensions/<ext> 의 두 단계 위).
+FORGE_ROOT = Path(os.environ["SAM3_FORGE_ROOT"]) if os.environ.get("SAM3_FORGE_ROOT") else ROOT.parents[1]
 FORGE_PROCESSING = FORGE_ROOT / "modules" / "processing.py"
 FORGE_SCRIPTS = FORGE_ROOT / "modules" / "scripts.py"
 FORGE_CALLBACKS = FORGE_ROOT / "modules" / "script_callbacks.py"
@@ -728,10 +729,10 @@ class ExtrasTests(unittest.TestCase):
         self.assertLess(EXTRAS.ScriptPostprocessingVaeDegrid.order, 1000)
 
     def test_forge_230_builtin_degrid_runs_after_this_one_in_extras(self):
-        """Forge 2.30 added its own Extras "DeGrid" (scripts/degrid.py — a pixel lattice filter, not NAFNet, on by
-        default). Both on = applied twice; Forge's own ``scripts_in_preferred_order`` (run here from its file) puts
-        this item first: same order 900, then the name. The README / Extras help say so. Forge 2.29.2 has no
-        built-in DeGrid."""
+        """Forge 2.30 added its own Extras "DeGrid" (scripts/degrid.py — a pixel lattice filter, not NAFNet; on by
+        default in 2.30.x, off by default from 2.31). Both on = applied twice; Forge's own
+        ``scripts_in_preferred_order`` (run here from its file) puts this item first: same order 900, then the name.
+        The README / Extras help say so. Forge 2.29.2 has no built-in DeGrid."""
         degrid = FORGE_ROOT / "scripts" / "degrid.py"
         runner_file = FORGE_ROOT / "modules" / "scripts_postprocessing.py"
         if not runner_file.is_file():
@@ -743,7 +744,11 @@ class ExtrasTests(unittest.TestCase):
         fields = {t.id: ast.literal_eval(n.value) for n in cls.body if isinstance(n, ast.Assign) for t in n.targets}
         accordion = next(n for n in ast.walk(cls) if isinstance(n, ast.Call)
                          and getattr(n.func, "id", None) == "InputAccordion")
-        self.assertIs(ast.literal_eval(accordion.args[0]), True, "Forge's DeGrid is on by default")
+        # 2.30.x: InputAccordion(True, …) — 2.31: InputAccordion(False, …). Extras 도움말이 둘 다 적는다.
+        default_on = ast.literal_eval(accordion.args[0])
+        self.assertIn(default_on, (True, False), "Forge's DeGrid accordion default is a plain bool")
+        self.assertIn("2.30.x 는 기본 켬", uvd.HELP_EXTRAS)
+        self.assertIn("2.31 부터 기본 끔", uvd.HELP_EXTRAS)
 
         runner = next(n for n in ast.parse(runner_file.read_text(encoding="utf-8")).body
                       if isinstance(n, ast.ClassDef) and n.name == "ScriptPostprocessingRunner")

@@ -3,6 +3,208 @@
 버전 태그는 GitHub Releases에도 발행됩니다. 아래는 요약이며, guidance/속도 기능의
 상세는 [docs/GUIDANCE.md](docs/GUIDANCE.md)를 참고하세요.
 
+## Unreleased — Forge Neo 2.31 호환
+
+Forge Neo 2.31(2.30.1 `a552980e` 뒤 커밋 13개 — MOSS-Image 지원, XYZ `VAE` · `Checkpoint name` 축과 cost 변경, MOSS 전용 Skip Layer
+Guidance, Extras DeGrid 기본 끔)에서 달라진 것에 맞춘 판입니다. 2.31 에서 실제로 깨진 곳은 XYZ 입니다: **`[Modules] Text Encoder` 축이
+`VAE` 축보다 먼저 적용되는 배치(Text Encoder 가 X, VAE 가 Y 등)에서 칸마다 앞 칸의 VAE 로 그렸고**, `Checkpoint name` 축으로 계열이 다른
+체크포인트를 섞은 그리드는 통째로 멈췄습니다. Forge 의 새 `VAE` 축은 값 목록에 없는 선택의 VAE 를 남겨 고른 VAE 가 무시될 수 있었습니다.
+그리고 **DoRA 추론 방식**의 LyCORIS · Forge fp32 에서 오프셋 패치(합쳐진 qkv 를 나눠 거는 LoRA 등)의 DoRA 가 통째로 빠지던 버그를
+고쳤습니다 — 2.30.1 에도 있던 버그이고, 2.31 의 MOSS LoRA 매핑이 경로를 하나 더했습니다. Text Encoder 축이 MOSS 의 Qwen3.5 9B 자리를
+알고, MCP 서버의 프리셋 표에 `moss` · `qwen21` 이 들어갑니다. Forge 2.30.1 과 2.31 모두에서 돌며, 판 번호가 아니라 동작(Forge 의
+`VAE` 축이 무엇을 쓰는지 등)으로 나눕니다. **2.30.1 의 결과는 그대로**이고(오프셋 패치의 DoRA 수정과, 그리드 도중 Checkpoint 드롭다운을 다른 계열로 바꾼
+경우만 예외 — 아래), 스크립트 인자 ·
+infotext · 설정 키 · XYZ 축 이름 · 자리 · cost 도 그대로입니다. 확인은 CPU 테스트뿐이고 GPU 생성은 아직 하지 않았습니다.
+
+**업그레이드할 때**
+
+- Forge 를 **완전히 다시 시작**하세요 — 바뀐 `sam3ext` 모듈(`xyz_text_encoder.py` · `xyz_text_encoder_cell.py` · `xyz_vae.py` ·
+  `dora_infer_mode.py` · `ui_vae_degrid.py`)과 `scripts/modules_xyz_text_encoder.py`(축을 `on_before_ui` 에서 바꿔 끼움)는 Reload UI
+  로 다 읽히지 않습니다. MCP 서버를 쓰면 클라이언트에서 서버도 다시 시작하세요(바뀐 `mcp_server/sam_extra_mcp/forgeneo/*`).
+- Forge 를 2.31 로 올리면 바뀌는 것(Forge 의 변경 — sam-extra 가 있든 없든):
+  - XYZ 의 기본 `VAE` 축은 칸마다 그 VAE 를 넣은 모듈 목록으로 **모델을 다시 불러옵니다** — 형식이 다른 VAE 도 검은 칸 없이 그리지만
+    칸마다 모델 로딩만큼 시간이 듭니다. 같은 계열 VAE 를 빨리 바꾸려면 Forge 의 새 `VAE ("state_dict" only)` 축(2.30 의 제자리 교체,
+    cost 0.3)을 쓰세요. sam-extra 는 이 축을 바꿔 끼우지 않으므로 형식이 다른 VAE 는 2.30 처럼 검은 칸이 됩니다.
+  - 새 축이 `VAE` 바로 뒤에 들어가 그 뒤의 기본 축과 확장 축(sam-extra 의 것 포함)의 번호가 하나씩 밀립니다. 저장해 둔 API 요청이
+    축을 번호(`x_type` 등의 정수)로 고르면 다시 확인하세요. notebook 의 XYZ 프리셋은 이름으로 고르므로 그대로입니다.
+  - cost: `Checkpoint name` 1.0 → 2.0, Prompt S/R · Prompt order · Styles 0 → 0.1. Settings → UI Alternatives → "Enable the cost
+    system for X/Y/Z Plot"(`xyz_use_cost`, 기본 켬, 재시작 필요)을 끄면 sam-extra 의 축까지 모든 cost 가 0 이라 화면 순서대로 돕니다.
+    어느 쪽이든 칸의 결과는 같고 순서만 바뀝니다.
+  - 기본 `Checkpoint name` · `VAE` 축의 값은 그 칸 동안 Forge 설정(`shared.opts`)에 들어갑니다(`process_images` 의 `set_config`).
+    그리드 도중 페이지를 열면(`on_preset_change` 가 설정을 저장) 그 값이 config.json 에 저장될 수 있습니다. sam-extra 의 Text Encoder
+    축은 여전히 설정에 쓰지 않습니다.
+- MOSS-Image 를 Forge 2.31 에서 쓰려면 텍스트 인코더가 `model.language_model.*` 키 형식이어야 합니다(Comfy-Org/MOSS-Image 의
+  `text_encoders/qwen3.5_9b_*`). OpenMOSS 공식 저장소의 `text_encoder` 조각을 합친 파일(`language_model.*` · `visual.*` 키, `model.`
+  없음)은 Forge 가 Qwen2.5-VL 7B 자리로 읽어 파일을 다 읽은 뒤 `You do not have Qwen3.5 state dict!` 로 멈춥니다(Forge 의 동작, 아래
+  **MOSS-Image**).
+
+### XYZ — `[Modules] Text Encoder` 축 × Forge 2.31 의 `VAE` · `Checkpoint name` 축 (고침)
+
+- **깨진 것**: 2.31 의 기본 `VAE` 축은 칸의 모듈 목록 전체를 `override_settings["forge_additional_modules"]` 에, `Checkpoint name` 축은
+  체크포인트를 `override_settings["sd_model_checkpoint"]` 에 씁니다. xyz_grid 는 칸마다 `p` 를 얕게 복사하므로 이 dict 를 모든 칸이 같이
+  쓰고, 다음 칸에는 앞 칸의 값이 남아 있습니다. v0.35.0 의 Text Encoder 축은 축을 적용할 때(`apply`) 그 dict 의 목록 · 체크포인트를
+  칸의 출발점으로 읽어서
+  - Text Encoder 축이 `VAE` 축보다 먼저 적용되는 배치에서는 칸마다 **앞 칸의 VAE** 로 그렸습니다(2.31 소스와 테스트 하네스로 CPU 재현 —
+    3 · 4번째 칸의 VAE 가 서로 바뀜). `VAE` 축이 먼저인 배치는 맞았습니다. 어느 축이 먼저 적용되는지는 축의 자리와 cost 가
+    정합니다.
+  - `Checkpoint name` 축과 섞으면 자리 확인이 앞 칸의 체크포인트를 봤고, 계열이 다른 체크포인트(Flux · Anima 와 CLIP-L 파일 등)를 섞은
+    그리드는 xyz_grid 의 try 밖에서 `AxisValueError` 가 나 **그리드 전체가 멈췄습니다**. 앞 칸의 체크포인트는 그 dict 뿐 아니라
+    드롭다운에도 남습니다: 2.31 의 `process_images` 는 config.json 에 있던 키만 되돌리고(UI 를 거치지 않은 API 전용 시작이면
+    `sd_model_checkpoint` 가 없을 수 있음 — UI 의 체크포인트 드롭다운이 이 키를 넣음), API 호출자가
+    `override_settings_restore_afterwards=False` 를 보내면 아무것도 되돌리지 않습니다.
+- **바뀐 것** (`scripts/modules_xyz_text_encoder.py`, `sam3ext/xyz_text_encoder_cell.py`, `sam3ext/xyz_text_encoder.py`): `apply` 는 칸의
+  값(이 축이 둘이면 적용한 순서대로)과 값 확인용 목록만 칸에 적고, 그리는 목록은 훅의 `before_process` 에서 — 칸의 모든 축이 적용된
+  뒤 — 그 칸의 선택(2.31 이면 `VAE` 축이 쓴 목록)과 그 칸이 불러올 체크포인트로 한 번 만듭니다(`_build_cell`, 새 `xte.plan_values` —
+  축 둘을 차례로 얹는 것은 전과 같음). 값 확인(`confirm` · `apply`)은 그리드가 시작할 때의 목록 · 체크포인트로만 합니다. 목록은 API
+  호출자의 것, 없으면 드롭다운의 것입니다(Forge 가 드롭다운에 남기는 것은 2.31 `VAE` 축의 목록뿐이고 그 인코더는 선택의 것 그대로).
+  체크포인트는 API 호출자의 것(Forge 가 아는 이름), 없으면 드롭다운의 것이고, `confirm` 이 첫 칸 전에 읽어 그리드의 `p` 에 적어 둡니다 —
+  칸마다 드롭다운을 다시 읽지 않습니다(위의 두 경우 앞 칸의 것). 그 칸의 체크포인트가 고른 인코더를 받지 않으면(계열이 다른 체크포인트를
+  섞은 그리드) 그리드를 멈추지 않고, 그 칸은 시작 체크포인트로 만든 목록 — 2.30 에서 그리던 목록 — 으로 그리며 콘솔에
+  `[XYZ Text Encoder] … - this cell's list is made as for the checkpoint "…", as the axis did before Forge 2.31` 를 남깁니다.
+- **그대로**: 2.30.1 에서는 `apply` 때와 `before_process` 때의 입력이 같아 칸의 목록과 결과가 v0.35.0 과 같습니다(2.30.1 의 옛 기대값은
+  고치지 않고 통과). 드롭다운(API 면 `override_settings`)의 체크포인트가 받지 않는 값은 두 판 모두 첫 칸 전에 그리드를 멈춥니다. 칸 안의
+  패스(ADetailer · SAM3 refine)는 칸의 목록을 그대로 쓰고, Hires · Refiner · `Module N` 처리도 그대로입니다. 하나 달라진 것(두 판 모두):
+  그리드 도중 사용자가 Checkpoint 드롭다운을 고른 인코더를 받지 않는 계열로 바꾸면 v0.35.0 은 다음 칸의 `apply` 에서 그리드가
+  멈췄고, 이제는 위의 섞인 그리드처럼 그 칸을 시작 체크포인트로 만든 목록으로 그리고 콘솔 줄을 남깁니다.
+- **설정**: sam-extra 는 여전히 Forge 설정에 아무것도 쓰지 않고 인코더는 opts · config.json 에 가지 않습니다. 2.31 에서 기본
+  `Checkpoint name` · `VAE` 축의 값이 칸 동안 opts 에 들어가는 것은 위 **업그레이드할 때** 의 Forge 동작이고, 모듈 docstring 과 테스트가
+  판마다 그렇게 적고 기대합니다.
+
+### XYZ — `VAE` 축: Forge 2.31 에서 고른 VAE 가 그 칸의 유일한 VAE 로 (고침)
+
+- 2.31 의 기본 `VAE` 축은 VAE 를 제자리에서 바꾸지 않고 모듈 목록에 넣어 모델을 다시 불러오므로, v0.34.0 에서 고친 **형식이 다른 VAE
+  의 검은 칸**은 Forge 자체로도 나오지 않습니다. 이 경로에서는 sam-extra 의 2.30 용 판정(`xyz_vae_cell.plan` — `sd_vae` 를 읽음)이 할
+  일이 없습니다.
+- **깨진 것**(Forge 2.31 의 목록): 축은 드롭다운 선택에서 **이름이 축의 값 중 하나로 끝나는** 모듈만 빼고 값을 더합니다. 그래서 선택의
+  VAE 가 값 목록에 없으면 남아 VAE 가 둘이 되고, Forge 가 목록을 이름순으로 정렬해 마지막 VAE 가 이기므로 고른 VAE 가 무시될 수
+  있습니다(CPU 재현: 선택이 `qwen_image_vae_HDR_fp32` 인데 값 `qwen_image_vae` 칸이 HDR 로 그려지고 `Module N` 에는 둘 다). 거꾸로
+  선택의 VAE 가 값 중 하나이면 `None` 칸은 그 VAE 마저 빠져 체크포인트의 VAE 로 그립니다.
+- **바뀐 것** (`scripts/modules_xyz_text_encoder.py` `make_vae_apply`, `sam3ext/xyz_vae.py` `axis_cell_modules`): 바꿔 끼운 축이 Forge 의
+  `apply_vae` 를 부른 뒤 그 칸의 `forge_additional_modules` 가 새로 쓰였으면(2.31 의 동작 — 실행 중에 알아봄) 그 목록을 **그리드가
+  시작한 목록에서 VAE 만 그 값으로 바꾼 것**으로 다시 씁니다 — VAE / Text Encoder 드롭다운에서 그 파일을 고른 것과 같고, 2.30 의 축이
+  그리던 것과 같습니다. `None` 은 선택의 VAE 를 그대로 둡니다(선택에 VAE 가 없으면 체크포인트에 든 VAE). 그리드가 시작한 목록 — API
+  호출자가 `override_settings` 에 준 목록, 없으면 첫 칸에서 읽은 드롭다운 목록 — 은 모든 칸의 출발점으로 남습니다(모든 칸이 같이
+  쓰는 dict 에 앞 칸의 목록이 남아도 — `CellModules` 가 시작 목록을 들고 다님). 드롭다운 목록을 칸마다 다시 읽지 않는 것은 2.31 이 앞
+  칸의 목록을 설정에 남기는 두 경우 때문입니다: config.json 에 `forge_additional_modules` 가 아직 없을 때(`process_images` 는 설정에
+  있던 키만 되돌림 — VAE / Text Encoder 를 한 번도 고르지 않은 SDXL 사용자 등)와 API 호출자가 `override_settings_restore_afterwards=False`
+  를 보냈을 때. 그때도 VAE 칸 뒤의 `None` 칸은 선택의 VAE 로 그립니다(Forge 의 축 · 2.30 과 같음). 그래서 그리드 도중 드롭다운을
+  바꿔도 2.31 에서는 이 축의 남은 칸에 반영되지 않습니다(보통은 Forge 2.31 도 칸이 끝날 때 칸 전의 목록을 설정에 되돌려 놓음 — 2.30
+  에서는 Forge 의 축 그대로 남은 칸에 반영됨). 다시 쓰다 실패하면 Forge 의 목록 그대로 그리고 콘솔에 `[XYZ VAE] setting the cell's VAE
+  failed - Forge's own list is used` 와 traceback 을 남깁니다.
+- **그대로**: 2.30.1 은 기본 축이 `sd_vae` 를 써서 다시 쓰기가 걸리지 않고, 판정 · 제자리 교체 · 다시 불러오기가 v0.35.0 과 같습니다.
+  축 이름 · 자리 · 값 후보와 `None` · cost 0.7 · 칸 라벨도 그대로입니다. 2.31 의 `VAE ("state_dict" only)` 축은 바꿔 끼우지 않습니다 —
+  같은 계열 VAE 전용입니다(다른 형식은 Forge 의 엄격한 로드가 실패해 2.30 처럼 검은 칸, docstring 에 적음). 이 축도 Text Encoder 축과
+  그대로 섞입니다.
+- 2.31 에서는 Forge 의 설계대로 기본 `VAE` 축의 칸마다 모델을 다시 불러오고, 그리드가 끝난 뒤 그리드의 `override_settings`(API
+  호출자가 준 dict 포함)에 마지막 칸의 VAE 목록 · 체크포인트가 남습니다.
+
+### XYZ — `[Modules] Text Encoder` 축: Qwen3.5 9B (MOSS-Image) 자리 (새 — Forge 2.31)
+
+- 2.31 의 `replace_state_dict` 는 Gemma-2 · Qwen 분기 앞에 Qwen3.5 9B 분기를 더했습니다(`model.language_model.layers.0.linear_attn.A_log`
+  와 `model.language_model.layers.0.input_layernorm.weight` 가 있으면 자리 `qwen35_9b`, 너비 4096 이 아니면 assert). `te_slots` 가 같은
+  자리에 같은 분기를 두고(너비가 4096 이 아니면 Forge 처럼 막음), 자리 이름 `Qwen3.5 9B` 를 더해 MOSS 올인원 체크포인트에 든 인코더
+  (`text_encoders.qwen35_9b.*`)도 `checkpoint_profile` 이 봅니다. MOSS 선택에서는 Comfy-Org 형식의 Qwen3.5 9B 파일이 후보가 됩니다.
+- 공식 `text_encoder` 를 합친 `model.` 없는 파일은 Forge 2.31 처럼 Qwen2.5-VL 7B 자리로 읽으므로 MOSS 의 인코더 자리를 채우지
+  않습니다(그 형식의 실제 파일 헤더로 확인).
+- 자리 판정은 판과 상관없이 2.31 의 로더를 따릅니다(2.29.2 에서 Qwen3-VL 8B 를 다루는 것과 같음). 2.30.1 에는 그 자리를 읽는 모델
+  계열이 없어, 그런 파일은 그 판에서 "모델이 가진 자리가 아닌 인코더" 로 막힙니다. Anima 3.8B 의 Qwen3.5 4B 파일 처리는 그대로입니다.
+
+### DoRA 추론 방식 — 오프셋 패치의 DoRA 가 통째로 빠지던 것 (고침, Forge 2.30.1 · 2.31)
+
+- **증상**: **LyCORIS** · **Forge fp32** 방식에서 오프셋 패치(한 가중치의 일부 행에만 거는 LoRA — 합쳐진 qkv 가중치를 q · k · v 로
+  나눠 거는 것 등)의 DoRA 가 **통째로 빠졌습니다**. 그 조각은 LoRA 없는 원래 가중치로 남았고, 콘솔의 레이어 수 · 합친 횟수는 성공으로
+  셌습니다. 해당 경로: 2.31 의 MOSS LoRA 매핑(합쳐진 `.proj.qkv.weight` 를 가진 MOSS 체크포인트), 2.30.1 에도 있던 Flux · Chroma ·
+  Z-Image 의 diffusers 형식 q/k/v, Qwen-Image 2.1 의 `gate_up`. 순정 · DoRA 끔 방식과 오프셋이 없는 LoRA(Anima 전부, q/k/v 가 따로인
+  MOSS 체크포인트)는 영향이 없었습니다.
+- **원인**: Forge 는 LoRA 를 `torch.inference_mode` 안에서 합치고(`modules/processing.py` 의 `with torch.inference_mode():`,
+  `backend/patcher/lora.py` `merge_lora_to_weight` 의 `@torch.inference_mode()`), 그 안에서 만든 narrow 뷰는 `_base` 가 None 입니다.
+  v0.35.0 은 `_base` 로 뷰를 가려 오프셋 뷰를 일반 임시 버퍼로 보고 fp32 결과를 돌려줬는데, Forge 의 오프셋 경로는 반환값을 버리고
+  뷰에 제자리로 쓰인 값만 씁니다.
+- **바뀐 것** (`sam3ext/dora_infer_mode.py`): 뷰를 저장소로 알아봅니다(`_is_partial_view` — 시작 위치가 0 이 아니거나 저장소가 텐서보다
+  크면 뷰, 저장소를 읽을 수 없으면 뷰로 봄). 그리고 결과를 **늘 버퍼에도 제자리로** 씁니다(순정 `weight_decompose` 처럼, `decompose` 의
+  새 인자 `return_fp32`). 일반 경로는 여전히 fp32 결과를 돌려줘 Forge 가 저장 dtype 으로 한 번만 반올림하고, 뷰를 놓치는 경우가 있어도
+  결과가 남습니다. 일반 경로에서 더 드는 것은 Forge 가 버리는 임시 버퍼에 쓰는 복사 한 번입니다.
+- **바뀌는 결과**: 위의 오프셋 경로를 LyCORIS · Forge fp32 로 합친 생성뿐입니다(이제 DoRA 가 들어감). 일반 경로 · Low VRAM · 온라인
+  LoRA 의 합친 가중치는 v0.35.0 과 같습니다. Forge 의 `backend/patcher` · `weight_adapter` 는 2.30.1 과 2.31 이 같아 두 판에서 같게
+  고쳐집니다.
+
+### MCP 서버 — `moss` · `qwen21` 프리셋 (새)
+
+- `ARCH_DEFAULTS` 에 Forge 의 `qwen21`(Qwen-Image-2.1 — Forge 2.30 부터 있던 프리셋인데 빠져 있었음: Euler · Simple · 32 스텝 · CFG 2.5)과
+  `moss`(MOSS-Image, Forge 2.31: Euler · Simple · 50 스텝 · CFG 3.0 · shift 5.0)를 Forge 의 값으로 더해, `model_profile` 이 '모르는
+  아키텍처' 경고 대신 기본값을 알려 줍니다. 두 프리셋은 자연어 방언입니다(`PROMPT_STYLE` — Forge 가 chat template 을 씌우고
+  `(word:1.2)` 같은 강조 가중치는 적용되지 않음, `moss` 는 Forge 의 JSON Builder 탭이 쓰는 JSON 레이아웃 프롬프트도 설명). base model
+  에 MOSS 가 적힌 LoRA · 체크포인트도 자연어로 봅니다.
+- `module_check` · `module_download`: `qwen21` 은 Qwen-Image-2.1 VAE + Qwen3-VL 8B(Forge 위키의 목록), `moss` 는 Flux.2 VAE + Qwen3.5 9B
+  (Comfy-Org/MOSS-Image 의 `vae/flux2-vae`, `text_encoders/qwen3.5_9b_bf16` · `qwen3.5_9b_int8_convrot`). Qwen-Image-2.1 저장소의
+  프롬프트 다시 쓰기 모델(`qwen3.5_9b_qwen_image_2.1_pe_*`, 역시 Qwen3.5 9B)은 MOSS 인코더로 치지 않습니다(새 `ModuleRequirement.excludes`).
+  모듈 확인은 이름으로 맞추므로 키 형식(`model.language_model.*`)은 보지 않습니다 — 안내 문구에 그렇게 적었습니다.
+- 모델 폴더 이름 `moss-image` · `qwen-image-2.1` 도 그 프리셋으로 읽습니다.
+- `qwen3.5_9b_int8_convrot` 를 Forge 2.31 이 MOSS 로 불러오는지는 확인하지 않았습니다(`w4a8_gptq` 판은 Forge 의 양자화 표가 받는지
+  확인하지 못해 목록에서 뺐습니다).
+
+### MOSS-Image (Forge 2.31) — 알아 둘 것 (코드 그대로)
+
+- **Forge 의 SLG**: 2.31 은 MOSS 전용 Skip Layer Guidance 를 늘 켜진 내장 스크립트로 둡니다(Settings → Stable Diffusion →
+  "[Moss-Image] Enable Skip Layer Guidance", **기본 켬**, 레이어 22, 처음 0\~50 % — infotext `Skip Layer Guidance`). 그 구간에서는 uncond 를
+  22번 블록을 건너뛰고 따로 돌리므로, MOSS 에서도 켜지는 sam-extra 의 CFG 쪽 기능 — Skimmed CFG · APG/SMC/CWM · Colorcraft · CFG++
+  샘플러 — 은 **SLG 로 바뀐 uncond** 위에서 계산됩니다. 효과를 볼 때는 SLG 를 끈 결과와도 비교하세요. Adaptive Guidance 는 cond · uncond
+  가 한 호출에 있어야 uncond 를 뺄 수 있어 그 구간에서는 아무것도 생략하지 못합니다(메시지 없음 — 기본 Skip after 0.5 에서는 겹치는
+  스텝이 거의 없고, 더 일찍 시작하게 하면 그만큼 절약이 줄어듦). sam-extra 의 PAG · SEG · SLG 는 그대로 Anima 에서만 돌아 레이어 건너뛰기가
+  겹치지 않습니다.
+- **DoRA 추론 방식**은 모델을 가리지 않아 MOSS LoRA(LoKr + DoRA)에도 걸립니다. 출력 축 DoRA 파일(`wd_on_output=True`, `dora_scale`
+  `[out,1]` — LyCORIS 기본값)은 Forge 순정이 `‖W₀‖` 로 나눠 레이어마다 LoRA 변화량의 약 1\~3 % 가 학습 식과 다르고
+  (CPU fp32 측정), **LyCORIS** 가 학습 식입니다. 입력 축 파일은 정밀도만 다릅니다.
+- **텍스트 인코더 형식**: 위 **업그레이드할 때**. Text Encoder 축과 MCP 의 `moss` 항목이 같은 규칙을 따릅니다.
+
+### 글 · 주석 (동작 그대로)
+
+- Extras 의 VAE DeGrid 도움말: Forge 자체 DeGrid 는 2.30.x 기본 켬, **2.31 부터 기본 끔**(`sam3ext/ui_vae_degrid.py` `HELP_EXTRAS`).
+  생성 탭 도움말은 기본값을 적지 않아 그대로입니다.
+- `scripts/anima_safe_pag.py` docstring: 2.31 부터 Forge 의 `modules/processing_scripts/slg.py` 가 `sampler_calc_cond_batch_function` 을
+  부르는 디스패처를 깔지만 칸이 하나뿐이고 MOSS SLG 가 덮어쓰므로, 이 확장은 model_function_wrapper + post-CFG 방식을 그대로 둡니다.
+- cost 주석(`sam3ext/xyz_text_encoder.py` `COST`): Checkpoint 1.0(2.31 부터 2.0) · `xyz_use_cost`. 축 순서(Checkpoint → Text Encoder 0.9 →
+  `[DoRA]` 축 0.8 → VAE 0.7)는 두 판에서 같습니다.
+- 모듈 docstring(`xyz_text_encoder.py` · `xyz_text_encoder_cell.py` · `xyz_vae.py` · `xyz_vae_cell.py` · `modules_xyz_text_encoder.py` ·
+  `dora_infer_mode.py`)에 2.31 의 동작을 적었습니다.
+
+### 문서 · 테스트
+
+- README: XYZ Plot 축(2.31 의 cost · `xyz_use_cost`), `[Modules] Text Encoder` 절(칸의 체크포인트 · 2.31 이 설정에 넣는 값 · Qwen3.5 9B ·
+  MOSS 인코더 형식), `VAE` 절(2.31 에서는 Forge 가 다시 불러오고 sam-extra 는 값을 그대로 맞춤 · `VAE ("state_dict" only)` 축), DoRA 추론
+  방식(오프셋 패치 · MOSS LoRA), VAE DeGrid(Forge DeGrid 기본값), Colorcraft 지원 모델(MOSS-Image), Anima Guidance Suite(Forge 의 MOSS
+  SLG), MCP 서버(`moss` · `qwen21`, 인코더 형식).
+- XYZ(`tests/test_xyz_*.py` 6개, 215 → 249): 하네스 — 가짜 opts 의 `xyz_use_cost` 를 그 Forge 의 `shared_options.py` 기본값에서, exec 한
+  xyz 이름공간에 `get_closet_checkpoint_match` · `checkpoints_list`, 축 cost 를 그 Forge 의 `axis_options` 에서 읽고, 판 구분은 판 번호가
+  아니라 Forge 소스로(`forge_axes_write_settings()` · `_forge_reads_qwen35_9b()`), 두 원본 그리드의 `assertRestored` 가 칸마다의 설정을
+  판마다의 기대(2.30 은 쓰는 것 없음, 2.31 은 Forge 의 Checkpoint · VAE 값)와 맞춤. `test_xyz_text_encoder_origin`(43 → 53): `VAE` 축을
+  Text Encoder 축 앞 · 뒤 여섯 자리에 + Checkpoint 축을 섞은 세 축 둘(고치기 전 코드는 2.31 에서 실패), 값 그대로, `VAE ("state_dict"
+  only)` 축(2.30 에서는 없는지 확인), `MixedFamilyGridTests` 3개(Flux · Anima 체크포인트 × CLIP-L — 고치기 전 코드는 2.31 에서 그리드가
+  멈춤; 드롭다운에 앞 칸의 체크포인트가 남는 두 경우 · 두 축 순서 · 어느 체크포인트가 먼저든 — 드롭다운 체크포인트를 칸마다 다시 읽던
+  코드는 2.31 에서 여덟 중 여섯이 멈춤), 기본 Checkpoint · VAE 축과 cost 의 원본 대조, Forge 2.31 이 앞 칸의 목록을 설정에 남기는 두
+  경우(config.json 에 모듈 목록이 없음 · `override_settings_restore_afterwards=False`)의 VAE 다음 `None` 칸 — 혼자 · Text Encoder
+  축과(드롭다운 목록을 칸마다 다시 읽던 코드는 2.31 에서 앞 칸의 VAE 로 그림). `test_xyz_vae_origin`(25 → 27): Forge 의 축과 달리 값
+  그대로, 선택의 VAE 가 값이 아닌 2D 그리드, 판마다의 로드 · 교체 · 콘솔 기대. `test_xyz_text_encoder_script`(28 → 35): `CellStartTests`
+  5개(`confirm` 이 적어 두는 체크포인트 포함) · 칸이 시작할 때의 체크포인트 · 드롭다운에 남은 앞 칸의 체크포인트.
+  `test_xyz_vae_script`(18 → 26): 2.31 모양의 `apply_vae` 로 `Forge231AxisTests` 8개. `test_xyz_text_encoder`(76 → 78) ·
+  `test_xyz_vae`(25 → 30): `qwen35_9b` 자리, `plan_values` = 축을 차례로, `AxisCellModulesTests` 5개, 헤더 예 다섯(qwen35_9b · Qwen3 키를
+  함께 가진 것 · 너비가 다른 것(막음) · `model.` 없는 것 · MOSS 올인원 체크포인트).
+- DoRA(`tests/test_dora_infer_mode.py`, 46 → 54): 뷰 테스트의 부모 텐서와 뷰를 Forge 처럼 `torch.inference_mode` 안에서 만들고(오프셋 0 ·
+  d · 2d, 조각 밖 행은 그대로인지까지), `ViewDetectionTests` 4개, `MossFusedQkvTests`(Forge 없이 `[3d,d]` 합쳐진 qkv 에 오프셋 패치 셋 —
+  LyCORIS · Forge fp32 · DoRA 끔, 조각마다 식과 `dora_scale`), `ForgePatchPathTests`(Forge 체크아웃의 실제 `weight_adapter` ·
+  `merge_lora_to_weight` · `patch_weight_to_device` 로 — 합쳐진 qkv 의 오프셋 패치가 빠지지 않음, q/k/v 가 따로인 일반 경로는 fp32 한 번
+  반올림 그대로). 이 테스트를 v0.35.0 의 모듈에 돌리면 실패 14 · 오류 22 입니다("slice 0: LoRA dropped").
+- MCP(새 `tests/test_mcp_forge_presets.py`, 12개): Forge 체크아웃의 모든 `PresetArch` 가 표에 Forge 와 같은 값 · 모듈 항목 · 방언으로
+  있는지, 2.31 에서 Forge 로더가 `model.language_model.*` 키를 보는지(2.30 에서는 건너뜀), `moss` · `qwen21` 의 기본값 · 방언 · 요구 모듈
+  (프롬프트 다시 쓰기 모델 제외 포함) · 내려받기 · 폴더 이름.
+- DeGrid(`tests/test_vae_degrid_script.py`): Forge DeGrid 의 기본값을 두 판 다 받고 Extras 도움말이 둘 다 적는지. Forge 위치를
+  `SAM3_FORGE_ROOT` 에서 읽어, 확장 폴더 밖 작업 트리에서도 Forge 를 읽는 DeGrid 테스트가 돕니다.
+- 전체(CPU, `CUDA_VISIBLE_DEVICES=-1`, 작업 트리에서 `SAM3_FORGE_ROOT` 로 Forge 를 고름), 2026-10-24: Forge 2.30.1(`a552980e`, 설치된
+  Forge) 3864 테스트 · 건너뜀 192 · 실패 0, 2.31(소스) 3864 · 건너뜀 200 · 실패 0(v0.35.0 은 3810). 두 판 모두 오류 11 은
+  `test_extra_samplers_forge_path` · `test_extra_samplers_substep_guard` 가 확장 폴더 밖 작업 트리에서 Forge 의 `backend` 를 import 하지
+  못하는 것으로, v0.35.0 에서도 같습니다. v0.35.0 은 2.31 에서 `test_xyz_vae_origin` · `test_xyz_text_encoder_origin` 의 실패 6 · 오류
+  21 이 더 있었습니다.
+
 ## v0.35.0 — TSM LoRA (시간 단계 전문가 · 실험) · TSM-LoKr 읽기 · 가벼운 LoRA 목록 (/sam3-lora/lite)
 
 2026-10-24. 시간 단계 전문가 LoRA 를 Forge 에서 쓰는 판입니다. LyCORIS `algo=tsm` 으로 학습한 LoRA(`ss_saved_format=tsm-native`)와

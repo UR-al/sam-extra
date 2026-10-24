@@ -5,15 +5,26 @@
 - LyCORIS 3.2: lycoris/modules/lokr.py get_merged_weight + apply_weight_decompose (_dora_norm_dims, _dora_eps)
 
 Forge 모듈(backend.*, modules_forge.*)은 import 하지 않는다 — backend.memory_management 는 import 만으로 CUDA 를
-조회한다. 필요한 것은 sys.modules 스텁으로 넣는다.
+조회한다. 필요한 것은 sys.modules 스텁으로 넣는다. ``ForgePatchPathTests`` 만 Forge 체크아웃($SAM3_FORGE_ROOT 등,
+tests/_forge_checkout.py)의 weight_adapter 패키지와 patch_weight_to_device·merge_lora_to_weight 를 그 스텁 위에서
+실제로 돌린다(체크아웃이 없으면 건너뛴다).
+
+Forge 는 LoRA 를 ``torch.inference_mode`` 안에서 합친다(modules/processing.py ``with torch.inference_mode():``,
+backend/patcher/lora.py ``@torch.inference_mode()``). 그 안에서 만든 narrow 뷰는 ``_base`` 가 None 이므로 뷰 테스트는
+뷰를 inference mode 안에서 만든다.
 """
 from __future__ import annotations
 
+import collections
+import contextlib
+import importlib
 import importlib.util
+import logging
 import sys
 import types
 import unittest
 from pathlib import Path
+from typing import Callable
 
 import torch
 
@@ -140,16 +151,26 @@ class DecomposeTests(unittest.TestCase):
         torch.testing.assert_close(half, w0 + 0.5 * (full - w0), rtol=1e-6, atol=1e-7)
 
     def test_writes_in_place_into_a_narrowed_half_precision_view(self):
-        # 오프셋 패치는 narrow 뷰를 넘기고 반환값을 버린다(backend/patcher/lora.py:47-65).
+        # 오프셋 패치는 narrow 뷰를 넘기고 반환값을 버린다(backend/patcher/lora.py:47-65). Forge 처럼 inference mode 안.
         w0, diff, scale = _case(out=8, inp=6, seed=9)
-        parent = torch.zeros(20, 6, dtype=torch.float16)
-        parent[4:12] = w0.to(torch.float16)
-        view = parent.narrow(0, 4, 8)
-        dim.decompose(scale, view, diff.clone(), 1.0, 1.0, _identity, merged_norm=True)
+        with torch.inference_mode():
+            parent = torch.zeros(20, 6, dtype=torch.float16)
+            parent[4:12] = w0.to(torch.float16)
+            view = parent.narrow(0, 4, 8)
+            dim.decompose(scale, view, diff.clone(), 1.0, 1.0, _identity, merged_norm=True)
         self.assertEqual(parent.dtype, torch.float16)
         expected = lycoris_merged_weight(w0.to(torch.float16).float(), diff, scale, True).to(torch.float16)
         torch.testing.assert_close(parent[4:12], expected, rtol=0, atol=0)
         self.assertTrue(bool((parent[:4] == 0).all()) and bool((parent[12:] == 0).all()))
+
+    def test_return_fp32_writes_the_buffer_and_returns_the_fp32_result(self):
+        w0, diff, scale = _case(seed=12)
+        weight = w0.to(torch.float16)
+        before = weight.clone()
+        out = dim.decompose(scale, weight, diff.clone(), 1.0, 1.0, _identity, merged_norm=True, return_fp32=True)
+        self.assertEqual(out.dtype, torch.float32)
+        torch.testing.assert_close(out, lycoris_merged_weight(before.float(), diff, scale, True), rtol=1e-6, atol=1e-7)
+        torch.testing.assert_close(weight, out.to(torch.float16), rtol=0, atol=0)
 
     def test_not_inplace_returns_fp32_and_leaves_weight(self):
         w0, diff, scale = _case(seed=10)
@@ -264,18 +285,20 @@ class HookTests(unittest.TestCase):
         self.assertEqual(calls, [("lokr", args)])
         self.assertEqual(dim.take_counters(), dim.Counters(0, 0, 0, None))
 
-    def test_normal_patch_path_returns_fp32_without_touching_the_buffer(self):
+    def test_normal_patch_path_returns_fp32_and_also_writes_the_buffer(self):
         # patch_weight_to_device: fp16 임시 버퍼, intermediate fp32 → fp32 결과를 받아 한 번만 bf16 으로 반올림한다.
+        # 버퍼에도 순정처럼 써 둔다 — 뷰를 못 알아봐도 오프셋 패치가 빠지지 않게.
         mods, _, calls = _fake_adapters()
         dim.install(mods)
         dim.set_mode(dim.MODE_LYCORIS)
         w0, diff, scale = _case(seed=21)
-        weight = w0.to(torch.float16)
-        before = weight.clone()
-        out = mods["lora"].weight_decompose(scale, weight, diff.clone(), 1.0, 1.0, torch.float32, _identity)
+        with torch.inference_mode():
+            weight = w0.to(torch.float16, copy=True)
+            before = weight.clone()
+            out = mods["lora"].weight_decompose(scale, weight, diff.clone(), 1.0, 1.0, torch.float32, _identity)
         self.assertEqual(out.dtype, torch.float32)
-        torch.testing.assert_close(weight, before, rtol=0, atol=0)
         torch.testing.assert_close(out, lycoris_merged_weight(before.float(), diff, scale, True), rtol=1e-6, atol=1e-7)
+        torch.testing.assert_close(weight, out.to(torch.float16), rtol=0, atol=0)
         self.assertEqual(calls, [])
 
     def test_lowvram_and_view_paths_write_in_place_in_the_storage_dtype(self):
@@ -287,12 +310,18 @@ class HookTests(unittest.TestCase):
         out = mods["lokr"].weight_decompose(scale, weight, diff.clone(), 1.0, 1.0, torch.bfloat16, _identity)
         self.assertIs(out, weight)
         self.assertEqual(out.dtype, torch.bfloat16)
-        parent = torch.zeros(30, 16, dtype=torch.float16)
-        parent[2:26] = w0.to(torch.float16)
-        view = parent.narrow(0, 2, 24)
-        out = mods["lokr"].weight_decompose(scale, view, diff.clone(), 1.0, 1.0, torch.float32, _identity)
-        self.assertIs(out, view)
-        self.assertFalse(bool((parent[2:26] == w0.to(torch.float16)).all()))
+        # 오프셋 패치: Forge 처럼 inference mode 안에서 만든 narrow 뷰(_base 가 None). 앞(저장소가 더 큼)·가운데·끝.
+        for start in (0, 3, 6):
+            with self.subTest(start=start), torch.inference_mode():
+                parent = torch.zeros(30, 16, dtype=torch.float16)
+                parent[start:start + 24] = w0.to(torch.float16)
+                view = parent.narrow(0, start, 24)
+                out = mods["lokr"].weight_decompose(scale, view, diff.clone(), 1.0, 1.0, torch.float32, _identity)
+                self.assertIs(out, view)
+                expected = lycoris_merged_weight(w0.to(torch.float16).float(), diff, scale, True).to(torch.float16)
+                torch.testing.assert_close(parent[start:start + 24], expected, rtol=0, atol=1e-4)
+                rest = torch.cat([parent[:start], parent[start + 24:]])
+                self.assertTrue(bool((rest == 0).all()))
 
     def test_no_magnitude_mode_is_bit_identical_to_forge_without_dora_scale(self):
         # dora_scale 이 없는 파일을 Forge 가 합치는 줄(lora.py·lokr.py·loha.py·glora.py)과 같아야 한다.
@@ -317,10 +346,11 @@ class HookTests(unittest.TestCase):
         dim.install(mods)
         dim.set_mode(dim.MODE_NO_MAGNITUDE)
         w0, diff, scale = _case(out=8, inp=6, seed=27)
-        parent = torch.zeros(20, 6, dtype=torch.float16)
-        parent[4:12] = w0.to(torch.float16)
-        view = parent.narrow(0, 4, 8)
-        mods["lora"].weight_decompose(scale, view, diff.clone(), 1.0, 1.0, torch.float32, _identity)
+        with torch.inference_mode():
+            parent = torch.zeros(20, 6, dtype=torch.float16)
+            parent[4:12] = w0.to(torch.float16)
+            view = parent.narrow(0, 4, 8)
+            mods["lora"].weight_decompose(scale, view, diff.clone(), 1.0, 1.0, torch.float32, _identity)
         torch.testing.assert_close(parent[4:12], w0.to(torch.float16) + diff.to(torch.float16), rtol=0, atol=0)
         self.assertTrue(bool((parent[:4] == 0).all()) and bool((parent[12:] == 0).all()))
 
@@ -392,6 +422,341 @@ class HookTests(unittest.TestCase):
         self.assertEqual(mods["lokr"].weight_decompose(*args), "stock")
         self.assertEqual(len(calls), 1)
 
+
+class _NoStorage(torch.Tensor):
+    """저장소를 읽을 수 없는 텐서 하위 클래스."""
+
+    def untyped_storage(self):
+        raise RuntimeError("no storage")
+
+
+class ViewDetectionTests(unittest.TestCase):
+    """``_is_partial_view``: 오프셋 패치의 narrow 뷰만 뷰로 보고, patch_weight_to_device 의 임시 버퍼는 통째로 본다."""
+
+    @staticmethod
+    def _full_buffers(stored: torch.Tensor):
+        big = torch.randn(100, stored.shape[1]).to(stored.dtype)
+        big[10:10 + stored.shape[0]] = stored
+        return {
+            # memory_management.cast_to: 같은 장치면 weight.to(dtype, copy=True), 다른 장치면 empty_like + copy_
+            "to_copy": stored.to(torch.float16, copy=True),
+            "empty_like_copy": torch.empty_like(stored, dtype=torch.float16).copy_(stored),
+            # 전치된(조밀한 비연속) 가중치의 복사본도 제 저장소를 꼭 채운다
+            "transposed": stored.t().to(torch.float16, copy=True),
+            # 더 큰 저장소의 일부로 올라온 가중치(mmap 된 safetensors 등)라도 복사본은 따로다
+            "copy_of_a_slice": big[10:10 + stored.shape[0]].to(torch.float16, copy=True),
+            # convert_func(dequantize)의 새 결과
+            "dequantized": (stored.float() * 1.5).to(torch.float16),
+        }
+
+    def test_full_temp_buffers_are_not_views_and_return_fp32(self):
+        for context in (torch.inference_mode, torch.no_grad):
+            with context():
+                stored = (torch.randn(36, 8) * 0.1).to(torch.bfloat16)
+                buffers = self._full_buffers(stored)
+            for name, buffer in buffers.items():
+                with self.subTest(context=context.__name__, buffer=name):
+                    self.assertFalse(dim._is_partial_view(buffer))
+                    self.assertTrue(dim._can_return_fp32(buffer, torch.float32))
+
+    def test_offset_views_are_views_inside_inference_mode(self):
+        for context in (torch.inference_mode, torch.no_grad):
+            with context():
+                temp = (torch.randn(36, 8) * 0.1).to(torch.float16)
+                views = {f"rows {start}": temp.narrow(0, start, 12) for start in (0, 12, 24)}
+                views["columns 0"] = temp.narrow(1, 0, 4)
+                views["columns 4"] = temp.narrow(1, 4, 4)
+            for name, view in views.items():
+                with self.subTest(context=context.__name__, view=name):
+                    self.assertTrue(dim._is_partial_view(view))
+                    self.assertFalse(dim._can_return_fp32(view, torch.float32))
+
+    def test_lowvram_online_and_fp32_weights_stay_in_place(self):
+        weight = torch.randn(12, 8).to(torch.bfloat16)
+        self.assertFalse(dim._can_return_fp32(weight, torch.bfloat16))  # computation_dtype = weight.dtype
+        self.assertFalse(dim._can_return_fp32(weight.float(), torch.float32))  # CPU·--force-fp32
+
+    def test_unreadable_storage_counts_as_a_view(self):
+        weight = torch.randn(12, 8).to(torch.float16).as_subclass(_NoStorage)
+        self.assertTrue(dim._is_partial_view(weight))
+        self.assertFalse(dim._can_return_fp32(weight, torch.float32))
+
+
+def _merge_offsets_like_forge(weight: torch.Tensor, patches) -> torch.Tensor:
+    """backend/patcher/lora.py:47-65 merge_lora_to_weight 의 오프셋 처리만: narrow 뷰에 합치고 반환값은 버린다."""
+    with torch.inference_mode():
+        for offset, apply in patches:
+            old_weight = weight
+            apply(weight.narrow(offset[0], offset[1], offset[2]))
+            weight = old_weight
+    return weight
+
+
+class MossFusedQkvTests(unittest.TestCase):
+    """Forge 2.31 MOSS 합친 ``proj.qkv`` — q/k/v 를 오프셋 패치 셋으로 나눠 각자 DoRA(출력 축 dora_scale)를 합친다."""
+
+    def tearDown(self):
+        dim.uninstall()
+        dim.take_counters()
+
+    def test_each_offset_slice_gets_its_own_dora_on_the_output_axis(self):
+        mods, _, calls = _fake_adapters()
+        dim.install(mods)
+        d = 12  # MOSS q/k/v 는 정사각형([3072, 3072]) — 출력 축 [d,1] 과 입력 축 [1,in] 이 헷갈리지 않아야 한다
+        with torch.inference_mode():
+            stored = (torch.randn(3 * d, d, generator=torch.Generator().manual_seed(40)) * 0.1).to(torch.bfloat16)
+        cases = [_case(out=d, inp=d, seed=41 + i, wd_on_output=True) for i in range(3)]
+        for mode in (dim.MODE_LYCORIS, dim.MODE_FORGE_FP32, dim.MODE_NO_MAGNITUDE):
+            with self.subTest(mode=mode):
+                dim.set_mode(mode)
+                dim.take_counters()  # 앞 subTest 가 실패해도 섞이지 않게
+                with torch.inference_mode():
+                    temp = stored.to(torch.float16, copy=True)  # base.py:458 cast_to_device(..., copy=True)
+                    w0h = temp.float()
+                patches = [
+                    ((0, i * d, d), lambda view, c=c: mods["lokr"].weight_decompose(
+                        c[2], view, c[1].clone(), 1.0, 1.0, torch.float32, _identity))
+                    for i, c in enumerate(cases)
+                ]
+                out = _merge_offsets_like_forge(temp, patches)
+                self.assertIs(out, temp)
+                for i, (_, diff, scale) in enumerate(cases):
+                    rows = slice(i * d, (i + 1) * d)
+                    base = w0h[rows]
+                    if mode == dim.MODE_LYCORIS:
+                        expected = lycoris_merged_weight(base, diff, scale, True)
+                    elif mode == dim.MODE_FORGE_FP32:
+                        expected = forge_weight_decompose(scale, base.clone(), diff.clone(), 1.0, 1.0, torch.float32, _identity)
+                    else:
+                        expected = (base.to(torch.float16) + diff.to(torch.float16)).float()
+                    self.assertFalse(torch.equal(out[rows].float(), base), f"slice {i}: LoRA dropped")
+                    torch.testing.assert_close(out[rows].float(), expected.to(torch.float16).float(), rtol=0, atol=1e-4)
+                    if mode == dim.MODE_LYCORIS:
+                        # 노름은 그 조각의 행만으로 — 합친 qkv 전체가 아니다
+                        torch.testing.assert_close(out[rows].float().norm(dim=1, keepdim=True), scale, rtol=2e-3, atol=1e-5)
+                counters = dim.take_counters()
+                self.assertEqual((counters.layers, counters.calls, counters.fallbacks), (3, 3, 0))
+        self.assertEqual(calls, [])
+
+
+# ── Forge 의 실제 패치 경로 ──
+
+_FORGE_PACKAGES = ("modules_forge", "modules_forge.packages", "modules_forge.packages.comfy")
+
+
+@contextlib.contextmanager
+def _forge_import_stubs(root: Path, memory_management: types.ModuleType):
+    """``backend.memory_management`` 스텁 위에서 Forge 의 ``modules_forge.packages.comfy.*`` 를 import 하게 한다.
+
+    끝나면 새로 생긴 ``backend*``·``modules_forge*`` 항목을 지우고 원래 항목을 되돌린다 — 다른 테스트가 보는
+    sys.modules 를 바꾸지 않는다. Forge 체크아웃에 __pycache__ 를 쓰지 않는다.
+    """
+    backend = types.ModuleType("backend")
+    backend.__path__ = []
+    backend.memory_management = memory_management
+    stubs = {"backend": backend, "backend.memory_management": memory_management}
+    for name in _FORGE_PACKAGES:
+        package = types.ModuleType(name)
+        package.__path__ = [str(root.joinpath(*name.split(".")))]
+        stubs[name] = package
+    before = set(sys.modules)
+    saved = {name: sys.modules.get(name) for name in stubs}
+    dont_write = sys.dont_write_bytecode
+    sys.dont_write_bytecode = True
+    sys.modules.update(stubs)
+    try:
+        yield
+    finally:
+        sys.dont_write_bytecode = dont_write
+        for name in set(sys.modules) - before:
+            if name.split(".")[0] in ("backend", "modules_forge"):
+                sys.modules.pop(name, None)
+        for name, module in saved.items():
+            if module is None:
+                sys.modules.pop(name, None)
+            else:
+                sys.modules[name] = module
+
+
+class ForgePatchPathTests(unittest.TestCase):
+    """Forge 의 실제 코드로 합친다 — 2.30.1·2.31 둘 다($SAM3_FORGE_ROOT 로 고른다).
+
+    weight_adapter 패키지(lora·lokr 와 base.weight_decompose), backend/patcher/lora.py merge_lora_to_weight
+    (``@torch.inference_mode()``), base.py ``ModelPatcher.patch_weight_to_device``·get_key_weight,
+    memory_management.cast_to·cast_to_device, float.py stochastic_rounding 은 Forge 소스 그대로다. memory_management
+    모듈은 import 만으로 CUDA 를 보므로 그 함수들만 잘라 스텁에 넣고, lora_compute_dtype 은 fp16(RTX 등)으로 둔다.
+    processing.py 처럼 바깥도 inference mode 로 감싼다.
+    """
+
+    D = 12  # 정사각형 q/k/v (MOSS [3072, 3072] 처럼)
+    KEY_QKV = "diffusion_model.layers.0.proj.qkv.weight"
+
+    @classmethod
+    def setUpClass(cls):
+        from tests._extra_schedulers_support import forge_function, forge_root
+        from tests._forge_checkout import require_forge_file
+
+        for rel in ("modules_forge/packages/comfy/weight_adapter/__init__.py", "backend/patcher/lora.py",
+                    "backend/patcher/base.py", "backend/memory_management.py", "backend/float.py", "backend/utils.py"):
+            if not require_forge_file(rel).is_file():
+                raise AssertionError(f"Forge moved {rel}")
+        root = forge_root()
+
+        cast_ns = {
+            "torch": torch,
+            "nullcontext": contextlib.nullcontext,
+            "QuantizedTensor": type("QuantizedTensor", (), {}),
+            "device_supports_non_blocking": lambda device: False,
+        }
+        mm = types.ModuleType("backend.memory_management")
+        mm.cast_to = forge_function("backend/memory_management.py", "cast_to", cast_ns)
+        mm.cast_to_device = forge_function("backend/memory_management.py", "cast_to_device", cast_ns)
+        mm.lora_compute_dtype = lambda device: torch.float16
+        mm.is_oom = lambda exc: False
+
+        with _forge_import_stubs(root, mm):
+            package = importlib.import_module("modules_forge.packages.comfy.weight_adapter")
+            cls.adapters = {name: sys.modules[f"{package.__name__}.{name}"] for name in dim.TARGET_ADAPTERS}
+        cls.weight_adapter = package
+
+        lora_ns = {"torch": torch, "memory_management": mm, "weight_adapter": package, "logger": logging.getLogger("lora")}
+        cls.merge = staticmethod(forge_function("backend/patcher/lora.py", "merge_lora_to_weight", lora_ns))
+        string_to_seed = forge_function("backend/patcher/lora.py", "string_to_seed", {})
+        utils = types.SimpleNamespace(get_attr=forge_function("backend/utils.py", "get_attr", {}))
+        get_key_weight = forge_function("backend/patcher/base.py", "get_key_weight",
+                                        {"torch": torch, "utils": utils, "Callable": Callable})
+        cls.patch_weight_to_device = staticmethod(forge_function(
+            "backend/patcher/base.py", "ModelPatcher.patch_weight_to_device",
+            {
+                "collections": collections,
+                "memory_management": mm,
+                "utils": utils,
+                "get_key_weight": get_key_weight,
+                "merge_lora_to_weight": cls.merge,
+                "stochastic_rounding": forge_function("backend/float.py", "stochastic_rounding", {"torch": torch}),
+                "string_to_seed": string_to_seed,
+            },
+        ))
+
+    def setUp(self):
+        self.assertEqual(dim.install(self.adapters), 4)
+
+    def tearDown(self):
+        dim.uninstall()
+        dim.take_counters()
+
+    # ── 만들기 ──
+
+    def _model(self, stored: torch.Tensor):
+        """``diffusion_model.layers.0.proj`` 에 합친 ``qkv`` 와 따로인 ``q``·``k``·``v`` (bf16 저장)."""
+        d = self.D
+        root = torch.nn.Module()
+        root.diffusion_model = torch.nn.Module()
+        root.diffusion_model.layers = torch.nn.ModuleList([torch.nn.Module()])
+        proj = torch.nn.Module()
+        root.diffusion_model.layers[0].proj = proj
+        for name, rows in (("qkv", slice(0, 3 * d)), ("q", slice(0, d)), ("k", slice(d, 2 * d)), ("v", slice(2 * d, 3 * d))):
+            linear = torch.nn.Linear(d, rows.stop - rows.start, bias=False, dtype=torch.bfloat16)
+            with torch.no_grad():
+                linear.weight.copy_(stored[rows])
+            setattr(proj, name, linear)
+        return root
+
+    def _adapters(self, wd_on_output: bool):
+        """q 는 LoRA, k·v 는 LoKr — 셋 다 dora_scale. 반환: [(어댑터, ΔW fp32, dora_scale)]"""
+        d = self.D
+        g = torch.Generator().manual_seed(50 + int(wd_on_output))
+        out = []
+        for i in range(3):
+            if i == 0:
+                up, down = torch.randn(d, 4, generator=g) * 0.1, torch.randn(4, d, generator=g) * 0.1
+                diff = up @ down
+            else:
+                w1, w2 = torch.randn(2, 2, generator=g) * 0.3, torch.randn(d // 2, d // 2, generator=g) * 0.1
+                diff = torch.kron(w1, w2)
+            shape = (d, 1) if wd_on_output else (1, d)
+            scale = (1.0 + 0.3 * torch.rand(shape, generator=g)) * (0.3 if wd_on_output else 0.6)
+            if i == 0:
+                adapter = self.weight_adapter.LoRAAdapter(set(), (up, down, None, None, scale, None))
+            else:
+                adapter = self.weight_adapter.LoKrAdapter(set(), (w1, w2, None, None, None, None, None, None, scale))
+            out.append((adapter, diff, scale))
+        return out
+
+    @staticmethod
+    def _patcher(model, patches: dict):
+        return types.SimpleNamespace(model=model, patches=patches, weight_inplace_update=False, backup={},
+                                     offload_device=torch.device("cpu"))
+
+    @staticmethod
+    def _expected(mode: str, w0h: torch.Tensor, diff, scale, wd_on_output: bool, half: bool) -> torch.Tensor:
+        """fp16 임시 버퍼 값 ``w0h``(fp32 로 들고 옴)에서 기대하는 결과 — ``half`` 면 fp16 버퍼에 쓴 값."""
+        if mode == dim.MODE_LYCORIS:
+            merged = lycoris_merged_weight(w0h, diff, scale, wd_on_output)
+        elif mode == dim.MODE_FORGE_FP32:
+            merged = forge_weight_decompose(scale, w0h.clone(), diff.clone(), 1.0, 1.0, torch.float32, _identity)
+        else:  # 순정: fp16 버퍼에서 Forge 공식 그대로
+            merged = forge_weight_decompose(scale, w0h.to(torch.float16), diff.clone(), 1.0, 1.0, torch.float32, _identity)
+        return merged.to(torch.float16).float() if half else merged.float()
+
+    # ── 테스트 ──
+
+    def test_fused_qkv_offset_patches_are_merged_not_dropped(self):
+        # 0.35.0 은 inference mode 안의 narrow 뷰를 일반 버퍼로 보고 fp32 결과를 돌려줬고, merge_lora_to_weight 가
+        # 오프셋 패치의 반환값을 버려서 LyCORIS·Forge fp32 방식의 q/k/v DoRA 가 통째로 빠졌다(카운터는 성공).
+        d = self.D
+        for wd_on_output in (True, False):  # 출력 축(LyCORIS 기본)·입력 축(MOSS 학습기 wd_on_output=False)
+            stored = (torch.randn(3 * d, d, generator=torch.Generator().manual_seed(60)) * 0.1).to(torch.bfloat16)
+            model = self._model(stored)
+            adapters = self._adapters(wd_on_output)
+            patches = {self.KEY_QKV: [(1.0, a, 1.0, (0, i * d, d), None) for i, (a, _, _) in enumerate(adapters)]}
+            w0h = stored.to(torch.float16).float()
+            for mode in (dim.MODE_LYCORIS, dim.MODE_FORGE_FP32, dim.MODE_FORGE):
+                for device_to in (torch.device("cpu"), None):  # cast_to_device(...) / weight.to(temp_dtype, copy=True)
+                    with self.subTest(wd_on_output=wd_on_output, mode=mode, device_to=device_to):
+                        dim.set_mode(mode)
+                        dim.take_counters()  # 앞 subTest 가 실패해도 섞이지 않게
+                        with torch.inference_mode():
+                            out = self.patch_weight_to_device(self._patcher(model, patches), self.KEY_QKV,
+                                                              device_to=device_to, return_weight=True)
+                        self.assertEqual(out.dtype, torch.bfloat16)
+                        for i, (_, diff, scale) in enumerate(adapters):
+                            rows = slice(i * d, (i + 1) * d)
+                            expected = self._expected(mode, w0h[rows], diff, scale, wd_on_output, half=True)
+                            expected = expected.to(torch.bfloat16).float()
+                            self.assertGreater((expected - stored[rows].float()).abs().max().item(), 0.02)
+                            self.assertFalse(torch.equal(out[rows], stored[rows]), f"slice {i}: LoRA dropped")
+                            torch.testing.assert_close(out[rows].float(), expected, rtol=1e-2, atol=1e-4)
+                        counters = dim.take_counters()
+                        if mode == dim.MODE_FORGE:
+                            self.assertEqual(counters, dim.Counters(0, 0, 0, None))
+                        else:
+                            self.assertEqual((counters.layers, counters.calls, counters.fallbacks), (3, 3, 0))
+
+    def test_separate_qkv_keep_the_single_rounding_fp32_path(self):
+        # 오프셋이 없는 일반 경로(사용자의 MOSS 체크포인트는 q/k/v 가 따로)는 그대로 fp32 를 돌려준다.
+        d = self.D
+        stored = (torch.randn(3 * d, d, generator=torch.Generator().manual_seed(61)) * 0.1).to(torch.bfloat16)
+        model = self._model(stored)
+        adapters = self._adapters(True)
+        dim.set_mode(dim.MODE_LYCORIS)
+        for i, name in enumerate("qkv"):
+            key = f"diffusion_model.layers.0.proj.{name}.weight"
+            adapter, diff, scale = adapters[i]
+            rows = slice(i * d, (i + 1) * d)
+            with self.subTest(key=key):
+                with torch.inference_mode():
+                    temp = stored[rows].to(torch.float16, copy=True)
+                    merged = self.merge([(1.0, adapter, 1.0, None, None)], temp, key)
+                    out = self.patch_weight_to_device(self._patcher(model, {key: [(1.0, adapter, 1.0, None, None)]}), key,
+                                                      device_to=torch.device("cpu"), return_weight=True)
+                self.assertEqual(merged.dtype, torch.float32)
+                expected = self._expected(dim.MODE_LYCORIS, stored[rows].to(torch.float16).float(), diff, scale, True,
+                                          half=False)
+                torch.testing.assert_close(merged, expected, rtol=1e-5, atol=1e-6)
+                torch.testing.assert_close(out.float(), expected.to(torch.bfloat16).float(), rtol=1e-2, atol=1e-4)
+        counters = dim.take_counters()
+        self.assertEqual((counters.layers, counters.fallbacks), (3, 0))
 
 def _proc_classes():
     class Proc:

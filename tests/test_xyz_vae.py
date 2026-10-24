@@ -154,6 +154,67 @@ class ModuleListTests(unittest.TestCase):
         self.assertFalse(xvae.same_file("C:/m/VAE/a.safetensors", "C:/m/VAE/b.safetensors"))
 
 
+class AxisCellModulesTests(unittest.TestCase):
+    """Forge 2.31's VAE axis cell: ``axis_cell_modules`` - the grid's starting list with exactly the value as the VAE."""
+
+    TE = "C:/m/text_encoder/qwen.safetensors"
+    TE2 = "C:/m/text_encoder/qwen_other.safetensors"
+    VAE3D = "C:/m/VAE/vae3d.safetensors"
+    VAE2D = "C:/m/VAE/vae2d.safetensors"
+    MODULE_LIST = {os.path.basename(path): path for path in (TE, TE2, VAE3D, VAE2D)}
+
+    def cell(self, before, value, selection=(VAE3D, TE)):
+        return xvae.axis_cell_modules(before, value, list(selection), module_list=self.MODULE_LIST,
+                                      classify=classify_by_name)
+
+    def test_the_dropdowns_list(self):
+        out = self.cell(None, self.VAE2D)
+        self.assertEqual(out, sorted([self.VAE2D, self.TE]))
+        self.assertIsInstance(out, xvae.CellModules)
+        self.assertIsInstance(out, list, "a list to Forge's set_config")
+        self.assertEqual(out.start, [self.VAE3D, self.TE], "the dropdown's list, kept for the later cells")
+        self.assertEqual(self.cell(None, None), sorted([self.VAE3D, self.TE]), '"None": the selection\'s own VAE')
+
+    def test_the_previous_cell_is_not_the_base(self):
+        # the dict every cell shares holds the previous cell's list: its VAE is not this cell's base ("None")
+        previous = self.cell(None, self.VAE2D)
+        self.assertEqual(self.cell(previous, None), sorted([self.VAE3D, self.TE]))
+        self.assertEqual(self.cell(previous, self.VAE3D), sorted([self.VAE3D, self.TE]))
+
+    def test_the_dropdowns_list_is_read_at_the_first_cell_only(self):
+        """Forge 2.31 leaves a cell's list in its settings - so in the dropdown's list the next cell is given - when
+        config.json has no module list (``process_images`` puts back only the keys it had) or the caller sent
+        ``override_settings_restore_afterwards=False``: the later cells keep the first cell's dropdown list."""
+        for selection in ([self.VAE3D, self.TE], []):
+            with self.subTest(selection=selection):
+                first = self.cell(None, self.VAE2D, selection)
+                self.assertEqual(first.start, selection)
+                second = self.cell(first, None, list(first))            # the first cell's list left in the settings
+                self.assertEqual(second, sorted(selection), '"None": the first cell\'s selection\'s own VAE')
+                self.assertEqual(second.start, selection)
+                self.assertEqual(self.cell(second, self.VAE3D, list(second)), sorted({self.VAE3D, *selection}))
+        # a list without a start of its own (not made by this function): the dropdown's, as for the first cell
+        self.assertEqual(self.cell(xvae.CellModules([self.VAE2D]), None), sorted([self.VAE3D, self.TE]))
+
+    def test_an_api_callers_list_is_the_start_of_every_cell(self):
+        api = ["vae2d.safetensors", "qwen_other.safetensors"]       # names, as an API caller may send them
+        first = self.cell(api, self.VAE3D)
+        self.assertEqual(first, sorted([self.VAE3D, self.TE2]))
+        self.assertEqual(first.start, api)
+        second = self.cell(first, None)
+        self.assertEqual(second, sorted([self.VAE2D, self.TE2]))
+        self.assertEqual(second.start, api)
+        self.assertEqual(self.cell(second, self.VAE3D), first)
+
+    def test_copies(self):
+        import copy
+        import json
+        out = self.cell(["vae2d.safetensors"], self.VAE3D)
+        self.assertEqual(json.loads(json.dumps(out)), list(out))
+        clone = copy.deepcopy(out)
+        self.assertEqual((clone, clone.start), (out, out.start))
+
+
 class PredictionTests(unittest.TestCase):
     def read(self, table):
         return lambda path: table.get(os.path.basename(path))

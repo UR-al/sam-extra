@@ -200,7 +200,7 @@ def make_axis_on_xyz_grid():
             partial(set_value, field="sam3_checkpoint"),
             format_value=format_path,
             # 값이 바뀌면 SAM3 번들을 버리고 다시 빌드한다(3~5 초). xyz_grid 는 cost 가 큰 축을 바깥 루프에
-            # 두므로 Checkpoint(1.0)보다 작고 [DoRA] 축(0.8)·VAE(0.7)보다 크게 — 각 칸의 결과는 같고 순서만 바뀐다.
+            # 두므로 Checkpoint(1.0, Forge 2.31 부터 2.0)보다 작고 [DoRA] 축(0.8)·VAE(0.7)보다 크게 — 각 칸의 결과는 같고 순서만 바뀐다.
             cost=SAM3_CHECKPOINT_AXIS_COST,
             choices=find_checkpoint_options,
         ),
