@@ -3,6 +3,159 @@
 버전 태그는 GitHub Releases에도 발행됩니다. 아래는 요약이며, guidance/속도 기능의
 상세는 [docs/GUIDANCE.md](docs/GUIDANCE.md)를 참고하세요.
 
+## v0.35.0 — TSM LoRA (시간 단계 전문가 · 실험) · TSM-LoKr 읽기 · 가벼운 LoRA 목록 (/sam3-lora/lite)
+
+2026-10-24. 시간 단계 전문가 LoRA 를 Forge 에서 쓰는 판입니다. LyCORIS `algo=tsm` 으로 학습한 LoRA(`ss_saved_format=tsm-native`)와
+sd-scripts 포크(UR-al/sd-scripts `moss-image`)의 `algo=tsm-lokr` 파일을 Anima 에서 학습과 같은 식으로 돌립니다 — 지금까지 Forge 는
+이 파일의 키를 몰라 'LoRA mismatch' 로 통째로 건너뛰었습니다. 그리고 LoRA 목록을 이름 · 경로 · 트리거 재료만으로 돌려주는 가벼운
+라우트 `GET /sam3-lora/lite` 를 더했습니다(AI Studio Pro 앱과 이 확장의 MCP 서버가 씁니다). 기존 스크립트 인자 · infotext · 설정 키 ·
+XYZ 축은 그대로이고, TSM 파일이 없는 생성은 바뀌지 않습니다. CPU 에서 학습 쪽 LyCORIS(+ sd-scripts 포크의 패치)와의 일치를
+확인했고, `algo=tsm` 파일은 2026-10-23\~24 시험용 Forge 의 GPU 에서도 생성 · 속도 · 하이레스 해제를 확인했습니다(TSM 없는 생성
+대비 비용 1단계 약 −11%, 2단계 약 −19%). TSM-LoKr 의 GPU 생성은 아직 확인하지 않았습니다.
+
+**업그레이드할 때**
+
+- Forge 를 **완전히 다시 시작**하세요 — 새 `sam3ext/tsm_lora/` 패키지 · `sam3ext/lora_lite.py` 와 바뀐 `sam3ext/unload_registry.py` ·
+  `sam3ext/layout_lanes.py` · `scripts/lora_manager.py`(라우트 등록, 앱 시작 때)는 Reload UI 로 읽히지 않습니다.
+- 프롬프트의 `<lora:…>` 에 TSM 파일이 있으면 이제 **아코디언을 꺼 두어도 적용됩니다**(전에는 Forge 가 건너뛰어 아무 효과가
+  없었습니다). 빼고 비교하려면 아코디언의 단계 계산을 **끔**으로 두세요.
+
+### TSM LoRA (새 기능, 실험)
+
+- **프롬프트로**: Forge `networks.load_lora_for_models` 를 감싸, 읽은 state dict 에서 TSM 모듈의 키(`experts.S.I.up/down` ·
+  `router_fc` · `timestep_embed` · `alpha`)를 떼어 모델에 기록합니다(Forge `current_lora_hash` 별 — 해시가 같아 다시 읽지
+  않는 생성과 하이레스 LoRA 도 기록으로 찾음). 남은 키가 있으면 순정 로더에 넘깁니다.
+- **아코디언으로**: txt2img · img2img 의 **TSM LoRA (시간 단계 전문가 · 실험)** 에서 파일 · 강도 · 단계 계산(자동 · 1단계 식 ·
+  2단계 식 · 끔) · 라우터 입력 묶음(샘플별 · 배치 전체)을 고릅니다. 파일 목록은 Forge LoRA 목록의 메타데이터로 거르고,
+  메타데이터가 없는 파일만 헤더 키를 봅니다.
+- **샘플링 패스마다**(`process_before_every_sampling` — 1차 · 하이레스 · img2img): 세션을 UNet 복제본의
+  `transformer_options["sam3_tsm"]` 에 싣고, DiT 에 forward pre/post 훅과 대상 Linear 마다 forward 훅을 겁니다. pre-hook 이
+  그 호출의 timestep(= σ)에서 행별 `t = round(q(fp32(σ)·1000))` 을 읽고(호스트 동기화는 DiT 호출마다 한 번, t 와 전문가
+  번호도 DiT 호출마다 한 번만 셈), Linear 훅이 출력에 Δ 를 제자리로 더합니다(`out.addmm_(x·downᵀ, upᵀ, alpha=scale·강도)` —
+  Δ · 스케일 곱 · 합 텐서를 따로 만들지 않음). `q` 는 학습기가
+  timesteps 를 바꾼 weight_dtype(메타데이터 `ss_mixed_precision` — bf16 이면 bf16 반올림, 512 이상에서 4 단위)이라, bf16 으로
+  학습한 2단계 파일이 학습 때 한 번도 쓰지 않은 `timestep_embed` 행(약 절반, 0 그대로)을 읽지 않습니다. 세션이 없는 DiT
+  호출(Tile-Repair 의 벤더 루프 등)은 그대로입니다. post-hook 은 `always_call` 이라 DiT 가 예외로 끝나도 활성 상태를 비우고
+  GPU 사본을 놓습니다. 새 패스가 시작되면 앞 패스의 GPU 사본을, 그 패스의 샘플링이 끝나면(그 패스 샘플러 객체의
+  `launch_sampling` 을 감싸 `finally` 로 — 정상 · 중단 · 예외 모두) 남은 사본을 놓습니다. `post_sample` 은 Forge 가 하이레스
+  결과를 디코드한 뒤에 불러 늦으므로 예비로만 남겼습니다. `postprocess` 에서 훅을 뗍니다. 훅은 모듈을 약한 참조로만 쥐어 하이레스 체크포인트 전환 때 앞 DiT 를 붙잡지 않습니다.
+  2단계 라우터는 장치 사본을 한 번만 만듭니다(Linear 호출마다 CPU→GPU 복사 없음). 라우터 입력 평균은
+  `mean(dtype=float32)` 로 내 입력의 fp32 사본(1024² mlp_layer2 입력이면 약 268 MB)을 만들지 않고, 같은 입력 텐서를 받는
+  self_attn q·k·v · cross_attn k·v 는 DiT 호출 안에서 평균을 한 번만 냅니다(약한 참조로 같은 객체일 때만). Forge 에 남겨 두라고
+  알리는 메모리에 Linear 호출 하나의 임시 텐서(중간값 · 제자리로 못 더할 때의 새 출력)를 더했습니다. 강도 0 인 TSM 은 훅을
+  걸지 않습니다.
+- **식**: 1단계는 스케일마다 고른 전문가의 합, 2단계는 코어 전문가 + 라우터 게이트 × 문맥 전문가(시그모이드 없음). 전문가
+  고르기는 `ceil(t/T·n)` 의 파이썬 float 식, 게이트의 시간 임베딩 행은 `t−1`. 2단계 라우터 평균은 학습(배치 1)처럼
+  샘플마다 따로 합니다 — cond · uncond 를 한 배치로 돌려도 따로 돌린 것과 같습니다.
+- **검증**: 파일 형식(스케일 · rank · 모양 · 라우터 너비로 input/bottleneck 판정 · `tsm_stage` · `tsm_n_scales`)이 맞지 않으면
+  한국어 / 영어 한 줄의 이유로 그 파일만 건너뛰고 화면에 알립니다. 단계가 메타데이터에 없으면 라우터가 0 이 아닌 파일만
+  2단계로 봅니다.
+- **블록 수**: 2.9B 파일을 3.8B · Base 에 얹으면 `anima_lora_blocks` 의 대응표와 '끼워 넣은 블록' 정책(그대로 · 덧셈형 ·
+  넣지 않음 · 약한 복사)을 따릅니다. 부분 파일은 추측하지 않습니다.
+- infotext `TSM LoRA` · `TSM LoRA info` · `TSM stage` · `TSM pooling`, XYZ 축 `[TSM] Stage` · `[TSM] Router pooling` ·
+  `[TSM] Strength`(cost 0.2), API `alwayson_scripts["TSM LoRA"]`(위치 인자 또는 dict).
+- 화면 정리의 LoRA 묶음에 들어가고(`lora-tsm`, 실험 표시), **모델 내리기** 가 읽어 둔 TSM 파일과 GPU 사본을 놓습니다
+  (`unload_registry` 의 `tsm_lora`).
+- 스크립트 파일은 `scripts/lora_tsm.py` 입니다(`negpip.py` 가 마지막 스크립트로 남도록). ADetailer 패스에도 걸려면 ADetailer 의
+  `ad_script_names` 에 `lora_tsm` 을 더합니다.
+- README 에 2단계 학습 방법(같은 설정에 `tsm_stage=2`, 1단계 파일을 `--network_weights` 로)을 적었습니다.
+
+### TSM-LoKr 읽기 (새, 실험)
+
+- sd-scripts 포크의 `algo=tsm-lokr` 파일(시간 구간 전문가가 LoKr, DoRA 출력 축 크기 하나를 모든 전문가가 같이 씀)을 같은
+  방법으로 겁니다. 새 모듈 `sam3ext/tsm_lora/lokr_format.py`(키 판별 · `ss_tsm_lokr` v1 엄격 검증 · LyCORIS `factorization`
+  으로 인자 모양 확인 · LoKr 스케일 규칙)와 `lokr_delta.py`(병합 가중치 · 2단계 세 벡터 노름 · 크로네커 곱 행렬곱 · 장치 사본 ·
+  슬롯). LoRA 전문가 TSM 파일의 경로 · 값 · infotext 는 그대로입니다(`build_tsm_file` 은 바뀌지 않았고, 판별 · 분리 · 캐시
+  함수만 두 종류를 나눔).
+- 계산: Forge Linear 의 `weight_function` 인스턴스 목록 끝에 붙인 함수가 그 구간의 병합 가중치 `W + μ·(D(W + ΔW_t) − W)` 를
+  넘깁니다(fp32 노름, Forge 가 넘긴 W 기준). 2단계는 `W + C` 를 넘기고 출력 훅이 게이트 항과 샘플별 DoRA 행 스케일을 fp32
+  누산기에서 더해 한 번만 반올림합니다. `weight_function` 이 없는 Linear 는 출력 훅만으로(크로네커 곱 + 모듈 · 구간별 노름).
+  한 호출 안에서 행마다 t 가 다르면 행 묶음마다 병합 가중치로 다시 계산합니다.
+- 장치 사본은 지금 구간의 전문가만(파일 dtype), 패스의 샘플링이 끝나면(VAE 디코드 전) 노름 항 · 병합 캐시와 함께 놓고
+  우리 가중치 함수도 목록에서 뺍니다. 처음에 인스턴스 목록이 없던 Linear 는 속성을 지워 Forge 클래스 목록으로 돌아갑니다.
+- 아코디언 **TSM-LoKr 병합 캐시**(기본 켬 — VRAM 약 5 GB 더 쓰고 가장 빠름, 스크립트 인자 6번째 `lokr_merge_cache`,
+  껐을 때만 infotext `TSM LoKr merge cache: off`).
+- 끼워 넣은 블록(40→52 등): 그대로 복제는 DoRA 크기까지, 덧셈형 · 약한 복사는 크기 없이(`TsmLokrModule.without_dora`).
+- 한 Linear 에 TSM-LoKr 하나(두 번째 파일은 이유와 함께 건너뜀). infotext `TSM LoRA info` 는 `이름 s1 8+1 lokr f4 dora x0.8`.
+- 테스트(`tests/test_tsm_lora.py`, CPU): 설계 식을 `torch.kron` 과 샘플별 dense `V_b` 로 옮긴 기준과 스텁 DiT 의 모든 Linear
+  출력 대조(두 계산 길 × 1 · 2단계 × [8,1] · [4,2,1] × 강도 1 · 0.8, fp64 1e-10 — 실측 3e-15 안), 행마다 다른 t · 배치 전체
+  풀링 · DoRA 없음 · bf16(학습 dtype 반올림 t, bf16 계산은 기준에서 bf16 반올림 두 번 안), 세 벡터 노름(fp64 1e-13, 8192x2048
+  fp32 1.7e-7), 가중치 함수 붙이기 · 떼기(클래스 목록 그대로, Forge 가 목록을 갈아 끼워도 다시 붙음), 병합 캐시(같은 출력 ·
+  구간 하나), 장치 사본 크기, VAE 디코드 전 해제, LoRA TSM 과 함께, 40→52 DoRA 정책, 로더 가로채기, 파일 검증 오류(한국어 /
+  영어). venv 의 LyCORIS `LokrModule.get_merged_weight` 와 2 ulp 안(작은 모양은 비트 단위), `SAM3_TSM_SD_SCRIPTS` 가 포크를
+  가리키면 포크의 학습 모듈 `TSMLokrModule` forward 와 대조(1단계 비트 단위 같음, 2단계 상대 1e-6 안) · `_rebuild_tsm_lokr` 와
+  비트 단위. `tests/test_tsm_lora_script.py`: 인자 6개 · 붙여 넣기 · 아코디언 TSM-LoKr 파일 적용과 뒷정리.
+- TSM-LoKr 파일의 실제 Forge GPU 생성 · 속도 · VRAM 은 아직 확인하지 않았습니다.
+
+### 문서 · 테스트 — TSM
+
+- README **별도 기능: TSM LoRA (시간 단계 전문가)** 와 목차 링크.
+- `tests/test_tsm_lora.py`: σ→t(float32 곱 · 짝수 쪽 반올림) · 전문가 경계(n = 2 · 4 · 8 · 25 · 50 · 100, t 0\~1000 전부) ·
+  파일 검증 · 1 · 2단계 Δ 를 LyCORIS 루프를 옮겨 적은 기준 식과 대조(3-D · 5-D 입력, input · bottleneck 라우터, [8,1] · [4,2,1] ·
+  [8]) · CFG 배치 2 의 샘플별 풀링 = 배치 1 · 배치 전체 풀링 = LyCORIS · 블록 대응(40→52 정책별 · 40→28 · 부분 파일) · DiT 훅
+  (모든 Linear 의 출력 = 기준 식, 세션 없는 호출 · 훅 뗀 뒤 비트 단위 그대로, 예외 뒤 상태 누수 없음) · 로더 가로채기.
+  σ→t 의 bf16 · fp16 반올림 = 학습기(`(σ·1000).to(dtype)` → `set_timestep`) · 예외 뒤 GPU 사본 해제 · 약한 참조와 재사용된 id ·
+  패스마다 앞 사본 해제 · 2단계 라우터 장치 사본.
+  환경 변수가 있을 때만 도는 선택 테스트: `SAM3_TSM_REF_DIR`(패치한 LyCORIS 로 만든 기준 출력 — 1단계 실제 파일 모듈 4개 72경우,
+  2단계 합성 모듈 3개 54경우), `SAM3_TSM_REAL_FILE`(실제 파일 640 모듈이 Anima DiT 경로로 풀리는지 — Forge 체크아웃이 있으면
+  Forge 의 `Block` 클래스로), `SAM3_TSM_SD_SCRIPTS`(살아 있는 `TSMModule` 과 대조, 포크의 `set_timestep` 에 bf16 · fp16 · fp32 timesteps 를 넣은 t 와 대조).
+- `tests/test_tsm_lora_script.py`: 인자 · 붙여 넣기 · XYZ 축 · UI 인자 순서 · 가짜 UnetPatcher 로 패스마다 적용과 뒷정리 ·
+  프롬프트 쪽과 아코디언 파일 합치기 · 내부 패스 · 하이레스 infotext · 강도 0 은 훅 없음 · `post_sample` 의 사본 해제 ·
+  패스마다 VAE 디코드 자리에서 사본이 이미 풀림(1차 · 하이레스, img2img batch count 의 같은 샘플러는 한 번만 감쌈) · 임시 메모리 예약.
+- `tests/test_tsm_lora.py` 의 훅 경로: `Slot.add`(제자리 addmm) = 기준 식(fp64 1e-12, 3·5·2-D, 두 라우터 · 두 묶음 · 강도 음수),
+  bf16 은 옛 훅과 반올림 몇 번 안 · 기준에 더 가깝거나 같음, 약한 복사가 사본 하나를 같이 씀, 라우터 평균에 전체 fp32 사본 없음
+  (디스패치 스파이), 평균 재사용은 같은 살아 있는 객체만(복사본 · 제자리 수정 · 풀린 텐서 제외) · 같은 게이트, 스텁 DiT 에서 블록마다
+  3번 재사용, release 뒤 장치 참조가 남지 않음, 샘플러 감싸기(중단 · 예외에도 해제). 기준 출력(`SAM3_TSM_REF_DIR`)을 훅 경로로도 대조.
+- `tests/test_layout_lanes.py` · `tests/test_unload_models.py` 에 새 항목.
+
+### 가벼운 LoRA 목록 — `GET /sam3-lora/lite` (새 라우트)
+
+Forge 의 `GET /sdapi/v1/loras` 는 LoRA 마다 safetensors 헤더의 메타데이터를 통째로 돌려줍니다. LoRA 809개(데이터셋 하위
+폴더)인 라이브러리에서 응답이 143 MB(`ss_datasets` 97 MiB · `ss_tag_frequency` 29 MiB)였고, Forge 의 메타데이터 캐시가 데워진
+상태에서 한 번에 5초, 캐시가 빈 새 데이터 폴더에서는 72초가 걸렸습니다(2026-10-24 측정). 이름과 트리거 몇 개만 쓰는
+클라이언트(AI Studio Pro 앱, 이 확장의 MCP 서버)도 그 값을 다 치렀습니다. 새 라우트는 같은 목록을 필요한 필드만으로 돌려줍니다.
+
+```json
+{"version": 1, "count": 1, "items": [
+  {"name": "styleA", "alias": "styleA_v2", "path": "D:/LoRA\\styleA\\styleA.safetensors",
+   "activation_text": "", "tag_frequency_top": [["1girl", 40], ["smile", 12]]}
+]}
+```
+
+- `name` · `alias` · `path` 와 항목 순서는 `/sdapi/v1/loras` 와 같습니다 — 그 라우트가 직렬화하는 바로 그 객체(내장
+  `sd_forge_lora` 의 `networks.available_networks`)를 같은 순서로 읽습니다.
+- `activation_text`: 메타데이터의 `activation text`, 비어 있으면 `ss_activation_text`, 둘 다 없으면 `""`. `/sdapi/v1/loras` 를
+  읽는 클라이언트가 고르는 값(`md.get("activation text", "") or md.get("ss_activation_text", "")`) 그대로이고, 그 값이 글자가
+  아니면(Forge 는 `{` 로 시작하는 값을 객체로 풉니다) `""` 입니다.
+- `tag_frequency_top`: `ss_tag_frequency`(JSON 문자열이든, Forge 가 이미 풀어 둔 dict 든)의 데이터셋별 태그 개수를 순서대로
+  `dict.update` 로 합친 뒤 개수 내림차순(같은 개수는 합친 순서 그대로)으로 앞 32개. 없으면 `[]`.
+- 그 밖의 메타데이터는 싣지 않습니다. 호출마다 파일을 읽지 않고 Forge 가 메모리에 들고 있는 메타데이터로 만들며, 태그 순위는
+  LoRA 마다 기억해 두었다가 Forge 가 다시 스캔해 새 객체를 만들 때만 다시 계산합니다. CPU 측정(가짜 LoRA 809개, 태그 빈도
+  14 MiB): 첫 호출 120 ms, 그다음부터 10 ms 이하 + JSON 인코딩 7 ms, 응답 0.5 MiB.
+- `?refresh=1` 은 먼저 LoRA 폴더를 다시 스캔합니다 — `POST /sdapi/v1/refresh-loras` 가 부르는 `networks.list_available_networks()`.
+  이 라우트에서 온 재스캔은 한 번에 하나씩 돌고(동시에 돌면 Forge 의 표를 비우고 다시 채우는 일이 섞입니다), 각 요청은 자기
+  재스캔이 끝난 목록을 받습니다.
+- 인증은 다른 sam-extra 라우트와 같은 로그인 가드(`--gradio-auth` 로그인, `--api`·`--nowebui` 일 때 `--api-auth`)입니다.
+  `/sdapi/v1/loras` 가 이미 주는 것의 일부만 주므로 `X-SAM3-Notebook: 1` 헤더는 요구하지 않습니다. 다만 Forge 는
+  `/sdapi/v1/loras` 를 로그인 가드 없이 붙이므로 이 라우트가 더 엄격합니다 — `--gradio-auth` 를 켠 Forge 에서 로그인 쿠키가 없는
+  외부 클라이언트(`--api-auth` 면 Basic 자격 증명이 없는 클라이언트)는 401 을 받고 `/sdapi/v1/loras` 로 돌아가야 합니다.
+  Forge 의 내장 LoRA 지원(`sd_forge_lora`)이 없으면 503 입니다.
+
+### MCP 서버 — LoRA 개수는 가벼운 목록에서
+
+`capabilities` 의 `counts.loras` 는 이제 `/sam3-lora/lite` 로 셉니다. 이 라우트가 없는 Forge(이전 sam-extra)나 다른 모양의
+답이면 예전처럼 `/sdapi/v1/loras` 로 돌아가고, 결과는 어느 쪽이든 같습니다. `loras` · `lora_info` 와 `capabilities` 의 LoRA
+요약은 제목 · 베이스 모델 · network dim · 합산한 태그 개수가 필요해 계속 `/sdapi/v1/loras` 를 읽습니다.
+
+### 테스트 — 가벼운 LoRA 목록
+
+- `tests/test_lora_lite.py`: 필드 규칙(JSON 문자열 · dict · 없는 메타데이터 · 같은 개수 · 32개 제한 · 비교할 수 없는 개수 ·
+  글자가 아닌 activation text), 메모와 다시 스캔(동시에 온 `?refresh=1` 은 하나씩), 라우트(`?refresh=1` · 503 · 인증 · 한 번만
+  등록), 그리고 Forge 의 실제 `sd_forge_lora` 코드(폴더 스캔 ·
+  `NetworkOnDisk` · `read_metadata_from_safetensors` · `/sdapi/v1/loras` 라우트)를 임시 폴더의 safetensors 헤더로 돌려 두 라우트를
+  항목마다 맞춰 봅니다(Forge 체크아웃이 없으면 그 부분만 건너뜀).
+- `tests/test_mcp_lora_lite.py`: MCP 클라이언트의 가벼운 목록 사용과 되돌아가기, `capabilities` 결과가 두 경우 같은지.
+
 ## v0.34.1 — 기본값 저장 뒤 Apply settings 되돌림 · 얼굴 crop 키우기(잘린 머리카락) · 저장 결과 줄 자리 · Tag Autocomplete 안내 넘침
 
 2026-10-13. v0.34.0 의 실제 확인(시험용 Forge 2.30-6)에서 찾은 네 가지를 고친 판입니다: **기본값 저장** 뒤 같은 페이지에서 누른

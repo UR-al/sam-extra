@@ -43,6 +43,8 @@ BUILTIN_HOOKS: tuple[tuple[str, str, str, str], ...] = (
     ("speed_dct", "샘플링 캐시", "sam3ext.speed.spectral", "clear_basis_cache"),
     ("hiflow_mask", "샘플링 캐시", "sam3ext.guidance.hiflow", "clear_mask_cache"),
     ("history_dct", "샘플링 캐시", "sam3ext.guidance.history", "clear_dct_cache"),
+    # TSM LoRA: 읽어 둔 TSM 파일(CPU, 최근 2개) · 샘플링용 장치 사본 · DiT 훅.
+    ("tsm_lora", "TSM LoRA", "sam3ext.tsm_lora.runtime", "release_all"),
 )
 
 

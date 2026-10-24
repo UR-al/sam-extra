@@ -28,6 +28,8 @@
 # - probe(refresh=True) rebuilds the history and LoRA indexes first.
 # - "filesystem" also reports whether Forge counts as being on this machine.
 # - ForgeClient, HistoryIndex and LoraIndex are imported for type checking only.
+# - (2026-10-24) counts["loras"] comes from client.lora_list(): sam-extra's light LoRA list when
+#   Forge serves it (the count needs no safetensors headers), else /sdapi/v1/loras as before.
 
 """Environment probe.
 
@@ -101,7 +103,7 @@ def probe(
     data = options.value or {}
     counts = {
         "checkpoints": _count(client.checkpoints()),
-        "loras": _count(client.loras()),
+        "loras": _count(client.lora_list()),
         "samplers": _count(client.samplers()),
         "schedulers": _count(client.schedulers()),
         "modules": _count(client.modules()),

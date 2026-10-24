@@ -85,6 +85,7 @@ REGISTRY: dict[str, Slot] = {
     "adetailer": Slot("det"),
     "lora-block-weight": Slot("lora"),
     "dora-infer-mode": Slot("lora"),
+    "lora-tsm": Slot("lora", exp=True),   # TSM LoRA(시간 단계 전문가) — 실험. 파일 이름은 negpip.py 가 마지막에 남게
     "controlnet": Slot("lora", on=OnRule(elem_class="cnet-unit-enabled")),
     "dynamic-prompting": Slot("lora", on=OnRule(label_equals="Dynamic Prompts enabled")),
     "dynamic-thresholding": Slot("lora", on=OnRule(elem_class="dynthres-enabled")),

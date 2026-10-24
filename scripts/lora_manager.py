@@ -14,6 +14,9 @@ Registers two things:
    JS reads back.
 
 The actual server lifecycle lives in ``sam3ext.lora_manager_core``.
+
+At app start it also registers ``GET /sam3-lora/lite`` (``sam3ext.lora_lite``):
+Forge's LoRA list without the safetensors headers, for external clients.
 """
 from __future__ import annotations
 
@@ -25,6 +28,7 @@ import gradio as gr
 
 from modules import script_callbacks, scripts, shared
 
+from sam3ext.lora_lite import register_lora_lite_route
 from sam3ext.lora_manager_core import (
     DEFAULT_PORT,
     lora_config_data,
@@ -83,6 +87,13 @@ def _on_app_started(demo, app) -> None:
     # lifecycle; see register_lora_routes.
     try:
         register_lora_routes(app)
+    except Exception:
+        traceback.print_exc(file=sys.stderr)
+    # GET /sam3-lora/lite: Forge's LoRA list without the safetensors headers
+    # (sam3ext/lora_lite.py). Separate from the routes above so one failing
+    # cannot keep the other away.
+    try:
+        register_lora_lite_route(app)
     except Exception:
         traceback.print_exc(file=sys.stderr)
 

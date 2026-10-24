@@ -34,6 +34,8 @@
 #   does not put a base64 image into the agent's context.
 # - Optional httpx transport (tests use httpx.MockTransport); requests may carry query params.
 # - httpx is imported lazily: ApiResult and the rest of the core import without it.
+# - (2026-10-24) lora_list(): sam-extra's light LoRA list (GET /sam3-lora/lite, no safetensors
+#   headers) when Forge serves it, else /sdapi/v1/loras - for callers that need no metadata.
 
 """HTTP client for the Forge Neo REST API.
 
@@ -66,6 +68,7 @@ ALLOWED_ROUTES = frozenset(
         ("GET", "/sdapi/v1/options"),
         ("GET", "/sdapi/v1/sd-models"),
         ("GET", "/sdapi/v1/loras"),
+        ("GET", "/sam3-lora/lite"),
         ("GET", "/sdapi/v1/sd-modules"),
         ("GET", "/sdapi/v1/samplers"),
         ("GET", "/sdapi/v1/schedulers"),
@@ -85,6 +88,10 @@ NEVER_REQUESTED = ("/sdapi/v1/cmd-flags", "/internal/sysinfo")
 # The only options this server writes: a checkpoint switch and the preset/modules that go with it.
 SETTABLE_OPTIONS = frozenset({"sd_model_checkpoint", "forge_preset", "forge_additional_modules"})
 OPTIONS_ROUTE = "/sdapi/v1/options"
+# sam-extra's light LoRA list (sam3ext/lora_lite.py): name/alias/path of every LoRA, in
+# /sdapi/v1/loras order, without the parsed safetensors headers (~143 MB for ~800 LoRAs there).
+LORA_LITE_ROUTE = "/sam3-lora/lite"
+LORA_LITE_VERSION = 1
 
 
 @dataclass(frozen=True)
@@ -201,6 +208,24 @@ class ForgeClient:
 
     def loras(self) -> ApiResult:
         return self.get("/sdapi/v1/loras")
+
+    def lora_list(self) -> ApiResult:
+        """Forge's LoRA list for a caller that needs no metadata: a list of dicts with "name",
+        "alias" and "path", in /sdapi/v1/loras order.
+
+        Asks sam-extra's light route first; a Forge without it (older sam-extra, or none) or an
+        answer of another shape falls back to /sdapi/v1/loras, whose items carry "metadata" too.
+        """
+        lite = self.get(LORA_LITE_ROUTE)
+        data = lite.value
+        if (
+            lite.ok
+            and isinstance(data, dict)
+            and data.get("version") == LORA_LITE_VERSION
+            and isinstance(data.get("items"), list)
+        ):
+            return ApiResult(True, data=data["items"])
+        return self.loras()
 
     def modules(self) -> ApiResult:
         return self.get("/sdapi/v1/sd-modules")
